@@ -91,6 +91,12 @@ namespace CoreMap
             Func<bool> calm = () => !simFans.On && !File.Exists(fanMark);
             Check(Until(() => fans.Supported && fans.Rpm != null, 3), "вентиляторы: обороты читаются");
             Check(fans.SetMode(Fans.Measure) == null && calm(), "вентиляторы: «макс при замерах» вне измерения максимум не включает");
+            // Опрос оборотов (Fans.Period): в покое редкий — здесь раз в 1,25 с; частый, раз в 0,25 с, — только пока
+            // идёт измерение (проверяется ниже, на «авто»).
+            int fanReads = simFans.Reads;
+            Thread.Sleep(2000);
+            int idleReads = simFans.Reads - fanReads;
+            Check(idleReads <= 3, "вентиляторы: в покое обороты читаются редко (" + idleReads + " раз за 2 с)");
             var runner = new Runner(load, new LimitHold(limits, blocks, lps, cpu, dir), fans);
             var curves = new CurveStore(limits, cpu, null);
             var ladder = new CurveTest(runner, monitor, limits, curves, true);
@@ -227,6 +233,14 @@ namespace CoreMap
             Check(Until(() => simFans.On, 3), "макс всегда: сброшенный максимум включён заново");
             Check(fans.SetMode(Fans.Auto) == null && calm(), "авто: максимум снят, метки нет");
             Check(Convert.ToInt32(Json.ReadFile(Path.Combine(dir, "fans.json"))["mode"]) == Fans.Auto, "выбор режима вентиляторов записан в файл");
+            // «Авто»: режим измерение не трогает, но обороты на его время читаются часто — они идут в точки кривой.
+            fanReads = simFans.Reads;
+            ladder.Start(new[] { first }, 1, double.NaN);
+            Thread.Sleep(1500);
+            int busyReads = simFans.Reads - fanReads;
+            Check(runner.Busy && busyReads >= 4 && calm(), "авто: во время измерения обороты читаются часто (" + busyReads + " раз за 1,5 с), максимум не включён");
+            runner.Stop();
+            Check(Until(() => !runner.Busy, 3) && back(), "авто: измерение остановлено, потолки прежние");
             // Отказ включить «макс всегда»: переключатель остаётся на прежнем выборе.
             simFans.Refuse = true;
             string fanRefusal = fans.SetMode(Fans.Always);

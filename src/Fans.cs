@@ -296,11 +296,13 @@ namespace CoreMap
         public volatile bool Broken;   // проверка: обороты не читаются
         public volatile bool Instant;  // проверка: обороты меняются сразу, без раскрутки
         public volatile int Writes;    // сколько раз режим записан
+        public volatile int Reads;     // сколько раз спрошены обороты
 
         public SimFans(Func<double> hottest) { this.hottest = hottest; }
 
         public int[] Speeds()
         {
+            Reads++;
             if (Broken) throw new FanException("обороты не прочитаны (проверка)");
             // До 50 °C обороты стоят: шум имитации в один градус не должен менять надпись в окне.
             double aim = Math.Min(5500, 2000 + Math.Max(0, hottest() - 50) * 80);
@@ -336,7 +338,7 @@ namespace CoreMap
 
         readonly Func<IFanBackend> create;
         readonly string modePath, markPath;  // null — имитация: ничего не пишется
-        readonly double interval, maxEvery, keepEvery, spinStep, spinMin, spinMax;
+        readonly double busyEvery, idleEvery, maxEvery, keepEvery, spinStep, spinMin, spinMax;
         readonly object gate = new object();
         readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly Queue<Row> history = new Queue<Row>();
@@ -368,8 +370,9 @@ namespace CoreMap
         public Fans(Func<IFanBackend> create, string saveDir, bool quick)
         {
             this.create = create;
-            // Обороты читаются раз в interval секунд, состояние максимума — раз в maxEvery.
-            interval = quick ? 0.25 : 1;
+            // Обороты читаются раз в Period секунд (busyEvery или idleEvery), состояние максимума — не чаще чем раз в maxEvery.
+            busyEvery = quick ? 0.25 : 1;
+            idleEvery = quick ? 1.25 : 5;
             maxEvery = quick ? 0.5 : 5;
             // Максимум, включённый программой, подтверждается раз в keepEvery секунд: без подтверждения прошивка
             // через 120 секунд сама возвращается к своему режиму. Узнать о таком возврате раньше нечем: ответу
@@ -402,6 +405,16 @@ namespace CoreMap
 
         // ----- поток вентиляторов -----
 
+        /// Раз во сколько секунд читаются обороты. Решается только здесь.
+        /// • busyEvery (1 с) — пока идёт измерение, которое греет процессор (engaged, от Engage до Release): оно
+        ///   пишет обороты в свои результаты, участок ступени длится три секунды, и среднему за него нужно
+        ///   несколько показаний. Раскрутка перед первой ступенью идёт внутри Engage и по этим же показаниям
+        ///   решает, что обороты установились.
+        /// • idleEvery (5 с) — в остальное время: обороты нужны только надписи в верхней полосе окна, а каждое
+        ///   чтение — вызов прошивки, цена которого для остальных ядер не измерена.
+        /// На время замера задержек чтение оборотов не идёт вовсе (Hush).
+        double Period { get { return engaged ? busyEvery : idleEvery; } }
+
         void Run()
         {
             if (!Probe()) return;
@@ -418,7 +431,7 @@ namespace CoreMap
                     served = ticket;
                     System.Threading.Monitor.PulseAll(gate);
                 }
-                wake.WaitOne(TimeSpan.FromSeconds(interval));
+                wake.WaitOne(TimeSpan.FromSeconds(Period));
             }
         }
 
@@ -624,7 +637,7 @@ namespace CoreMap
             string refused = Settle();
             if (refused != null && value == Always)
             {
-                // Максимум не включился: переключатель не должен показывать то, чего нет.
+                // Максимум не включился: кнопка режима не должна показывать то, чего нет.
                 mode = before;
                 Settle();
                 return refused;
@@ -641,7 +654,14 @@ namespace CoreMap
         public void Engage(Func<double, bool> wait)
         {
             engaged = true;
-            if (!Supported || mode != Measure) return;
+            if (!Supported) return;
+            if (mode != Measure)
+            {
+                // Режим не меняется, но частый опрос (Period) должен начаться сразу, а не когда истечёт редкий шаг:
+                // иначе у первой ступени оборотов за её участок не было бы.
+                wake.Set();
+                return;
+            }
             bool was = Max;
             string refused = Settle();
             if (refused != null)
@@ -703,7 +723,7 @@ namespace CoreMap
             {
                 rows = history.Where(r => r.At >= now - seconds).ToArray();
                 // Участок короче шага опроса: берётся последнее показание, если оно свежее.
-                if (rows.Length == 0 && history.Count > 0 && history.Last().At >= now - Math.Max(seconds, 3 * interval))
+                if (rows.Length == 0 && history.Count > 0 && history.Last().At >= now - Math.Max(seconds, 3 * Period))
                     rows = new[] { history.Last() };
             }
             if (rows.Length == 0) return null;
