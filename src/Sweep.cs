@@ -46,6 +46,8 @@ namespace CoreMap
         readonly string saveDir;  // null — результат не сохранять (имитация)
         double startedAt;
 
+        // Результат пишет поток измерения, читает окно: всё, что его трогает, идёт под замком, окну отдаются копии.
+        readonly object gate = new object();
         List<double[][]> passes = new List<double[][]>();  // [проход][нагруженное ядро] → нагрев всех ядер
         List<double[][]> probes = new List<double[][]>();  // [проход][ядро] → {нагрев, прирост Вт, скорость}
         public bool[] Throttled;  // под нагрузкой упёрлось в порог и сбрасывало частоту
@@ -125,8 +127,11 @@ namespace CoreMap
         {
             Seconds = seconds;
             PassCount = passCount;
-            passes = new List<double[][]>();
-            probes = new List<double[][]>();
+            lock (gate)
+            {
+                passes = new List<double[][]>();
+                probes = new List<double[][]>();
+            }
             Throttled = new bool[n];
             Levels = new int[n];
             Done = 0;
@@ -137,8 +142,11 @@ namespace CoreMap
             double baseWatts = monitor.Power(BaseSeconds);
             for (int p = 0; p < PassCount; p++)
             {
-                passes.Add(new double[n][]);
-                probes.Add(new double[n][]);
+                lock (gate)
+                {
+                    passes.Add(new double[n][]);
+                    probes.Add(new double[n][]);
+                }
                 // Обратный порядок во втором проходе: у каждого ядра другой предшественник.
                 foreach (int u in p % 2 == 0 ? order : order.Reverse().ToArray())
                     if (!Measure(p, blocks[u], ref baseTemps, ref baseWatts)) return;
@@ -180,7 +188,8 @@ namespace CoreMap
             {
                 Math.Round(rise, 1), Math.Round(monitor.Power(ProbeSeconds / 2) - baseWatts, 1), Math.Round(members.Sum(m => Load.Rate(m))),
             };
-            foreach (int m in members) probes[p][m] = probe;
+            lock (gate)
+                foreach (int m in members) probes[p][m] = probe;
             Version++;
             if (Levels[first] != 0) return;
             int level = LoadManager.Levels.Where(lv => lv <= Load.Level && baseTemp + rise * Rise[lv] <= Ceiling).DefaultIfEmpty(1).Max();
@@ -221,7 +230,8 @@ namespace CoreMap
             // Фоновые задачи только греют, поэтому исходной считается меньшая из температур до и после.
             var row = new double[n];
             for (int j = 0; j < n; j++) row[j] = Math.Round(hot[j] - Math.Min(baseTemps[j], after[j]), 1);
-            foreach (int m in members) passes[p][m] = row;
+            lock (gate)
+                foreach (int m in members) passes[p][m] = row;
             baseTemps = after;
             baseWatts = monitor.Power(BaseSeconds);
             Done++;
@@ -257,12 +267,19 @@ namespace CoreMap
 
         // ----- результат -----
 
+        /// Копия проходов для расчёта в потоке окна. Строка прохода (нагрев всех ядер) после записи не меняется,
+        /// поэтому копируются только списки строк.
+        double[][][] Taken(List<double[][]> list)
+        {
+            lock (gate) return list.Select(p => (double[][])p.Clone()).ToArray();
+        }
+
         /// Среднее по проходам (mean) и половина размаха между ними (spread) для каждой ячейки.
         public void Combined(out double[][] mean, out double[][] spread)
         {
             mean = new double[n][];
             spread = new double[n][];
-            List<double[][]> taken = passes;
+            double[][][] taken = Taken(passes);
             for (int i = 0; i < n; i++)
             {
                 List<double[]> rows = taken.Where(p => p[i] != null).Select(p => p[i]).ToList();
@@ -282,7 +299,7 @@ namespace CoreMap
         public double[] Own(int what)
         {
             var result = new double[n];
-            List<double[][]> taken = probes;
+            double[][][] taken = Taken(probes);
             for (int i = 0; i < n; i++)
                 result[i] = taken.Where(p => p[i] != null && !double.IsNaN(p[i][what])).Select(p => p[i][what])
                     .DefaultIfEmpty(double.NaN).Average();
@@ -321,8 +338,11 @@ namespace CoreMap
                 readPasses.Add(Json.Rows(saved["matrix"]).ToArray());
                 Levels = Enumerable.Repeat(3, n).ToArray();
             }
-            passes = readPasses;
-            probes = readProbes;
+            lock (gate)
+            {
+                passes = readPasses;
+                probes = readProbes;
+            }
             PassCount = readPasses.Count;
             Done = readPasses.Sum(p => blocks.Count(b => p[b.First] != null));
             Finished = File.GetLastWriteTime(path).ToString("dd.MM HH:mm");
