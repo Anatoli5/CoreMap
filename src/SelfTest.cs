@@ -256,6 +256,10 @@ namespace CoreMap
             none.Engage(seconds => false);
             none.Release();
             Check(none.SetMode(Fans.Always) != null && none.Typical(5) == null && Program.Told() == null, "нет вентиляторов: режим не ставится, сообщений владельцу нет");
+            // Настоящий доступ к вентиляторам (HpFans) здесь не создавался, и библиотека WMI загрузиться не должна
+            // была: так же в работе без окна, где опрос вентиляторов не запускается.
+            Check(!AppDomain.CurrentDomain.GetAssemblies().Any(a => a.GetName().Name == "System.Management"),
+                "вентиляторы: пока настоящий доступ не создан, System.Management не загружен");
 
             // 12. Нечитаемый файл данных не пропадает: при чтении он сохраняется рядом как .bad, и запись
             // новых данных поверх него эту копию не трогает. Половина файла в хранилище не попадает.
