@@ -355,6 +355,7 @@ namespace CoreMap
         public double[] Ratio;                 // фактический множитель; null или NaN — неизвестен
         public bool[] Loaded, Throttled;
         public int[] Limit, LimitFused;        // потолок множителя и заводской предел; null — неизвестны
+        public int[] LimitBase;                // потолки базы: от них считается разница на плитке; null — неизвестны
         public Block Selected;                 // блок, для которого показана кривая: его плитка обведена
         public Action<Block> Clicked;
         public Action<Block, Point> Menu;      // правая кнопка по плитке
@@ -506,17 +507,27 @@ namespace CoreMap
                                       Theme.Text, TextFormatFlags.Left | TextFormatFlags.Bottom | plain);
 
                 // Справа внизу: фактический множитель и потолок («52.4 / ×53»); жёлтым — если потолок ниже
-                // заводского предела. Если рядом с температурой пара не помещается, остаётся потолок.
+                // заводского предела. За потолком — на сколько ступеней он отличается от базы («−2»), если отличается.
+                // Если рядом с температурой пара не помещается, остаётся потолок.
                 if (Limit == null || Limit[first] <= 0) continue;
+                int shift = LimitBase == null || LimitBase[first] <= 0 ? 0 : Limit[first] - LimitBase[first];
+                int deltaWidth = 0;
+                if (shift != 0)
+                {
+                    string delta = (shift > 0 ? "+" : "−") + Math.Abs(shift);
+                    deltaWidth = TextRenderer.MeasureText(g, delta, small, Size.Empty, plain).Width + Zoomed(5);
+                    TextRenderer.DrawText(g, delta, small, new Rectangle(t.X, t.Bottom - pad - small.Height, t.Width - pad, small.Height),
+                                          Theme.Text, TextFormatFlags.Right | TextFormatFlags.Bottom | plain);
+                }
                 string ceiling = "×" + Limit[first], pair = ceiling;
                 double ratio = Highest(Ratio, members);
                 if (!double.IsNaN(ratio))
                 {
                     pair = ratio.ToString("0.0") + " / " + ceiling;
-                    int free = t.Width - 2 * pad - Zoomed(4) - TextRenderer.MeasureText(g, cur, large, Size.Empty, plain).Width;
+                    int free = t.Width - 2 * pad - Zoomed(4) - deltaWidth - TextRenderer.MeasureText(g, cur, large, Size.Empty, plain).Width;
                     if (TextRenderer.MeasureText(g, pair, small, Size.Empty, plain).Width > free) pair = ceiling;
                 }
-                TextRenderer.DrawText(g, pair, small, new Rectangle(t.X, t.Bottom - pad - small.Height, t.Width - pad, small.Height),
+                TextRenderer.DrawText(g, pair, small, new Rectangle(t.X, t.Bottom - pad - small.Height, t.Width - pad - deltaWidth, small.Height),
                                       Limit[first] < LimitFused[first] ? Theme.Accent : Limit[first] > LimitFused[first] ? Theme.Bad : Theme.Text,
                                       TextFormatFlags.Right | TextFormatFlags.Bottom | plain);
             }
@@ -524,8 +535,8 @@ namespace CoreMap
     }
 
     /// График «температура от множителя»: кривые всех блоков разом, приглушённые, и одна выделенная поверх них —
-    /// по кривой на каждую силу нагрузки. Горизонтальная линия — температура с ползунка, кружки на ней —
-    /// потолки, которые ползунок ставит блокам.
+    /// по кривой на каждую силу нагрузки. Горизонтальная линия — температура с ползунка, жёлтые кружки —
+    /// потолки, которые стоят у блоков сейчас.
     /// Точка стоит по множителю, на котором ядро работало на самом деле, а не по заданному потолку:
     /// замер на 275HX показал, что при высоких потолках ядро до потолка не доходит (при потолке ×54
     /// ядро 12 шло на ×50,8), и по потолку кривая получалась искажённой.
@@ -539,7 +550,7 @@ namespace CoreMap
         CurveRun[] front = new CurveRun[0];  // кривые выделенного блока
         CurveRun[] back = new CurveRun[0];   // кривые остальных блоков на текущей силе нагрузки
         BlockMap blocks;                     // чья кривая: блок находится по CurveRun.Lp
-        CurveChoice[] picks = new CurveChoice[0];  // выбор ползунка по блокам; null — кривой блока нет
+        CurveChoice[] picks = new CurveChoice[0];  // потолок, стоящий у каждого блока, и его точка на кривой; null — неизвестен
         double cutoff = double.NaN;
         bool byPeak;  // работа идёт по наибольшей температуре ступени: её линия толстая, средняя — тонкая
         string empty = "";
@@ -702,7 +713,7 @@ namespace CoreMap
                 }
             }
 
-            // Выбор ползунка: кружок на той точке кривой каждого блока, с которой взят потолок.
+            // Потолок, который стоит сейчас: кружок на той точке кривой блока, что снята при нём.
             using (var mark = new SolidBrush(Theme.Accent))
             using (var rim = new Pen(Theme.Panel, Theme.Px(1.5)))
                 foreach (CurveRun run in back.Concat(front))
@@ -719,14 +730,15 @@ namespace CoreMap
         }
     }
 
-    /// Список блоков рядом с графиком: название, потолок под температуру с ползунка и температура на нём по кривой.
+    /// Список блоков рядом с графиком: название, потолок, который стоит сейчас, его разница с базой и температура
+    /// на нём по кривой.
     /// Наведение на строку выводит кривую блока поверх остальных, щелчок закрепляет её.
     class BlockList : Painted
     {
         readonly Block[] blocks;
-        CurveChoice[] picks;
+        CurveChoice[] picks;  // потолок, который стоит у блока сейчас, и что о нём говорит кривая; null — потолок неизвестен
         double[] joint;  // температура блока под общей нагрузкой; NaN — замера нет
-        int[] delta;     // на сколько ступеней выбор ползунка отличается от действующего профиля
+        int[] delta;     // на сколько ступеней потолок блока отличается от базы
         int pinned = -1, under = -1, lit = -1;
 
         public Action<int> Hovered, Clicked;  // номер блока по порядку; -1 — курсор ушёл
@@ -756,12 +768,12 @@ namespace CoreMap
         protected override string TipAt(Point at)
         {
             return "Блоки\nНаведи на строку — кривая блока выходит на графике поверх остальных; щелчок закрепляет её.\n" +
-                "• ×N — потолок, который ползунок ставит блоку; правее — температура на нём по кривой\n" +
-                "• +N или −N после потолка — разница с действующим профилем, а без профиля — с потолками при запуске программы\n" +
-                "• красная температура — блок горячее цели уже на нижней точке своей кривой\n" +
-                "• ▲ — взята верхняя точка кривой: выше она не снята\n" +
+                "• ×N — потолок, который стоит у блока сейчас; правее — температура на нём по кривой блока\n" +
+                "• +N или −N после потолка — разница с базой: с базовым профилем, а без него — с заводскими потолками\n" +
+                "• красная температура — ползунок поставил нижнюю точку кривой, а блок и на ней горячее цели\n" +
+                "• ▲ — ползунок взял верхнюю точку кривой: выше она не снята\n" +
                 "• после стрелки — температура блока, когда нагружены все блоки разом (кнопка «проверить все разом»)\n" +
-                "• прочерк — кривой блока нет";
+                "• прочерк вместо температуры — кривой блока нет или при таком потолке она не снималась";
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -816,7 +828,7 @@ namespace CoreMap
                     TextRenderer.DrawText(g, (delta[u] > 0 ? "+" : "−") + Math.Abs(delta[u]), font, new Rectangle(Width * 45 / 100, row.Top, Width * 13 / 100, row.Height),
                                           delta[u] > 0 ? Theme.Good : Theme.Bad, Flags);
                 bool both = !double.IsNaN(joint[u]);
-                TextRenderer.DrawText(g, pick.Temp.ToString("0") + "°" + (both ? "→" : pick.Top ? " ▲" : ""), font,
+                TextRenderer.DrawText(g, (double.IsNaN(pick.Temp) ? "—" : pick.Temp.ToString("0") + "°") + (both ? "→" : pick.Top ? " ▲" : ""), font,
                                       new Rectangle(Width * 58 / 100, row.Top, (both ? Width * 21 / 100 : Width * 42 / 100 - pad), row.Height),
                                       pick.Hot ? Theme.Bad : Theme.Dim, Flags | TextFormatFlags.Right);
                 if (both)

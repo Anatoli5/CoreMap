@@ -17,7 +17,8 @@
 // CoreMap.exe --slide N     вместе с --simulate --saved --snapshot: вместо измерения поставить ползунок потолков на N °C
 // CoreMap.exe --best        вместе с --slide: ползунок работает «по выгоде»
 // CoreMap.exe --joint       вместе с --simulate --snapshot: вместо измерения запустить проверку под общей нагрузкой
-// CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
+// CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх базы
+// CoreMap.exe --size WxH   вместе с --snapshot: размер окна в пикселях, например 1280x800
 using System;
 using System.Globalization;
 using System.IO;
@@ -34,6 +35,7 @@ namespace CoreMap
         public static bool TestBest;  // проверка на имитации с ключом --best: ползунок делит температуру «по выгоде»
         public static bool TestJoint;  // проверка на имитации с ключом --joint
         public static bool TestFit;  // проверка на имитации с ключом --fit: вместо измерения запускается подбор под температуру
+        public static bool TestProfile;  // проверка на имитации с ключом --profile: два профиля, один открыт поверх базы
 
         public static void Log(string text)
         {
@@ -62,6 +64,7 @@ namespace CoreMap
             if (simulate) int.TryParse(Option(args, "--slide"), out TestSlide);
             TestBest = simulate && Array.IndexOf(args, "--best") >= 0;
             TestJoint = simulate && Array.IndexOf(args, "--joint") >= 0;
+            TestProfile = simulate && Array.IndexOf(args, "--profile") >= 0;
             int limit;
             int.TryParse(Option(args, "--limit"), out limit);
 

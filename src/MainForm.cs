@@ -24,14 +24,14 @@ namespace CoreMap
 
         Label pkg, pkgMax, watts, since, banner, sweepStatus, sweepNotes, latencyStatus, dieNote, calibrationStatus, profileStatus;
         Label curveTitle, curveStatus, sweepAxes, fitStatus, profileLabel, fitValue;
-        Button curveAllButton, fitButton, profileApply, profileList, helpButton;
+        Button curveAllButton, fitButton, profilePin, profileList, helpButton;
         // Режим вопроса: курсоры элементов, какими они были до него.
         readonly Dictionary<Control, Cursor> cursors = new Dictionary<Control, Cursor>();
         TextBox profileName;
         Slider fitSlider;        // цель подбора потолков, °C
         NumericUpDown curveTemp;  // предел, до которого греется блок при снятии кривой, °C
         string fitReport;  // итог последнего подбора потолков по температуре
-        Button reset, stopLoad, sweepButton, latencyButton, calibrationButton, profileSave, profileForget, limitsRestore, curveButton;
+        Button reset, stopLoad, sweepButton, latencyButton, calibrationButton, profileSave, profileForget, baseRestore, curveButton;
         const int FitLow = 55, FitHigh = 95;  // пределы ползунка температуры, °C
         CurveView curveView;
         BlockList blockList;
@@ -488,11 +488,17 @@ namespace CoreMap
                     BackColor = Theme.Button, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Font = Theme.Font(13),
                     Margin = new Padding(0, 0, Theme.Px(4), 0),
                 };
-                Theme.Tips.SetToolTip(profileName, "Название профиля\nВпиши новое название или выбери сохранённый профиль кнопкой ▾ справа.");
+                Theme.Tips.SetToolTip(profileName, "Название профиля\nПод этим названием «сохранить» запишет то, что стоит сейчас.\n" +
+                    "• существующее название — профиль перезаписывается; новое — появляется новый профиль\n" +
+                    "• открыть сохранённый профиль — кнопка ▾ справа");
                 profileName.Text = core.Profile.Exists ? core.Profile.Name : "";
                 field.Controls.Add(profileName);
                 field.Controls.Add(profileList = Widgets.Button("▾", ProfileMenu,
-                    "Сохранённые профили\nПоказывает список сохранённых профилей; щелчок по названию вписывает его в поле."));
+                    "Открыть профиль\nЩелчок по названию ставит потолки этого профиля. База при этом не меняется.\n" +
+                    "• разница открытого профиля с базой видна на плитках и в списке блоков: +N и −N\n" +
+                    "• «заводские» — потолки, с которыми процессор выпущен\n" +
+                    "• чтобы открытый профиль ставился при запуске программы — кнопка «сделать базой»\n" +
+                    "• вернуться — кнопка «вернуть базу»"));
                 profileList.Margin = Padding.Empty;
                 foreach (Control c in field.Controls) c.Anchor = AnchorStyles.Left;
                 panel.Controls.Add(field);
@@ -502,22 +508,25 @@ namespace CoreMap
                 row.WrapContents = true;  // в узкой панели кнопки переносятся на вторую строку
                 profileRow = row;
                 row.Controls.Add(profileSave = Widgets.Button("сохранить", () => Report(core.SaveProfile(profileName.Text)),
-                    "Сохранить профиль\nЗапоминает действующие потолки множителей под названием из поля выше.\n" +
-                    "• новое название — новый профиль; существующее — профиль перезаписывается\n" +
+                    "Сохранить профиль\nЗаписывает то, что стоит сейчас, в профиль с названием из поля выше и делает его базой.\n" +
+                    "• название базы — база перезаписывается; новое название — новый профиль\n" +
                     "• без сохранения любые изменения потолков пропадают при перезагрузке\n" +
                     "• профили хранятся в файле рядом с программой, в прошивку ноутбука ничего не пишется\n" +
-                    "• сохранённый последним становится действующим: он применяется заново при запуске программы\n" +
-                    "• если после применения был сбой, профиль с потолками выше заводских отключается сам"));
-                row.Controls.Add(profileApply = Widgets.Button("применить", () => Report(core.ApplyProfile(profileName.Text)),
-                    "Применить профиль\nСтавит потолки из профиля, выбранного в поле выше, и делает его действующим.\n" +
-                    "• он же будет применяться при запуске программы"));
-                row.Controls.Add(profileForget = Widgets.Button("удалить", () => Report(core.DeleteProfile(profileName.Text)),
-                    "Удалить профиль\nУдаляет профиль, выбранный в поле выше.\n" +
-                    "• если он действующий — при следующем запуске потолки меняться не будут\n" +
-                    "• потолки, которые стоят сейчас, остаются до перезагрузки"));
-                row.Controls.Add(limitsRestore = Widgets.Button("как было", () => Report(core.RestoreLimits()),
-                    "Вернуть потолки\nСтавит потолки, какими они были при запуске программы, до применения профиля.\n" +
+                    "• база ставится заново при запуске программы\n" +
+                    "• если после этого был сбой, профиль с потолками выше заводских отключается сам"));
+                row.Controls.Add(profilePin = Widgets.Button("сделать базой", () => Report(core.PinStanding(profileName.Text)),
+                    "Сделать базой то, что стоит сейчас\nОткрытый профиль становится базой: он ставится при запуске программы, " +
+                    "от него считается разница потолков.\n" +
+                    "• сами профили не меняются\n" +
+                    "• если открыты заводские — при запуске программы ничего ставиться не будет\n" +
+                    "• если потолки менялись после открытия — сначала «сохранить»"));
+                row.Controls.Add(baseRestore = Widgets.Button("вернуть базу", () => Report(core.RestoreBase()),
+                    "Вернуть базу\nСтавит потолки базы: всё, что менялось ползунком, вручную или открытием другого профиля, отменяется.\n" +
                     "• сохранённые профили при этом не меняются"));
+                row.Controls.Add(profileForget = Widgets.Button("удалить", () => Report(core.DeleteProfile(profileName.Text)),
+                    "Удалить профиль\nУдаляет профиль с названием из поля выше.\n" +
+                    "• если он база — базой становятся заводские потолки, при запуске программы ничего ставиться не будет\n" +
+                    "• потолки, которые стоят сейчас, остаются до перезагрузки"));
                 foreach (Control c in row.Controls) c.Margin = new Padding(0, 0, Theme.Px(4), Theme.Px(4));
                 panel.Controls.Add(row);
                 panel.Controls.Add(profileStatus = Widgets.Label("", Theme.Dim, 11));
@@ -645,7 +654,7 @@ namespace CoreMap
                     Help = "Кривые «температура от множителя»\nКривые всех блоков разом; яркая — блок под курсором (в списке, на схеме или на графике).\n" +
                         "• щелчок по строке списка или по плитке закрепляет блок\n" +
                         "• по горизонтали — множитель, на котором блок работал на самом деле\n" +
-                        "• пунктир — температура с ползунка, жёлтые кружки — потолки, которые он ставит\n" +
+                        "• пунктир — температура с ползунка, жёлтые кружки — потолки, которые стоят сейчас\n" +
                         "• у яркой кривой: толстая линия — средняя температура, тонкая — наибольшая; чёрточка у точки — разница между " +
                         "подъёмом и спуском; пустой кружок — до заданного потолка блок не дошёл\n" +
                         "• наведи на точку — её числа",
@@ -782,11 +791,12 @@ namespace CoreMap
             var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, Font = Theme.Font(13) };
             menu.Items.Add(new ToolStripLabel("Потолок множителя: " + (block.Kind == 'E' ? "кластер ядра " : "ядро ") + block.Lp));
             menu.Items.Add(new ToolStripSeparator());
+            int[] baseline = core.BaseLimits;
             foreach (int ratio in limits.Choices(i))
             {
                 int value = ratio;
                 string text = "×" + value + (value == limits.Fused[i] ? "  заводской предел" : value > limits.Fused[i] ? "  выше заводского" : "") +
-                    (value == limits.Initial[i] && value != limits.Fused[i] ? "  был при запуске" : "");
+                    (value == baseline[i] && value != limits.Fused[i] ? "  база" : "");
                 var item = new ToolStripMenuItem(text) { Checked = value == limits.Current[i], Enabled = !core.Busy };
                 item.Click += (s, e) =>
                 {
@@ -823,7 +833,7 @@ namespace CoreMap
             Block shown = hovered ?? selected;  // блок, чья кривая поверх остальных
             curveTitle.Text = "Кривая · " + shown.Title;
             string key = curve.Version + "/" + shown.Index + "/" + selected.Index + "/" + fitSlider.Value + "/" + core.Load.Level + "/" + fitBest + "/" + curve.ByPeak +
-                "/" + string.Join(",", core.Limits.Current) + "/" + string.Join(",", Baseline());
+                "/" + string.Join(",", core.Limits.Current) + "/" + string.Join(",", core.BaseLimits);
             if (drawnKey == key) return;
             drawnKey = key;
             DrawCurves(shown);
@@ -835,11 +845,12 @@ namespace CoreMap
             CurveTest curve = core.Curve;
             int level = core.Load.Level, target = fitSlider.Value;
             CurveChoice[] picks = core.ChooseAll(target, fitBest);
+            // График и список показывают то, что стоит в процессоре; выбор ползунка в них попадает, когда ползунок
+            // его поставил. От положения ползунка, пока он ничего не ставил, зависят только отсечка и средний множитель.
+            CurveChoice[] standing = Standing(picks);
             curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
-                           core.Blocks, target, picks, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
-            int[] baseline = Baseline();
-            blockList.Show(picks, selected.Index, shown.Index, JointTemps(),
-                           blocks.Select(b => picks[b.Index] == null || baseline[b.First] <= 0 ? 0 : picks[b.Index].Limit - baseline[b.First]).ToArray());
+                           core.Blocks, target, standing, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
+            blockList.Show(standing, selected.Index, shown.Index, JointTemps(), Delta());
 
             double[] now = Means(picks);
             double even = fitBest ? Means(core.ChooseAll(target))[0] : double.NaN;
@@ -877,18 +888,36 @@ namespace CoreMap
             meanView.Show(meanEven, meanBest, fitBest, meanRough, meanReadout, Knee(meanEven, meanRough));
         }
 
-        /// Потолки, с которыми сравнивается выбор ползунка: действующий профиль, а без него — потолки при запуске программы.
-        int[] Baseline()
+        /// На сколько ступеней потолок каждого блока, стоящий сейчас, отличается от базы; 0 — не отличается или неизвестен.
+        int[] Delta()
         {
-            return core.Profile != null && core.Profile.Exists ? core.Profile.Ratios : core.Limits.Initial;
+            int[] now = core.Limits.Current, baseline = core.BaseLimits;
+            return blocks.Select(b => now[b.First] <= 0 || baseline[b.First] <= 0 ? 0 : now[b.First] - baseline[b.First]).ToArray();
+        }
+
+        /// Что кривые говорят о потолке, который стоит у каждого блока сейчас. Если он совпал с выбором ползунка,
+        /// берётся этот выбор; иначе — точка кривой, снятая при таком потолке. Кривой нет или потолок вне её —
+        /// запись без температуры; null — потолок блока неизвестен.
+        CurveChoice[] Standing(CurveChoice[] picks)
+        {
+            int level = core.Load.Level;
+            return blocks.Select(b =>
+            {
+                if (!core.Limits.Known(b.First)) return null;
+                int now = core.Limits.Current[b.First];
+                if (picks[b.Index] != null && picks[b.Index].Limit == now) return picks[b.Index];
+                CurveChoice[] options = core.Curve.Options(b, level) ?? new CurveChoice[0];
+                CurveChoice at = options.FirstOrDefault(o => o.From == now) ?? options.LastOrDefault(o => o.Limit == now);
+                // В записи кривой потолок может стоять ниже снятого (блок до него не дошёл); в списке нужен тот, что стоит.
+                return at == null ? new CurveChoice { Limit = now, From = now, Temp = double.NaN, Ratio = double.NaN }
+                    : new CurveChoice { Limit = now, From = at.From, Temp = at.Temp, Ratio = at.Ratio };
+            }).ToArray();
         }
 
         /// Приписка к итогу ползунка: как вернуть потолки, которые стояли до него.
         string BackHint()
         {
-            return core.Profile != null && core.Profile.Exists
-                ? " Вернуть профиль «" + core.Profile.Name + "» — кнопка «применить» в «Профилях»."
-                : " Вернуть прежние потолки — кнопка «как было».";
+            return " Отменить — кнопка «вернуть базу».";
         }
 
         /// Температура каждого блока в последнем замере под общей нагрузкой; NaN — замера нет или потолки с тех пор менялись.
@@ -961,21 +990,48 @@ namespace CoreMap
             return best < 0 ? -1 : FitLow + best;
         }
 
-        /// Список сохранённых профилей под кнопкой ▾: щелчок по названию вписывает его в поле.
+        /// Список под кнопкой ▾: заводские потолки и сохранённые профили. Щелчок открывает набор — ставит его
+        /// потолки; база при этом прежняя. Пометки словами говорят, что база и что стоит сейчас.
         void ProfileMenu()
         {
-            var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, Font = Theme.Font(13) };
-            string[] names = core.Profiles.Names;
-            if (names.Length == 0) menu.Items.Add(new ToolStripLabel("Сохранённых профилей нет"));
-            foreach (string name in names)
+            var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = false, Font = Theme.Font(13) };
+            Profile profile = core.Profile;
+            string standing = core.Standing(profileName.Text);
+            // "" — заводские потолки: у них нет названия, и в поле названия они ничего не вписывают.
+            foreach (string name in new[] { "" }.Concat(core.Profiles.Names))
             {
                 string picked = name;
-                var item = new ToolStripMenuItem(picked) { Checked = core.Profile.Exists && core.Profile.Name == picked };
-                item.Click += (s, e) => { profileName.Text = picked; Tick(); };
+                bool isBase = picked == "" ? !profile.Exists : profile.Exists && profile.Name == picked;
+                string text = (picked == "" ? "заводские" : picked) + (isBase ? "  · база" : "") +
+                    (isBase && profile.Disabled ? " (отключена после сбоя)" : "") + (standing == picked ? "  · стоит сейчас" : "");
+                var item = new ToolStripMenuItem(text) { Enabled = !core.Busy };
+                item.Click += (s, e) =>
+                {
+                    string refusal = core.OpenProfile(picked);
+                    if (refusal == null) { profileName.Text = picked; fitReport = null; }
+                    Report(refusal);
+                };
                 menu.Items.Add(item);
+                if (picked == "" && core.Profiles.Names.Length > 0) menu.Items.Add(new ToolStripSeparator());
             }
             menu.Closed += (s, e) => BeginInvoke((Action)menu.Dispose);
             menu.Show(profileList, new Point(0, profileList.Height));
+        }
+
+        /// Строка состояния профилей: что база и что стоит в процессоре сейчас. attention — стоит не база.
+        string ProfileStatus(bool busy, out bool attention)
+        {
+            Profile profile = core.Profile;
+            attention = false;
+            // Всегда две короткие строки: высота надписи не меняется, и окно под ней не прыгает.
+            string text = profile.Describe() + "\n";
+            if (busy) return text + "Сейчас — измерение: потолки временные";
+            int differ = Delta().Count(d => d != 0);
+            if (differ == 0) return text + "Сейчас — база";
+            attention = true;
+            string standing = core.Standing(profileName.Text);
+            return text + "Сейчас — " + (standing == null ? "не сохранено" : standing == "" ? "заводские" : "«" + standing + "»") +
+                ": разница с базой у " + differ + " из " + blocks.Length + " блоков";
         }
 
         /// Показывает отказ действия в полосе сверху; null — действие выполнено.
@@ -1033,6 +1089,7 @@ namespace CoreMap
                     (double.IsNaN(core.LoadRatio[i]) ? "" : ", в среднем под нагрузкой — " + core.LoadRatio[i].ToString("0.0"));
             if (core.Limits != null && core.Limits.Known(i))
                 text += "\n• потолок множителя: ×" + core.Limits.Current[i] + ", заводской предел ×" + core.Limits.Fused[i] +
+                    (core.Limits.Current[i] == core.BaseLimits[i] ? "" : "\n• в базе ×" + core.BaseLimits[i] + ": число после потолка на плитке — разница с базой") +
                     "\n• правая кнопка — изменить потолок" + (block.Kind == 'E' ? " (общий для кластера)" : "") +
                     "\n• потолок выше заводского показан красным; частоту ограничивает ещё таблица «по числу работающих ядер»";
             if (core.Busy) text += "\n• идёт измерение: ручная нагрузка недоступна";
@@ -1129,7 +1186,21 @@ namespace CoreMap
             // В имитации хватает 30 секунд; на настоящих датчиках — до трёх измеренных ядер, но не дольше 4 минут.
             if (++ticks == 2)
             {
-                if (Program.TestSlide > 0) { fitBest = Program.TestBest; fitSlider.Value = Program.TestSlide; fitSlider.Moved(Program.TestSlide); if (Program.TestJoint) core.StartJoint(); }
+                if (Program.TestProfile)
+                {
+                    // Два профиля, второй — база, первый открыт поверх неё: на картинке видны пометки и разница с базой.
+                    int a = blocks[0].First, b = blocks[2].First, c = blocks[5].First;
+                    int top = core.Limits.Current[a];
+                    core.SetLimit(a, top - 3);
+                    core.SetLimit(b, core.Limits.Current[b] - 2);
+                    core.SaveProfile("Тихий");
+                    core.SetLimit(a, top);
+                    core.SetLimit(c, core.Limits.Current[c] + 1);
+                    core.SaveProfile("Игровой");
+                    Report(core.OpenProfile("Тихий"));
+                    profileName.Text = "Тихий";
+                }
+                else if (Program.TestSlide > 0) { fitBest = Program.TestBest; fitSlider.Value = Program.TestSlide; fitSlider.Moved(Program.TestSlide); if (Program.TestJoint) core.StartJoint(); }
                 else if (Program.TestJoint) core.StartJoint();
                 else if (Program.TestFit) core.FitLimits(47);
                 else if (autoCurve) core.StartCurve(selected, double.NaN);
@@ -1185,15 +1256,18 @@ namespace CoreMap
             if (core.Profile != null)
             {
                 Profile profile = core.Profile;
-                // Во время измерения потолки временные: их меняет само измерение, сохранять их нельзя.
-                bool unsaved = !busy && (profile.Exists ? !profile.InEffect : core.Limits.Changed);
-                bool listed = core.Profiles.Get(profileName.Text) != null;
+                // Во время измерения потолки временные: их меняет само измерение, сохранять их и менять базу нельзя.
+                bool attention;
+                string status = ProfileStatus(busy, out attention);
                 profileSave.Enabled = profileName.Text.Trim() != "" && !busy;
-                profileApply.Enabled = listed && !busy;
-                profileForget.Enabled = listed;
-                limitsRestore.Enabled = core.Limits.Changed && !busy;
-                profileStatus.Text = profile.Describe(unsaved);
-                profileStatus.ForeColor = profile.State == "failed" && profile.Exists ? Theme.Bad : unsaved ? Theme.Accent : Theme.Dim;
+                profilePin.Enabled = core.CanPin(profileName.Text);
+                profileForget.Enabled = core.Profiles.Get(profileName.Text) != null;
+                baseRestore.Enabled = attention && !busy;
+                if (profileStatus.Text != status) profileStatus.Text = status;
+                string details = profile.Details() ?? "";
+                if (Theme.Readout.GetToolTip(profileStatus) != details) Theme.Readout.SetToolTip(profileStatus, details);
+                profileStatus.ForeColor = profile.Disabled ? Theme.Bad : attention ? Theme.Accent : Theme.Dim;
+                die.LimitBase = core.BaseLimits;
             }
 
             if (core.Curve != null)

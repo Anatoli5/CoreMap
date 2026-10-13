@@ -67,7 +67,6 @@ namespace CoreMap
         readonly BlockMap blocks;
         readonly int[] lps;
         public readonly int[] Fused, Current;  // 0 — процессор не ответил
-        public readonly int[] Initial;         // действующие потолки на момент запуска программы
 
         public CoreLimits(PawnIo io, CpuCore[] cores, BlockMap blocks)
         {
@@ -83,7 +82,6 @@ namespace CoreMap
                     Fused[i] = lps[i] == 12 || lps[i] == 23 ? 54 : Current[i];
                 }
             else Read();
-            Initial = (int[])Current.Clone();
         }
 
         public bool Known(int index) { return Fused[index] > 0; }
@@ -126,11 +124,11 @@ namespace CoreMap
             return null;
         }
 
-        /// Действующие потолки отличаются от тех, что были при запуске программы.
-        public bool Changed { get { return !Current.SequenceEqual(Initial); } }
-
-        /// Возвращает потолки, какими они были при запуске программы. null — все приняты.
-        public string Restore() { return Apply(Initial); }
+        /// Действующие потолки совпадают с набором (ядра, о которых процессор не ответил, не в счёт).
+        public bool Same(int[] ratios)
+        {
+            return Enumerable.Range(0, lps.Length).All(i => !Known(i) || Current[i] == ratios[i]);
+        }
 
         /// Ставит потолок каждому ядру из набора. null — все приняты.
         public string Apply(int[] ratios)

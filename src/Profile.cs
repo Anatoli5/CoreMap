@@ -1,8 +1,10 @@
 // Профили потолков множителей.
 //
 // Профилей может быть несколько, у каждого своё название (ProfileSets, data\profiles.json). Один из них —
-// действующий (Profile, data\profile.json): тот, что сохранён или применён последним; он и ставится заново
-// при запуске программы.
+// база (Profile, data\profile.json): тот, что сохранён последним или сделан базой; он ставится заново
+// при запуске программы, и от него окно считает разницу потолков. Без профиля базой служат заводские
+// потолки. Профиль, выбранный в списке, только ставит свои потолки — база остаётся прежней, пока её
+// не сменят явно.
 //
 // Изменение потолка в окне — проба: оно действует сразу, нигде не записывается и пропадает при
 // перезагрузке. Профиль появляется только по кнопке «сохранить» и хранится в data\profile.json;
@@ -36,7 +38,8 @@ namespace CoreMap
         public DateTime Saved, Applied;
         public int Boots;
         public double Hours;
-        public string Note;         // что произошло с профилем при запуске программы
+        public string Note;         // что пошло не так с профилем при запуске программы; null — всё штатно
+        public string AtStartup;    // во сколько профиль поставлен при этом запуске программы; null — не ставился
 
         public Profile(CoreLimits limits, int[] lps, string cpu, string saveDir)
         {
@@ -49,15 +52,15 @@ namespace CoreMap
         public bool Exists { get { return Ratios != null; } }
 
         /// Действующие потолки совпадают с профилем.
-        public bool InEffect
-        {
-            get { return Exists && Enumerable.Range(0, lps.Length).All(i => !limits.Known(i) || limits.Current[i] == Ratios[i]); }
-        }
+        public bool InEffect { get { return Exists && limits.Same(Ratios); } }
+
+        /// Профиль отключён после сбоя: при запуске программы он не ставится.
+        public bool Disabled { get { return Exists && State == Failed; } }
 
         /// В профиле есть потолок выше заводского предела: такой профиль проходит испытательный срок.
         bool Risky { get { return Enumerable.Range(0, lps.Length).Any(i => limits.Known(i) && Ratios[i] > limits.Fused[i]); } }
 
-        /// Делает действующие потолки действующим профилем с данным названием.
+        /// Делает то, что стоит в процессоре сейчас, базой — профилем с данным названием.
         public void Save(string name)
         {
             Name = name;
@@ -65,7 +68,7 @@ namespace CoreMap
             Saved = Applied = DateTime.Now;
             Boots = 0;
             Hours = 0;
-            Failure = Note = null;
+            Failure = Note = AtStartup = null;
             State = Risky ? Trial : Trusted;
             Write();
         }
@@ -149,20 +152,10 @@ namespace CoreMap
             // отнесёт сбой к этому применению, а не к прошлому.
             Applied = DateTime.Now;
             Write();
-            string refusal = Apply();
+            string refusal = limits.Apply(Ratios);
             if (refusal != null) Note = "профиль применён не полностью: " + refusal;
-            else if (Note == null) Note = "применён при запуске " + DateTime.Now.ToString("HH:mm");
+            else AtStartup = DateTime.Now.ToString("HH:mm");
             Write();
-        }
-
-        /// Ставит потолки из профиля. null — все приняты.
-        public string Apply()
-        {
-            string refusal = null;
-            for (int i = 0; i < lps.Length; i++)
-                if (limits.Known(i) && limits.Current[i] != Ratios[i])
-                    refusal = limits.Set(i, Ratios[i]) ?? refusal;
-            return refusal;
         }
 
         const string FailureEvents =
@@ -192,19 +185,26 @@ namespace CoreMap
             }
         }
 
-        /// Строка состояния для окна.
-        public string Describe(bool changed)
+        /// Что сейчас база, одной короткой строкой для окна. Что стоит в процессоре, окно дописывает само.
+        public string Describe()
         {
-            string unsaved = changed ? " · потолки изменены и не сохранены: пропадут при перезагрузке" : "";
-            if (!Exists) return changed ? "Действующего профиля нет" + unsaved : "Действующего профиля нет: потолки как у системы";
-            string text = "Действует профиль «" + Name + "» от " + Saved.ToString("dd.MM HH:mm");
-            if (State == Failed) return text + " отключён: " + Failure + unsaved;
-            if (State == Trial)
-                text += " · пробный: пережил перезапусков " + Boots + " из " + TrialBoots + ", часов " + Hours.ToString("0.0") + " из " + TrialHours;
-            else text += " · проверенный";
-            text += InEffect ? "" : " · сейчас потолки другие";
-            if (Note != null) text += " · " + Note;
-            return text + unsaved;
+            string note = Note == null ? "" : " · " + Note;  // редкое и важное: профиль не прочитан, не применён, применён после сбоя
+            if (!Exists) return "База — заводские потолки" + note;
+            return "База — «" + Name + "» от " + Saved.ToString("dd.MM HH:mm") +
+                (State == Failed ? " · отключён после сбоя" : State == Trial ? " · пробный" : " · проверенный") + note;
+        }
+
+        /// Подробности о базовом профиле для подсказки под курсором; null — сказать нечего.
+        public string Details()
+        {
+            if (!Exists) return null;
+            string text = "Профиль «" + Name + "»";
+            if (State == Failed) text += "\n• отключён и при запуске программы не ставится: " + Failure;
+            else if (State == Trial)
+                text += "\n• пробный, потому что в нём есть потолки выше заводских: пережил перезапусков " + Boots + " из " + TrialBoots +
+                    ", часов " + Hours.ToString("0.0") + " из " + TrialHours;
+            if (AtStartup != null) text += "\n• поставлен при запуске программы в " + AtStartup;
+            return text.Contains("\n") ? text : null;
         }
     }
 

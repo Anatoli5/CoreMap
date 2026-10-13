@@ -43,6 +43,7 @@ $sets = [ordered]@{
     e = '--joint --limit 400 --size 1920x1040'
     f = '--saved --slide 76 --size 1280x800'
     g = '--size 1920x1040'
+    h = '--profile --saved --size 1920x1040'
 }
 $env:__COMPAT_LAYER = 'RunAsInvoker'
 $stamp = Get-Date

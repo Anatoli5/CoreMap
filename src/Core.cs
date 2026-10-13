@@ -23,7 +23,7 @@ namespace CoreMap
         public readonly LatencyTest Latency;
         public readonly Calibration Calibration;
         public readonly CoreLimits Limits;    // null — потолки недоступны (нет доступа к процессору)
-        public readonly Profile Profile;      // действующий профиль потолков; null — потолки недоступны
+        public readonly Profile Profile;      // база: профиль, который ставится при запуске; null — потолки недоступны
         public readonly ProfileSets Profiles; // все сохранённые профили по названиям
         public readonly CurveTest Curve;      // кривые «температура от потолка»; null — нет потолков или датчиков
         public readonly bool Simulated;
@@ -242,7 +242,37 @@ namespace CoreMap
 
         public void StartLatency() { if (!Busy) Latency.Start(); }
 
-        /// Сохраняет действующие потолки профилем с данным названием и делает его действующим.
+        // Профили. Состояний два: база и то, что стоит в процессоре сейчас. База — профиль, который ставится при
+        // запуске программы (Profile), а без него — заводские потолки. Всё, что показывает разницу потолков,
+        // считает её как «сейчас минус база». Открыть профиль, подвинуть ползунок, поставить потолок вручную —
+        // меняет только «сейчас»; базу меняют «сохранить», «сделать базой» и удаление базового профиля.
+
+        /// Потолки базы по ядрам; null — потолки недоступны.
+        public int[] BaseLimits
+        {
+            get { return Limits == null ? null : Profile != null && Profile.Exists ? Profile.Ratios : Limits.Fused; }
+        }
+
+        /// Какой сохранённый набор стоит в процессоре сейчас: название профиля, "" — заводские потолки,
+        /// null — ни один (потолки менялись вручную, ползунком или измерением). Если подходит несколько
+        /// профилей, первым идёт базовый, затем preferred, затем по алфавиту.
+        public string Standing(string preferred = null)
+        {
+            if (Limits == null || Profiles == null) return null;
+            if (!Profile.Exists && Limits.Same(Limits.Fused)) return "";
+            if (Profile.Exists && Profile.InEffect && Profiles.Get(Profile.Name) != null) return Profile.Name;
+            if (preferred != null && Profiles.Get(preferred) != null && Limits.Same(Profiles.Get(preferred))) return preferred.Trim();
+            foreach (string name in Profiles.Names)
+                if (Limits.Same(Profiles.Get(name))) return name;
+            return Limits.Same(Limits.Fused) ? "" : null;
+        }
+
+        bool IsBase(string name)
+        {
+            return Profile.Exists && name != null && string.Equals(Profile.Name, name.Trim(), StringComparison.CurrentCultureIgnoreCase);
+        }
+
+        /// Сохраняет то, что стоит сейчас, профилем с данным названием и делает его базой.
         /// null — сделано; иначе причина отказа.
         public string SaveProfile(string name)
         {
@@ -258,39 +288,67 @@ namespace CoreMap
             return null;
         }
 
-        /// Ставит потолки из сохранённого профиля и делает его действующим.
-        public string ApplyProfile(string name)
+        /// Открывает сохранённый профиль: ставит его потолки, база остаётся прежней — так видна разница профиля
+        /// с базой. name = "" — заводские потолки.
+        public string OpenProfile(string name)
         {
             if (Profile == null) return "потолки множителей недоступны";
             if (Busy) return "идёт измерение: потолки сейчас менять нельзя";
-            int[] ratios = Profiles.Get(name);
+            int[] ratios = name == "" ? Limits.Fused : Profiles.Get(name);
             if (ratios == null) return "профиля «" + name + "» нет";
-            string refusal = Limits.Apply(ratios);
-            if (refusal != null) return refusal;
-            try { Profile.Save(name.Trim()); }
+            return Limits.Apply(ratios);
+        }
+
+        /// Можно ли сделать базой то, что стоит сейчас: это сохранённый профиль или заводские потолки, и база —
+        /// не они. Отключённый после сбоя базовый профиль тоже можно: так он включается заново.
+        public bool CanPin(string preferred = null)
+        {
+            if (Profile == null || Busy) return false;
+            string standing = Standing(preferred);
+            if (standing == null) return false;
+            if (standing == "") return Profile.Exists;
+            return !IsBase(standing) || Profile.Disabled;
+        }
+
+        /// Делает базой то, что стоит сейчас: сохранённый профиль (он будет ставиться при запуске программы)
+        /// или заводские потолки (при запуске ничего ставиться не будет). Сами профили не меняются.
+        public string PinStanding(string preferred = null)
+        {
+            if (Profile == null) return "потолки множителей недоступны";
+            if (Busy) return "идёт измерение: потолки сейчас временные";
+            string standing = Standing(preferred);
+            if (standing == null) return "сейчас стоят несохранённые потолки: сначала сохрани их профилем";
+            try
+            {
+                if (standing == "") Profile.Forget();
+                else Profile.Save(standing);
+            }
             catch (Exception e) { return e.Message; }
             return null;
         }
 
-        /// Удаляет сохранённый профиль; действующий перестаёт применяться при запуске.
+        /// Возвращает потолки базы.
+        public string RestoreBase()
+        {
+            if (Limits == null) return "потолки множителей недоступны";
+            if (Busy) return "идёт измерение: потолки сейчас менять нельзя";
+            // Отключённый профиль одним щелчком не возвращается: это был бы тот самый набор, после которого случился сбой.
+            if (Profile.Disabled) return "базовый профиль «" + Profile.Name + "» отключён после сбоя; поставить его потолки всё равно — выбери его в списке ▾";
+            return Limits.Apply(BaseLimits);
+        }
+
+        /// Удаляет сохранённый профиль. Если он был базой, базой становятся заводские потолки: при запуске
+        /// программы ничего ставиться не будет.
         public string DeleteProfile(string name)
         {
             if (Profile == null) return "потолки множителей недоступны";
             try
             {
                 Profiles.Delete(name);
-                if (Profile.Exists && string.Equals(Profile.Name, name.Trim(), StringComparison.CurrentCultureIgnoreCase)) Profile.Forget();
+                if (IsBase(name)) Profile.Forget();
             }
             catch (Exception e) { return e.Message; }
             return null;
-        }
-
-        /// Возвращает потолки, какими они были при запуске программы (до применения профиля).
-        public string RestoreLimits()
-        {
-            if (Limits == null) return "потолки множителей недоступны";
-            if (Busy) return "идёт измерение: потолки сейчас менять нельзя";
-            return Limits.Restore();
         }
 
         /// Ставит ядру потолок множителя. null — принято; иначе причина отказа.
