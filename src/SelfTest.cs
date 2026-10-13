@@ -163,6 +163,74 @@ namespace CoreMap
             notice = new LimitHold(limits, blocks, lps, cpu, dir).Recover();
             Check(limits.Of(first) == step && !File.Exists(mark), "метка: выше заводского не поднимает, метка убрана");
             Check(notice != null && notice.Contains("выше заводского"), "метка: о невозвращённом сказано (" + notice + ")");
+
+            // 9. Процессор не отвечает о потолке ядра: чтение не выдаёт себя за удачное, запись не считается
+            // принятой, а исходный потолок в конце измерения всё равно записан.
+            limits.Set(first.First, before[first.First]);
+            limits.Deaf = i => i == first.First;
+            string unread = limits.Refresh();
+            Check(unread != null && unread.Contains(first.Lp.ToString()), "нет ответа: чтение потолков сообщает о неудаче (" + unread + ")");
+            ladder.Start(new[] { first }, 1, double.NaN);
+            Check(Until(() => !runner.Busy, 8), "нет ответа: измерение закончило");
+            Check(ladder.Error != null && ladder.Error.Contains("не ответил"), "нет ответа: запись не выдана за принятую (" + ladder.Error + ")");
+            limits.Deaf = null;
+            Check(limits.Refresh() == null && back() && !File.Exists(mark), "нет ответа: исходный потолок в процессор записан, метки нет");
+
+            // 10. Набор потолков (профиль) при ядре без ответа: потолок пишется и тогда, когда по памяти
+            // программы он уже такой, — в процессоре мог остаться другой.
+            limits.Deaf = i => i == first.First;
+            limits.Set(first.First, step);  // в «процессоре» теперь step, а программа помнит прежний
+            Check(limits.Of(first) == before[first.First], "набор: программа помнит прежний потолок");
+            string refusal = limits.Apply(before);
+            Check(refusal != null && refusal.Contains("не ответил"), "набор: неподтверждённая запись названа (" + refusal + ")");
+            limits.Deaf = null;
+            Check(limits.Refresh() == null && back(), "набор: потолок в процессор записан");
+
+            // 11. Поток датчиков переживает любую ошибку — опроса и обработки показаний (в ней защита от
+            // перегрева): ошибка видна, защите передано «показаний нет», опрос идёт дальше.
+            var flaky = new Flaky(lps.Length);
+            int seen = 0, blind = 0;
+            bool breakHandler = false;
+            var watch = new Monitor(flaky, lps.Length, 0.05)
+            {
+                OnSample = temps =>
+                {
+                    if (temps == null) blind++; else seen++;
+                    if (breakHandler) throw new InvalidOperationException("нарочно, в обработке");
+                },
+            };
+            watch.Start();
+            Check(Until(() => seen > 0 && watch.Error == null, 3), "датчики: опрос идёт");
+            flaky.Broken = true;
+            Check(Until(() => blind > 0 && watch.Error != null, 3), "датчики: ошибка опроса видна, защите передано «показаний нет» (" + watch.Error + ")");
+            flaky.Broken = false;
+            Check(Until(() => watch.Error == null, 3), "датчики: после ошибки опрос продолжился");
+            breakHandler = true;
+            Check(Until(() => watch.Error != null, 3), "датчики: ошибка обработки показаний видна (" + watch.Error + ")");
+            breakHandler = false;
+            int was = seen;
+            Check(Until(() => seen > was && watch.Error == null, 3), "датчики: поток опроса жив");
+        }
+
+        /// Датчики-подделка: по просьбе опрос кончается ошибкой, которой настоящие датчики не дают.
+        class Flaky : ISensorBackend
+        {
+            readonly int count;
+            public volatile bool Broken;
+
+            public Flaky(int count) { this.count = count; }
+
+            public int ThrottleAt { get { return 100; } }
+
+            public Sample Read()
+            {
+                if (Broken) throw new InvalidOperationException("нарочно, в опросе");
+                return new Sample
+                {
+                    Temps = Enumerable.Repeat(45.0, count).ToArray(), Throttled = new bool[count],
+                    Ratio = Enumerable.Repeat(31.0, count).ToArray(), Pkg = 45,
+                };
+            }
         }
     }
 }

@@ -28,8 +28,10 @@ $icon = @()
 if (Test-Path assets\coremap.ico) { $icon = @('/win32icon:assets\coremap.ico') }
 
 function Build {
+    # The compiler's messages go to the host, not into the function's result: with them in the result a failed
+    # build returned a non-empty list, which counts as true, and the check went on with the previous exe.
     & $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
-        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" src\*.cs
+        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" src\*.cs | Out-Host
     return $LASTEXITCODE -eq 0
 }
 

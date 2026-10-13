@@ -32,8 +32,9 @@ namespace CoreMap
         public string Problem;  // ошибка программы или отказ действия, показывается в полосе сообщений
 
         bool wasBusy;           // в прошлый опрос шло измерение
-        string loggedError;     // последняя ошибка окна, уже записанная в журнал
         int sinceRefresh;       // тактов с последнего перечитывания потолков из процессора
+        string limitsUnread;    // почему потолки не перечитались два раза подряд; null — перечитались
+        bool unreadBefore;      // прошлое перечитывание не удалось
 
         /// size — размер окна; пустой — обычный: под содержимое, но не больше экрана.
         public MainForm(Core core, bool hidden, Size size)
@@ -245,16 +246,18 @@ namespace CoreMap
             try { UpdateAll(); }
             catch (Exception e)
             {
-                // Повторяющаяся ошибка пишется в журнал один раз, а не дважды в секунду.
-                if (e.Message != loggedError) Program.Log(e.ToString());
-                loggedError = e.Message;
+                Program.LogOnce("обновление окна", e);  // повторяющаяся ошибка пишется один раз, а не дважды в секунду
                 Problem = "Ошибка в программе: " + e.Message + ". Подробности записаны в data\\error.log";
             }
             // Раз в десять секунд потолки перечитываются из процессора: их мог сбросить сон или сменить другая программа.
             if (core.Limits != null && !core.Busy && ++sinceRefresh >= 20)
             {
-                sinceRefresh = 0;
-                core.Limits.Refresh();
+                string unread = core.Limits.Refresh();
+                // Не прочитались — повтор через секунду. Владельцу об этом говорится, если не прочитались и со второго
+                // раза: тогда на плитках стоят прежние значения, а не то, что в процессоре.
+                sinceRefresh = unread == null ? 0 : 18;
+                limitsUnread = unread != null && unreadBefore ? unread : null;
+                unreadBefore = unread != null;
             }
             ShowBanner();
         }
@@ -266,6 +269,7 @@ namespace CoreMap
             // Сначала то, что касается железа: срабатывание защиты и отказ датчиков не должны прятаться за старым отказом кнопки.
             if (core.Trip != null) text = "Нагрузка снята защитой: " + core.Trip;
             else if (core.Monitor != null && core.Monitor.Error != null) text = "Ошибка датчиков: " + core.Monitor.Error;
+            else if (limitsUnread != null) text = "Потолки не перечитаны из процессора: " + limitsUnread + ". На плитках — прежние значения.";
             else if (Problem != null) text = Problem;
             else if (core.Simulated) { text = "ИМИТАЦИЯ — температуры ненастоящие, нагрузка на процессор не подаётся"; bad = false; }
             else if (core.Monitor == null) { text = "Датчики недоступны: " + core.SensorProblem + ". Нагрузка на ядра без датчиков не даётся."; bad = false; }

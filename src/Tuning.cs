@@ -2,6 +2,7 @@
 // по каждому ядру. Intel этот интерфейс не документирует; раскладка полей и номера команд взяты
 // из исходников Linux (drivers/platform/x86/intel_turbo_max_3.c) и справочного кода прошивок.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -55,6 +56,12 @@ namespace CoreMap
     }
 
     /// Потолки множителя по ядрам: заводской предел, действующий потолок и его изменение.
+    ///
+    /// Читают и пишут потолки два потока: окно раз в десять секунд перечитывает их, измерение в своём потоке
+    /// ставит ступени. Каждое обращение к процессору — чтение всех ядер, запись с обратным чтением, применение
+    /// набора — идёт под одним замком целиком: иначе устаревшее чтение одного потока ложилось бы поверх свежего
+    /// чтения другого, и запись выглядела бы непринятой либо, наоборот, принятой.
+    /// Fused и Current — то, что программа знает после последнего обращения; читать их можно без замка.
     class CoreLimits
     {
         const int Span = 14;  // на столько ступеней ниже заводского предела можно опустить потолок
@@ -62,11 +69,18 @@ namespace CoreMap
         // Примет ли процессор такое значение, видно по обратному чтению в Set. Частоту сверх того держит ещё и
         // таблица «множитель от числа работающих ядер» (54, 54, 52…): действует меньшее из двух.
         public const int Over = 4;
+        const int Attempts = 3;  // столько раз ядро спрашивается о потолке, прежде чем чтение считается неудачным
 
-        readonly PawnIo io;   // null — имитация: значения ненастоящие, запись только меняет их в памяти
+        readonly PawnIo io;        // null — имитация: «процессор» — массив в памяти
+        readonly int[] simulated;  // имитация: потолки, которые стоят в «процессоре»
         readonly BlockMap blocks;
         readonly int[] lps;
-        public readonly int[] Fused, Current;  // 0 — процессор не ответил
+        readonly object gate = new object();
+        readonly bool[] silent;    // о потолке этого ядра процессор при последнем чтении не ответил: Current устарел
+
+        public readonly int[] Fused, Current;  // 0 — процессор не ответил ни разу
+        /// Самопроверка на имитации: ядра, о потолке которых «процессор» не отвечает. В работе не используется.
+        public Predicate<int> Deaf;
 
         public CoreLimits(PawnIo io, CpuCore[] cores, BlockMap blocks)
         {
@@ -75,13 +89,19 @@ namespace CoreMap
             lps = cores.Select(c => c.Lp).ToArray();
             Fused = new int[cores.Length];
             Current = new int[cores.Length];
+            silent = new bool[cores.Length];
             if (io == null)
+            {
+                simulated = new int[cores.Length];
                 for (int i = 0; i < cores.Length; i++)
                 {
-                    Current[i] = cores[i].Kind == 'P' ? 53 : 46;
-                    Fused[i] = lps[i] == 12 || lps[i] == 23 ? 54 : Current[i];
+                    simulated[i] = cores[i].Kind == 'P' ? 53 : 46;
+                    Fused[i] = lps[i] == 12 || lps[i] == 23 ? 54 : simulated[i];
                 }
-            else Read();
+            }
+            // Ядро, о котором процессор не ответил, остаётся неизвестным (Known): его потолок не показывается и не меняется.
+            string unread = Read();
+            if (unread != null) Program.Log("потолки множителей при запуске: " + unread);
         }
 
         public bool Known(int index) { return Fused[index] > 0; }
@@ -98,33 +118,85 @@ namespace CoreMap
         /// То же, но не выше заводского предела: в этих пределах работают измерения и подбор — кривые, поиск, ползунок.
         public int[] Factory(int index) { return Choices(index).Where(r => r <= Fused[index]).ToArray(); }
 
-        void Read()
+        // ----- обращения к процессору: только под замком -----
+
+        /// Спрашивает процессор о потолке ядра. false — поток не привязался к ядру или процессор не ответил.
+        bool Ask(int index, out int fused, out int current)
         {
+            fused = current = 0;
+            if (io == null)
+            {
+                if (Deaf != null && Deaf(index)) return false;
+                fused = Fused[index];
+                current = simulated[index];
+                return true;
+            }
+            if (!Native.Pin(lps[index])) return false;
+            int error;
+            uint data = OcMailbox.Query(io, OcMailbox.ReadCoreLimit, 0, 0, 0, out error);
+            if (error != 0) return false;
+            fused = (int)(data >> 8 & 0xFF);
+            current = (int)(data & 0xFF);
+            return true;
+        }
+
+        /// Пишет потолок ядра; у кластера E-ядер он общий, процессор сам распространяет запись на остальные ядра.
+        /// false — поток не привязался к ядру, запись не отправлена. Принята ли запись, показывает только обратное
+        /// чтение: error — что процессор ответил на саму команду.
+        bool Tell(int index, int ratio, out int error)
+        {
+            error = 0;
+            if (io == null)
+            {
+                foreach (int i in blocks.Of(index).Members) simulated[i] = ratio;
+                return true;
+            }
+            if (!Native.Pin(lps[index])) return false;
+            OcMailbox.Query(io, OcMailbox.WriteCoreLimit, 0, 0, (uint)ratio, out error);
+            return true;
+        }
+
+        /// Читает потолки всех ядер. null — прочитаны все; иначе — о каких ядрах процессор не ответил.
+        /// Неудачный ответ не стирает то, что известно: заводской предел читается один раз, действующий потолок
+        /// остаётся прежним до следующего удачного чтения — но ядро помечается (silent), и чтение не выдаёт
+        /// себя за удачное.
+        string Read()
+        {
+            var unread = new List<int>();
             try
             {
                 for (int i = 0; i < lps.Length; i++)
                 {
-                    if (!Native.Pin(lps[i])) continue;
-                    int error;
-                    uint data = OcMailbox.Query(io, OcMailbox.ReadCoreLimit, 0, 0, 0, out error);
-                    // Один неудачный ответ не стирает то, что известно: заводской предел читается один раз,
-                    // действующий потолок остаётся прежним до следующего удачного чтения.
-                    if (error != 0) continue;
-                    if (Fused[i] == 0) Fused[i] = (int)(data >> 8 & 0xFF);
-                    Current[i] = (int)(data & 0xFF);
+                    int fused = 0, current = 0;
+                    bool answered = false;
+                    for (int attempt = 0; attempt < Attempts && !answered; attempt++) answered = Ask(i, out fused, out current);
+                    silent[i] = !answered;
+                    if (!answered) { unread.Add(lps[i]); continue; }
+                    if (Fused[i] == 0) Fused[i] = fused;
+                    Current[i] = current;
                 }
             }
-            finally { Native.Unpin(lps); }
+            catch (SensorException)
+            {
+                // Чтение оборвалось: про все ядра известно только то, что было раньше.
+                for (int i = 0; i < silent.Length; i++) silent[i] = true;
+                throw;
+            }
+            finally { if (io != null) Native.Unpin(lps); }
+            return unread.Count == 0 ? null : "процессор не ответил о потолке ядер: " + string.Join(", ", unread);
         }
 
+        // ----- что видят остальные -----
+
         /// Перечитывает действующие потолки из процессора: их мог сбросить сон или изменить другая программа.
-        /// null — прочитано; иначе причина.
+        /// null — прочитаны все; иначе причина, и тогда часть потолков в Current — прежние, а не из процессора.
         public string Refresh()
         {
-            if (io == null) return null;
-            try { Read(); }
-            catch (SensorException e) { return e.Message; }
-            return null;
+            lock (gate)
+            {
+                try { return Read(); }
+                catch (SensorException e) { return e.Message; }
+            }
         }
 
         /// Действующие потолки совпадают с набором (ядра, о которых процессор не ответил, не в счёт).
@@ -136,37 +208,38 @@ namespace CoreMap
         /// Ставит потолок каждому ядру из набора. null — все приняты.
         public string Apply(int[] ratios)
         {
-            Refresh();
-            string refusal = null;
-            for (int i = 0; i < lps.Length; i++)
-                if (Known(i) && Current[i] != ratios[i]) refusal = Set(i, ratios[i]) ?? refusal;
-            return refusal;
+            lock (gate)
+            {
+                Refresh();
+                string refusal = null;
+                for (int i = 0; i < lps.Length; i++)
+                    // Потолок, о котором процессор не ответил, пишется и тогда, когда по памяти программы он уже такой.
+                    if (Known(i) && (silent[i] || Current[i] != ratios[i])) refusal = Set(i, ratios[i]) ?? refusal;
+                return refusal;
+            }
         }
 
-        /// Ставит потолок ядру, а с ним — всему его блоку: у кластера E-ядер потолок общий, процессор сам
-        /// распространяет запись на остальные ядра. null — принято; иначе причина отказа.
+        /// Ставит потолок ядру, а с ним — всему его блоку. null — принято; иначе причина отказа.
         public string Set(int index, int ratio)
         {
             if (!Known(index)) return "процессор не сообщил потолок этого ядра";
             if (!Choices(index).Contains(ratio)) return "потолок " + ratio + " вне допустимого: от ×" + Choices(index).Last() + " до ×" + Choices(index).First();
-            if (io == null)
+            lock (gate)
             {
-                foreach (int i in blocks.Of(index).Members) Current[i] = ratio;
-                return null;
+                int error;
+                try
+                {
+                    if (!Tell(index, ratio, out error)) return "не удалось привязать поток к процессору " + lps[index] + ": потолок не записан";
+                    Read();
+                }
+                catch (SensorException e) { return e.Message; }
+                finally { if (io != null) Native.Unpin(lps); }
+                if (silent[index])
+                    return "потолок " + ratio + " для ядра " + lps[index] + " записан, но процессор не ответил, принял ли он его";
+                if (Current[index] == ratio) return null;
+                return "процессор не принял потолок " + ratio + " для ядра " + lps[index] + ": код ответа " + error +
+                    ", действующий потолок остался " + Current[index];
             }
-            int error;
-            try
-            {
-                if (!Native.Pin(lps[index])) return "не удалось привязать поток к процессору " + lps[index] + ": потолок не записан";
-                OcMailbox.Query(io, OcMailbox.WriteCoreLimit, 0, 0, (uint)ratio, out error);
-                Native.Unpin(lps);
-                Read();
-            }
-            catch (SensorException e) { return e.Message; }
-            finally { Native.Unpin(lps); }
-            if (Current[index] == ratio) return null;
-            return "процессор не принял потолок " + ratio + " для ядра " + lps[index] + ": код ответа " + error +
-                ", действующий потолок остался " + Current[index];
         }
     }
 

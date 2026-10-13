@@ -25,6 +25,7 @@
 // Ключи, по которым программа что-то делает сама (--run, --calibrate, --snapshot и всё, что идёт вместе с ним),
 // исполняет Scenario.cs. Для владельца они не нужны: всё, чем он пользуется, есть в окне.
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Threading;
@@ -45,6 +46,21 @@ namespace CoreMap
                 File.AppendAllText(Path.Combine(DataDir, "error.log"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n" + text + "\r\n\r\n");
             }
             catch (Exception) { }  // журнал не должен ронять программу, какой бы ни была причина
+        }
+
+        static readonly Dictionary<string, string> logged = new Dictionary<string, string>();
+
+        /// Пишет в журнал ошибку, которая может повторяться много раз в секунду (опрос датчиков, обновление окна):
+        /// одна и та же ошибка в одном и том же месте where пишется один раз, а не при каждом повторе.
+        public static void LogOnce(string where, Exception e)
+        {
+            lock (logged)
+            {
+                string last;
+                if (logged.TryGetValue(where, out last) && last == e.Message) return;
+                logged[where] = e.Message;
+            }
+            Log(where + ": " + e);
         }
 
         /// Значение ключа командной строки — слово после него; null — ключа нет.

@@ -117,7 +117,7 @@ namespace CoreMap
                 // Свой предел принимается только в разумных границах: опечатка вроде 950 оставила бы машину без защиты.
                 // В имитации границ нет — там он нужен для проверки окна.
                 Limit = (simulate ? limit > 0 : limit >= 50 && limit <= ThrottleAt) ? limit : ThrottleAt - GuardMargin;
-                Monitor = new Monitor(backend, Lps.Length, 0.5) { OnSample = Guard };
+                Monitor = new Monitor(backend, Lps.Length, 0.5) { OnSample = Sampled };
                 Monitor.Start();
             }
             string saveDir = simulate ? null : Program.DataDir;  // имитация ничего не пишет: её числа ненастоящие
@@ -206,10 +206,27 @@ namespace CoreMap
             return Native.Now() - blindSince >= GuardSeconds;
         }
 
+        /// После каждого опроса датчиков, в их потоке: средняя под нагрузкой и защита от перегрева.
+        /// temps = null — датчики не прочитались.
+        void Sampled(double[] temps)
+        {
+            // Средняя — показание для окна: её ошибка не должна оставить программу без защиты.
+            try { Average(temps); }
+            catch (Exception e) { Program.LogOnce("средняя под нагрузкой", e); }
+            try { Guard(temps); }
+            catch (Exception e)
+            {
+                // Защита не отработала, и перегрева она сейчас не увидит: нагрузка снимается.
+                Program.LogOnce("защита от перегрева", e);
+                Trip = "защита от перегрева дала ошибку: " + e.Message + ". Подробности записаны в data\\error.log";
+                Runner.Stop();
+                Load.StopAll();
+            }
+        }
+
         /// Снимает нагрузку и останавливает измерение, если ядро держится на пределе или датчики замолчали.
         void Guard(double[] temps)
         {
-            Average(temps);
             // Идущее измерение — тоже нагрузка, даже когда у LoadManager пусто: измерение задержек занимает ядра
             // своими потоками.
             if (!Load.Any() && !Runner.Busy) { hotSince = double.NaN; return; }

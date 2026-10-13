@@ -148,7 +148,13 @@ namespace CoreMap
             {
                 for (int i = 0; i < lps.Length; i++)
                 {
-                    Native.Pin(lps[i]);
+                    // Поток не привязался — регистры прочитались бы с какого-то другого ядра. Показаний этого ядра
+                    // в опросе нет; если оно нагружено, защита снимет нагрузку (Core.Blind).
+                    if (!Native.Pin(lps[i]))
+                    {
+                        s.Temps[i] = s.Ratio[i] = double.NaN;
+                        continue;
+                    }
                     ulong v = io.ReadMsr(ThermStatus);
                     s.Temps[i] = (v >> 31 & 1) != 0 ? tjMax[i] - (int)(v >> 16 & 0x7F) : double.NaN;
                     s.Throttled[i] = (v & 1) != 0;
@@ -239,8 +245,8 @@ namespace CoreMap
         public bool[] Throttled;
         public double PkgCur = double.NaN, PkgMax = double.NaN, Watts = double.NaN;
         public DateTime ResetAt = DateTime.Now;
-        public string Error;
-        public Action<double[]> OnSample;  // после каждого опроса: температуры или null при сбое датчиков
+        public volatile string Error;      // почему последний опрос не удался; null — удался
+        public Action<double[]> OnSample;  // после каждого опроса, в потоке датчиков: температуры или null при сбое датчиков
 
         public Monitor(ISensorBackend backend, int count, double interval)
         {
@@ -265,6 +271,7 @@ namespace CoreMap
             {
                 double started = Native.Now();
                 double[] temps = null;
+                string problem = null;
                 try
                 {
                     Sample s = backend.Read();
@@ -272,7 +279,6 @@ namespace CoreMap
                     if (!double.IsNaN(lastAt) && readAt > lastAt) Watts = (s.Joules - lastJoules) / (readAt - lastAt);
                     lastAt = readAt;
                     lastJoules = s.Joules;
-                    Error = null;
                     temps = s.Temps;
                     lock (gate)
                     {
@@ -287,10 +293,22 @@ namespace CoreMap
                         while (history.Count > 0 && history.Peek().At < started - 60) history.Dequeue();
                     }
                 }
-                catch (SensorException e) { Error = e.Message; }
-                if (OnSample != null) OnSample(temps);
+                catch (SensorException e) { problem = e.Message; }
+                // Этот поток не должен умереть ни от какой ошибки: с ним умерла бы защита от перегрева, а необработанная
+                // ошибка в потоке закрывает всю программу. Ошибка — в журнал и в полосу сообщений, опрос идёт дальше.
+                catch (Exception e) { problem = Failed("опрос датчиков", e); }
+                // Без показаний (temps = null) защита снимает нагрузку: см. Core.Guard.
+                try { if (OnSample != null) OnSample(temps); }
+                catch (Exception e) { problem = Failed("обработка показаний датчиков", e); }
+                Error = problem;
                 Thread.Sleep((int)(Math.Max(0.05, interval - (Native.Now() - started)) * 1000));
             }
+        }
+
+        static string Failed(string where, Exception e)
+        {
+            Program.LogOnce(where, e);
+            return where + ": " + e.Message + ". Подробности записаны в data\\error.log";
         }
 
         public void ResetMax()
