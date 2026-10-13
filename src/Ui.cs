@@ -556,9 +556,11 @@ namespace CoreMap
 
         CurveRun[] front = new CurveRun[0];  // кривые выделенного блока
         CurveRun[] back = new CurveRun[0];   // кривые остальных блоков на текущей силе нагрузки
+        CurveRun[] scale = new CurveRun[0];  // кривые, по которым строятся оси: все снятые, какая бы ни была выделена
         BlockMap blocks;                     // чья кривая: блок находится по CurveRun.Lp
         CurveChoice[] picks = new CurveChoice[0];  // потолок, стоящий у каждого блока, и его точка на кривой; null — неизвестен
         double cutoff = double.NaN;
+        string progress;  // ход идущего измерения — строка в правом верхнем углу графика; null — не идёт
         bool byPeak;  // работа идёт по наибольшей температуре ступени: её линия толстая, средняя — тонкая
         string empty = "";
         string uneven;   // кривые сняты при разных вентиляторах (CurveStore.Uneven); null — при одинаковых или неизвестно
@@ -572,13 +574,26 @@ namespace CoreMap
 
         protected override bool Data { get { return true; } }
 
-        public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty,
+        /// Ход идущего измерения: где оно сейчас и сколько осталось. Пишется на самом графике — туда и смотрят,
+        /// пока идёт прогон, — и не занимает отдельной строки окна.
+        public void Progress(string text)
+        {
+            if (text == progress) return;
+            progress = text;
+            Invalidate();
+        }
+
+        /// scale — кривые, по которым строятся оси. Они не должны зависеть от того, какой блок выделен: иначе
+        /// наведение на точку меняет масштаб, точка уезжает из-под курсора, выделение снимается, масштаб
+        /// возвращается — и график дёргается под неподвижным курсором.
+        public void Show(CurveRun[] front, CurveRun[] back, CurveRun[] scale, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty,
                          string uneven)
         {
             this.uneven = uneven;
             this.byPeak = byPeak;
             this.front = front;
             this.back = back;
+            this.scale = scale;
             this.blocks = blocks;
             this.cutoff = cutoff;
             this.picks = picks;
@@ -586,7 +601,13 @@ namespace CoreMap
             Invalidate();
         }
 
-        static bool Near(Point a, Point b) { return Math.Abs(a.X - b.X) <= Theme.Px(7) && Math.Abs(a.Y - b.Y) <= Theme.Px(7); }
+        public static bool Near(Point a, Point b) { return Math.Abs(a.X - b.X) <= Theme.Px(7) && Math.Abs(a.Y - b.Y) <= Theme.Px(7); }
+
+        // Для проверки наведения без мыши (MainForm.HoverCheck): точки графика с их блоками, движение курсора
+        // в точку и текст подсказки в ней.
+        public KeyValuePair<Point, Block>[] Hotspots() { return owners.ToArray(); }
+        public void MouseAt(Point at) { OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, at.X, at.Y, 0)); }
+        public string TipText(Point at) { return TipAt(at); }
 
         protected override string TipAt(Point at)
         {
@@ -631,15 +652,29 @@ namespace CoreMap
             Func<CurvePoint, double> heat = p => byPeak ? p.Peak : p.Temp, other = p => byPeak ? p.Temp : p.Peak;
             CurvePoint[] ahead = front.SelectMany(r => r.Points.ToArray()).ToArray();
             CurvePoint[] all = ahead.Concat(back.SelectMany(r => r.Points.ToArray())).ToArray();
+            // Ход измерения — справа над графиком, в той же строке, что значки силы нагрузки слева.
+            // room — докуда в этой строке можно писать слева: строка о вентиляторах, которая не помещается перед
+            // ходом измерения, на время измерения не пишется (она остаётся в подсказке строки).
+            int room = Width;
+            if (progress != null)
+            {
+                const TextFormatFlags right = TextFormatFlags.Right | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+                TextRenderer.DrawText(g, progress, Theme.Font(11, true), new Rectangle(0, 0, Width - Theme.Px(4), Theme.Px(16)), Theme.Text, right);
+                room = Width - Theme.Px(4) - TextRenderer.MeasureText(g, progress, Theme.Font(11, true), Size.Empty, right).Width - Theme.Px(8);
+            }
             if (all.Length == 0)
             {
                 TextRenderer.DrawText(g, empty, Theme.Font(11), ClientRectangle, Theme.Dim,
                                       TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
                 return;
             }
-            int x0 = (int)Math.Floor(all.Min(p => p.Actual)), x1 = Math.Max((int)Math.Ceiling(all.Max(p => p.Actual)), x0 + 1);
-            double high = Math.Max(all.Max(p => heat(p)), ahead.Length > 0 ? ahead.Max(p => Math.Max(p.Temp, p.Peak)) : 0);
-            double y0 = Math.Floor(all.Min(p => p.Temp) / 5) * 5 - 5, y1 = Math.Ceiling(high / 5) * 5 + 5;
+            // Оси — по всем снятым кривым и по обеим температурам точки: у любой выделенной кривой помещаются и
+            // толстая линия, и тонкая, а масштаб от выделения не зависит.
+            CurvePoint[] span = all.Concat(scale.SelectMany(r => r.Points.ToArray())).Where(p => !double.IsNaN(p.Temp)).ToArray();
+            if (span.Length == 0) span = all;
+            int x0 = (int)Math.Floor(span.Min(p => p.Actual)), x1 = Math.Max((int)Math.Ceiling(span.Max(p => p.Actual)), x0 + 1);
+            double high = span.Max(p => double.IsNaN(p.Peak) ? p.Temp : Math.Max(p.Temp, p.Peak));
+            double y0 = Math.Floor(span.Min(p => p.Temp) / 5) * 5 - 5, y1 = Math.Ceiling(high / 5) * 5 + 5;
             var plot = Rectangle.FromLTRB(Theme.Px(26), Theme.Px(16), Width - Theme.Px(10), Height - Theme.Px(18));
             Func<double, int> px = v => plot.Left + (int)Math.Round((v - x0) / (x1 - x0) * plot.Width);
             Func<double, int> py = v => plot.Bottom - (int)Math.Round((v - y0) / (y1 - y0) * plot.Height);
@@ -659,6 +694,28 @@ namespace CoreMap
                                           TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding);
             }
 
+            // Числа точки для подсказки. Они есть у точек всех кривых, а не только выделенной: подсказка появляется
+            // сразу и не меняется оттого, что кривая под курсором вышла вперёд.
+            Func<CurveRun, CurvePoint, Block, string> describe = (run, p, owner) =>
+            {
+                bool fell = !double.IsNaN(p.Ratio) && Math.Abs(p.Ratio - p.Limit) > CurveStore.Reached;
+                return (owner == null ? "" : char.ToUpper(owner.Title[0]) + owner.Title.Substring(1) + " · ") +
+                    (double.IsNaN(p.Ratio) ? "потолок ×" + p.Limit : "множитель " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
+                        (fell ? " — до потолка не дошло" : "")) + "\n" +
+                    "Сила нагрузки " + Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
+                    "\n• средняя под нагрузкой: " + p.Temp.ToString("0.0") + " °C" +
+                    (double.IsNaN(p.TempDown) ? "" : " (на подъёме " + p.TempUp.ToString("0.0") + ", на спуске " + p.TempDown.ToString("0.0") + ")") +
+                    "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
+                    "\n• без нагрузки перед замером: " + p.Base.ToString("0.0") + " °C" +
+                    "\n• прибавка мощности: " + p.Watts.ToString("0.0") + " Вт" +
+                    (p.Air == null ? "" : "\n• вентиляторы: " + p.Air) +
+                    "\n• снято " + run.Time;
+            };
+            // Точки остальных кривых идут в списки после точек выделенной: где они накладываются, курсор
+            // относится к выделенной, и выделение не перескакивает на соседа.
+            var backSpots = new List<KeyValuePair<Point, string>>();
+            var backOwners = new List<KeyValuePair<Point, Block>>();
+
             // Остальные блоки — приглушёнными линиями без точек.
             foreach (CurveRun run in back)
             {
@@ -668,7 +725,12 @@ namespace CoreMap
                 using (var pen = new Pen(Color.FromArgb(120, Theme.KindText(owner.Kind)), Theme.Px(1.5)))
                     for (int k = 1; k < points.Length; k++)
                         g.DrawLine(pen, px(points[k - 1].Actual), py(heat(points[k - 1])), px(points[k].Actual), py(heat(points[k])));
-                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, Block>(new Point(px(p.Actual), py(heat(p))), owner));
+                foreach (CurvePoint p in points)
+                {
+                    var at = new Point(px(p.Actual), py(heat(p)));
+                    backOwners.Add(new KeyValuePair<Point, Block>(at, owner));
+                    backSpots.Add(new KeyValuePair<Point, string>(at, describe(run, p, owner)));
+                }
             }
 
             // Отсечка — температура с ползунка.
@@ -691,8 +753,12 @@ namespace CoreMap
                 legend += Theme.Px(16);
                 // При каких вентиляторах снята кривая: от этого зависит, с чем её температуры можно сравнивать.
                 string air = "вент.: " + FanStat.Brief(points.Select(p => p.Air));
-                TextRenderer.DrawText(g, air, font, new Point(legend, 0), Theme.Dim, TextFormatFlags.NoPadding);
-                legend += TextRenderer.MeasureText(g, air, font, Size.Empty, TextFormatFlags.NoPadding).Width + Theme.Px(8);
+                int airWidth = TextRenderer.MeasureText(g, air, font, Size.Empty, TextFormatFlags.NoPadding).Width;
+                if (legend + airWidth <= room)
+                {
+                    TextRenderer.DrawText(g, air, font, new Point(legend, 0), Theme.Dim, TextFormatFlags.NoPadding);
+                    legend += airWidth + Theme.Px(8);
+                }
                 airTip = (airTip ?? "Вентиляторы при снятии кривых") + "\n• эта кривая, сила нагрузки " +
                     Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] + ": " + FanStat.Describe(points.Select(p => p.Air));
                 using (var thick = new Pen(color, Theme.Px(2)))
@@ -717,28 +783,21 @@ namespace CoreMap
                         g.FillEllipse(off ? hollow : fill, at.X - r, at.Y - r, 2 * r, 2 * r);
                         g.DrawEllipse(thick, at.X - r, at.Y - r, 2 * r, 2 * r);
                         if (owner != null) owners.Add(new KeyValuePair<Point, Block>(at, owner));
-                        spots.Add(new KeyValuePair<Point, string>(at,
-                            (double.IsNaN(p.Ratio) ? "" : "Работало на множителе " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
-                                (off ? " — до потолка не дошло" : "") + "\n") +
-                            "Сила нагрузки " + Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
-                            "\n• средняя под нагрузкой: " + p.Temp.ToString("0.0") + " °C" +
-                            (double.IsNaN(p.TempDown) ? "" : " (на подъёме " + p.TempUp.ToString("0.0") + ", на спуске " + p.TempDown.ToString("0.0") + ")") +
-                            "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
-                            "\n• без нагрузки перед замером: " + p.Base.ToString("0.0") + " °C" +
-                            "\n• прибавка мощности: " + p.Watts.ToString("0.0") + " Вт" +
-                            (p.Air == null ? "" : "\n• вентиляторы: " + p.Air) +
-                            "\n• снято " + run.Time));
+                        spots.Add(new KeyValuePair<Point, string>(at, describe(run, p, owner)));
                     }
                 }
             }
+            owners.AddRange(backOwners);
+            spots.AddRange(backSpots);
 
             // Кривые сняты при разных вентиляторах — заметная пометка в той же строке над графиком: высоты окну она
             // не добавляет (лишняя строка в итоге ползунка выталкивает окно 1920×1040 в прокрутку).
             if (uneven != null)
             {
                 // У выделенного блока кривой может и не быть: тогда пометка стоит одна.
-                TextRenderer.DrawText(g, airTip != null ? "· у других иначе" : "вент.: у кривых разные", font, new Point(legend, 0), Theme.Accent,
-                                      TextFormatFlags.NoPadding);
+                string note = airTip != null ? "· у других иначе" : "вент.: у кривых разные";
+                if (legend + TextRenderer.MeasureText(g, note, font, Size.Empty, TextFormatFlags.NoPadding).Width <= room)
+                    TextRenderer.DrawText(g, note, font, new Point(legend, 0), Theme.Accent, TextFormatFlags.NoPadding);
                 airTip = (airTip ?? "Вентиляторы при снятии кривых") + "\n• " + uneven;
             }
 
@@ -768,6 +827,7 @@ namespace CoreMap
         CurveChoice[] picks;  // потолок, который стоит у блока сейчас, и что о нём говорит кривая; null — потолок неизвестен
         double[] joint;  // температура блока под общей нагрузкой; NaN — замера нет
         int[] delta;     // на сколько ступеней потолок блока отличается от того, что было
+        bool[] done;     // блок пройден идущим измерением; null — измерение по блокам не идёт
         int pinned = -1, under = -1, lit = -1;
 
         public Action<int> Hovered, Clicked;  // номер блока по порядку; -1 — курсор ушёл
@@ -792,6 +852,15 @@ namespace CoreMap
             Invalidate();
         }
 
+        /// Какие блоки идущее измерение уже прошло; null — измерение по блокам не идёт.
+        public void Mark(bool[] done)
+        {
+            bool same = done == null ? this.done == null : this.done != null && done.SequenceEqual(this.done);
+            if (same) return;
+            this.done = done;
+            Invalidate();
+        }
+
         int Row(Point at) { return at.Y < 0 || at.Y >= Height ? -1 : Math.Min(blocks.Length - 1, at.Y * blocks.Length / Math.Max(1, Height)); }
 
         protected override string TipAt(Point at)
@@ -802,7 +871,8 @@ namespace CoreMap
                 "• красная температура — ползунок поставил нижнюю точку кривой, а блок и на ней горячее цели\n" +
                 "• ▲ — ползунок взял верхнюю точку кривой: выше она не снята\n" +
                 "• после стрелки — температура блока, когда нагружены все блоки разом (кнопка «проверить все разом»)\n" +
-                "• прочерк вместо температуры — кривой блока нет или при таком потолке она не снималась";
+                "• прочерк вместо температуры — кривой блока нет или при таком потолке она не снималась\n" +
+                "• зелёная точка перед названием — блок уже пройден идущим измерением";
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -844,6 +914,10 @@ namespace CoreMap
                     using (var back = new SolidBrush(u == lit ? Theme.Cell : Theme.Button)) g.FillRectangle(back, row);
                 if (u == pinned)
                     using (var bar = new SolidBrush(Theme.Accent)) g.FillRectangle(bar, row.Left, row.Top, Theme.Px(2), row.Height);
+                // Пройденный идущим измерением блок — зелёная точка перед названием.
+                if (done != null && done[u])
+                    using (var dot = new SolidBrush(Theme.Good))
+                        g.FillEllipse(dot, Theme.Px(1), row.Top + row.Height / 2 - Theme.Px(2), Theme.Px(4), Theme.Px(4));
                 TextRenderer.DrawText(g, blocks[u].Name, u == lit || u == pinned ? bold : font, new Rectangle(pad, row.Top, Width * 27 / 100, row.Height),
                                       Theme.KindText(blocks[u].Kind), Flags);
                 CurveChoice pick = picks[u];
@@ -964,10 +1038,12 @@ namespace CoreMap
         }
     }
 
-    /// Полоса прогресса измерения.
+    /// Полоса прогресса измерения. Parts — на сколько равных частей она поделена чёрточками (блоки запуска);
+    /// 0 — без делений.
     class RunBar : Painted
     {
         double fraction;
+        int parts;
 
         public RunBar(int width)
         {
@@ -975,10 +1051,11 @@ namespace CoreMap
             Margin = new Padding(0, 0, 0, Theme.Px(4));
         }
 
-        public void Set(double value)
+        public void Set(double value, int parts = 0)
         {
-            if (value == fraction) return;
+            if (value == fraction && parts == this.parts) return;
             fraction = value;
+            this.parts = parts;
             Invalidate();
         }
 
@@ -988,6 +1065,8 @@ namespace CoreMap
         {
             using (var back = new SolidBrush(Theme.Cell)) e.Graphics.FillRectangle(back, ClientRectangle);
             using (var fill = new SolidBrush(Theme.Accent)) e.Graphics.FillRectangle(fill, 0, 0, (int)(Width * fraction), Height);
+            using (var gap = new Pen(Theme.Panel))
+                for (int k = 1; k < parts; k++) e.Graphics.DrawLine(gap, Width * k / parts, 0, Width * k / parts, Height);
         }
     }
 

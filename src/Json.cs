@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Web.Script.Serialization;
 
 namespace CoreMap
 {
@@ -22,9 +21,9 @@ namespace CoreMap
             string text = File.ReadAllText(path, Encoding.UTF8);
             try
             {
-                var reader = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-                var value = reader.Deserialize<Dictionary<string, object>>(text);
-                if (value == null) throw new InvalidDataException("файл пуст");
+                if (text.Trim().Length == 0) throw new InvalidDataException("файл пуст");
+                var value = new Reader(text).Whole() as Dictionary<string, object>;
+                if (value == null) throw new InvalidDataException("в файле не объект");
                 return value;
             }
             catch (Exception e) { throw Spoiled(path, e); }
@@ -61,7 +60,7 @@ namespace CoreMap
         static void Write(StringBuilder text, object value)
         {
             if (value == null) { text.Append("null"); return; }
-            if (value is string) { text.Append(new JavaScriptSerializer().Serialize(value)); return; }
+            if (value is string) { text.Append(Quote((string)value)); return; }
             if (value is bool) { text.Append((bool)value ? "true" : "false"); return; }
             if (value is double)
             {
@@ -95,6 +94,162 @@ namespace CoreMap
                 Write(text, item);
             }
             text.Append(']');
+        }
+
+        /// Строка в кавычках, как её пишут в JSON.
+        public static string Quote(string value)
+        {
+            var text = new StringBuilder("\"", value.Length + 2);
+            foreach (char c in value)
+            {
+                if (c == '"' || c == '\\') text.Append('\\').Append(c);
+                else if (c == '\n') text.Append("\\n");
+                else if (c == '\r') text.Append("\\r");
+                else if (c == '\t') text.Append("\\t");
+                else if (c < ' ') text.Append("\\u").Append(((int)c).ToString("x4"));
+                else text.Append(c);
+            }
+            return text.Append('"').ToString();
+        }
+
+        /// Разбор JSON. Свой, а не JavaScriptSerializer из System.Web.Extensions: тот тянет в процесс ещё и
+        /// System.Web, System.Configuration и System.Xml. Резиденту (Tray.cs), которому нужны два маленьких файла
+        /// профилей, это стоило 5,8 МБ выделенной памяти из 21,6 (замер на 275HX 13.10.2026).
+        /// Объект читается как Dictionary<string, object>, массив — List<object>, число — int, если оно целое
+        /// и помещается, иначе double; остальное — string, bool и null.
+        class Reader
+        {
+            readonly string text;
+            int at;
+
+            public Reader(string text) { this.text = text; }
+
+            /// Весь текст — одно значение, и после него ничего нет.
+            public object Whole()
+            {
+                object value = Value();
+                Skip();
+                if (at < text.Length) throw Bad("лишнее после конца данных");
+                return value;
+            }
+
+            Exception Bad(string what) { return new FormatException(what + ", знак " + at); }
+
+            void Skip() { while (at < text.Length && (text[at] == ' ' || text[at] == '\n' || text[at] == '\r' || text[at] == '\t')) at++; }
+
+            /// Следующий значащий знак — тот, что нужен; иначе файл не разобран.
+            void Expect(char c)
+            {
+                Skip();
+                if (at >= text.Length) throw Bad("файл обрывается");
+                if (text[at] != c) throw Bad("ждали «" + c + "», а стоит «" + text[at] + "»");
+                at++;
+            }
+
+            bool Next(char c)
+            {
+                Skip();
+                if (at >= text.Length || text[at] != c) return false;
+                at++;
+                return true;
+            }
+
+            object Value()
+            {
+                Skip();
+                if (at >= text.Length) throw Bad("файл обрывается");
+                char c = text[at];
+                if (c == '"') return String();
+                if (c == '{')
+                {
+                    at++;
+                    var map = new Dictionary<string, object>();
+                    if (Next('}')) return map;
+                    do
+                    {
+                        Skip();
+                        if (at >= text.Length || text[at] != '"') throw Bad("ждали название поля");
+                        string key = String();
+                        Expect(':');
+                        map[key] = Value();
+                    }
+                    while (Next(','));
+                    Expect('}');
+                    return map;
+                }
+                if (c == '[')
+                {
+                    at++;
+                    var list = new List<object>();
+                    if (Next(']')) return list;
+                    do list.Add(Value());
+                    while (Next(','));
+                    Expect(']');
+                    return list;
+                }
+                if (Word("true")) return true;
+                if (Word("false")) return false;
+                if (Word("null")) return null;
+                return Numeral();
+            }
+
+            bool Word(string word)
+            {
+                if (string.CompareOrdinal(text, at, word, 0, word.Length) != 0) return false;
+                at += word.Length;
+                return true;
+            }
+
+            object Numeral()
+            {
+                int from = at;
+                bool whole = true;
+                for (; at < text.Length; at++)
+                {
+                    char c = text[at];
+                    if (c == '.' || c == 'e' || c == 'E') whole = false;
+                    else if (!(c >= '0' && c <= '9' || c == '-' || c == '+')) break;
+                }
+                string number = text.Substring(from, at - from);
+                int small;
+                if (whole && int.TryParse(number, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out small)) return small;
+                double value;
+                if (number.Length == 0 || !double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+                {
+                    at = from;
+                    throw Bad("не число и не значение");
+                }
+                return value;
+            }
+
+            string String()
+            {
+                at++;  // открывающая кавычка
+                var value = new StringBuilder();
+                while (true)
+                {
+                    if (at >= text.Length) throw Bad("строка не закрыта");
+                    char c = text[at++];
+                    if (c == '"') return value.ToString();
+                    if (c != '\\') { value.Append(c); continue; }
+                    if (at >= text.Length) throw Bad("строка не закрыта");
+                    c = text[at++];
+                    if (c == 'n') value.Append('\n');
+                    else if (c == 'r') value.Append('\r');
+                    else if (c == 't') value.Append('\t');
+                    else if (c == 'b') value.Append('\b');
+                    else if (c == 'f') value.Append('\f');
+                    else if (c == 'u')
+                    {
+                        int code;
+                        if (at + 4 > text.Length || !int.TryParse(text.Substring(at, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out code))
+                            throw Bad("негодный знак \\u");
+                        value.Append((char)code);
+                        at += 4;
+                    }
+                    else value.Append(c);  // кавычка, обратная и прямая косая черта
+                }
+            }
         }
 
         /// Число из прочитанного файла; null превращается в NaN.

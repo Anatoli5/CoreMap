@@ -78,6 +78,7 @@ namespace CoreMap
             SizeThermal(cell);
             // Колонка потолков — шириной со схему, но не уже своей самой широкой строки: шрифт с ячейкой не мельчает.
             int list = blockList != null ? Theme.Px(170) + blockList.Margin.Horizontal : 0;  // список блоков справа от графика
+            ShrinkBar();
             int side = Math.Max(die.Width, curveRow != null ? curveRow.PreferredSize.Width : 0) + list;
             if (profileStatus != null) SizeProfiles(side);
             if (curveView != null) SizeLimits(side, list, cell);

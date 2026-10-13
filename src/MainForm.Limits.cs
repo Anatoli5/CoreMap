@@ -32,6 +32,9 @@ namespace CoreMap
         Label curveTitle, curveStatus;
         FlowLayoutPanel curveRow;
         Button curveButton, curveAllButton;
+        RunBar curveBar;         // ход измерения по блокам: лесенка, поиск замером, проверка под общей нагрузкой
+        Measurement timed;       // измерение, для которого идёт отсчёт времени
+        double timedSince;       // когда оно началось
         NumericUpDown curveTemp;  // предел, до которого греется блок при снятии кривой, °C
         CurveView curveView;
         BlockList blockList;
@@ -184,6 +187,8 @@ namespace CoreMap
             Label degrees = Widgets.Label("°C", Theme.Dim, 13);
             degrees.Margin = Padding.Empty;
             row.Controls.Add(degrees);
+            // Полоса хода стоит в ряду кнопок: своей строки у неё нет, чтобы окно не росло в высоту.
+            row.Controls.Add(curveBar = new RunBar(Theme.Px(BarMin)) { Margin = new Padding(Theme.Px(10), 0, 0, 0) });
             foreach (Control c in row.Controls) c.Anchor = AnchorStyles.Left;
             panel.Controls.Add(row);
             FlowLayoutPanel graph = Widgets.Row();
@@ -213,8 +218,15 @@ namespace CoreMap
             curveStatus.Margin = new Padding(0, Theme.Px(4), 0, 0);
         }
 
+        const int BarMin = 60;  // наименьшая ширина полосы хода: с ней считается ширина колонки
+
+        /// Перед расчётом ширины колонки полоса хода сжимается до наименьшей: иначе ряд кнопок, по которому
+        /// эта ширина считается, рос бы вместе с ней.
+        void ShrinkBar() { if (curveBar != null) curveBar.Width = Theme.Px(BarMin); }
+
         void SizeLimits(int side, int list, int cell)
         {
+            curveBar.Width = Math.Max(Theme.Px(BarMin), side - (curveRow.PreferredSize.Width - curveBar.Width));
             // Высота — чтобы двенадцать строк списка оставались читаемыми и при наименьшей ячейке.
             curveView.Size = new Size(side - list, Math.Max(cell * 8, Theme.Px(192)));
             blockList.Size = new Size(Theme.Px(170), curveView.Height);
@@ -275,15 +287,12 @@ namespace CoreMap
             wasJoint = joint.Running;
             fitMode.Show(fitBest ? 1 : 0, !busy);
             heatMode.Show(core.Curves.ByPeak ? 1 : 0, !busy);
-            curveStatus.Text = joint.Running ? "Идёт проверка под общей нагрузкой: нагружены все блоки разом."
-                : search.Running ? "Идёт подбор потолков по температуре — пройденные ступени добавляются на кривые."
-                : curve.Running
-                ? (curve.BlockTotal > 1 ? "Снимаю кривые · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal + " · шаг "
-                    : "Снимаю кривую · шаг ") + Math.Min(curve.Done + 1, curve.Total) + " из " + curve.Total +
-                    (curve.Current != null ? " · " + curve.Current : "")
-                : curve.Error ?? "";
+            ShowProgress(curve, search, joint);
+            // Строка под графиком — только для ошибки: ход измерения написан на самом графике и в полосе,
+            // а появлявшаяся на время прогона строка удлиняла окно.
+            curveStatus.Text = curve.Running || search.Running || joint.Running ? "" : curve.Error ?? "";
             curveStatus.Visible = curveStatus.Text != "";
-            curveStatus.ForeColor = curve.Running ? Theme.Text : curve.Error != null ? Theme.Bad : Theme.Dim;
+            curveStatus.ForeColor = Theme.Bad;
             fitStatus.Text = joint.Running
                 ? "Все блоки под нагрузкой · " + (joint.Current ?? "") + " · " + Math.Min(joint.Done, joint.Total) + " с из " + joint.Total
                 : search.Running
@@ -291,6 +300,92 @@ namespace CoreMap
                     (search.Current != null ? " · " + search.Current : "")
                 : fitReport ?? search.Report ?? "Ползунок ставит потолки по снятым кривым, кнопка — замером под нагрузкой.";
             ShowCurves();
+        }
+
+        /// Проверка наведения на график кривых без мыши и без экрана. Курсор «ставится» на каждую точку графика
+        /// дважды, с перерисовкой после каждого раза. Точка годится, если под курсором оба раза оказался один и тот же
+        /// блок, его точка после перерисовки осталась под курсором и у неё есть подсказка. Иначе график от наведения
+        /// сдвигается сам под собой: выделение скачет, подсказка появляется и пропадает.
+        /// Первая строка отчёта — ok или FAILED.
+        public string HoverCheck()
+        {
+            var bad = new List<string>();
+            Action paint = () =>
+            {
+                using (var picture = new Bitmap(Math.Max(1, curveView.Width), Math.Max(1, curveView.Height)))
+                    curveView.DrawToBitmap(picture, new Rectangle(Point.Empty, curveView.Size));
+            };
+            paint();
+            KeyValuePair<Point, Block>[] spots = curveView.Hotspots();
+            if (spots.Length == 0) bad.Add("на графике нет точек: проверять нечего");
+            foreach (KeyValuePair<Point, Block> spot in spots)
+            {
+                Point at = spot.Key;
+                curveView.MouseAt(at);
+                paint();
+                Block first = hovered;
+                curveView.MouseAt(at);
+                paint();
+                Block second = hovered;
+                string where = "точка " + at.X + "," + at.Y + " блока " + spot.Value.Name + ": ";
+                if (first == null) bad.Add(where + "наведение не выделило ни один блок");
+                else if (second != first) bad.Add(where + "выделение сменилось с " + first.Name + " на " + (second == null ? "ничего" : second.Name));
+                else if (!curveView.Hotspots().Any(o => o.Value == first && CurveView.Near(o.Key, at))) bad.Add(where + "после перерисовки точка блока " + first.Name + " ушла из-под курсора");
+                else if (curveView.TipText(at) == null) bad.Add(where + "нет подсказки");
+            }
+            curveView.MouseAt(new Point(-100, -100));
+            return (bad.Count == 0 ? "ok" : "FAILED") + "\r\nточек на графике: " + spots.Length + ", с дефектом: " + bad.Count +
+                (bad.Count == 0 ? "" : "\r\n" + string.Join("\r\n", bad)) + "\r\n";
+        }
+
+        /// Ход измерения по блокам: полоса с делениями по блокам в ряду кнопок, строка на графике («блок 3 из 12 ·
+        /// шаг 5 из 16 · осталось ≈ 6 мин») и зелёные точки у пройденных блоков в списке. Какой блок меряется, видно
+        /// по заголовку раздела и по самой кривой: график идёт за ним.
+        void ShowProgress(CurveTest curve, LimitSearch search, JointTest joint)
+        {
+            StepTest step = curve.Running ? (StepTest)curve : search.Running ? search : null;
+            Measurement running = step ?? (joint.Running ? joint : (Measurement)null);
+            if (running != timed)
+            {
+                timed = running;
+                timedSince = Native.Now();
+            }
+            if (running == null)
+            {
+                curveBar.Set(0);
+                curveView.Progress(null);
+                blockList.Mark(null);
+                return;
+            }
+            double fraction;
+            string where;
+            if (step != null)
+            {
+                int total = Math.Max(1, step.BlockTotal), done = Math.Min(step.BlockDone, total);
+                double inside = step.StepTotal > 0 ? Math.Min(1.0, (double)step.StepDone / step.StepTotal) : 0;
+                fraction = Math.Min(1.0, (done + (done < total ? inside : 0)) / total);
+                where = (total > 1 ? "блок " + Math.Min(done + 1, total) + " из " + total + " · " : "") +
+                    (step.StepTotal > 0 ? "шаг " + Math.Min(step.StepDone + 1, step.StepTotal) + " из " + step.StepTotal : step.Current ?? "");
+                Block[] order = step.Order ?? new Block[0];
+                blockList.Mark(blocks.Select(b => { int at = Array.IndexOf(order, b); return at >= 0 && at < done; }).ToArray());
+                curveBar.Set(fraction, total);
+            }
+            else
+            {
+                fraction = joint.Total > 0 ? Math.Min(1.0, (double)joint.Done / joint.Total) : 0;
+                where = "все блоки разом · " + Math.Min(joint.Done, joint.Total) + " с из " + joint.Total;
+                blockList.Mark(null);
+                curveBar.Set(fraction);
+            }
+            // Остаток — по тому, сколько времени ушло на пройденную долю. Пока пройдено мало, оценка скачет: не показывается.
+            double spent = Native.Now() - timedSince;
+            string left = fraction >= 0.05 && spent >= 10 ? " · осталось ≈ " + Remaining(spent * (1 - fraction) / fraction) : "";
+            curveView.Progress(where + left);
+        }
+
+        static string Remaining(double seconds)
+        {
+            return seconds < 90 ? Math.Max(5, (int)Math.Round(seconds / 5) * 5) + " с" : (int)Math.Round(seconds / 60) + " мин";
         }
 
         /// Обновляет заголовок и график кривых, если изменилось то, от чего они зависят. Наведение мыши на блок
@@ -317,7 +412,9 @@ namespace CoreMap
             // График и список показывают то, что стоит в процессоре; выбор ползунка в них попадает, когда ползунок
             // его поставил. От положения ползунка, пока он ничего не ставил, зависят только отсечка и средний множитель.
             CurveChoice[] standing = core.Fit.Standing(level, picks);
-            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
+            // Оси графика — по всем кривым всех блоков: от выделенного блока они не зависят.
+            CurveRun[] everything = blocks.SelectMany(b => curve.For(b)).Concat(curve.All(level)).ToArray();
+            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(), everything,
                            core.Blocks, target, standing, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все",
                            curve.Uneven(level, core.Blocks));
             blockList.Show(standing, selected.Index, shown.Index, JointTemps(), Delta());

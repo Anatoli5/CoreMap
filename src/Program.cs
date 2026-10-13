@@ -19,9 +19,17 @@
 // CoreMap.exe --joint       вместе с --simulate --snapshot: вместо измерения запустить проверку под общей нагрузкой
 // CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх второго
 // CoreMap.exe --fans N      вместе с --simulate --snapshot: режим вентиляторов — 1 «макс при замерах», 2 «макс всегда»
+// CoreMap.exe --hover       вместе с --simulate --saved --snapshot F: без мыши проверить наведение на точки графика кривых
+//                           (MainForm.HoverCheck); отчёт — текстом в файл F
 // CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
 // CoreMap.exe --selftest    вместе с --simulate --snapshot F: без окна проверить, что измерения на любом пути выхода
 //                           возвращают потолки, и остальное из SelfTest.cs; отчёт — текстом в файл F
+// CoreMap.exe --tray        резидент: без окна поставить профиль «при запуске» и остаться значком у часов; из меню
+//                           значка — сменить профиль, открыть окно программы, выйти (Tray.cs). Запускает его
+//                           Windows при входе, если в окне включён выключатель «в трее при входе» (Autostart.cs)
+// CoreMap.exe --simulate --tray --snapshot F   проверка резидента: значка нет, запуск на имитации, щелчки по
+//                           пунктам меню, замер памяти и процессорного времени; отчёт — текстом в файл F.
+//                           С --saved — на копии сохранённых профилей из data\
 //
 // Ключи, по которым программа что-то делает сама (--run, --calibrate, --snapshot и всё, что идёт вместе с ним),
 // исполняет Scenario.cs: за запуск — один сценарий. Для владельца они не нужны: всё, чем он пользуется, есть в окне.
@@ -36,6 +44,10 @@ namespace CoreMap
 {
     static class Program
     {
+        /// Мьютекс-одиночка окна программы. Резидент (--tray) — одиночка сам по себе: он не мешает открыть окно
+        /// с ярлыка, а по этому мьютексу узнаёт, что окно открыто.
+        public const string WindowMutex = "Local\\CoreMap.SingleInstance";
+
         public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
         public static readonly string Build = BuildStamp();  // когда собран этот exe: «13.10.26 05:15»; показан в заголовке окна
 
@@ -127,19 +139,30 @@ namespace CoreMap
             if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
             bool simulate = Array.IndexOf(args, "--simulate") >= 0;
             if (simulate && Array.IndexOf(args, "--selftest") >= 0 && Option(args, "--snapshot") != null) return SelfTest.Run(Option(args, "--snapshot"));
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
+            // Резидент уходит в свой файл до всего, что касается окна: само упоминание окна в этом методе
+            // загрузило бы в его процесс библиотеки интерфейса.
+            if (Array.IndexOf(args, "--tray") >= 0) return Tray.Run(simulate, Option(args, "--snapshot"), Array.IndexOf(args, "--saved") >= 0);
+            return Window(args, simulate);
+        }
+
+        static int Window(string[] args, bool simulate)
+        {
             var scenario = new Scenario(args, simulate);
             int limit;
             int.TryParse(Option(args, "--limit"), out limit);
 
-            bool first;
-            using (new Mutex(true, "Local\\CoreMap.SingleInstance", out first))
+            // Скрытая проверка на имитации процессор не трогает, одиночкой не считается и мьютекс не берёт:
+            // иначе окно, которое владелец открыл во время проверки, приняло бы её за свою копию и не открылось.
+            bool quiet = simulate && scenario.Hidden, first = true;
+            using (quiet ? null : new Mutex(true, WindowMutex, out first))
             {
-                // Скрытая проверка на имитации процессор не трогает и открытой программе не мешает.
-                if (!first && !(simulate && scenario.Hidden))
+                if (!first)
                 {
                     Native.ActivateOtherCopy();
                     return 0;
                 }
+                if (!quiet) Tray.Announce();  // резидент с этого момента потолки не трогает
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 MainForm form = null;
@@ -148,7 +171,6 @@ namespace CoreMap
                     Log(e.Exception.ToString());
                     if (form != null) form.Problem = "Ошибка в программе: " + e.Exception.Message + ". Подробности записаны в data\\error.log";
                 };
-                AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
                 try
                 {
                     var core = new Core(simulate, limit, scenario.Saved);

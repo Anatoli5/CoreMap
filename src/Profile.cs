@@ -90,7 +90,8 @@ namespace CoreMap
             });
         }
 
-        void Read()
+        /// Читает профиль из файла и ничего не ставит: резидент так узнаёт, что изменило окно (LimitsStartup).
+        public void Read()
         {
             if (path == null || !File.Exists(path)) return;
             Dictionary<string, object> saved = Json.ReadFile(path);
@@ -170,7 +171,11 @@ namespace CoreMap
             "(Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41) or " +
             "(Provider[@Name='EventLog'] and EventID=6008) or " +
             "(Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting'] and EventID=1001) or " +
-            "(Provider[@Name='Microsoft-Windows-WHEA-Logger'] and (Level=1 or Level=2 or Level=3))";
+            // Из аппаратных ошибок в счёт идут неисправимые (уровни 1 и 2) и исправленная ошибка самого процессора
+            // (событие 19 — первый признак неустойчивого разгона). Остальные исправленные ошибки — предупреждения
+            // о других устройствах: на машине владельца событие 17 (исправленная ошибка шины PCI Express) пишется
+            // пачками при каждой загрузке, и по прежнему условию «любое предупреждение» оно считалось сбоем профиля.
+            "(Provider[@Name='Microsoft-Windows-WHEA-Logger'] and (Level=1 or Level=2 or EventID=19))";
 
         /// Первое после указанного времени событие системного журнала Windows, подходящее под условие.
         /// Возвращает его название по-русски или null, если таких нет.
@@ -188,7 +193,7 @@ namespace CoreMap
                     case "Microsoft-Windows-Kernel-Power": return "аварийное выключение или зависание";
                     case "EventLog": return record.Id == 6008 ? "неожиданное выключение" : "завершение работы";
                     case "Microsoft-Windows-WER-SystemErrorReporting": return "синий экран";
-                    default: return "аппаратная ошибка процессора";
+                    default: return record.Id == 19 ? "исправленная ошибка процессора" : "неисправимая аппаратная ошибка";
                 }
             }
         }

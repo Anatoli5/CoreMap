@@ -86,36 +86,22 @@ namespace CoreMap
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
 
-            LimitHold hold = Limits == null ? null : new LimitHold(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
-            // Прошлый запуск мог оборваться посреди измерения и оставить блоку потолок ступени. Он возвращается
-            // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
-            string recovered = hold == null ? null : hold.Recover();
-            if (recovered != null) Program.Tell(recovered);  // полоса сообщений в окне сменится, запись в журнале останется
+            // Возврат потолков по метке оборванного измерения, затем профиль «при запуске» — общий путь окна
+            // и резидента, см. Startup.cs.
+            LimitsStartup startup = Limits == null ? null : new LimitsStartup(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
+            if (startup != null)
+            {
+                if (startup.Recovered != null) Program.Tell(startup.Recovered);  // полоса сообщений в окне сменится, запись в журнале останется
+                Profile = startup.Profile;
+                Profiles = startup.Profiles;
+                // «Было» — то, что стояло в процессоре до того, как профиль запуска встал поверх: после перезагрузки
+                // это заводские потолки, и разница с профилем должна быть видна, а откат — возвращать к ним.
+                was = startup.Was;
+            }
             // Доступ к вентиляторам создаётся в их потоке и только после Fans.Start: без окна он не нужен.
             Fans = new Fans(simulate ? (Func<IFanBackend>)(() => new SimFans(() => Monitor == null ? 45 : Monitor.PkgCur)) : () => new HpFans(),
                 simulate ? null : Program.DataDir, simulate);
-            Runner = new Runner(Load, hold, Fans);
-            // «Было» читается из процессора до того, как профиль запуска встанет поверх: после перезагрузки это
-            // заводские потолки, и разница с профилем должна быть видна, а откат — возвращать к ним.
-            if (Limits != null) was = (int[])Limits.Current.Clone();
-
-            if (Limits != null)
-            {
-                Profile = new Profile(Limits, Lps, CpuName, simulate ? null : Program.DataDir);
-                Profiles = new ProfileSets(Lps, CpuName, simulate ? null : Program.DataDir);
-                try
-                {
-                    Profiles.Read();
-                    Profile.Startup();
-                    // Профиль, сохранённый до появления названий, попадает в общий список.
-                    if (Profile.Exists && Profiles.Get(Profile.Name) == null) Profiles.Put(Profile.Name, Profile.Ratios);
-                }
-                catch (Exception e)
-                {
-                    Program.Log("профиль потолков не прочитан: " + e);
-                    Profile.Note = "профиль не прочитан: " + e.Message;
-                }
-            }
+            Runner = new Runner(Load, startup == null ? null : startup.Hold, Fans);
 
             if (backend != null)
             {
@@ -306,18 +292,12 @@ namespace CoreMap
             return Enumerable.Range(0, a.Length).All(i => !Limits.Known(i) || a[i] == b[i]);
         }
 
-        /// Каким сохранённым набором является данный: название профиля, "" — заводские потолки, null — ни одним
-        /// (потолки ставились вручную, ползунком или измерением). Если подходит несколько профилей, первым идёт
-        /// профиль запуска, затем preferred, затем по алфавиту.
+        /// Каким сохранённым набором является данный: название профиля, "" — заводские потолки, null — ни одним.
+        /// Правило — LimitsStartup.Named, общее с резидентом.
         public string Named(int[] ratios, string preferred = null)
         {
-            if (Limits == null || Profiles == null || ratios == null) return null;
-            if (!Profile.Exists && Equal(ratios, Limits.Fused)) return "";
-            if (Profile.Exists && Profiles.Get(Profile.Name) != null && Equal(ratios, Profile.Ratios)) return Profile.Name;
-            if (preferred != null && Profiles.Get(preferred) != null && Equal(ratios, Profiles.Get(preferred))) return preferred.Trim();
-            foreach (string name in Profiles.Names)
-                if (Equal(ratios, Profiles.Get(name))) return name;
-            return Equal(ratios, Limits.Fused) ? "" : null;
+            if (Limits == null || Profiles == null) return null;
+            return LimitsStartup.Named(ratios, Limits, Profile, Profiles, preferred);
         }
 
         /// Какой сохранённый набор стоит в процессоре сейчас — см. Named.

@@ -20,7 +20,7 @@ namespace CoreMap
         const double ShotNoSooner = 10, ShotNoLater = 240;
 
         readonly string snapshot;  // куда сохранить картинку окна; null — снимок не нужен
-        readonly bool calibrate, run, curve, fit, joint, best, profile;
+        readonly bool calibrate, run, curve, fit, joint, best, profile, hover;
         readonly int slide;        // на сколько градусов поставить ползунок потолков; 0 — не ставить
         readonly int fans;         // режим вентиляторов (Fans.Measure, Fans.Always); 0 — не менять
 
@@ -49,6 +49,7 @@ namespace CoreMap
             joint = simulate && has("--joint");
             best = simulate && has("--best");
             profile = simulate && has("--profile");
+            hover = simulate && has("--hover");
             if (simulate) int.TryParse(Program.Option(args, "--slide"), out slide);
             if (simulate) int.TryParse(Program.Option(args, "--fans"), out fans);
             string[] size = (Program.Option(args, "--size") ?? "").Split('x');
@@ -86,7 +87,8 @@ namespace CoreMap
                 // таблицы, поэтому первые секунды он не в счёт.
                 bool ready = core.Simulated ? passed >= ShotAfter
                     : passed >= ShotNoSooner && core.Sweep.Done >= 3 || passed >= ShotNoLater;
-                if (ready) Finish(() => form.SavePicture(snapshot));
+                if (ready && hover) Finish(() => System.IO.File.WriteAllText(snapshot, form.HoverCheck()));
+                else if (ready) Finish(() => form.SavePicture(snapshot));
             }
             else if (calibrate)
             {
@@ -104,6 +106,7 @@ namespace CoreMap
                 return;
             }
             if (fans > 0) core.SetFanMode(fans);
+            if (hover) return;  // проверка наведения: измерение не нужно, график берётся как есть
             if (profile) TwoProfiles();
             else if (slide > 0)
             {

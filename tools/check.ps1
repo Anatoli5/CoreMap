@@ -1,7 +1,7 @@
 # Project check for the agent: builds the sources into CoreMapNew.exe (the owner's CoreMap.exe is not touched),
-# takes hidden simulated window snapshots into outputs\<Name>\ and runs the self-test of the measurement base.
-# Nothing appears on screen, no elevation prompt, no real load. Exit code 0 = built, every snapshot was written
-# and the self-test passed.
+# takes hidden simulated window snapshots into outputs\<Name>\, runs the self-test of the measurement base and the
+# hidden check of the tray resident. Nothing appears on screen, no elevation prompt, no real load. Exit code 0 =
+# built, every snapshot was written, the self-test and the resident check passed.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -Name stage1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -BuildOnly
@@ -43,7 +43,7 @@ function Build {
     # The compiler's messages go to the host, not into the function's result: with them in the result a failed
     # build returned a non-empty list, which counts as true, and the check went on with the previous exe.
     & $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
-        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /r:System.Management.dll "/out:$out" src\*.cs | Out-Host
+        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll "/out:$out" src\*.cs | Out-Host
     return $LASTEXITCODE -eq 0
 }
 
@@ -92,6 +92,18 @@ if ($null -eq $procs) { Write-Host 'the build was refused four times'; exit 4 }
 $report = Join-Path $dir 'selftest.txt'
 $procs += Start-Process -FilePath $out -ArgumentList "--simulate --snapshot $report --selftest" -PassThru
 
+# The resident (src\Tray.cs, CoreMap.exe --tray) on simulated limits and a temp copy of the saved profiles: no tray
+# icon, it applies the start-up profile, clicks through its menu, measures its memory and idle CPU time and writes
+# a text report. First line of the report: ok / FAILED.
+$tray = Join-Path $dir 'tray.txt'
+$procs += Start-Process -FilePath $out -ArgumentList "--simulate --tray --saved --snapshot $tray" -PassThru
+
+# Hover on the curve graph without a mouse (MainForm.HoverCheck): the cursor is put on every point twice, with a
+# repaint after each; the highlighted block must not change, the point must stay under the cursor and have a tooltip.
+# First line of the report: ok / FAILED.
+$hover = Join-Path $dir 'hover.txt'
+$procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover --snapshot $hover --size 1920x1040" -PassThru
+
 $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
@@ -106,6 +118,20 @@ elseif ((Get-Content $report -TotalCount 1) -ne 'ok') {
     Select-String -Path $report -Pattern '^FAILED  ' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
     $failed++
 }
+$trayed = Get-Item $tray -ErrorAction SilentlyContinue
+if (-not $trayed -or $trayed.LastWriteTime -lt $stamp) { Write-Host 'no resident report'; $failed++ }
+elseif ((Get-Content $tray -TotalCount 1) -ne 'ok') {
+    Write-Host "resident check failed, see $tray"
+    Select-String -Path $tray -Pattern '^FAILED' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
+    $failed++
+}
+$hovered = Get-Item $hover -ErrorAction SilentlyContinue
+if (-not $hovered -or $hovered.LastWriteTime -lt $stamp) { Write-Host 'no hover report'; $failed++ }
+elseif ((Get-Content $hover -TotalCount 1) -ne 'ok') {
+    Write-Host "hover check failed, see $hover"
+    Get-Content $hover -Encoding UTF8 -TotalCount 6 | ForEach-Object { Write-Host $_ }
+    $failed++
+}
 if ($failed -gt 0) { exit 2 }
-Write-Host "snapshots and self-test ok: $dir"
+Write-Host "snapshots, self-test, resident and hover checks ok: $dir"
 exit 0
