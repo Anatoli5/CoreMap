@@ -21,6 +21,9 @@
 // CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
 // CoreMap.exe --selftest    вместе с --simulate --snapshot F: без окна проверить, что измерения на любом пути выхода
 //                           возвращают потолки (SelfTest.cs); отчёт — текстом в файл F
+//
+// Ключи, по которым программа что-то делает сама (--run, --calibrate, --snapshot и всё, что идёт вместе с ним),
+// исполняет Scenario.cs. Для владельца они не нужны: всё, чем он пользуется, есть в окне.
 using System;
 using System.Globalization;
 using System.IO;
@@ -33,11 +36,6 @@ namespace CoreMap
     {
         public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
         public static string DataDir = Path.Combine(Root, "data");  // проверка --selftest подставляет временную папку
-        public static int TestSlide;  // проверка на имитации с ключом --slide: ползунок потолков ставится на это значение
-        public static bool TestBest;  // проверка на имитации с ключом --best: ползунок делит температуру «по выгоде»
-        public static bool TestJoint;  // проверка на имитации с ключом --joint
-        public static bool TestFit;  // проверка на имитации с ключом --fit: вместо измерения запускается подбор под температуру
-        public static bool TestProfile;  // проверка на имитации с ключом --profile: два профиля, один открыт поверх базы
 
         public static void Log(string text)
         {
@@ -49,7 +47,8 @@ namespace CoreMap
             catch (Exception) { }  // журнал не должен ронять программу, какой бы ни была причина
         }
 
-        static string Option(string[] args, string name)
+        /// Значение ключа командной строки — слово после него; null — ключа нет.
+        public static string Option(string[] args, string name)
         {
             int at = Array.IndexOf(args, name);
             return at >= 0 && at + 1 < args.Length ? args[at + 1] : null;
@@ -63,11 +62,7 @@ namespace CoreMap
             if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
             bool simulate = Array.IndexOf(args, "--simulate") >= 0;
             if (simulate && Array.IndexOf(args, "--selftest") >= 0 && Option(args, "--snapshot") != null) return SelfTest.Run(Option(args, "--snapshot"));
-            TestFit = simulate && Array.IndexOf(args, "--fit") >= 0;
-            if (simulate) int.TryParse(Option(args, "--slide"), out TestSlide);
-            TestBest = simulate && Array.IndexOf(args, "--best") >= 0;
-            TestJoint = simulate && Array.IndexOf(args, "--joint") >= 0;
-            TestProfile = simulate && Array.IndexOf(args, "--profile") >= 0;
+            var scenario = new Scenario(args, simulate);
             int limit;
             int.TryParse(Option(args, "--limit"), out limit);
 
@@ -75,7 +70,7 @@ namespace CoreMap
             using (new Mutex(true, "Local\\CoreMap.SingleInstance", out first))
             {
                 // Скрытая проверка на имитации процессор не трогает и открытой программе не мешает.
-                if (!first && !(simulate && Option(args, "--snapshot") != null))
+                if (!first && !(simulate && scenario.Hidden))
                 {
                     Native.ActivateOtherCopy();
                     return 0;
@@ -91,16 +86,11 @@ namespace CoreMap
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
                 try
                 {
-                    var core = new Core(simulate, limit, Array.IndexOf(args, "--saved") >= 0);
-                    string[] size = (Option(args, "--size") ?? "").Split('x');
-                    int width = 0, height = 0;
-                    if (size.Length == 2) { int.TryParse(size[0], out width); int.TryParse(size[1], out height); }
-                    form = new MainForm(core, Option(args, "--snapshot"),
-                                        width > 0 && height > 0 ? new System.Drawing.Size(width, height) : System.Drawing.Size.Empty,
-                                        Array.IndexOf(args, "--calibrate") >= 0, Array.IndexOf(args, "--run") >= 0,
-                                        simulate && Array.IndexOf(args, "--curve") >= 0);
+                    var core = new Core(simulate, limit, scenario.Saved);
+                    form = new MainForm(core, scenario.Hidden, scenario.Size);
                     // Потолки возвращены после оборванного измерения: владелец видит это в полосе сообщений.
                     if (core.Notice != null) form.Problem = core.Notice;
+                    scenario.Attach(form, core);
                     Application.Run(form);
                 }
                 catch (Exception e)

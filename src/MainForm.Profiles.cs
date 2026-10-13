@@ -112,17 +112,20 @@ namespace CoreMap
                 string text = (picked == "" ? "заводские" : picked) + (isBase ? "  · база" : "") +
                     (isBase && profile.Disabled ? " (отключена после сбоя)" : "") + (standing == picked ? "  · стоит сейчас" : "");
                 var item = new ToolStripMenuItem(text) { Enabled = !core.Busy };
-                item.Click += (s, e) =>
-                {
-                    string refusal = core.OpenProfile(picked);
-                    if (refusal == null) { profileName.Text = picked; fitReport = null; }
-                    Report(refusal);
-                };
+                item.Click += (s, e) => OpenProfile(picked);
                 menu.Items.Add(item);
                 if (picked == "" && core.Profiles.Names.Length > 0) menu.Items.Add(new ToolStripSeparator());
             }
             menu.Closed += (s, e) => BeginInvoke((Action)menu.Dispose);
             menu.Show(profileList, new Point(0, profileList.Height));
+        }
+
+        /// Открывает набор из списка: ставит его потолки, база остаётся прежней. "" — заводские потолки.
+        public void OpenProfile(string name)
+        {
+            string refusal = core.OpenProfile(name);
+            if (refusal == null) { profileName.Text = name; fitReport = null; }
+            Report(refusal);
         }
 
         /// Строка состояния профилей: что база и что стоит в процессоре сейчас. attention — стоит не база.

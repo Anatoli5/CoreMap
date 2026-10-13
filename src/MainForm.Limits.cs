@@ -61,7 +61,7 @@ namespace CoreMap
             head.Controls.Add(heatMode = new Segmented(new[] { 0, 1 }, v => v == 0 ? "по средней" : "по наибольшей", v =>
                 {
                     core.Curves.ByPeak = v == 1;
-                    if (fitApplied) fitReport = core.FitFromCurves(fitSlider.Value, fitBest) + BackHint();
+                    if (fitApplied) ApplySlider();
                     Tick();
                 },
                 "По какой температуре работать\nВ каждой точке кривой хранятся обе температуры ступени; здесь выбирается, по какой считать.\n" +
@@ -89,7 +89,7 @@ namespace CoreMap
                 "• поставленные потолки — проба: пропадут при перезагрузке, пока не сохранён профиль")
             {
                 Margin = new Padding(0, 0, Theme.Px(8), 0),
-                Moved = t => { fitValue.Text = t + " °C"; fitApplied = true; fitReport = core.FitFromCurves(t, fitBest) + BackHint(); Tick(); },
+                Moved = t => { ApplySlider(); Tick(); },
             };
             fit.Controls.Add(fitSlider);
             fit.Controls.Add(fitValue = Widgets.Label("75 °C", Theme.Text, 14, true));
@@ -103,7 +103,7 @@ namespace CoreMap
             fit.Controls.Add(fitMode = new Segmented(new[] { 0, 1 }, v => v == 0 ? "ровно" : "по выгоде", v =>
                 {
                     fitBest = v == 1;
-                    if (fitApplied) fitReport = core.FitFromCurves(fitSlider.Value, fitBest) + BackHint();
+                    if (fitApplied) ApplySlider();
                     Tick();
                 },
                 "Как делить температуру между блоками\nОба способа берут потолки из снятых кривых.\n" +
@@ -221,6 +221,24 @@ namespace CoreMap
             fitSlider.Width = Math.Max(Theme.Px(80), side - fitValue.PreferredSize.Width - fitSlider.Margin.Horizontal);
             meanView.Width = fitSlider.Width;
             fitMean.MaximumSize = new Size(side, 0);
+        }
+
+        /// Ставит потолки под температуру с ползунка по снятым кривым и запоминает итог.
+        void ApplySlider()
+        {
+            fitValue.Text = fitSlider.Value + " °C";
+            fitApplied = true;
+            fitReport = core.FitFromCurves(fitSlider.Value, fitBest) + BackHint;
+        }
+
+        /// Ставит ползунок на температуру и потолки под неё — то же, что владелец делает мышью.
+        public void SlideTo(int temp, bool best)
+        {
+            if (fitSlider == null) return;
+            fitBest = best;
+            fitSlider.Value = temp;
+            ApplySlider();
+            Tick();
         }
 
         void CurveClick()
@@ -357,10 +375,7 @@ namespace CoreMap
         }
 
         /// Приписка к итогу ползунка: как вернуть потолки, которые стояли до него.
-        string BackHint()
-        {
-            return " Отменить — кнопка «вернуть базу».";
-        }
+        const string BackHint = " Отменить — кнопка «вернуть базу».";
 
         /// Температура каждого блока в последнем замере под общей нагрузкой; NaN — замера нет или потолки с тех пор менялись.
         double[] JointTemps()

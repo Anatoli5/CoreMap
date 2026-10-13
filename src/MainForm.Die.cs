@@ -59,6 +59,9 @@ namespace CoreMap
             die.Invalidate();
         }
 
+        /// Выбранный блок: его кривая снимается кнопкой ▶.
+        public Block Selected { get { return selected; } }
+
         void Select(Block block)
         {
             selected = block;

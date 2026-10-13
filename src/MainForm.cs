@@ -24,8 +24,7 @@ namespace CoreMap
         readonly Core core;
         readonly Block[] blocks;  // все блоки по порядку: строки и столбцы таблиц, строки списка
         readonly Timer timer = new Timer { Interval = 500 };
-        readonly string snapshotPath;
-        int ticks;
+        readonly bool hidden;  // окно для скрытой проверки (Scenario): стоит за краем экрана и ни о чём не спрашивает
         HelpMode help;
 
         // Верхняя полоса и полоса сообщений.
@@ -37,18 +36,12 @@ namespace CoreMap
         bool wasBusy;           // в прошлый опрос шло измерение
         string loggedError;     // последняя ошибка окна, уже записанная в журнал
         int sinceRefresh;       // тактов с последнего перечитывания потолков из процессора
-        bool autoCurve;      // проверка на имитации с ключом --curve: вместо теплового измерения снимается кривая
-        bool autoSweep;      // запуск с ключом --run: тепловое измерение начинается само, окно остаётся открытым
-        bool autoCalibrate;  // запуск с ключом --calibrate: подбор нагрузки начинается сам, по окончании окно закрывается
 
-        /// snapshotSize — размер окна для режима проверки; пустой — обычный.
-        public MainForm(Core core, string snapshotPath, Size snapshotSize, bool autoCalibrate, bool autoSweep, bool autoCurve)
+        /// size — размер окна; пустой — обычный: под содержимое, но не больше экрана.
+        public MainForm(Core core, bool hidden, Size size)
         {
-            this.autoCurve = autoCurve;
             this.core = core;
-            this.snapshotPath = snapshotPath;
-            this.autoSweep = autoSweep && core.Monitor != null && snapshotPath == null;
-            this.autoCalibrate = autoCalibrate && core.Monitor != null;
+            this.hidden = hidden;
             using (Graphics g = CreateGraphics()) Theme.Scale = g.DpiX / 96f;
 
             Text = "CoreMap";
@@ -59,7 +52,7 @@ namespace CoreMap
             MinimumSize = new Size(Theme.Px(640), Theme.Px(420));
             StartPosition = FormStartPosition.Manual;
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-            if (snapshotPath != null) ShowInTaskbar = false;
+            if (hidden) ShowInTaskbar = false;
 
             blocks = core.Blocks.All;
 
@@ -101,14 +94,14 @@ namespace CoreMap
             Apply(cell);
             Size want = root.GetPreferredSize(Size.Empty), frame = Size - ClientSize;
             Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
-            Size outer = !snapshotSize.IsEmpty ? snapshotSize
+            Size outer = !size.IsEmpty ? size
                 : new Size(Math.Min(want.Width + frame.Width, area.Width), Math.Min(want.Height + frame.Height, area.Height));
-            // В режиме проверки окно стоит за краем экрана: на экране ничего не появляется.
-            Point corner = snapshotPath != null ? new Point(-20000, -20000)
+            // Скрытое окно стоит за краем экрана: на экране ничего не появляется.
+            Point corner = hidden ? new Point(-20000, -20000)
                 : new Point(area.X + (area.Width - outer.Width) / 2, area.Y + (area.Height - outer.Height) / 2);
             Bounds = new Rectangle(corner, outer);
             // Окно собирается невидимым и показывается готовым: иначе почти сто его элементов рисуются на экране по одному.
-            if (snapshotPath == null) Opacity = 0;
+            if (!hidden) Opacity = 0;
 
             help = new HelpMode(this) { Button = helpButton };
             timer.Tick += (s, e) => Tick();
@@ -127,8 +120,8 @@ namespace CoreMap
             Opacity = 1;
         }
 
-        /// В режиме проверки окно не забирает ввод у того, чем занят владелец.
-        protected override bool ShowWithoutActivation { get { return snapshotPath != null; } }
+        /// Скрытое окно не забирает ввод у того, чем занят владелец.
+        protected override bool ShowWithoutActivation { get { return hidden; } }
 
         // ----- построение окна -----
 
@@ -231,7 +224,7 @@ namespace CoreMap
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (core.Busy && snapshotPath == null && MessageBox.Show(this,
+            if (core.Busy && !hidden && MessageBox.Show(this,
                     "Идёт измерение. Если закрыть окно, оно прервётся.\n\nЗакрыть?", "CoreMap", MessageBoxButtons.OKCancel,
                     MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK)
             {
@@ -266,44 +259,6 @@ namespace CoreMap
                 core.Limits.Refresh();
             }
             ShowBanner();
-            if (autoSweep)
-            {
-                if (++ticks == 2) { core.StartSweep(seconds, passes); autoSweep = false; }
-                return;
-            }
-            if (autoCalibrate)
-            {
-                if (++ticks == 2) core.StartCalibration();
-                else if (ticks > 2 && !core.Calibration.Running) Close();
-                return;
-            }
-            if (snapshotPath == null) return;
-            // Режим проверки: запустить измерение, дать ему дойти до первых результатов, снять картинку.
-            // В имитации хватает 30 секунд; на настоящих датчиках — до трёх измеренных ядер, но не дольше 4 минут.
-            if (++ticks == 2)
-            {
-                if (Program.TestProfile)
-                {
-                    // Два профиля, второй — база, первый открыт поверх неё: на картинке видны пометки и разница с базой.
-                    int a = blocks[0].First, b = blocks[2].First, c = blocks[5].First;
-                    int top = core.Limits.Current[a];
-                    core.SetLimit(a, top - 3);
-                    core.SetLimit(b, core.Limits.Current[b] - 2);
-                    core.SaveProfile("Тихий");
-                    core.SetLimit(a, top);
-                    core.SetLimit(c, core.Limits.Current[c] + 1);
-                    core.SaveProfile("Игровой");
-                    Report(core.OpenProfile("Тихий"));
-                    profileName.Text = "Тихий";
-                }
-                else if (Program.TestSlide > 0) { fitBest = Program.TestBest; fitSlider.Value = Program.TestSlide; fitSlider.Moved(Program.TestSlide); if (Program.TestJoint) core.StartJoint(); }
-                else if (Program.TestJoint) core.StartJoint();
-                else if (Program.TestFit) core.FitLimits(47);
-                else if (autoCurve) core.StartCurve(selected, double.NaN);
-                else core.StartSweep(10, 1);
-            }
-            // Счёт ядер до запуска — от прошлой сохранённой таблицы, поэтому первые 10 секунд он не в счёт.
-            if (core.Simulated ? ticks == 60 : ticks >= 20 && core.Sweep.Done >= 3 || ticks >= 480) SaveSnapshot();
         }
 
         void ShowBanner()
@@ -387,19 +342,15 @@ namespace CoreMap
             return core.Monitor == null || core.Simulated ? "" : "сила не подобрана — нажми ⚙";
         }
 
-        /// Режим проверки: сохраняет картинку окна в файл и закрывает программу.
-        void SaveSnapshot()
+        /// Сохраняет картинку окна в файл: скрытая проверка (Scenario) смотрит на окно так.
+        public void SavePicture(string path)
         {
-            // Закрыться нужно и при неудаче: иначе невидимая копия программы осталась бы висеть.
-            try
+            Tick();  // на картинке — показания на этот момент
+            using (var image = new Bitmap(Width, Height))
             {
-                using (var image = new Bitmap(Width, Height))
-                {
-                    DrawToBitmap(image, new Rectangle(0, 0, Width, Height));
-                    image.Save(snapshotPath, ImageFormat.Png);
-                }
+                DrawToBitmap(image, new Rectangle(0, 0, Width, Height));
+                image.Save(path, ImageFormat.Png);
             }
-            finally { Close(); }
         }
     }
 }

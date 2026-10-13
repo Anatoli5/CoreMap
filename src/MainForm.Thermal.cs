@@ -134,7 +134,7 @@ namespace CoreMap
 
         // ----- действия -----
 
-        void SweepClick()
+        public void SweepClick()
         {
             if (core.Sweep.Running) core.Sweep.Stop();
             else core.StartSweep(seconds, passes);
