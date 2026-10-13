@@ -28,6 +28,8 @@ namespace CoreMap
         // Верхняя полоса и полоса сообщений.
         Label pkg, pkgMax, watts, since, banner, calibrationStatus;
         Button reset, stopLoad, calibrationButton, helpButton;
+        Button autostartButton;  // выключатель «в трее при входе»: резидент, см. Tray.cs и Autostart.cs
+        bool autostartOn;        // что ответил планировщик Windows; своей записи об этом у программы нет
         Segmented level;
         public string Problem;  // ошибка программы или отказ действия, показывается в полосе сообщений
 
@@ -160,6 +162,17 @@ namespace CoreMap
                     "Защитный предел\nЕсли любое ядро держится на этой температуре 3 секунды, нагрузка снимается сама.\n" +
                     "• процессор сам сбрасывает частоту при " + core.ThrottleAt + " °C\n" +
                     "• свой предел задаётся при запуске: --limit N"));
+            bar.Controls.Add(autostartButton = Widgets.Button("в трее при входе", AutostartClick,
+                "Значок в трее при входе в Windows\nПри входе в Windows профиль потолков ставится без этого окна: маленькая копия программы " +
+                "ставит его и остаётся значком у часов.\n" +
+                "• меню значка (правая кнопка): сменить профиль, открыть это окно, выйти\n" +
+                "• включение создаёт задание «" + Autostart.TaskName + "» в планировщике Windows и сразу ставит значок\n" +
+                "• выключение удаляет задание и убирает значок\n" +
+                "• программу перенесли в другую папку — включить заново\n" +
+                "• выключено, пока не включишь сам"));
+            // Имитация систему не меняет: выключатель в ней не работает и планировщик не спрашивается.
+            autostartButton.Enabled = !core.Simulated;
+            if (!core.Simulated) ReadAutostart();
             bar.Controls.Add(helpButton = Widgets.Button("?", () => help.Set(true),
                 "Режим вопроса\nПока он включён, при наведении на любой элемент окна показывается подсказка о нём.\n" +
                 "• первый щелчок в окне выключает режим и ничего не нажимает\n" +
@@ -219,6 +232,30 @@ namespace CoreMap
         {
             if (core.Calibration.Running) core.Calibration.Stop();
             else core.StartCalibration();
+        }
+
+        /// Спрашивает планировщик Windows, включён ли запуск резидента при входе, и показывает ответ на выключателе.
+        /// Возвращает причину, если узнать не удалось.
+        string ReadAutostart()
+        {
+            string problem;
+            autostartOn = Autostart.Enabled(out problem);
+            autostartButton.ForeColor = autostartOn ? Theme.Accent : Theme.Text;
+            autostartButton.BackColor = autostartOn ? Theme.Cell : Theme.Button;
+            return problem;
+        }
+
+        void AutostartClick()
+        {
+            string refusal = autostartOn ? Autostart.Disable() : Autostart.Enable();
+            string unknown = ReadAutostart();  // на выключателе — то, что получилось, а не то, что нажато
+            // Включил — значок появляется сразу, а не после следующего входа в Windows; выключил — сразу пропадает.
+            if (refusal == null)
+            {
+                if (autostartOn) refusal = Tray.Launch();
+                else Tray.Dismiss();
+            }
+            Report(refusal ?? unknown);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)

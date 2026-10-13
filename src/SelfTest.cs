@@ -208,7 +208,7 @@ namespace CoreMap
             reread.Flush();
             Check(File.ReadAllText(curvesFile + ".bad").Length == whole.Length / 2, "файлы: новая запись копию .bad не тронула");
             // Файл разбирается, но поля нет: это тоже нечитаемый файл.
-            File.WriteAllText(curvesFile, "{\"cpu\": " + new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(cpu) + "}");
+            File.WriteAllText(curvesFile, "{\"cpu\": " + Json.Quote(cpu) + "}");
             spoiled = null;
             reread = new CurveStore(limits, cpu, dir);
             try { reread.LoadSaved(); }
@@ -247,6 +247,104 @@ namespace CoreMap
             breakHandler = false;
             int was = seen;
             Check(Until(() => seen > was && watch.Error == null, 3), "датчики: поток опроса жив");
+
+            TrayScenarios(Path.Combine(dir, "tray"), cores, blocks, lps, cpu);
+            AutostartScenarios();
+        }
+
+        /// 13. Резидент (Tray.cs) без значка. «Процессор» у него свой, в памяти, и при каждом создании — с
+        /// заводскими потолками имитации, как после перезагрузки; файлы профилей — в папке dir.
+        static void TrayScenarios(string dir, CpuCore[] cores, BlockMap blocks, int[] lps, string cpu)
+        {
+            Directory.CreateDirectory(dir);
+            Block first = blocks.All[0], second = blocks.All[1];
+            // Профили собираются на отдельном «процессоре» — как их сохранило бы окно программы до перезагрузки.
+            var desk = new CoreLimits(null, cores, blocks);
+            var sets = new ProfileSets(lps, cpu, dir);
+            desk.Set(first.First, desk.Fused[first.First] - 4);
+            sets.Put("Тихий", desk.Current);
+            desk.Set(second.First, desk.Fused[second.First] - 5);
+            sets.Put("Игровой", desk.Current);
+            int[] bad = (int[])desk.Current.Clone();
+            bad[first.First] = 999;
+            sets.Put("Негодный", bad);
+            new Profile(desk, lps, cpu, dir).Save("Игровой");
+
+            // Запуск: профиль «при запуске» поставлен тем же путём, что в окне.
+            var resident = new Resident(true, dir);
+            string news = resident.Load(true);
+            Check(resident.Available && resident.Standing() == "Игровой" && resident.Limits.Same(desk.Current),
+                "резидент: при запуске поставлен профиль «при запуске» (" + resident.Tip().Replace("\n", " / ") + ")");
+            Check(news == null, "резидент: штатный запуск — без уведомления (" + news + ")");
+            List<TrayItem> menu = resident.Menu();
+            Check(menu.Count(i => i.Checked) == 1 && menu.Single(i => i.Checked).Text == "Игровой" &&
+                menu.Any(i => i.Id == Resident.OpenId && i.Default) && menu.Any(i => i.Id == Resident.ExitId),
+                "резидент: в меню отмечен стоящий профиль, есть «Открыть» и «Выход»");
+
+            // Щелчок по другому профилю: его потолки стоят, и при следующем запуске ставится он.
+            int quiet = menu.First(i => i.Text != null && i.Text.StartsWith("Тихий")).Id;
+            Check(resident.Switch(resident.NameOf(quiet)) == null && resident.Standing() == "Тихий" && resident.AtStartup == "Тихий",
+                "резидент: щелчок по профилю ставит его и делает профилем «при запуске»");
+            var next = new Resident(true, dir);
+            next.Load(true);
+            Check(next.Standing() == "Тихий", "резидент: выбор записан в файл — следующий запуск ставит его");
+
+            // Отказ записи потолка: не проглочен, профиль «при запуске» прежний.
+            string refused = resident.Switch("Негодный");
+            Check(refused != null && refused.Contains("999") && resident.AtStartup == "Тихий" && resident.Tip().Contains("не поставлен"),
+                "резидент: отказ записи потолка назван, профиль «при запуске» прежний (" + refused + ")");
+
+            // Открыто окно программы: профили в меню серые, щелчок ничего не ставит.
+            resident.WindowOpen = true;
+            int[] standing = (int[])resident.Limits.Current.Clone();
+            Check(resident.Switch("Игровой") != null && resident.Limits.Current.SequenceEqual(standing) &&
+                resident.Menu().Where(i => i.Id >= Resident.FactoryId).All(i => !i.Enabled && !i.Checked),
+                "резидент: при открытом окне профили серые и не переключаются");
+            resident.WindowOpen = false;
+
+            // «Заводские»: заводские потолки, при запуске ничего не ставится.
+            Check(resident.Switch("") == null && resident.Limits.Same(resident.Limits.Fused) && resident.Standing() == "" &&
+                resident.AtStartup == "" && !File.Exists(Path.Combine(dir, "profile.json")),
+                "резидент: «заводские» ставят заводские потолки и снимают профиль «при запуске»");
+
+            // Окно программы закрылось, изменив файлы: они перечитаны, потолки не тронуты.
+            sets.Delete("Тихий");
+            new Profile(desk, lps, cpu, dir).Save("Игровой");
+            news = resident.Load(false);
+            Check(news == null && resident.AtStartup == "Игровой" && resident.Standing() == "" &&
+                !resident.Menu().Any(i => i.Text != null && i.Text.StartsWith("Тихий")) && resident.Tip().Contains("при запуске — «Игровой»"),
+                "резидент: после окна файлы профилей перечитаны, потолки не тронуты (" + resident.Tip().Replace("\n", " / ") + ")");
+
+            // Окно сняли посреди измерения: метку возвращает и резидент.
+            new LimitHold(desk, blocks, lps, cpu, dir).Take();
+            news = resident.Load(false);
+            Check(news != null && news.StartsWith("Прошлый запуск оборвался") && resident.Limits.Same(desk.Current) &&
+                !File.Exists(Path.Combine(dir, "limits-held.json")), "резидент: потолки возвращены по метке, владельцу сказано (" + news + ")");
+        }
+
+        /// 14. Запуск резидента при входе в Windows (Autostart.cs). Описание задания отдаётся на разбор самому
+        /// планировщику; задание при этом не создаётся, и в планировщике ничего не меняется.
+        static void AutostartScenarios()
+        {
+            const string exe = "C:\\Папка с пробелом & знаком\\CoreMap.exe";
+            object task = Autostart.Parse(Autostart.Xml(exe, System.Security.Principal.WindowsIdentity.GetCurrent().User.Value));
+            object settings = Autostart.Get(task, "Settings"), principal = Autostart.Get(task, "Principal"), triggers = Autostart.Get(task, "Triggers");
+            Check(Autostart.Runs(task, exe) && !Autostart.Runs(task, "C:\\Другая папка\\CoreMap.exe"),
+                "автозапуск: описание задания принято планировщиком, запускает этот файл с --tray");
+            Check((int)Autostart.Get(triggers, "Count") == 1 && (int)Autostart.Get(Autostart.Get(triggers, "Item", 1), "Type") == 9,
+                "автозапуск: один запуск — при входе в Windows");
+            Check((int)Autostart.Get(principal, "RunLevel") == 1 && (int)Autostart.Get(principal, "LogonType") == 3,
+                "автозапуск: с наивысшими правами, в сеансе вошедшего");
+            Check(!(bool)Autostart.Get(settings, "DisallowStartIfOnBatteries") && !(bool)Autostart.Get(settings, "StopIfGoingOnBatteries"),
+                "автозапуск: от батареи запускается и не снимается");
+            Check((string)Autostart.Get(settings, "ExecutionTimeLimit") == "PT0S" && (int)Autostart.Get(settings, "MultipleInstances") == 2 &&
+                (int)Autostart.Get(settings, "Priority") == 4, "автозапуск: без предела времени, вторая копия не запускается, приоритет обычный");
+            // Этот же вопрос окно задаёт планировщику при каждом своём запуске: сколько он стоит, видно в отчёте.
+            string problem;
+            double asked = Native.Now();
+            bool on = Autostart.Enabled("CoreMap selftest no such task", out problem);
+            Check(!on && problem == null, "автозапуск: задания нет — «выключено», без ошибки (" + problem + "), ответ за " +
+                Math.Round((Native.Now() - asked) * 1000) + " мс");
         }
 
         /// Датчики-подделка: по просьбе опрос кончается ошибкой, которой настоящие датчики не дают.

@@ -90,7 +90,8 @@ namespace CoreMap
             });
         }
 
-        void Read()
+        /// Читает профиль из файла и ничего не ставит: резидент так узнаёт, что изменило окно (LimitsStartup).
+        public void Read()
         {
             if (path == null || !File.Exists(path)) return;
             Dictionary<string, object> saved = Json.ReadFile(path);

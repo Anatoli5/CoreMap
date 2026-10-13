@@ -23,21 +23,47 @@ namespace CoreMap
         static extern int pawnio_execute(IntPtr handle, string name, ulong[] input, UIntPtr inputSize,
                                          ulong[] output, UIntPtr outputSize, out UIntPtr returned);
 
-        readonly IntPtr handle;
+        [DllImport("PawnIOLib.dll")] static extern int pawnio_close(IntPtr handle);
+
+        readonly string modulePath;
+        IntPtr handle;  // Zero — закрыт (Close): следующее обращение к регистру откроет драйвер заново
         readonly ulong[] input = new ulong[2], output = new ulong[1];
 
         public PawnIo(string modulePath)
         {
+            this.modulePath = modulePath;
             string lib = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PawnIO", "PawnIOLib.dll");
             if (!File.Exists(lib)) throw new SensorException("драйвер PawnIO не установлен: нет " + lib);
             if (!File.Exists(modulePath)) throw new SensorException("нет файла модуля " + modulePath);
             if (Native.LoadLibrary(lib) == IntPtr.Zero) throw new SensorException("не загрузилась библиотека " + lib);
+            Open();
+        }
+
+        /// Открывает драйвер и загружает в него модуль: модуль живёт вместе с дескриптором.
+        void Open()
+        {
             int hr = pawnio_open(out handle);
+            if (hr != 0) handle = IntPtr.Zero;
             if (hr == unchecked((int)0x80070005)) throw new SensorException("программа запущена без прав администратора");
             if (hr != 0) throw new SensorException("PawnIO не открылся, код 0x" + hr.ToString("X8"));
             byte[] blob = File.ReadAllBytes(modulePath);
             hr = pawnio_load(handle, blob, (UIntPtr)blob.Length);
-            if (hr != 0) throw new SensorException("модуль IntelMSR не загрузился, код 0x" + hr.ToString("X8"));
+            if (hr == 0) return;
+            Close();
+            throw new SensorException("модуль IntelMSR не загрузился, код 0x" + hr.ToString("X8"));
+        }
+
+        /// Закрывает дескриптор драйвера до следующего обращения к регистрам. Нужен резиденту (Tray.cs): он
+        /// обращается к процессору только при запуске и по щелчку в меню, а между этим драйвер не держит.
+        /// Окно дескриптор не закрывает.
+        public void Close()
+        {
+            lock (input)
+            {
+                if (handle == IntPtr.Zero) return;
+                pawnio_close(handle);
+                handle = IntPtr.Zero;
+            }
         }
 
         /// Читает регистр на том ядре, к которому сейчас привязан вызывающий поток.
@@ -46,6 +72,7 @@ namespace CoreMap
             lock (input)
             {
                 UIntPtr got;
+                if (handle == IntPtr.Zero) Open();
                 input[0] = msr;
                 int hr = pawnio_execute(handle, "ioctl_read_msr", input, (UIntPtr)1, output, (UIntPtr)1, out got);
                 if (hr != 0) throw new SensorException("чтение регистра 0x" + msr.ToString("X") + " не удалось, код 0x" + hr.ToString("X8"));
@@ -63,6 +90,7 @@ namespace CoreMap
             lock (input)
             {
                 UIntPtr got;
+                if (handle == IntPtr.Zero) Open();
                 input[0] = msr;
                 input[1] = value;
                 int hr = pawnio_execute(handle, "ioctl_write_msr", input, (UIntPtr)2, output, (UIntPtr)0, out got);
