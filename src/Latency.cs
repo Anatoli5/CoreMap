@@ -14,7 +14,7 @@ using System.Threading;
 
 namespace CoreMap
 {
-    class LatencyTest
+    class LatencyTest : Measurement
     {
         const int LineCount = 48;      // строк кэша на пару ядер
         const int Iterations = 3000;   // передач туда-обратно в одном замере
@@ -23,22 +23,18 @@ namespace CoreMap
         const int WordsPerLine = 8, TotalLines = 8192;  // массив 512 КБ
         static readonly long[] memory = new long[TotalLines * WordsPerLine];
 
-        readonly LoadManager load;
         readonly int[] lps;
         readonly int n;
         readonly string saveDir;
-        volatile bool cancel;
 
         public double[][] Matrix, Lowest, Highest;  // среднее, лучшая и худшая строка; NaN — не измерено
-        public volatile bool Running;
-        public int Done, Version;
-        public string Error, Finished;
+        public int Done;
 
         public int Total { get { return n * (n - 1) / 2; } }
 
-        public LatencyTest(LoadManager load, int[] lps, string saveDir)
+        public LatencyTest(Runner runner, int[] lps, string saveDir)
+            : base(runner, null)
         {
-            this.load = load;
             this.lps = lps;
             this.saveDir = saveDir;
             n = lps.Length;
@@ -53,28 +49,17 @@ namespace CoreMap
             Highest = empty();
         }
 
-        public void Start()
-        {
-            if (Running) return;
-            Running = true;
-            cancel = false;
-            new Thread(Run) { IsBackground = true, Name = "latency" }.Start();
-        }
-
-        public void Stop() { cancel = true; }
+        public void Start() { Launch(Run); }
 
         void Run()
         {
-            load.StopAll();
             Clear();
             Done = 0;
-            Error = null;
-            Finished = null;
             Version++;
             try
             {
-                for (int a = 0; a < n && !cancel; a++)
-                    for (int b = a + 1; b < n && !cancel; b++)
+                for (int a = 0; a < n && !Stopped; a++)
+                    for (int b = a + 1; b < n && !Stopped; b++)
                     {
                         Native.Pin(lps[a]);
                         double sum = 0, lo = double.MaxValue, hi = 0;
@@ -96,14 +81,7 @@ namespace CoreMap
                 if (Done == Total) Save();
                 else Error = "измерение прервано, таблица неполная";
             }
-            catch (Exception e) { Error = e.Message; }
-            finally
-            {
-                Native.Unpin(lps);
-                Running = false;
-                Finished = DateTime.Now.ToString("dd.MM HH:mm");
-                Version++;
-            }
+            finally { Native.Unpin(lps); }
         }
 
         static void RoundTrips(int cell, int count)

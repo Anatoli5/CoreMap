@@ -463,7 +463,7 @@ namespace CoreMap
             {
                 head.Controls.Add(heatMode = new Segmented(new[] { 0, 1 }, v => v == 0 ? "по средней" : "по наибольшей", v =>
                     {
-                        core.Curve.ByPeak = v == 1;
+                        core.Curves.ByPeak = v == 1;
                         if (fitApplied) fitReport = core.FitFromCurves(fitSlider.Value, fitBest) + BackHint();
                         Tick();
                     },
@@ -565,7 +565,7 @@ namespace CoreMap
                         "• расчёт по кривым одиночной нагрузки: под общей нагрузкой блоки греют друг друга, это ещё не учтено"));
                     fit.Controls.Add(fitButton = Widgets.Button("подобрать замером", () =>
                         {
-                            if (core.Curve.Searching) core.Curve.Stop();
+                            if (core.Search.Running) core.Search.Stop();
                             else fitReport = core.FitLimits(fitSlider.Value);
                             Tick();
                         },
@@ -584,7 +584,7 @@ namespace CoreMap
                     fit.Margin = new Padding(0, Theme.Px(4), 0, 0);
                     fit.Controls.Add(jointButton = Widgets.Button("проверить все разом", () =>
                         {
-                            if (core.Curve.Joint) core.Curve.Stop();
+                            if (core.Joint.Running) core.Joint.Stop();
                             else { fitReport = null; core.StartJoint(); }
                             Tick();
                         },
@@ -819,7 +819,7 @@ namespace CoreMap
         void ShowCurves()
         {
             if (core.Curve == null || curveView == null || fitSlider == null) return;
-            CurveTest curve = core.Curve;
+            CurveStore curve = core.Curves;
             Block shown = hovered ?? selected;  // блок, чья кривая поверх остальных
             curveTitle.Text = "Кривая · " + shown.Title;
             string key = curve.Version + "/" + shown.Index + "/" + selected.Index + "/" + fitSlider.Value + "/" + core.Load.Level + "/" + fitBest + "/" + curve.ByPeak +
@@ -832,7 +832,7 @@ namespace CoreMap
         /// Рисует график кривых, список блоков и средний множитель для температуры с ползунка.
         void DrawCurves(Block shown)
         {
-            CurveTest curve = core.Curve;
+            CurveStore curve = core.Curves;
             int level = core.Load.Level, target = fitSlider.Value;
             CurveChoice[] picks = core.ChooseAll(target, fitBest);
             curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
@@ -850,7 +850,7 @@ namespace CoreMap
             // Кривая среднего множителя пересчитывается по готовым кривым: пока идёт измерение, она не трогается
             // (иначе полный пересчёт шёл бы на каждой ступени) и обновляется, когда оно закончилось.
             string meanNow = curve.Version + "/" + level + "/" + curve.ByPeak;
-            if (meanKey != meanNow && !(curve.Running && meanEven.Length > 0 && meanKey != null && meanKey.EndsWith("/" + level + "/" + curve.ByPeak)))
+            if (meanKey != meanNow && !(core.Busy && meanEven.Length > 0 && meanKey != null && meanKey.EndsWith("/" + level + "/" + curve.ByPeak)))
             {
                 meanKey = meanNow;
                 int count = FitHigh - FitLow + 1;
@@ -894,17 +894,17 @@ namespace CoreMap
         /// Температура каждого блока в последнем замере под общей нагрузкой; NaN — замера нет или потолки с тех пор менялись.
         double[] JointTemps()
         {
-            JointResult joint = core.Curve.JointLast;
+            JointResult joint = core.Joint.Last;
             bool valid = joint != null && joint.Level == core.Load.Level && joint.Limits.SequenceEqual(core.Limits.Current);
-            return blocks.Select(b => valid ? b.Temp(core.Curve.ByPeak ? joint.Peak : joint.Temp) : double.NaN).ToArray();
+            return blocks.Select(b => valid ? b.Temp(core.Curves.ByPeak ? joint.Peak : joint.Temp) : double.NaN).ToArray();
         }
 
         /// Итог замера под общей нагрузкой одной строкой: насколько блоки горячее, чем по своим кривым.
         string JointSummary()
         {
-            JointResult joint = core.Curve.JointLast;
+            JointResult joint = core.Joint.Last;
             if (joint == null) return null;
-            double[] heat = core.Curve.ByPeak ? joint.Peak : joint.Temp;
+            double[] heat = core.Curves.ByPeak ? joint.Peak : joint.Temp;
             var above = new List<double>();
             var ratios = new List<double>();
             Block hottest = blocks[0];
@@ -1199,9 +1199,11 @@ namespace CoreMap
             if (core.Curve != null)
             {
                 CurveTest curve = core.Curve;
+                LimitSearch search = core.Search;
+                JointTest joint = core.Joint;
                 // График идёт за блоком, который меряется сейчас. Переход — один раз на блок: если владелец
                 // во время замера щёлкнул другую плитку, её кривая остаётся на виду до следующего блока.
-                Block active = curve.Active;
+                Block active = curve.Active ?? search.Active;
                 if (active != followed)
                 {
                     followed = active;
@@ -1210,17 +1212,17 @@ namespace CoreMap
                 curveButton.Text = curve.Running ? "■" : "▶";
                 curveButton.Enabled = curve.Running || !busy;
                 curveAllButton.Enabled = !busy;
-                fitButton.Enabled = curve.Searching || !busy;
-                fitButton.Text = curve.Searching ? "■ стоп" : "подобрать замером";
+                fitButton.Enabled = search.Running || !busy;
+                fitButton.Text = search.Running ? "■ стоп" : "подобрать замером";
                 fitSlider.Enabled = !busy;
-                jointButton.Enabled = curve.Joint || !busy;
-                jointButton.Text = curve.Joint ? "■ стоп" : "проверить все разом";
-                if (wasJoint && !curve.Joint) fitReport = curve.Error ?? JointSummary();
-                wasJoint = curve.Joint;
+                jointButton.Enabled = joint.Running || !busy;
+                jointButton.Text = joint.Running ? "■ стоп" : "проверить все разом";
+                if (wasJoint && !joint.Running) fitReport = joint.Error ?? JointSummary();
+                wasJoint = joint.Running;
                 fitMode.Show(fitBest ? 1 : 0, !busy);
-                heatMode.Show(curve.ByPeak ? 1 : 0, !busy);
-                curveStatus.Text = curve.Joint ? "Идёт проверка под общей нагрузкой: нагружены все блоки разом."
-                    : curve.Searching ? "Идёт подбор потолков по температуре — пройденные ступени добавляются на кривые."
+                heatMode.Show(core.Curves.ByPeak ? 1 : 0, !busy);
+                curveStatus.Text = joint.Running ? "Идёт проверка под общей нагрузкой: нагружены все блоки разом."
+                    : search.Running ? "Идёт подбор потолков по температуре — пройденные ступени добавляются на кривые."
                     : curve.Running
                     ? (curve.BlockTotal > 1 ? "Снимаю кривые · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal + " · шаг "
                         : "Снимаю кривую · шаг ") + Math.Min(curve.Done + 1, curve.Total) + " из " + curve.Total +
@@ -1228,12 +1230,12 @@ namespace CoreMap
                     : curve.Error ?? "";
                 curveStatus.Visible = curveStatus.Text != "";
                 curveStatus.ForeColor = curve.Running ? Theme.Text : curve.Error != null ? Theme.Bad : Theme.Dim;
-                fitStatus.Text = curve.Joint
-                    ? "Все блоки под нагрузкой · " + (curve.Current ?? "") + " · " + Math.Min(curve.Done, curve.Total) + " с из " + curve.Total
-                    : curve.Searching
-                    ? "Подбираю · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal +
-                        (curve.Current != null ? " · " + curve.Current : "")
-                    : fitReport ?? curve.Report ?? "Ползунок ставит потолки по снятым кривым, кнопка — замером под нагрузкой.";
+                fitStatus.Text = joint.Running
+                    ? "Все блоки под нагрузкой · " + (joint.Current ?? "") + " · " + Math.Min(joint.Done, joint.Total) + " с из " + joint.Total
+                    : search.Running
+                    ? "Подбираю · блок " + Math.Min(search.BlockDone + 1, search.BlockTotal) + " из " + search.BlockTotal +
+                        (search.Current != null ? " · " + search.Current : "")
+                    : fitReport ?? search.Report ?? "Ползунок ставит потолки по снятым кривым, кнопка — замером под нагрузкой.";
                 ShowCurves();
             }
 
@@ -1265,7 +1267,8 @@ namespace CoreMap
             Text = sw.Running ? "CoreMap — тепловое измерение " + sw.Done + " из " + sw.Total
                 : lat.Running ? "CoreMap — измерение задержек"
                 : cal.Running ? "CoreMap — подбор нагрузки " + cal.Done + " из " + cal.Total
-                : core.Curve != null && core.Curve.Searching ? "CoreMap — подбор, блок " + (core.Curve.BlockDone + 1) + " из " + core.Curve.BlockTotal
+                : core.Search != null && core.Search.Running ? "CoreMap — подбор, блок " + (core.Search.BlockDone + 1) + " из " + core.Search.BlockTotal
+                : core.Joint != null && core.Joint.Running ? "CoreMap — проверка под общей нагрузкой"
                 : core.Curve != null && core.Curve.Running ? "CoreMap — кривая " + core.Curve.Done + " из " + core.Curve.Total : "CoreMap";
             if (busy != wasBusy)
             {

@@ -6,11 +6,10 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading;
 
 namespace CoreMap
 {
-    class Calibration
+    class Calibration : Measurement
     {
         const double IdleSeconds = 4, LoadSeconds = 8;
         const double AbortAt = 96;  // шаг прерывается, если ядро дважды подряд показало столько, °C
@@ -22,24 +21,21 @@ namespace CoreMap
         }
 
         readonly Monitor monitor;
-        readonly LoadManager load;
         readonly int[] lps, targets;
         readonly string cpu, path;
-        volatile bool cancel;
 
-        public volatile bool Running;
         public int Done;
-        public string Current, Error, Finished;
+        public string Current;
         public bool Fitted;                          // ступени силы выбраны замером на этом процессоре
         public readonly double[] Heat = new double[4];  // нагрев ядра на ступенях 1–3, °C
 
         public int Total { get { return Kernels.All.Length * targets.Length; } }
 
         /// saveDir = null — результат не применяется и не запоминается (имитация: температуры ненастоящие).
-        public Calibration(Monitor monitor, LoadManager load, CpuCore[] cores, string cpu, string saveDir)
+        public Calibration(Runner runner, Monitor monitor, CpuCore[] cores, string cpu, string saveDir)
+            : base(runner, "подбор не удался")
         {
             this.monitor = monitor;
-            this.load = load;
             this.cpu = cpu;
             lps = cores.Select(c => c.Lp).ToArray();
             // Первые два P-ядра по номеру: на 275HX это прохладное ядро 0 и горячее ядро 1.
@@ -50,78 +46,52 @@ namespace CoreMap
 
         public void Start()
         {
-            if (Running || monitor == null) return;
-            Running = true;
-            cancel = false;
-            new Thread(Run) { IsBackground = true, Name = "calibration" }.Start();
+            if (monitor == null) return;
+            Launch(Run);
         }
 
-        public void Stop() { cancel = true; }
-
-        void Wait(double seconds)
-        {
-            for (double end = Native.Now() + seconds; Native.Now() < end && !cancel; ) Thread.Sleep(100);
-        }
+        protected override void Finish() { Current = null; }
 
         void Run()
         {
-            load.StopAll();
             Done = 0;
-            Error = null;
-            Finished = null;
             var rows = new List<Row>();
-            try
+            for (int k = 0; k < Kernels.All.Length && !Stopped; k++)
             {
-                for (int k = 0; k < Kernels.All.Length && !cancel; k++)
+                int count = targets.Length;
+                var row = new Row
                 {
-                    int count = targets.Length;
-                    var row = new Row
+                    Rise = new double[count], Peak = new double[count], Watts = new double[count], Speed = new double[count],
+                    Throttled = new bool[count], Aborted = new bool[count],
+                };
+                for (int t = 0; t < count && !Stopped; t++)
+                {
+                    int i = targets[t];
+                    Current = "вид вычислений " + (k + 1) + " из " + Kernels.All.Length + ", ядро " + lps[i];
+                    Wait(IdleSeconds);
+                    double idle = monitor.Typical(IdleSeconds / 2)[i], idleWatts = monitor.Power(IdleSeconds / 2);
+                    Load.StartKernel(i, Kernels.All[k]);
+                    double end = Native.Now() + LoadSeconds;
+                    int hot = 0;
+                    while (Native.Now() < end && !Wait(0.5))
                     {
-                        Rise = new double[count], Peak = new double[count], Watts = new double[count], Speed = new double[count],
-                        Throttled = new bool[count], Aborted = new bool[count],
-                    };
-                    for (int t = 0; t < count && !cancel; t++)
-                    {
-                        int i = targets[t];
-                        Current = "вид вычислений " + (k + 1) + " из " + Kernels.All.Length + ", ядро " + lps[i];
-                        Wait(IdleSeconds);
-                        double idle = monitor.Typical(IdleSeconds / 2)[i], idleWatts = monitor.Power(IdleSeconds / 2);
-                        load.StartKernel(i, Kernels.All[k]);
-                        double end = Native.Now() + LoadSeconds;
-                        int hot = 0;
-                        while (Native.Now() < end && !cancel)
-                        {
-                            Thread.Sleep(500);
-                            double now = monitor.Cur[i];
-                            row.Peak[t] = Math.Max(row.Peak[t], now);
-                            row.Throttled[t] |= monitor.Throttled[i];
-                            hot = now >= AbortAt ? hot + 1 : 0;
-                            if (hot >= 2) { row.Aborted[t] = true; break; }
-                        }
-                        double span = row.Aborted[t] ? 1 : LoadSeconds / 2;
-                        row.Rise[t] = monitor.Typical(span)[i] - idle;
-                        row.Watts[t] = monitor.Power(span) - idleWatts;
-                        row.Speed[t] = load.Rate(i);
-                        load.Stop(i);
-                        if (!cancel) Done++;
+                        double now = monitor.Cur[i];
+                        row.Peak[t] = Math.Max(row.Peak[t], now);
+                        row.Throttled[t] |= monitor.Throttled[i];
+                        hot = now >= AbortAt ? hot + 1 : 0;
+                        if (hot >= 2) { row.Aborted[t] = true; break; }
                     }
-                    rows.Add(row);
+                    double span = row.Aborted[t] ? 1 : LoadSeconds / 2;
+                    row.Rise[t] = monitor.Typical(span)[i] - idle;
+                    row.Watts[t] = monitor.Power(span) - idleWatts;
+                    row.Speed[t] = Load.Rate(i);
+                    Load.Stop(i);
+                    if (!Stopped) Done++;
                 }
-                if (cancel) Error = "подбор остановлен, сила нагрузки прежняя";
-                else if (path != null && Choose(rows)) Save(rows);
+                rows.Add(row);
             }
-            catch (Exception e)
-            {
-                Program.Log(e.ToString());
-                Error = "подбор не удался: " + e.Message;
-            }
-            finally
-            {
-                load.StopAll();
-                Current = null;
-                Finished = DateTime.Now.ToString("dd.MM HH:mm");
-                Running = false;
-            }
+            if (Stopped) Error = "подбор остановлен, сила нагрузки прежняя";
+            else if (path != null && Choose(rows)) Save(rows);
         }
 
         /// Полная ступень — вид вычислений с наибольшим нагревом; лёгкая — ближайший к половине этого

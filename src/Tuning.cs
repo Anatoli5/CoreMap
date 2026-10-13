@@ -88,6 +88,9 @@ namespace CoreMap
 
         public bool Known(int index) { return Fused[index] > 0; }
 
+        /// Действующий потолок блока: он у блока общий и читается по первому ядру.
+        public int Of(Block block) { return Current[block.First]; }
+
         /// Значения, которые можно поставить ядру вручную, по убыванию: от Over ступеней выше заводского предела вниз.
         public int[] Choices(int index)
         {

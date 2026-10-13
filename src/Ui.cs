@@ -684,7 +684,7 @@ namespace CoreMap
                         // тем меньше отставание и тем надёжнее точка.
                         if (!byPeak && !double.IsNaN(p.TempUp) && !double.IsNaN(p.TempDown))
                             g.DrawLine(thin, at.X, py(p.TempUp), at.X, py(p.TempDown));
-                        bool off = !double.IsNaN(p.Ratio) && Math.Abs(p.Ratio - p.Limit) > CurveTest.Reached;
+                        bool off = !double.IsNaN(p.Ratio) && Math.Abs(p.Ratio - p.Limit) > CurveStore.Reached;
                         g.FillEllipse(off ? hollow : fill, at.X - r, at.Y - r, 2 * r, 2 * r);
                         g.DrawEllipse(thick, at.X - r, at.Y - r, 2 * r, 2 * r);
                         if (owner != null) owners.Add(new KeyValuePair<Point, Block>(at, owner));
