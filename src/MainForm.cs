@@ -243,6 +243,9 @@ namespace CoreMap
 
         void Tick()
         {
+            // То, что случилось не по действию владельца: не записался файл, не прочитались сохранённые данные.
+            string told = Program.Told();
+            if (told != null) Problem = told;
             try { UpdateAll(); }
             catch (Exception e)
             {

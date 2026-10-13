@@ -63,6 +63,37 @@ namespace CoreMap
             Log(where + ": " + e);
         }
 
+        static string told;
+
+        /// Сообщение владельцу о том, что случилось не по его действию: не записался файл результата, не
+        /// прочитались сохранённые данные. Пишется в журнал; окно показывает его в полосе сообщений, пока
+        /// владелец не сделает следующее действие. Звать можно из любого потока.
+        public static void Tell(string text, Exception e = null)
+        {
+            Log(e == null ? text : text + "\r\n" + e);
+            lock (logged) told = told == null ? text : told + " " + text;
+        }
+
+        /// Причина ошибки для сообщения владельцу: одной строкой, без точки в конце и не длиннее полутора сотен
+        /// знаков — разбор JSON, например, кладёт в текст ошибки весь файл. Полный текст — в журнале.
+        public static string Why(Exception e)
+        {
+            string text = e.Message.Split('\r', '\n')[0].Trim();
+            if (text.Length > 150) text = text.Substring(0, 150).TrimEnd() + "…";
+            return text.TrimEnd('.');
+        }
+
+        /// Отдаёт окну сообщения владельцу, накопившиеся с прошлого раза; null — их нет.
+        public static string Told()
+        {
+            lock (logged)
+            {
+                string text = told;
+                told = null;
+                return text;
+            }
+        }
+
         /// Значение ключа командной строки — слово после него; null — ключа нет.
         public static string Option(string[] args, string name)
         {
@@ -104,8 +135,6 @@ namespace CoreMap
                 {
                     var core = new Core(simulate, limit, scenario.Saved);
                     form = new MainForm(core, scenario.Hidden, scenario.Size);
-                    // Потолки возвращены после оборванного измерения: владелец видит это в полосе сообщений.
-                    if (core.Notice != null) form.Problem = core.Notice;
                     scenario.Attach(form, core);
                     Application.Run(form);
                 }

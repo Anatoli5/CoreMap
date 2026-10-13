@@ -9,12 +9,41 @@ using System.Web.Script.Serialization;
 
 namespace CoreMap
 {
+    /// Файл данных есть, но не читается: испорчен или записан не этой программой.
+    class SpoiledFile : Exception
+    {
+        public SpoiledFile(string message, Exception cause) : base(message, cause) { }
+    }
+
     static class Json
     {
         public static Dictionary<string, object> ReadFile(string path)
         {
-            var reader = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-            return reader.Deserialize<Dictionary<string, object>>(File.ReadAllText(path, Encoding.UTF8));
+            string text = File.ReadAllText(path, Encoding.UTF8);
+            try
+            {
+                var reader = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var value = reader.Deserialize<Dictionary<string, object>>(text);
+                if (value == null) throw new InvalidDataException("файл пуст");
+                return value;
+            }
+            catch (Exception e) { throw Spoiled(path, e); }
+        }
+
+        /// Файл прочитан, но не разобран — как JSON или как данные программы (нет нужного поля). Сохраняет его
+        /// рядом как .bad: следующая запись заменила бы его новым, а так прежнее содержимое остаётся владельцу.
+        /// Возвращает ошибку с текстом для него. Зовут те, кто читает файл: ReadFile и разбор его полей.
+        public static Exception Spoiled(string path, Exception cause)
+        {
+            if (cause is SpoiledFile) return cause;
+            string name = Path.GetFileName(path), kept = "";
+            try
+            {
+                File.Copy(path, path + ".bad", true);
+                kept = "; он сохранён рядом как " + name + ".bad";
+            }
+            catch (Exception) { }  // копия — если получится: важнее причина, по которой файл не прочитан
+            return new SpoiledFile("файл " + name + " не читается (" + Program.Why(cause) + ")" + kept, cause);
         }
 
         public static void WriteFile(string path, Dictionary<string, object> value)

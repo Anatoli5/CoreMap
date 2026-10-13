@@ -122,11 +122,12 @@ namespace CoreMap
             Version++;
         }
 
-        /// Пишет кривые в файл. Не записались — в журнал: измерение из-за этого не прерывается.
+        /// Пишет кривые в файл. Не записались — измерение из-за этого не прерывается, но владелец об этом узнаёт:
+        /// кривые остались только в памяти программы.
         public void Flush()
         {
             try { Save(); }
-            catch (Exception e) { Program.Log("кривые не сохранены: " + e); }
+            catch (Exception e) { Program.Tell("Кривые не сохранены в файл: " + Program.Why(e) + ".", e); }
         }
 
         // ----- чтение: окно и подбор -----
@@ -254,8 +255,10 @@ namespace CoreMap
             string file = from ?? path;
             if (file == null || !File.Exists(file)) return;
             Dictionary<string, object> saved = Json.ReadFile(file);
-            if ((saved["cpu"] as string) != cpu) return;
-            lock (runs)
+            var read = new List<CurveRun>();
+            try
+            {
+                if ((saved["cpu"] as string) != cpu) return;
                 foreach (Dictionary<string, object> r in (IEnumerable)saved["runs"])
                 {
                     var run = new CurveRun { Lp = Convert.ToInt32(r["lp"]), Level = Convert.ToInt32(r["level"]), Time = r["time"] as string };
@@ -267,8 +270,12 @@ namespace CoreMap
                             TempUp = p.ContainsKey("up") ? Json.Number(p["up"]) : double.NaN,
                             TempDown = p.ContainsKey("down") ? Json.Number(p["down"]) : double.NaN,
                         });
-                    runs.Add(run);
+                    read.Add(run);
                 }
+            }
+            catch (Exception e) { throw Json.Spoiled(file, e); }
+            // Кривые попадают в хранилище только все разом: половина файла, записанная потом поверх целого, хуже пустого.
+            lock (runs) runs.AddRange(read);
         }
     }
 }

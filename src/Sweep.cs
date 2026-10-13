@@ -109,7 +109,7 @@ namespace CoreMap
             Current = null;
             // Записывается и прерванное измерение, если первый проход пройден целиком.
             try { if (saveDir != null && passes.Count > 0 && passes[0].All(row => row != null)) Save(); }
-            catch (Exception e) { Program.Log("тепловое измерение не сохранено: " + e); }
+            catch (Exception e) { Program.Tell("Тепловое измерение не сохранено в файл: " + Program.Why(e) + ".", e); }
         }
 
         void SetLevel(Block block, int level)

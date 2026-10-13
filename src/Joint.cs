@@ -90,7 +90,7 @@ namespace CoreMap
                 Ratio = ratioSum.Select((v, i) => ratioCount[i] > 0 ? v / ratioCount[i] : double.NaN).ToArray(),
             };
             try { Save(Last); }
-            catch (Exception e) { Program.Log("замер под общей нагрузкой не сохранён: " + e); }
+            catch (Exception e) { Program.Tell("Замер под общей нагрузкой не сохранён в файл: " + Program.Why(e) + ".", e); }
         }
 
         void Save(JointResult r)

@@ -145,10 +145,16 @@ namespace CoreMap
         {
             if (path == null || !File.Exists(path)) return;
             Dictionary<string, object> saved = Json.ReadFile(path);
-            if ((saved["cpu"] as string) != cpu) return;
-            int[] kernels = ((IEnumerable)saved["levels"]).Cast<object>()
-                .Select(name => Array.FindIndex(Kernels.All, kernel => kernel.Name == (name as string))).ToArray();
-            double[] heat = Json.Row(saved["heat"]);
+            int[] kernels;
+            double[] heat;
+            try
+            {
+                if ((saved["cpu"] as string) != cpu) return;
+                kernels = ((IEnumerable)saved["levels"]).Cast<object>()
+                    .Select(name => Array.FindIndex(Kernels.All, kernel => kernel.Name == (name as string))).ToArray();
+                heat = Json.Row(saved["heat"]);
+            }
+            catch (Exception e) { throw Json.Spoiled(path, e); }
             if (kernels.Length != 3 || heat.Length != 3 || kernels.Contains(-1) || !(heat[0] > 0)) return;
             Set(kernels, heat);
         }

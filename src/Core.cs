@@ -35,7 +35,6 @@ namespace CoreMap
         public readonly CurveTest Curve;      // лесенка: снятие кривой
         public readonly LimitSearch Search;   // поиск потолков замером под температуру
         public readonly JointTest Joint;      // проверка под общей нагрузкой
-        public readonly string Notice;        // что сделано с потолками при запуске после оборванного измерения; null — ничего
         public readonly bool Simulated;
         public readonly string SensorProblem; // почему датчики недоступны
         public readonly int ThrottleAt, Limit;
@@ -82,15 +81,15 @@ namespace CoreMap
                     var io = new PawnIo(Path.Combine(Program.Root, "modules", "IntelMSR.bin"));
                     backend = new LiveBackend(io, Lps);
                     try { Limits = new CoreLimits(io, Cores, Blocks); }
-                    catch (SensorException e) { Program.Log("потолки множителей недоступны: " + e.Message); }
+                    catch (SensorException e) { Program.Tell("Потолки множителей недоступны: " + Program.Why(e) + "."); }
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
 
             LimitHold hold = Limits == null ? null : new LimitHold(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
             // Прошлый запуск мог оборваться посреди измерения и оставить блоку потолок ступени. Он возвращается
             // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
-            if (hold != null) Notice = hold.Recover();
-            if (Notice != null) Program.Log(Notice);  // полоса сообщений в окне сменится, запись останется
+            string recovered = hold == null ? null : hold.Recover();
+            if (recovered != null) Program.Tell(recovered);  // полоса сообщений в окне сменится, запись в журнале останется
             Runner = new Runner(Load, hold);
 
             if (Limits != null)
@@ -125,7 +124,7 @@ namespace CoreMap
             Latency = new LatencyTest(Runner, Lps, simulate, saveDir);
             Calibration = new Calibration(Runner, Monitor, Cores, CpuName, saveDir);
             try { Calibration.LoadSaved(); }
-            catch (Exception e) { Program.Log("не прочитан прошлый подбор нагрузки: " + e); }
+            catch (Exception e) { Program.Tell("Прошлый подбор нагрузки не прочитан: " + Program.Why(e) + ".", e); }
             if (Limits != null && Monitor != null)
             {
                 Curves = new CurveStore(Limits, CpuName, saveDir);
@@ -134,7 +133,7 @@ namespace CoreMap
                 Search = new LimitSearch(Runner, Monitor, Limits, Curves, simulate);
                 Joint = new JointTest(Runner, Monitor, Limits, Curves, Lps, CpuName, saveDir);
                 try { Curves.LoadSaved(simulate && showSaved ? Path.Combine(Program.DataDir, "curves.json") : null); }
-                catch (Exception e) { Program.Log("не прочитаны сохранённые кривые: " + e); }
+                catch (Exception e) { Program.Tell("Сохранённые кривые не прочитаны: " + Program.Why(e) + ".", e); }
             }
             if (!simulate || showSaved) LoadLatest("thermal-*.json", Sweep.LoadSaved);
             LoadLatest("latency-*.json", Latency.LoadSaved);
@@ -146,7 +145,7 @@ namespace CoreMap
             string latest = Directory.GetFiles(Program.DataDir, pattern).OrderBy(p => p).LastOrDefault();
             if (latest == null) return;
             try { load(latest); }
-            catch (Exception e) { Program.Log("не прочитан файл " + latest + ": " + e); }
+            catch (Exception e) { Program.Tell("Прошлый замер " + Path.GetFileName(latest) + " не прочитан: " + Program.Why(e) + ".", e); }
         }
 
         const int AverageSkip = 4;  // столько первых опросов (2 секунды) после смены условий в среднюю не идут: ядро ещё греется

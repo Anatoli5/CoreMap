@@ -186,6 +186,42 @@ namespace CoreMap
             limits.Deaf = null;
             Check(limits.Refresh() == null && back(), "набор: потолок в процессор записан");
 
+            // 12. Нечитаемый файл данных не пропадает: при чтении он сохраняется рядом как .bad, и запись
+            // новых данных поверх него эту копию не трогает. Половина файла в хранилище не попадает.
+            string curvesFile = Path.Combine(dir, "curves.json");
+            var store = new CurveStore(limits, cpu, dir);
+            var point = new CurvePoint { Limit = 50, Ratio = 50, Temp = 60, Peak = 62, Base = 40, Watts = 10 };
+            store.Record(first, 1, point);
+            store.Record(first, 1, new CurvePoint { Limit = 51, Ratio = 51, Temp = 64, Peak = 66, Base = 40, Watts = 12 });
+            store.Flush();
+            Check(File.Exists(curvesFile) && Program.Told() == null, "файлы: кривые записаны, сообщений владельцу нет");
+            string whole = File.ReadAllText(curvesFile);
+            File.WriteAllText(curvesFile, whole.Substring(0, whole.Length / 2));  // обрыв посреди файла
+            string spoiled = null;
+            var reread = new CurveStore(limits, cpu, dir);
+            try { reread.LoadSaved(); }
+            catch (Exception e) { spoiled = e.Message; }
+            Check(spoiled != null && spoiled.Contains("curves.json.bad"), "файлы: нечитаемый файл назван, копия обещана (" + spoiled + ")");
+            Check(File.Exists(curvesFile + ".bad") && File.ReadAllText(curvesFile + ".bad").Length == whole.Length / 2, "файлы: копия .bad лежит рядом");
+            reread.Record(second, 1, point);
+            reread.Flush();
+            Check(File.ReadAllText(curvesFile + ".bad").Length == whole.Length / 2, "файлы: новая запись копию .bad не тронула");
+            // Файл разбирается, но поля нет: это тоже нечитаемый файл.
+            File.WriteAllText(curvesFile, "{\"cpu\": " + new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(cpu) + "}");
+            spoiled = null;
+            reread = new CurveStore(limits, cpu, dir);
+            try { reread.LoadSaved(); }
+            catch (Exception e) { spoiled = e.Message; }
+            Check(spoiled != null && spoiled.Contains("curves.json.bad") && reread.All(1).Length == 0, "файлы: файл без нужного поля — тоже (" + spoiled + ")");
+            // Запись не удалась: владельцу сказано.
+            File.Delete(curvesFile);
+            Directory.CreateDirectory(curvesFile);  // на месте файла — папка: записать нельзя
+            reread.Record(second, 1, point);
+            reread.Flush();
+            string told = Program.Told();
+            Check(told != null && told.StartsWith("Кривые не сохранены"), "файлы: отказ записи доходит до владельца (" + told + ")");
+            Directory.Delete(curvesFile, true);
+
             // 11. Поток датчиков переживает любую ошибку — опроса и обработки показаний (в ней защита от
             // перегрева): ошибка видна, защите передано «показаний нет», опрос идёт дальше.
             var flaky = new Flaky(lps.Length);

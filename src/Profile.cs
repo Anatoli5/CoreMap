@@ -94,15 +94,23 @@ namespace CoreMap
         {
             if (path == null || !File.Exists(path)) return;
             Dictionary<string, object> saved = Json.ReadFile(path);
-            if ((saved["cpu"] as string) != cpu || !Json.Ints(saved["lps"]).SequenceEqual(lps)) return;  // профиль от другого процессора
-            Ratios = Json.Ints(saved["ratios"]);
-            Name = saved.ContainsKey("name") ? saved["name"] as string ?? "" : "Профиль";
-            State = saved["state"] as string;
-            Saved = DateTime.Parse((string)saved["saved"], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
-            Applied = DateTime.Parse((string)saved["applied"], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
-            Boots = Convert.ToInt32(saved["boots"]);
-            Hours = Json.Number(saved["hours"]);
-            Failure = saved["failure"] as string;
+            try
+            {
+                if ((saved["cpu"] as string) != cpu || !Json.Ints(saved["lps"]).SequenceEqual(lps)) return;  // профиль от другого процессора
+                Ratios = Json.Ints(saved["ratios"]);
+                Name = saved.ContainsKey("name") ? saved["name"] as string ?? "" : "Профиль";
+                State = saved["state"] as string;
+                Saved = DateTime.Parse((string)saved["saved"], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                Applied = DateTime.Parse((string)saved["applied"], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                Boots = Convert.ToInt32(saved["boots"]);
+                Hours = Json.Number(saved["hours"]);
+                Failure = saved["failure"] as string;
+            }
+            catch (Exception e)
+            {
+                Ratios = null;  // прочитанный наполовину профиль базой не становится
+                throw Json.Spoiled(path, e);
+            }
         }
 
         /// Запуск программы: читает профиль и, если потолки с прошлого раза сбросились (перезагрузка,
@@ -255,9 +263,16 @@ namespace CoreMap
         {
             if (path == null || !File.Exists(path)) return;
             Dictionary<string, object> saved = Json.ReadFile(path);
-            if ((saved["cpu"] as string) != cpu || !Json.Ints(saved["lps"]).SequenceEqual(lps)) return;  // профили от другого процессора
-            foreach (Dictionary<string, object> set in (System.Collections.IEnumerable)saved["sets"])
-                sets[(string)set["name"]] = Json.Ints(set["ratios"]);
+            var read = new Dictionary<string, int[]>();
+            try
+            {
+                if ((saved["cpu"] as string) != cpu || !Json.Ints(saved["lps"]).SequenceEqual(lps)) return;  // профили от другого процессора
+                foreach (Dictionary<string, object> set in (System.Collections.IEnumerable)saved["sets"])
+                    read[(string)set["name"]] = Json.Ints(set["ratios"]);
+            }
+            catch (Exception e) { throw Json.Spoiled(path, e); }
+            // Профили попадают в список только все разом: половина файла, записанная потом поверх целого, хуже пустого.
+            foreach (KeyValuePair<string, int[]> set in read) sets[set.Key] = set.Value;
         }
     }
 }
