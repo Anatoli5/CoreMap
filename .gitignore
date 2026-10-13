@@ -1,0 +1,24 @@
+# Сборки
+*.exe
+*.pdb
+
+# Данные замеров и профили владельца, журнал ошибок
+data/
+
+# Рабочие записи и отчёты: локальные, в репозиторий не идут
+CLAUDE.md
+KNOWLEDGE.md
+DECISIONS.md
+BACKLOG.md
+outputs/
+
+# Прежняя Python-версия, не используется
+coremap/
+web/
+old/
+start.cmd
+start.ps1
+__pycache__/
+
+# Скачанный архив модулей PawnIO: в работе нужен только распакованный IntelMSR.bin
+modules/*.zip
