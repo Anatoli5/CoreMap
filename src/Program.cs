@@ -89,10 +89,13 @@ namespace CoreMap
                     string[] size = (Option(args, "--size") ?? "").Split('x');
                     int width = 0, height = 0;
                     if (size.Length == 2) { int.TryParse(size[0], out width); int.TryParse(size[1], out height); }
-                    Application.Run(form = new MainForm(core, Option(args, "--snapshot"),
-                                                        width > 0 && height > 0 ? new System.Drawing.Size(width, height) : System.Drawing.Size.Empty,
-                                                        Array.IndexOf(args, "--calibrate") >= 0, Array.IndexOf(args, "--run") >= 0,
-                                                        simulate && Array.IndexOf(args, "--curve") >= 0));
+                    form = new MainForm(core, Option(args, "--snapshot"),
+                                        width > 0 && height > 0 ? new System.Drawing.Size(width, height) : System.Drawing.Size.Empty,
+                                        Array.IndexOf(args, "--calibrate") >= 0, Array.IndexOf(args, "--run") >= 0,
+                                        simulate && Array.IndexOf(args, "--curve") >= 0);
+                    // Потолки возвращены после оборванного измерения: владелец видит это в полосе сообщений.
+                    if (core.Notice != null) form.Problem = core.Notice;
+                    Application.Run(form);
                 }
                 catch (Exception e)
                 {

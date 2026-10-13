@@ -31,6 +31,7 @@ namespace CoreMap
         public readonly CurveTest Curve;      // лесенка: снятие кривой
         public readonly LimitSearch Search;   // поиск потолков замером под температуру
         public readonly JointTest Joint;      // проверка под общей нагрузкой
+        public readonly string Notice;        // что сделано с потолками при запуске после оборванного измерения; null — ничего
         public readonly bool Simulated;
         public readonly string SensorProblem; // почему датчики недоступны
         public readonly int ThrottleAt, Limit;
@@ -81,6 +82,10 @@ namespace CoreMap
                 catch (SensorException e) { SensorProblem = e.Message; }
 
             LimitHold hold = Limits == null ? null : new LimitHold(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
+            // Прошлый запуск мог оборваться посреди измерения и оставить блоку потолок ступени. Он возвращается
+            // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
+            if (hold != null) Notice = hold.Recover();
+            if (Notice != null) Program.Log(Notice);  // полоса сообщений в окне сменится, запись останется
             Runner = new Runner(Load, hold);
 
             if (Limits != null)
@@ -468,7 +473,8 @@ namespace CoreMap
         public void Close()
         {
             // Измерение возвращает потолки и дописывает файл в своём потоке. Без ожидания процесс завершался раньше,
-            // и ядро оставалось с потолком текущей ступени.
+            // и ядро оставалось с потолком текущей ступени. Не дождались за три секунды — потолки при следующем
+            // запуске вернёт метка (LimitHold.Recover).
             Runner.Close(3);
             Load.StopAll();
         }

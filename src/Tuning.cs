@@ -91,6 +91,10 @@ namespace CoreMap
         /// Действующий потолок блока: он у блока общий и читается по первому ядру.
         public int Of(Block block) { return Current[block.First]; }
 
+        /// Потолки, которые стоят сейчас, становятся потолками «при запуске программы»: так делает возврат потолков
+        /// после оборванного измерения (LimitHold.Recover) — до него в процессоре стоял потолок ступени.
+        public void Rebase() { Array.Copy(Current, Initial, Current.Length); }
+
         /// Значения, которые можно поставить ядру вручную, по убыванию: от Over ступеней выше заводского предела вниз.
         public int[] Choices(int index)
         {

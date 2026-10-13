@@ -7,6 +7,7 @@
 //
 // На случай, когда вернуть некому — процесс убит или упал посреди измерения, — исходные потолки лежат в
 // файле-метке data\limits-held.json: он пишется до первой записи в процессор и удаляется после возврата.
+// Следующий запуск программы, найдя метку, возвращает потолки по ней (Recover).
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -75,6 +76,45 @@ namespace CoreMap
             held = null;
             Erase();
             return refusal;
+        }
+
+        /// Запуск программы. Метка осталась — прошлый запуск оборвался посреди измерения, и у блока мог остаться
+        /// потолок ступени: возвращает потолки по метке. Выше заводского предела не поднимает: метка могла остаться
+        /// и после зависания машины, а потолки выше заводских после сбоя проверяет профиль (Profile.Startup).
+        /// Возвращает строку для владельца; null — метки нет или потолки с ней совпадают.
+        public string Recover()
+        {
+            if (path == null || !File.Exists(path)) return null;
+            const string intro = "Прошлый запуск оборвался посреди измерения. ";
+            try
+            {
+                Dictionary<string, object> saved = Json.ReadFile(path);
+                if ((saved["cpu"] as string) != cpu || !Json.Ints(saved["lps"]).SequenceEqual(lps)) return null;  // метка от другого процессора
+                int[] before = Json.Ints(saved["limits"]);
+                var back = new List<string>();
+                var above = new List<string>();
+                string refusal = null;
+                foreach (Block block in blocks.All)
+                {
+                    int index = block.First;
+                    if (!limits.Known(index) || before[index] <= 0 || limits.Of(block) == before[index]) continue;
+                    if (before[index] > limits.Fused[index]) { above.Add(block.Name + " ×" + before[index]); continue; }
+                    string refused = limits.Set(index, before[index]);
+                    if (refused == null) back.Add(block.Name + " ×" + before[index]);
+                    else refusal = refused;
+                }
+                if (back.Count > 0) limits.Rebase();
+                if (back.Count == 0 && above.Count == 0 && refusal == null) return null;
+                return (intro + (back.Count > 0 ? "Блокам возвращены потолки, стоявшие до него: " + string.Join(", ", back) + ". " : "") +
+                    (above.Count > 0 ? "Не возвращены потолки выше заводского предела — поставь их сам: " + string.Join(", ", above) + ". " : "") +
+                    (refusal != null ? "Отказ: " + refusal + "." : "")).TrimEnd();
+            }
+            catch (Exception e)
+            {
+                Program.Log("метка исходных потолков не прочитана: " + e);
+                return intro + "Файл с потолками, стоявшими до него, не прочитан — проверь потолки блоков.";
+            }
+            finally { Erase(); }
         }
 
         void Write()
