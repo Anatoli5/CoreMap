@@ -34,11 +34,11 @@ namespace CoreMap
         Button reset, stopLoad, sweepButton, latencyButton, calibrationButton, profileSave, profileForget, limitsRestore, curveButton;
         const int FitLow = 55, FitHigh = 95;  // пределы ползунка температуры, °C
         CurveView curveView;
-        UnitList unitList;
+        BlockList blockList;
         MeanView meanView;
         Label fitMean;
-        int selected;        // выбранное (закреплённое) ядро: его кривая поверх остальных, пока курсор не на другом блоке
-        int hovered = -1;    // ядро блока под курсором — на схеме, в списке блоков или на графике; -1 — нет
+        Block selected;      // выбранный (закреплённый) блок: его кривая поверх остальных, пока курсор не на другом блоке
+        Block hovered;       // блок под курсором — на схеме, в списке блоков или на графике; null — нет
         string drawnKey, meanKey;  // по чему нарисованы график кривых и график среднего множителя
         Segmented fitMode, heatMode;
         Button jointButton;
@@ -48,13 +48,12 @@ namespace CoreMap
         double[] meanEven = new double[0], meanBest = new double[0];
         bool[] meanRough = new bool[0];
         string[] meanReadout = new string[0];
-        int followed = -1;              // блок, за которым график уже перешёл во время снятия кривых
+        Block followed;                 // блок, за которым график уже перешёл во время снятия кривых
         Segmented level, secondsPick, passesPick, unitPick;
         CheckBox relative;
         DieView die;
         PairView pairView;
-        int[][] units;        // блоки таблиц: P-ядро или кластер E-ядер целиком — позиции ядер в общем списке
-        string[] unitNames;
+        Block[] blocks;       // все блоки по порядку: строки и столбцы таблиц, строки списка
         StripView ownView;
         RunBar sweepBar, latencyBar;
         FlowLayoutPanel root, topBar, body, sweepHead, profileRow, curveRow;
@@ -98,8 +97,7 @@ namespace CoreMap
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             if (snapshotPath != null) ShowInTaskbar = false;
 
-            units = core.Units;
-            unitNames = units.Select(u => u.Length == 1 ? core.Lps[u[0]].ToString() : core.Lps[u[0]] + "–" + core.Lps[u[u.Length - 1]]).ToArray();
+            blocks = core.Blocks.All;
 
             int cell = Theme.Px(NormalCell);
             int pad = Theme.Px(14);
@@ -234,7 +232,7 @@ namespace CoreMap
             SetWidth(latencyStatus, wide);
             if (dieNote != null) dieNote.MaximumSize = new Size(die.Width, 0);
             // Колонка потолков — шириной со схему, но не уже своей самой широкой строки: шрифт с ячейкой не мельчает.
-            int list = unitList != null ? Theme.Px(170) + unitList.Margin.Horizontal : 0;  // список блоков справа от графика
+            int list = blockList != null ? Theme.Px(170) + blockList.Margin.Horizontal : 0;  // список блоков справа от графика
             int side = Math.Max(die.Width, curveRow != null ? curveRow.PreferredSize.Width : 0) + list;
             if (profileStatus != null)
             {
@@ -247,7 +245,7 @@ namespace CoreMap
             {
                 // Высота — чтобы двенадцать строк списка оставались читаемыми и при наименьшей ячейке.
                 curveView.Size = new Size(side - list, Math.Max(cell * 8, Theme.Px(192)));
-                unitList.Size = new Size(Theme.Px(170), curveView.Height);
+                blockList.Size = new Size(Theme.Px(170), curveView.Height);
                 curveStatus.MaximumSize = new Size(side, 0);
             }
             if (fitSlider != null)
@@ -437,10 +435,10 @@ namespace CoreMap
             FlowLayoutPanel panel = Section("Кристалл", null, out head);
             die = new DieView(core.Cores, core.Layout)
             {
-                Clicked = i => { Select(i); core.ToggleLoad(UnitOf(i)); }, Tip = TileTip, Menu = (i, at) => { Select(i); LimitMenu(i, at); },
-                Hovered = i => { hovered = i; ShowCurves(); },
+                Clicked = b => { Select(b); core.ToggleLoad(b); }, Tip = TileTip, Menu = (b, at) => { Select(b); LimitMenu(b, at); },
+                Hovered = b => { hovered = b; ShowCurves(); },
             };
-            Select(Array.FindIndex(core.Cores, c => c.Kind == 'P') < 0 ? 0 : Array.FindIndex(core.Cores, c => c.Kind == 'P'));
+            Select(blocks.FirstOrDefault(b => b.Kind == 'P') ?? blocks[0]);
             if (core.Limits != null)
             {
                 die.Limit = core.Limits.Current;
@@ -643,7 +641,7 @@ namespace CoreMap
                 graph.Margin = Padding.Empty;
                 graph.Controls.Add(curveView = new CurveView
                 {
-                    Hovered = lp => { hovered = lp < 0 ? -1 : Array.IndexOf(core.Lps, lp); ShowCurves(); },
+                    Hovered = b => { hovered = b; ShowCurves(); },
                     Help = "Кривые «температура от множителя»\nКривые всех блоков разом; яркая — блок под курсором (в списке, на схеме или на графике).\n" +
                         "• щелчок по строке списка или по плитке закрепляет блок\n" +
                         "• по горизонтали — множитель, на котором блок работал на самом деле\n" +
@@ -652,11 +650,11 @@ namespace CoreMap
                         "подъёмом и спуском; пустой кружок — до заданного потолка блок не дошёл\n" +
                         "• наведи на точку — её числа",
                 });
-                graph.Controls.Add(unitList = new UnitList(unitNames, units.Select(u => core.Cores[u[0]].Kind).ToArray())
+                graph.Controls.Add(blockList = new BlockList(blocks)
                 {
                     Margin = new Padding(Theme.Px(8), 0, 0, 0),
-                    Hovered = u => { hovered = u < 0 ? -1 : units[u][0]; ShowCurves(); },
-                    Clicked = u => { Select(units[u][0]); die.Invalidate(); ShowCurves(); },
+                    Hovered = u => { hovered = u < 0 ? null : blocks[u]; ShowCurves(); },
+                    Clicked = u => { Select(blocks[u]); die.Invalidate(); ShowCurves(); },
                 });
                 panel.Controls.Add(graph);
                 panel.Controls.Add(curveStatus = Widgets.Label("", Theme.Dim, 11));
@@ -702,7 +700,7 @@ namespace CoreMap
             foreach (Control c in head.Controls) c.Margin = new Padding(c.Margin.Left, c.Margin.Top, c.Margin.Right, Theme.Px(4));
             headWidth = head.GetPreferredSize(Size.Empty).Width;
 
-            pairView = new PairView(unitNames, units.Select(u => core.Cores[u[0]].Kind).ToArray(), cell * 2)
+            pairView = new PairView(blocks, cell * 2)
             {
                 Tip = PairTip, Lower = "Задержки, нс",
             };
@@ -747,8 +745,7 @@ namespace CoreMap
                 "• Вт — насколько выросло потребление всего процессора\n" +
                 "• °C/Вт — нагрев на каждый ватт: чем больше, тем хуже ядро отдаёт тепло", out head);
             string speed = Kernels.ForLevel(1).Unit;
-            CpuCore[] columns = units.Select(u => new CpuCore { Lp = core.Lps[u[0]], Kind = core.Cores[u[0]].Kind, Cluster = core.Cores[u[0]].Cluster }).ToArray();
-            ownView = new StripView(columns, unitNames, cell * 2, cell, new[] { speed, "°C", "°C на 1000", "Вт", "°C/Вт" }, new[] { 0, 1, 1, 1, 1 });
+            ownView = new StripView(blocks, cell * 2, cell, new[] { speed, "°C", "°C на 1000", "Вт", "°C/Вт" }, new[] { 0, 1, 1, 1, 1 });
             panel.Controls.Add(ownView);
             return panel;
         }
@@ -776,14 +773,14 @@ namespace CoreMap
             else core.StartLatency();
         }
 
-        /// Меню потолка множителя для ядра: от нескольких ступеней выше заводского предела (CoreLimits.Over) вниз.
-        void LimitMenu(int i, Point at)
+        /// Меню потолка множителя для блока: от нескольких ступеней выше заводского предела (CoreLimits.Over) вниз.
+        void LimitMenu(Block block, Point at)
         {
             CoreLimits limits = core.Limits;
+            int i = block.First;  // потолок блока читается и ставится через первое ядро
             if (limits == null || !limits.Known(i)) return;
             var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, Font = Theme.Font(13) };
-            bool cluster = core.Cores[i].Kind == 'E';
-            menu.Items.Add(new ToolStripLabel("Потолок множителя: " + (cluster ? "кластер ядра " : "ядро ") + core.Lps[i]));
+            menu.Items.Add(new ToolStripLabel("Потолок множителя: " + (block.Kind == 'E' ? "кластер ядра " : "ядро ") + block.Lp));
             menu.Items.Add(new ToolStripSeparator());
             foreach (int ratio in limits.Choices(i))
             {
@@ -803,13 +800,10 @@ namespace CoreMap
             menu.Show(die, at);
         }
 
-        /// Блок, в который входит ядро: само P-ядро или все ядра его кластера E-ядер.
-        int[] UnitOf(int i) { return units.First(u => u.Contains(i)); }
-
-        void Select(int i)
+        void Select(Block block)
         {
-            selected = i;
-            if (die != null) die.Selected = i;
+            selected = block;
+            if (die != null) die.Selected = block;
             drawnKey = null;
         }
 
@@ -826,11 +820,9 @@ namespace CoreMap
         {
             if (core.Curve == null || curveView == null || fitSlider == null) return;
             CurveTest curve = core.Curve;
-            int shown = hovered >= 0 ? hovered : selected;  // блок, чья кривая поверх остальных
-            int[] members = curve.Members(shown);
-            curveTitle.Text = "Кривая · " + (members.Length > 1 ? "блок E-ядер " + core.Lps[members[0]] + "–" + core.Lps[members[members.Length - 1]]
-                : "ядро " + core.Lps[shown]);
-            string key = curve.Version + "/" + shown + "/" + selected + "/" + fitSlider.Value + "/" + core.Load.Level + "/" + fitBest + "/" + curve.ByPeak +
+            Block shown = hovered ?? selected;  // блок, чья кривая поверх остальных
+            curveTitle.Text = "Кривая · " + shown.Title;
+            string key = curve.Version + "/" + shown.Index + "/" + selected.Index + "/" + fitSlider.Value + "/" + core.Load.Level + "/" + fitBest + "/" + curve.ByPeak +
                 "/" + string.Join(",", core.Limits.Current) + "/" + string.Join(",", Baseline());
             if (drawnKey == key) return;
             drawnKey = key;
@@ -838,20 +830,16 @@ namespace CoreMap
         }
 
         /// Рисует график кривых, список блоков и средний множитель для температуры с ползунка.
-        void DrawCurves(int shown)
+        void DrawCurves(Block shown)
         {
             CurveTest curve = core.Curve;
             int level = core.Load.Level, target = fitSlider.Value;
-            int lp = core.Lps[curve.Members(shown)[0]];
             CurveChoice[] picks = core.ChooseAll(target, fitBest);
-            var byLp = new Dictionary<int, CurveChoice>();
-            for (int u = 0; u < units.Length; u++)
-                if (picks[u] != null) byLp[core.Lps[units[u][0]]] = picks[u];
-            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != lp).ToArray(),
-                           l => core.Cores[Array.IndexOf(core.Lps, l)].Kind, target, byLp, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
+            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
+                           core.Blocks, target, picks, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
             int[] baseline = Baseline();
-            unitList.Show(picks, Array.FindIndex(units, u => u.Contains(selected)), Array.FindIndex(units, u => u.Contains(shown)), JointTemps(),
-                          units.Select((u, k) => picks[k] == null || baseline[u[0]] <= 0 ? 0 : picks[k].Limit - baseline[u[0]]).ToArray());
+            blockList.Show(picks, selected.Index, shown.Index, JointTemps(),
+                           blocks.Select(b => picks[b.Index] == null || baseline[b.First] <= 0 ? 0 : picks[b.Index].Limit - baseline[b.First]).ToArray());
 
             double[] now = Means(picks);
             double even = fitBest ? Means(core.ChooseAll(target))[0] : double.NaN;
@@ -882,7 +870,7 @@ namespace CoreMap
                         "\n• по выгоде: ×" + meanBest[k].ToString("0.00") +
                         (double.IsNaN(m[1]) ? "" : "\n• P-ядра: ×" + m[1].ToString("0.00")) +
                         (double.IsNaN(m[2]) ? "" : "\n• блоки E-ядер: ×" + m[2].ToString("0.00")) +
-                        "\n• блоков с кривой: " + at.Count(c => c != null) + " из " + units.Length +
+                        "\n• блоков с кривой: " + at.Count(c => c != null) + " из " + blocks.Length +
                         (meanRough[k] ? "\n• часть блоков горячее этой температуры уже на нижней точке кривой: среднее завышено" : "");
                 }
             }
@@ -908,7 +896,7 @@ namespace CoreMap
         {
             JointResult joint = core.Curve.JointLast;
             bool valid = joint != null && joint.Level == core.Load.Level && joint.Limits.SequenceEqual(core.Limits.Current);
-            return units.Select(u => valid ? (core.Curve.ByPeak ? joint.Peak : joint.Temp)[u[0]] : double.NaN).ToArray();
+            return blocks.Select(b => valid ? b.Temp(core.Curve.ByPeak ? joint.Peak : joint.Temp) : double.NaN).ToArray();
         }
 
         /// Итог замера под общей нагрузкой одной строкой: насколько блоки горячее, чем по своим кривым.
@@ -919,16 +907,16 @@ namespace CoreMap
             double[] heat = core.Curve.ByPeak ? joint.Peak : joint.Temp;
             var above = new List<double>();
             var ratios = new List<double>();
-            int hottest = 0;
-            for (int u = 0; u < units.Length; u++)
+            Block hottest = blocks[0];
+            foreach (Block b in blocks)
             {
-                int i = units[u][0];
-                if (heat[i] > heat[units[hottest][0]]) hottest = u;
-                if (!double.IsNaN(joint.Ratio[i])) ratios.Add(joint.Ratio[i]);
-                double alone = core.CurveTemp(u);
-                if (!double.IsNaN(alone)) above.Add(heat[i] - alone);
+                if (b.Temp(heat) > hottest.Temp(heat)) hottest = b;
+                double ratio = b.Ratio(joint.Ratio);
+                if (!double.IsNaN(ratio)) ratios.Add(ratio);
+                double alone = core.CurveTemp(b);
+                if (!double.IsNaN(alone)) above.Add(b.Temp(heat) - alone);
             }
-            return "Под общей нагрузкой: самый горячий блок " + unitNames[hottest] + " — " + heat[units[hottest][0]].ToString("0") + " °C" +
+            return "Под общей нагрузкой: самый горячий блок " + hottest.Name + " — " + hottest.Temp(heat).ToString("0") + " °C" +
                 (above.Count > 0 ? "; в среднем на " + above.Average().ToString("+0.0;−0.0") + " °C к своим кривым (от " + above.Min().ToString("+0;−0") +
                     " до " + above.Max().ToString("+0;−0") + ")" : "") +
                 (ratios.Count > 0 ? "; средний множитель ×" + ratios.Average().ToString("0.00") : "") +
@@ -941,11 +929,11 @@ namespace CoreMap
             var all = new List<double>();
             var p = new List<double>();
             var e = new List<double>();
-            for (int u = 0; u < units.Length; u++)
+            for (int u = 0; u < blocks.Length; u++)
             {
                 if (picks[u] == null) continue;
                 all.Add(picks[u].Ratio);
-                (core.Cores[units[u][0]].Kind == 'P' ? p : e).Add(picks[u].Ratio);
+                (blocks[u].Kind == 'P' ? p : e).Add(picks[u].Ratio);
             }
             return new[] { all, p, e }.Select(v => v.Count > 0 ? v.Average() : double.NaN).ToArray();
         }
@@ -1027,13 +1015,13 @@ namespace CoreMap
 
         // ----- подсказки по ячейкам -----
 
-        string TileTip(int i)
+        string TileTip(Block block)
         {
-            int[] block = UnitOf(i);
-            string text = block.Length > 1
-                ? "Блок E-ядер " + core.Lps[block[0]] + "–" + core.Lps[block[block.Length - 1]] + "\n" +
-                    (block.Any(k => die.Loaded[k]) ? "Щелчок снимает нагрузку со всего блока." : "Щелчок даёт нагрузку на все ядра блока разом.")
-                : "Ядро " + core.Lps[i] + " (" + core.Cores[i].Kind + ")\n" +
+            int i = block.First;  // числа подсказки — по первому ядру блока
+            string text = block.Members.Length > 1
+                ? Capital(block.Title) + "\n" +
+                    (block.Members.Any(k => die.Loaded[k]) ? "Щелчок снимает нагрузку со всего блока." : "Щелчок даёт нагрузку на все ядра блока разом.")
+                : Capital(block.Title) + " (" + block.Kind + ")\n" +
                     (die.Loaded[i] ? "Щелчок снимает нагрузку с этого ядра." : "Щелчок даёт нагрузку на это ядро.");
             if (!double.IsNaN(die.Cur[i])) text += "\n• сейчас: " + die.Cur[i] + " °C\n• ▲ максимум с последнего сброса: " + die.Max[i] + " °C";
             if (!double.IsNaN(core.LoadAverage[i]))
@@ -1045,7 +1033,7 @@ namespace CoreMap
                     (double.IsNaN(core.LoadRatio[i]) ? "" : ", в среднем под нагрузкой — " + core.LoadRatio[i].ToString("0.0"));
             if (core.Limits != null && core.Limits.Known(i))
                 text += "\n• потолок множителя: ×" + core.Limits.Current[i] + ", заводской предел ×" + core.Limits.Fused[i] +
-                    "\n• правая кнопка — изменить потолок" + (core.Cores[i].Kind == 'E' ? " (общий для кластера)" : "") +
+                    "\n• правая кнопка — изменить потолок" + (block.Kind == 'E' ? " (общий для кластера)" : "") +
                     "\n• потолок выше заводского показан красным; частоту ограничивает ещё таблица «по числу работающих ядер»";
             if (core.Busy) text += "\n• идёт измерение: ручная нагрузка недоступна";
             return text;
@@ -1063,22 +1051,22 @@ namespace CoreMap
             return top;
         }
 
-        string UnitName(int u) { return (units[u].Length > 1 ? "блок E-ядер " : "ядро ") + unitNames[u]; }
+        static string Capital(string text) { return char.ToUpper(text[0]) + text.Substring(1); }
 
         string PairTip(int r, int c, bool lower)
         {
             string suffix = unit == 0 ? " %" : " °C";
             if (r == c)
             {
-                string text = char.ToUpper(UnitName(r)[0]) + UnitName(r).Substring(1);
+                string text = Capital(blocks[r].Title);
                 if (!lower)
-                    foreach (int a in units[r])
+                    foreach (int a in blocks[r].Members)
                         if (sweepMean != null && sweepMean[a] != null)
                             text += "\n• под нагрузкой на ядро " + core.Lps[a] + " нагрев +" + sweepMean[a][a].ToString("0.0") + " °C" +
                                 (core.Sweep.Levels[a] > 0 ? ", сила " + LevelName[core.Sweep.Levels[a]] : "");
-                if (lower && units[r].Length > 1)
+                if (lower && blocks[r].Members.Length > 1)
                 {
-                    double[] inside = units[r].SelectMany(a => units[r].Where(b => b != a).Select(b => core.Latency.Matrix[a][b]))
+                    double[] inside = blocks[r].Members.SelectMany(a => blocks[r].Members.Where(b => b != a).Select(b => core.Latency.Matrix[a][b]))
                         .Where(v => !double.IsNaN(v)).ToArray();
                     if (inside.Length > 0) text += "\n• задержка между ядрами блока: " + inside.Average().ToString("0.0") + " нс";
                 }
@@ -1088,21 +1076,21 @@ namespace CoreMap
             {
                 var lines = new System.Collections.Generic.List<string>();
                 foreach (int[] way in new[] { new[] { r, c }, new[] { c, r } })
-                    foreach (int a in units[way[0]])
+                    foreach (int a in blocks[way[0]].Members)
                     {
-                        double v = Strongest(sweepShown, new[] { a }, units[way[1]]);
-                        if (!double.IsNaN(v)) lines.Add("• нагрузка на ядро " + core.Lps[a] + " → " + UnitName(way[1]) + ": " + v.ToString("0.0") + suffix);
+                        double v = Strongest(sweepShown, new[] { a }, blocks[way[1]].Members);
+                        if (!double.IsNaN(v)) lines.Add("• нагрузка на ядро " + core.Lps[a] + " → " + blocks[way[1]].Title + ": " + v.ToString("0.0") + suffix);
                     }
                 if (lines.Count == 0) return null;
-                return "Тепловая связь: " + UnitName(r) + " и " + UnitName(c) + "\nВ ячейке — наибольшее из значений ниже" +
+                return "Тепловая связь: " + blocks[r].Title + " и " + blocks[c].Title + "\nВ ячейке — наибольшее из значений ниже" +
                     (unit == 0 ? "; проценты — от собственного нагрева нагруженного ядра." : ".") + "\n" + string.Join("\n", lines);
             }
             LatencyTest lat = core.Latency;
-            double[] mean = units[r].SelectMany(a => units[c].Select(b => lat.Matrix[a][b])).Where(v => !double.IsNaN(v)).ToArray();
+            double[] mean = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Matrix[a][b])).Where(v => !double.IsNaN(v)).ToArray();
             if (mean.Length == 0) return null;
-            double lo = units[r].SelectMany(a => units[c].Select(b => lat.Lowest[a][b])).Where(v => !double.IsNaN(v)).Min();
-            double hi = units[r].SelectMany(a => units[c].Select(b => lat.Highest[a][b])).Where(v => !double.IsNaN(v)).Max();
-            return "Задержка: " + UnitName(r) + " и " + UnitName(c) + "\n• в среднем " + mean.Average().ToString("0.0") + " нс" +
+            double lo = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Lowest[a][b])).Where(v => !double.IsNaN(v)).Min();
+            double hi = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Highest[a][b])).Where(v => !double.IsNaN(v)).Max();
+            return "Задержка: " + blocks[r].Title + " и " + blocks[c].Title + "\n• в среднем " + mean.Average().ToString("0.0") + " нс" +
                 "\n• от " + lo.ToString("0.0") + " до " + hi.ToString("0.0") + " нс для разных пар ядер и участков памяти";
         }
 
@@ -1213,11 +1201,11 @@ namespace CoreMap
                 CurveTest curve = core.Curve;
                 // График идёт за блоком, который меряется сейчас. Переход — один раз на блок: если владелец
                 // во время замера щёлкнул другую плитку, её кривая остаётся на виду до следующего блока.
-                int active = curve.Active;
+                Block active = curve.Active;
                 if (active != followed)
                 {
                     followed = active;
-                    if (active >= 0) Select(active);
+                    if (active != null) Select(active);
                 }
                 curveButton.Text = curve.Running ? "■" : "▶";
                 curveButton.Enabled = curve.Running || !busy;
@@ -1234,7 +1222,7 @@ namespace CoreMap
                 curveStatus.Text = curve.Joint ? "Идёт проверка под общей нагрузкой: нагружены все блоки разом."
                     : curve.Searching ? "Идёт подбор потолков по температуре — пройденные ступени добавляются на кривые."
                     : curve.Running
-                    ? (curve.UnitTotal > 1 ? "Снимаю кривые · блок " + Math.Min(curve.UnitDone + 1, curve.UnitTotal) + " из " + curve.UnitTotal + " · шаг "
+                    ? (curve.BlockTotal > 1 ? "Снимаю кривые · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal + " · шаг "
                         : "Снимаю кривую · шаг ") + Math.Min(curve.Done + 1, curve.Total) + " из " + curve.Total +
                         (curve.Current != null ? " · " + curve.Current : "")
                     : curve.Error ?? "";
@@ -1243,7 +1231,7 @@ namespace CoreMap
                 fitStatus.Text = curve.Joint
                     ? "Все блоки под нагрузкой · " + (curve.Current ?? "") + " · " + Math.Min(curve.Done, curve.Total) + " с из " + curve.Total
                     : curve.Searching
-                    ? "Подбираю · блок " + Math.Min(curve.UnitDone + 1, curve.UnitTotal) + " из " + curve.UnitTotal +
+                    ? "Подбираю · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal +
                         (curve.Current != null ? " · " + curve.Current : "")
                     : fitReport ?? curve.Report ?? "Ползунок ставит потолки по снятым кривым, кнопка — замером под нагрузкой.";
                 ShowCurves();
@@ -1277,7 +1265,7 @@ namespace CoreMap
             Text = sw.Running ? "CoreMap — тепловое измерение " + sw.Done + " из " + sw.Total
                 : lat.Running ? "CoreMap — измерение задержек"
                 : cal.Running ? "CoreMap — подбор нагрузки " + cal.Done + " из " + cal.Total
-                : core.Curve != null && core.Curve.Searching ? "CoreMap — подбор, блок " + (core.Curve.UnitDone + 1) + " из " + core.Curve.UnitTotal
+                : core.Curve != null && core.Curve.Searching ? "CoreMap — подбор, блок " + (core.Curve.BlockDone + 1) + " из " + core.Curve.BlockTotal
                 : core.Curve != null && core.Curve.Running ? "CoreMap — кривая " + core.Curve.Done + " из " + core.Curve.Total : "CoreMap";
             if (busy != wasBusy)
             {
@@ -1293,7 +1281,8 @@ namespace CoreMap
             if (core.Monitor == null) return "Без датчиков тепловое измерение невозможно.";
             if (sw.Running)
             {
-                string text = "Идёт измерение · " + (sw.Current < 0 ? "подготовка: жду ровной температуры" : UnitName(Array.FindIndex(units, u => u.Contains(sw.Current)))) +
+                Block now = sw.Current;
+                string text = "Идёт измерение · " + (now == null ? "подготовка: жду ровной температуры" : now.Title) +
                     " · готово " + sw.Done + " из " + sw.Total + " · прошло " + Theme.Clock(sw.Elapsed);
                 if (sw.Done > 0)
                     text += " · осталось около " + Math.Max(1, Math.Round(sw.Elapsed / sw.Done * (sw.Total - sw.Done) / 60)) + " мин";
@@ -1347,22 +1336,22 @@ namespace CoreMap
             sweepShown = rows;
             sweepMean = mean;
             // Над диагональю: связь пары блоков — больший из нагревов соседа в обе стороны.
-            int count = units.Length;
+            int count = blocks.Length;
             var pair = new double[count, count];
             double top = 1;
             for (int a = 0; a < count; a++)
                 for (int b = a + 1; b < count; b++)
                 {
-                    double there = Strongest(rows, units[a], units[b]), back = Strongest(rows, units[b], units[a]);
+                    double there = Strongest(rows, blocks[a].Members, blocks[b].Members), back = Strongest(rows, blocks[b].Members, blocks[a].Members);
                     pair[a, b] = double.IsNaN(there) ? back : double.IsNaN(back) ? there : Math.Max(there, back);
                     if (pair[a, b] > top) top = pair[a, b];
                 }
             for (int a = 0; a < count; a++)
             {
-                pairView.Bad[a] = units[a].Any(i => sw.Throttled[i]);
+                pairView.Bad[a] = blocks[a].Members.Any(i => sw.Throttled[i]);
                 // На диагонали — собственный нагрев блока под нагрузкой, °C (у блока E-ядер — наибольший из четырёх).
                 double own = double.NaN;
-                foreach (int i in units[a])
+                foreach (int i in blocks[a].Members)
                     if (mean[i] != null && !double.IsNaN(mean[i][i]) && !(own >= mean[i][i])) own = mean[i][i];
                 pairView.UpperOwn[a] = double.IsNaN(own) ? null
                     : new PairView.CellData { Text = "+" + Math.Round(own) + "°", Fill = Theme.Button, Own = true };
@@ -1372,7 +1361,7 @@ namespace CoreMap
                     pairView.Cells[a, b] = double.IsNaN(v) ? null : new PairView.CellData
                     {
                         Text = v.ToString(percent || Math.Abs(v) >= 10 ? "0" : "0.0"), Fill = Theme.Heat(v / top),
-                        Shaky = Strongest(spread, units[a], units[b]) >= Shaky || Strongest(spread, units[b], units[a]) >= Shaky,
+                        Shaky = Strongest(spread, blocks[a].Members, blocks[b].Members) >= Shaky || Strongest(spread, blocks[b].Members, blocks[a].Members) >= Shaky,
                     };
                 }
             }
@@ -1398,8 +1387,8 @@ namespace CoreMap
             double[][] own_ = { speed, rise, per(rise, speed, 1000), power, per(rise, power, 1) };
             // По блокам: у нового замера значения всех ядер блока одинаковы, у старого (по одному ядру) берётся среднее.
             for (int r = 0; r < own_.Length; r++)
-                for (int u = 0; u < units.Length; u++)
-                    ownView.Values[r][u] = units[u].Select(i => own_[r][i]).Where(v => !double.IsNaN(v)).DefaultIfEmpty(double.NaN).Average();
+                for (int u = 0; u < blocks.Length; u++)
+                    ownView.Values[r][u] = blocks[u].Members.Select(i => own_[r][i]).Where(v => !double.IsNaN(v)).DefaultIfEmpty(double.NaN).Average();
             ownView.Invalidate();
         }
 
@@ -1407,13 +1396,13 @@ namespace CoreMap
         {
             // Под диагональю: средняя задержка между ядрами двух блоков.
             double[][] m = core.Latency.Matrix;
-            int count = units.Length;
+            int count = blocks.Length;
             var pair = new double[count, count];
             double lo = double.MaxValue, hi = 0;
             for (int a = 0; a < count; a++)
                 for (int b = 0; b < a; b++)
                 {
-                    double[] known = units[a].SelectMany(i => units[b].Select(j => m[i][j])).Where(v => !double.IsNaN(v)).ToArray();
+                    double[] known = blocks[a].Members.SelectMany(i => blocks[b].Members.Select(j => m[i][j])).Where(v => !double.IsNaN(v)).ToArray();
                     pair[a, b] = known.Length > 0 ? known.Average() : double.NaN;
                     if (known.Length == 0) continue;
                     lo = Math.Min(lo, pair[a, b]);
@@ -1427,7 +1416,7 @@ namespace CoreMap
                         Text = pair[a, b].ToString("0"), Fill = Theme.Heat(hi > lo ? (pair[a, b] - lo) / (hi - lo) : 0),
                     };
                 // На диагонали — задержка между ядрами самого блока E-ядер; у P-ядра ячейки нет.
-                double[] inside = units[a].SelectMany(i => units[a].Where(j => j != i).Select(j => m[i][j])).Where(v => !double.IsNaN(v)).ToArray();
+                double[] inside = blocks[a].Members.SelectMany(i => blocks[a].Members.Where(j => j != i).Select(j => m[i][j])).Where(v => !double.IsNaN(v)).ToArray();
                 pairView.LowerOwn[a] = inside.Length == 0 ? null
                     : new PairView.CellData { Text = inside.Average().ToString("0"), Fill = Theme.Button, Own = true };
             }

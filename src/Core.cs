@@ -13,9 +13,8 @@ namespace CoreMap
 
         public readonly CpuCore[] Cores;
         public readonly int[] Lps;
-        /// Блоки: P-ядро или кластер E-ядер целиком — позиции ядер в общем списке. У кластера общие
-        /// температура и потолок множителя, поэтому в измерениях и таблицах он идёт как одна единица.
-        public readonly int[][] Units;
+        /// Блоки: P-ядро или кластер E-ядер целиком. Список один на всю программу — см. Block.cs.
+        public readonly BlockMap Blocks;
         public readonly string CpuName;
         public readonly DieLayout Layout;
         public readonly LoadManager Load;
@@ -46,14 +45,7 @@ namespace CoreMap
         {
             Cores = Topology.Read().ToArray();
             Lps = Cores.Select(c => c.Lp).ToArray();
-            var blocks = new System.Collections.Generic.List<System.Collections.Generic.List<int>>();
-            for (int i = 0; i < Cores.Length; i++)
-            {
-                bool joins = i > 0 && Cores[i].Kind == 'E' && Cores[i - 1].Kind == 'E' && Cores[i].Cluster == Cores[i - 1].Cluster;
-                if (joins) blocks[blocks.Count - 1].Add(i);
-                else blocks.Add(new System.Collections.Generic.List<int> { i });
-            }
-            Units = blocks.Select(b => b.ToArray()).ToArray();
+            Blocks = new BlockMap(Cores);
             LoadAverage = Enumerable.Repeat(double.NaN, Lps.Length).ToArray();
             LoadRatio = Enumerable.Repeat(double.NaN, Lps.Length).ToArray();
             averageSum = new double[Lps.Length];
@@ -62,7 +54,7 @@ namespace CoreMap
             ratioCount = new int[Lps.Length];
             string identifier;
             Topology.Identity(out CpuName, out identifier);
-            Layout = DieLayout.Pick(Cores.ToList(), identifier, Path.Combine(Program.Root, "layouts"));
+            Layout = DieLayout.Pick(Cores, Blocks, identifier, Path.Combine(Program.Root, "layouts"));
             double[][] positions = Layout.Positions(Lps.Length);
             Load = new LoadManager(Lps, simulate);
             Simulated = simulate;
@@ -71,14 +63,14 @@ namespace CoreMap
             if (simulate)
             {
                 backend = new SimBackend(positions, Load.Active);
-                Limits = new CoreLimits(null, Cores);
+                Limits = new CoreLimits(null, Cores, Blocks);
             }
             else
                 try
                 {
                     var io = new PawnIo(Path.Combine(Program.Root, "modules", "IntelMSR.bin"));
                     backend = new LiveBackend(io, Lps);
-                    try { Limits = new CoreLimits(io, Cores); }
+                    try { Limits = new CoreLimits(io, Cores, Blocks); }
                     catch (SensorException e) { Program.Log("потолки множителей недоступны: " + e.Message); }
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
@@ -110,14 +102,14 @@ namespace CoreMap
                 Monitor = new Monitor(backend, Lps.Length, 0.5) { OnSample = Guard };
                 Monitor.Start();
             }
-            Sweep = new ThermalSweep(Monitor, Load, Lps, Units, positions, simulate ? null : Program.DataDir);
+            Sweep = new ThermalSweep(Monitor, Load, Lps, Blocks.All, positions, simulate ? null : Program.DataDir);
             Latency = new LatencyTest(Load, Lps, Program.DataDir);
             Calibration = new Calibration(Monitor, Load, Cores, CpuName, simulate ? null : Program.DataDir);
             try { Calibration.LoadSaved(); }
             catch (Exception e) { Program.Log("не прочитан прошлый подбор нагрузки: " + e); }
             if (Limits != null && Monitor != null)
             {
-                Curve = new CurveTest(Monitor, Load, Limits, Cores, CpuName, simulate ? null : Program.DataDir);
+                Curve = new CurveTest(Monitor, Load, Limits, Lps, CpuName, simulate ? null : Program.DataDir);
                 try { Curve.LoadSaved(simulate && showSaved ? Path.Combine(Program.DataDir, "curves.json") : null); }
                 catch (Exception e) { Program.Log("не прочитаны сохранённые кривые: " + e); }
             }
@@ -224,17 +216,17 @@ namespace CoreMap
         }
 
         /// Включает или снимает нагрузку со всех ядер блока разом: если хоть одно нагружено — снимает.
-        public void ToggleLoad(int[] members)
+        public void ToggleLoad(Block block)
         {
             if (Busy || Monitor == null) return;  // без датчиков нет и защиты от перегрева: нагрузку не даём
             bool[] active = Load.Active();
-            if (members.Any(i => active[i]))
+            if (block.Members.Any(i => active[i]))
             {
-                foreach (int i in members) Load.Stop(i);
+                foreach (int i in block.Members) Load.Stop(i);
                 return;
             }
             Trip = null;
-            foreach (int i in members) Load.Start(i);
+            foreach (int i in block.Members) Load.Start(i);
         }
 
         public void StopLoad() { if (!Busy) Load.StopAll(); }
@@ -309,12 +301,12 @@ namespace CoreMap
             return Limits.Set(index, ratio);
         }
 
-        /// Снимает кривую «температура от множителя» для блока, в который входит ядро, на текущей силе нагрузки.
-        public void StartCurve(int index, double maxTemp)
+        /// Снимает кривую «температура от множителя» для блока на текущей силе нагрузки.
+        public void StartCurve(Block block, double maxTemp)
         {
             if (Busy || Curve == null) return;
             Trip = null;
-            Curve.Start(new[] { index }, Load.Level, maxTemp);
+            Curve.Start(new[] { block }, Load.Level, maxTemp);
         }
 
         /// Снимает кривые всех блоков подряд.
@@ -322,14 +314,14 @@ namespace CoreMap
         {
             if (Busy || Curve == null) return;
             Trip = null;
-            Curve.Start(SpreadUnits(), Load.Level, maxTemp);
+            Curve.Start(SpreadBlocks(), Load.Level, maxTemp);
         }
 
         /// Порядок обхода блоков, в котором соседние по списку блоки разнесены: половины списка чередуются.
-        int[] SpreadUnits()
+        Block[] SpreadBlocks()
         {
-            int half = (Units.Length + 1) / 2;
-            return Enumerable.Range(0, Units.Length).OrderBy(u => u < half ? 2 * u : 2 * (u - half) + 1).Select(u => Units[u][0]).ToArray();
+            int half = (Blocks.All.Length + 1) / 2;
+            return Blocks.All.OrderBy(b => b.Index < half ? 2 * b.Index : 2 * (b.Index - half) + 1).ToArray();
         }
 
         /// Подбирает каждому блоку под нагрузкой текущей силы самый высокий потолок, при котором средняя
@@ -339,7 +331,7 @@ namespace CoreMap
             if (Limits == null || Curve == null) return "потолки множителей недоступны";
             if (Busy) return "идёт измерение: дождись его конца";
             Trip = null;
-            Curve.StartSearch(SpreadUnits(), Load.Level, maxTemp);
+            Curve.StartSearch(SpreadBlocks(), Load.Level, maxTemp);
             return null;
         }
 
@@ -347,10 +339,10 @@ namespace CoreMap
         /// best — не ровная отсечка, а передел: см. Rebalance.
         public CurveChoice[] ChooseAll(double maxTemp, bool best = false)
         {
-            bool[] known = Units.Select(u => Curve != null && Limits != null && Limits.Known(u[0])).ToArray();
-            CurveChoice[] even = Units.Select((u, k) => known[k] ? Curve.Choose(u[0], Load.Level, maxTemp) : null).ToArray();
+            bool[] known = Blocks.All.Select(b => Curve != null && Limits != null && Limits.Known(b.First)).ToArray();
+            CurveChoice[] even = Blocks.All.Select(b => known[b.Index] ? Curve.Choose(b, Load.Level, maxTemp) : null).ToArray();
             if (!best) return even;
-            return Rebalance(even, Units.Select((u, k) => known[k] ? Curve.Options(u[0], Load.Level) : null).ToArray(), maxTemp);
+            return Rebalance(even, Blocks.All.Select(b => known[b.Index] ? Curve.Options(b, Load.Level) : null).ToArray(), maxTemp);
         }
 
         public const double Spread = 6;  // на сколько градусов блок при переделе может уйти выше температуры с ползунка
@@ -417,20 +409,19 @@ namespace CoreMap
             string refusal = null;
             int set = 0;
             CurveChoice[] picks = ChooseAll(maxTemp, best);
-            foreach (int[] unit in Units)
+            foreach (Block block in Blocks.All)
             {
-                int index = unit[0];
+                int index = block.First;
                 if (!Limits.Known(index)) continue;
-                string name = unit.Length == 1 ? Lps[index].ToString() : Lps[index] + "–" + Lps[unit[unit.Length - 1]];
-                CurveChoice choice = picks[Array.IndexOf(Units, unit)];
-                if (choice == null) { none.Add(name); continue; }
+                CurveChoice choice = picks[block.Index];
+                if (choice == null) { none.Add(block.Name); continue; }
                 if (Limits.Current[index] != choice.Limit) refusal = Limits.Set(index, choice.Limit) ?? refusal;
                 set++;
-                if (choice.Hot) hot.Add(name + " (×" + choice.Limit + " — " + choice.Temp.ToString("0") + "°)");
-                else if (choice.Top) top.Add(name);
+                if (choice.Hot) hot.Add(block.Name + " (×" + choice.Limit + " — " + choice.Temp.ToString("0") + "°)");
+                else if (choice.Top) top.Add(block.Name);
             }
             if (set == 0) return "Под " + maxTemp + " °C ничего не поставлено: на выбранной силе нагрузки кривых нет — сними их кнопкой ▶▶.";
-            string report = "Под " + maxTemp + " °C по кривым" + (best ? ", по выгоде," : "") + " поставлено блоков: " + set + " из " + Units.Length +
+            string report = "Под " + maxTemp + " °C по кривым" + (best ? ", по выгоде," : "") + " поставлено блоков: " + set + " из " + Blocks.All.Length +
                 ". Это проба: чтобы потолки остались, сохрани профиль.";
             if (none.Count > 0) report += " Нет кривой: " + string.Join(", ", none) + ".";
             if (hot.Count > 0) report += " Горячее цели и на нижней точке кривой: " + string.Join(", ", hot) + ".";
@@ -448,11 +439,11 @@ namespace CoreMap
         }
 
         /// Температура блока по его снятой кривой при потолке, который стоит сейчас; NaN — кривой нет или потолок вне её.
-        public double CurveTemp(int unit)
+        public double CurveTemp(Block block)
         {
-            int index = Units[unit][0];
+            int index = block.First;
             if (Curve == null || Limits == null || !Limits.Known(index)) return double.NaN;
-            CurveChoice[] options = Curve.Options(index, Load.Level);
+            CurveChoice[] options = Curve.Options(block, Load.Level);
             CurveChoice at = options == null ? null : options.LastOrDefault(o => o.Limit == Limits.Current[index]);
             return at == null ? double.NaN : at.Temp;
         }

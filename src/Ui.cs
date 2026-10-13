@@ -120,44 +120,39 @@ namespace CoreMap
         }
     }
 
-    /// Общая геометрия таблиц по столбцам: столбцы с зазорами между группами и цветные полосы P/E сверху.
-    /// Группа — P-ядра, идущие подряд, или один кластер E-ядер. Столбец — ядро или целый блок: во втором
-    /// случае ему даётся своё название.
+    /// Общая геометрия таблиц по столбцам: столбец на блок, зазоры между группами столбцов и цветные полосы
+    /// P/E сверху. Группа — P-ядра, идущие подряд, или один блок E-ядер.
     class BlockGrid
     {
-        public class Block { public char Kind; public int Start, Size; }
+        public class Group { public char Kind; public int Start, Size; }
 
-        public readonly CpuCore[] Cores;
-        public readonly string[] Names;   // названия столбцов; null — номера ядер
+        public readonly Block[] Columns;
         public readonly int Cell, High, Span;  // ширина столбца, высота строки, общая ширина
         public readonly int[] Pos;
-        public readonly List<Block> Blocks = new List<Block>();
+        public readonly List<Group> Groups = new List<Group>();
         public readonly Font CellFont;
 
-        public BlockGrid(CpuCore[] cores, int cell, int high = 0, string[] names = null)
+        public BlockGrid(Block[] columns, int cell, int high = 0)
         {
-            Cores = cores;
-            Names = names;
+            Columns = columns;
             Cell = cell;
             High = high > 0 ? high : cell;
             CellFont = Theme.PixelFont(Math.Max(8, (int)(Math.Min(cell, High * 1.25) * 0.42)));
-            for (int i = 0; i < cores.Length; i++)
+            for (int i = 0; i < columns.Length; i++)
             {
-                bool same = i > 0 && cores[i].Kind == cores[i - 1].Kind && cores[i].Cluster == cores[i - 1].Cluster;
-                if (same) Blocks[Blocks.Count - 1].Size++;
-                else Blocks.Add(new Block { Kind = cores[i].Kind, Start = i, Size = 1 });
+                bool same = i > 0 && columns[i].Kind == 'P' && columns[i - 1].Kind == 'P';
+                if (same) Groups[Groups.Count - 1].Size++;
+                else Groups.Add(new Group { Kind = columns[i].Kind, Start = i, Size = 1 });
             }
-            Pos = new int[cores.Length];
+            Pos = new int[columns.Length];
             int off = 0;
-            foreach (Block b in Blocks)
+            foreach (Group group in Groups)
             {
-                for (int k = 0; k < b.Size; k++) { Pos[b.Start + k] = off; off += cell; }
+                for (int k = 0; k < group.Size; k++) { Pos[group.Start + k] = off; off += cell; }
                 off += Theme.Px(4);
             }
             Span = off - Theme.Px(4);
         }
-
-        public string Name(int j) { return Names != null ? Names[j] : Cores[j].Lp.ToString(); }
 
         /// Номер столбца по координате внутри таблицы; -1 — мимо ячеек.
         public int Index(int v)
@@ -168,14 +163,14 @@ namespace CoreMap
 
         public void PaintColumnHeaders(Graphics g, int left)
         {
-            foreach (Block b in Blocks)
+            foreach (Group group in Groups)
             {
-                var band = Rectangle.FromLTRB(left + Pos[b.Start], 0, left + Pos[b.Start + b.Size - 1] + Cell - 1, High - 3);
-                using (var brush = new SolidBrush(Theme.KindBack(b.Kind))) g.FillRectangle(brush, band);
-                Theme.Center(g, b.Kind.ToString(), Theme.Font(11, true), band, Theme.Text);
+                var band = Rectangle.FromLTRB(left + Pos[group.Start], 0, left + Pos[group.Start + group.Size - 1] + Cell - 1, High - 3);
+                using (var brush = new SolidBrush(Theme.KindBack(group.Kind))) g.FillRectangle(brush, band);
+                Theme.Center(g, group.Kind.ToString(), Theme.Font(11, true), band, Theme.Text);
             }
-            for (int j = 0; j < Cores.Length; j++)
-                Theme.Center(g, Name(j), CellFont, new Rectangle(left + Pos[j], High, Cell, High), Theme.KindText(Cores[j].Kind));
+            for (int j = 0; j < Columns.Length; j++)
+                Theme.Center(g, Columns[j].Name, CellFont, new Rectangle(left + Pos[j], High, Cell, High), Theme.KindText(Columns[j].Kind));
         }
     }
 
@@ -190,8 +185,7 @@ namespace CoreMap
 
         public class CellData { public string Text; public Color Fill; public bool Shaky, Own; }
 
-        readonly string[] names;
-        readonly char[] kinds;
+        readonly Block[] blocks;
         int cell;
         public readonly CellData[,] Cells;         // [строка, столбец]: столбец больше строки — верхняя таблица, меньше — нижняя
         public readonly CellData[] UpperOwn, LowerOwn;  // диагонали двух таблиц
@@ -199,14 +193,13 @@ namespace CoreMap
         public string Upper = "", Lower = "";      // заголовки верхней и нижней таблиц
         public Func<int, int, bool, string> Tip;   // строка, столбец, нижняя ли таблица
 
-        public PairView(string[] names, char[] kinds, int cell)
+        public PairView(Block[] blocks, int cell)
         {
-            this.names = names;
-            this.kinds = kinds;
-            Cells = new CellData[names.Length, names.Length];
-            UpperOwn = new CellData[names.Length];
-            LowerOwn = new CellData[names.Length];
-            Bad = new bool[names.Length];
+            this.blocks = blocks;
+            Cells = new CellData[blocks.Length, blocks.Length];
+            UpperOwn = new CellData[blocks.Length];
+            LowerOwn = new CellData[blocks.Length];
+            Bad = new bool[blocks.Length];
             SetCell(cell);
         }
 
@@ -216,7 +209,7 @@ namespace CoreMap
         int Gap { get { return cell / 2; } }                                // зазор между таблицами
         int UpperTop { get { return Title + Head; } }
         int LowerTop { get { return UpperTop + cell + Gap; } }              // нижняя таблица сдвинута на строку и зазор
-        int Span { get { return names.Length * cell; } }
+        int Span { get { return blocks.Length * cell; } }
 
         /// Размер ячейки в пикселях: окно меняет его, когда меняется само.
         public void SetCell(int value)
@@ -234,19 +227,19 @@ namespace CoreMap
             if (at.Y >= UpperTop && (at.Y - UpperTop) / cell <= c) return Tip((at.Y - UpperTop) / cell, c, false);
             if (at.Y < LowerTop) return null;
             int r = (at.Y - LowerTop) / cell;
-            return r < names.Length && c <= r ? Tip(r, c, true) : null;
+            return r < blocks.Length && c <= r ? Tip(r, c, true) : null;
         }
 
-        void Number(Graphics g, int unit, Rectangle box, Font font, bool bad)
+        void Number(Graphics g, Block block, Rectangle box, Font font, bool bad)
         {
-            using (var brush = new SolidBrush(bad ? Theme.Bad : Theme.KindBack(kinds[unit]))) g.FillRectangle(brush, box);
-            Theme.Center(g, names[unit], font, box, bad ? Color.Black : Theme.Text);
+            using (var brush = new SolidBrush(bad ? Theme.Bad : Theme.KindBack(block.Kind))) g.FillRectangle(brush, box);
+            Theme.Center(g, block.Name, font, box, bad ? Color.Black : Theme.Text);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            int n = names.Length;
+            int n = blocks.Length;
             Font value = Theme.PixelFont(Math.Max(9, (int)(cell * 0.36))), label = Theme.PixelFont(Math.Max(8, (int)(cell * 0.28)), true);
             TextRenderer.DrawText(g, Upper, Theme.Font(13, true), new Rectangle(0, 0, Width, Title), Theme.Text,
                                   TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
@@ -254,10 +247,10 @@ namespace CoreMap
                                   TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             for (int k = 0; k < n; k++)
             {
-                Number(g, k, new Rectangle(Side + k * cell, Title, cell - 1, Head - 1), label, Bad[k]);                    // верхняя: столбцы сверху
-                Number(g, k, new Rectangle(Side + Span, UpperTop + k * cell, Side - 1, cell - 1), label, Bad[k]);          // верхняя: строки справа
-                Number(g, k, new Rectangle(0, LowerTop + k * cell, Side - 1, cell - 1), label, false);                     // нижняя: строки слева
-                Number(g, k, new Rectangle(Side + k * cell, LowerTop + Span, cell - 1, Head - 1), label, false);           // нижняя: столбцы снизу
+                Number(g, blocks[k], new Rectangle(Side + k * cell, Title, cell - 1, Head - 1), label, Bad[k]);                    // верхняя: столбцы сверху
+                Number(g, blocks[k], new Rectangle(Side + Span, UpperTop + k * cell, Side - 1, cell - 1), label, Bad[k]);          // верхняя: строки справа
+                Number(g, blocks[k], new Rectangle(0, LowerTop + k * cell, Side - 1, cell - 1), label, false);                     // нижняя: строки слева
+                Number(g, blocks[k], new Rectangle(Side + k * cell, LowerTop + Span, cell - 1, Head - 1), label, false);           // нижняя: столбцы снизу
             }
             using (var dashed = new Pen(Theme.Text) { DashPattern = new float[] { 2, 2 } })
                 for (int r = 0; r < n; r++)
@@ -276,13 +269,12 @@ namespace CoreMap
         }
     }
 
-    /// Таблица «столбец → значение» в несколько строк, с той же разметкой групп. Столбец — ядро или блок.
+    /// Таблица «блок → значение» в несколько строк, с той же разметкой групп: столбец на блок.
     class StripView : Painted
     {
         protected override bool Data { get { return true; } }
 
-        readonly CpuCore[] cores;
-        readonly string[] names;
+        readonly Block[] columns;
         BlockGrid grid;
         readonly string[] units;
         readonly int left;
@@ -290,14 +282,13 @@ namespace CoreMap
         public readonly double[][] Values;  // [строка][столбец], NaN — нет значения
         public readonly int[] Digits;
 
-        public StripView(CpuCore[] cores, string[] names, int cell, int high, string[] units, int[] digits)
+        public StripView(Block[] columns, int cell, int high, string[] units, int[] digits)
         {
-            this.cores = cores;
-            this.names = names;
+            this.columns = columns;
             this.units = units;
             Digits = digits;
             left = Theme.Px(92);
-            Values = units.Select(u => Enumerable.Repeat(double.NaN, cores.Length).ToArray()).ToArray();
+            Values = units.Select(u => Enumerable.Repeat(double.NaN, columns.Length).ToArray()).ToArray();
             SetCell(cell, high);
         }
 
@@ -305,7 +296,7 @@ namespace CoreMap
         public void SetCell(int cell, int high)
         {
             if (grid != null && grid.Cell == cell && grid.High == high) return;
-            grid = new BlockGrid(cores, cell, high, names);
+            grid = new BlockGrid(columns, cell, high);
             top = 2 * high;
             Size = new Size(left + grid.Span, top + units.Length * high);
             Invalidate();
@@ -322,8 +313,7 @@ namespace CoreMap
         {
             int j = grid.Index(at.X - left), r = at.Y >= top ? (at.Y - top) / grid.High : -1;
             if (j < 0 || r < 0 || r >= units.Length || double.IsNaN(Values[r][j])) return null;
-            return (names != null && names[j].Contains("–") ? "блок E-ядер " : "ядро ") + grid.Name(j) + ": " +
-                Values[r][j].ToString("0.#") + " " + units[r];
+            return columns[j].Title + ": " + Values[r][j].ToString("0.#") + " " + units[r];
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -338,7 +328,7 @@ namespace CoreMap
                                       TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 double[] known = Values[r].Where(v => !double.IsNaN(v)).ToArray();
                 double lo = known.Length > 0 ? known.Min() : 0, hi = known.Length > 0 ? known.Max() : 0;
-                for (int j = 0; j < grid.Cores.Length; j++)
+                for (int j = 0; j < columns.Length; j++)
                 {
                     double v = Values[r][j];
                     var box = new Rectangle(left + grid.Pos[j], y, c - 1, h - 1);
@@ -357,7 +347,7 @@ namespace CoreMap
     {
         readonly CpuCore[] cores;
         readonly DieLayout layout;
-        readonly Rectangle[] blocks;   // плитки блоков схемы
+        readonly Rectangle[] tiles;    // плитки блоков схемы
         readonly Rectangle[] marks;    // место номера ядра на плитке кластера
         double zoom;
         public double[] Cur, Max;
@@ -365,18 +355,18 @@ namespace CoreMap
         public double[] Ratio;                 // фактический множитель; null или NaN — неизвестен
         public bool[] Loaded, Throttled;
         public int[] Limit, LimitFused;        // потолок множителя и заводской предел; null — неизвестны
-        public int Selected = -1;              // ядро, для которого показана кривая: его плитка обведена
-        public Action<int> Clicked;
-        public Action<int, Point> Menu;        // правая кнопка по плитке
-        public Action<int> Hovered;            // курсор встал на плитку (первое ядро блока) или ушёл с плиток (-1)
-        int under = -1;
-        public Func<int, string> Tip;
+        public Block Selected;                 // блок, для которого показана кривая: его плитка обведена
+        public Action<Block> Clicked;
+        public Action<Block, Point> Menu;      // правая кнопка по плитке
+        public Action<Block> Hovered;          // курсор встал на плитку блока или ушёл с плиток (null)
+        Block under;
+        public Func<Block, string> Tip;
 
         public DieView(CpuCore[] cores, DieLayout layout)
         {
             this.cores = cores;
             this.layout = layout;
-            blocks = new Rectangle[layout.Units.Count];
+            tiles = new Rectangle[layout.Tiles.Count];
             marks = new Rectangle[cores.Length];
             Cur = Enumerable.Repeat(double.NaN, cores.Length).ToArray();
             Max = (double[])Cur.Clone();
@@ -396,28 +386,28 @@ namespace CoreMap
             zoom = value;
             int uw = Zoomed(150), uh = Zoomed(96), gap = Zoomed(8), pad = Zoomed(7);
             int bw = Zoomed(24), bh = Zoomed(17);
-            for (int u = 0; u < blocks.Length; u++)
+            for (int u = 0; u < tiles.Length; u++)
             {
-                DieUnit unit = layout.Units[u];
-                Rectangle block = blocks[u] = new Rectangle(unit.Col * (uw + gap), unit.Row * (uh + gap), uw, uh);
-                for (int k = 0; k < unit.Indexes.Length; k++)
-                    marks[unit.Indexes[k]] = new Rectangle(block.X + pad + k % 2 * bw, block.Y + pad + k / 2 * bh, bw, bh);
+                DieTile tile = layout.Tiles[u];
+                Rectangle box = tiles[u] = new Rectangle(tile.Col * (uw + gap), tile.Row * (uh + gap), uw, uh);
+                for (int k = 0; k < tile.Places.Length; k++)
+                    marks[tile.Places[k]] = new Rectangle(box.X + pad + k % 2 * bw, box.Y + pad + k / 2 * bh, bw, bh);
             }
             Size = new Size(layout.Cols * (uw + gap) - gap, layout.Rows * (uh + gap) - gap);
             Invalidate();
         }
 
-        /// Первое ядро блока под курсором; -1 — мимо плиток.
-        int HitBlock(Point at)
+        /// Блок под курсором; null — мимо плиток.
+        Block HitBlock(Point at)
         {
-            int u = Array.FindIndex(blocks, b => b.Contains(at));
-            return u < 0 ? -1 : layout.Units[u].Indexes.Min();
+            int u = Array.FindIndex(tiles, t => t.Contains(at));
+            return u < 0 ? null : layout.Tiles[u].Block;
         }
 
         protected override string TipAt(Point at)
         {
-            int i = HitBlock(at);
-            return i < 0 || Tip == null ? null : Tip(i);
+            Block b = HitBlock(at);
+            return b == null || Tip == null ? null : Tip(b);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -429,24 +419,27 @@ namespace CoreMap
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            Hover(-1);
+            Hover(null);
         }
 
-        void Hover(int i)
+        void Hover(Block b)
         {
-            if (i == under) return;
-            under = i;
-            if (Hovered != null) Hovered(i);
+            if (b == under) return;
+            under = b;
+            if (Hovered != null) Hovered(b);
         }
 
         protected override void OnMouseClick(MouseEventArgs e)
         {
             base.OnMouseClick(e);
-            if (e.Button == MouseButtons.Left && Clicked != null && HitBlock(e.Location) >= 0) Clicked(HitBlock(e.Location));
-            if (e.Button == MouseButtons.Right && Menu != null && HitBlock(e.Location) >= 0) Menu(HitBlock(e.Location), e.Location);
+            Block hit = HitBlock(e.Location);
+            if (hit == null) return;
+            if (e.Button == MouseButtons.Left && Clicked != null) Clicked(hit);
+            if (e.Button == MouseButtons.Right && Menu != null) Menu(hit, e.Location);
         }
 
-        /// Наибольшее из значений по ядрам блока; NaN — ни одного нет.
+        /// Наибольшее из значений по ядрам блока; NaN — ни одного нет. Это только показ на плитке: в измерениях
+        /// температура и множитель блока берутся по Block.Temp и Block.Ratio.
         static double Highest(double[] values, int[] members)
         {
             double top = double.NaN;
@@ -463,15 +456,16 @@ namespace CoreMap
             int pad = Zoomed(7);
             Font small = Theme.PixelFont(Math.Max(8, Zoomed(12))), tiny = Theme.PixelFont(Math.Max(8, Zoomed(11)));
             Font large = Theme.PixelFont(Math.Max(9, Zoomed(28)), true);
-            for (int u = 0; u < blocks.Length; u++)
+            for (int u = 0; u < tiles.Length; u++)
             {
-                int[] members = layout.Units[u].Indexes;
-                int first = members[0];
-                Rectangle t = blocks[u];
+                Block block = layout.Tiles[u].Block;
+                int[] members = block.Members;
+                int first = block.First;
+                Rectangle t = tiles[u];
                 double temp = Highest(Cur, members);
                 using (var brush = new SolidBrush(double.IsNaN(temp) ? Theme.Cell : Theme.Heat((temp - 40) / 60))) g.FillRectangle(brush, t);
 
-                if (members.Contains(Selected))
+                if (block == Selected)
                     using (var pen = new Pen(Theme.Text)) g.DrawRectangle(pen, t.X, t.Y, t.Width - 1, t.Height - 1);
 
                 if (members.Any(i => Loaded[i]))
@@ -544,26 +538,26 @@ namespace CoreMap
 
         CurveRun[] front = new CurveRun[0];  // кривые выделенного блока
         CurveRun[] back = new CurveRun[0];   // кривые остальных блоков на текущей силе нагрузки
-        Func<int, char> kind;                // вид ядра по его номеру: цвет приглушённой кривой
-        Dictionary<int, CurveChoice> picks = new Dictionary<int, CurveChoice>();  // выбор ползунка по номеру первого ядра блока
+        BlockMap blocks;                     // чья кривая: блок находится по CurveRun.Lp
+        CurveChoice[] picks = new CurveChoice[0];  // выбор ползунка по блокам; null — кривой блока нет
         double cutoff = double.NaN;
         bool byPeak;  // работа идёт по наибольшей температуре ступени: её линия толстая, средняя — тонкая
         string empty = "";
         readonly List<KeyValuePair<Point, string>> spots = new List<KeyValuePair<Point, string>>();
-        readonly List<KeyValuePair<Point, int>> owners = new List<KeyValuePair<Point, int>>();  // точка кривой → её блок
-        int under = -1;
+        readonly List<KeyValuePair<Point, Block>> owners = new List<KeyValuePair<Point, Block>>();  // точка кривой → её блок
+        Block under;
 
-        public Action<int> Hovered;  // курсор встал на точку кривой блока (номер его первого ядра) или ушёл (-1)
+        public Action<Block> Hovered;  // курсор встал на точку кривой блока или ушёл (null)
         public string Help;          // описание графика: показывается в режиме вопроса, когда курсор не на точке
 
         protected override bool Data { get { return true; } }
 
-        public void Show(CurveRun[] front, CurveRun[] back, Func<int, char> kind, double cutoff, Dictionary<int, CurveChoice> picks, bool byPeak, string empty)
+        public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty)
         {
             this.byPeak = byPeak;
             this.front = front;
             this.back = back;
-            this.kind = kind;
+            this.blocks = blocks;
             this.cutoff = cutoff;
             this.picks = picks;
             this.empty = empty;
@@ -582,23 +576,23 @@ namespace CoreMap
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            int lp = -1;
-            foreach (KeyValuePair<Point, int> owner in owners)
-                if (Near(owner.Key, e.Location)) { lp = owner.Value; break; }
-            Hover(lp);
+            Block over = null;
+            foreach (KeyValuePair<Point, Block> owner in owners)
+                if (Near(owner.Key, e.Location)) { over = owner.Value; break; }
+            Hover(over);
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
-            Hover(-1);
+            Hover(null);
         }
 
-        void Hover(int lp)
+        void Hover(Block b)
         {
-            if (lp == under) return;
-            under = lp;
-            if (Hovered != null) Hovered(lp);
+            if (b == under) return;
+            under = b;
+            if (Hovered != null) Hovered(b);
         }
 
         static double Actual(CurvePoint p) { return double.IsNaN(p.Ratio) ? p.Limit : p.Ratio; }
@@ -645,11 +639,13 @@ namespace CoreMap
             // Остальные блоки — приглушёнными линиями без точек.
             foreach (CurveRun run in back)
             {
+                Block owner = blocks.ByLp(run.Lp);
+                if (owner == null) continue;  // кривая из файла, которой не соответствует ни один блок
                 CurvePoint[] points = run.Points.ToArray().OrderBy(p => Actual(p)).ToArray();
-                using (var pen = new Pen(Color.FromArgb(120, Theme.KindText(kind(run.Lp))), Theme.Px(1.5)))
+                using (var pen = new Pen(Color.FromArgb(120, Theme.KindText(owner.Kind)), Theme.Px(1.5)))
                     for (int k = 1; k < points.Length; k++)
                         g.DrawLine(pen, px(Actual(points[k - 1])), py(heat(points[k - 1])), px(Actual(points[k])), py(heat(points[k])));
-                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, int>(new Point(px(Actual(p)), py(heat(p))), run.Lp));
+                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, Block>(new Point(px(Actual(p)), py(heat(p))), owner));
             }
 
             // Отсечка — температура с ползунка.
@@ -664,6 +660,7 @@ namespace CoreMap
             int legend = plot.Left;
             foreach (CurveRun run in front)
             {
+                Block owner = blocks.ByLp(run.Lp);
                 CurvePoint[] points = run.Points.ToArray().OrderBy(p => Actual(p)).ToArray();
                 if (points.Length == 0) continue;
                 Color color = LevelColor[Math.Max(0, Math.Min(3, run.Level))];
@@ -690,7 +687,7 @@ namespace CoreMap
                         bool off = !double.IsNaN(p.Ratio) && Math.Abs(p.Ratio - p.Limit) > CurveTest.Reached;
                         g.FillEllipse(off ? hollow : fill, at.X - r, at.Y - r, 2 * r, 2 * r);
                         g.DrawEllipse(thick, at.X - r, at.Y - r, 2 * r, 2 * r);
-                        owners.Add(new KeyValuePair<Point, int>(at, run.Lp));
+                        if (owner != null) owners.Add(new KeyValuePair<Point, Block>(at, owner));
                         spots.Add(new KeyValuePair<Point, string>(at,
                             (double.IsNaN(p.Ratio) ? "" : "Работало на множителе " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
                                 (off ? " — до потолка не дошло" : "") + "\n") +
@@ -710,8 +707,9 @@ namespace CoreMap
             using (var rim = new Pen(Theme.Panel, Theme.Px(1.5)))
                 foreach (CurveRun run in back.Concat(front))
                 {
-                    CurveChoice pick;
-                    if (!picks.TryGetValue(run.Lp, out pick) || pick == null) continue;
+                    Block owner = blocks.ByLp(run.Lp);
+                    CurveChoice pick = owner == null || owner.Index >= picks.Length ? null : picks[owner.Index];
+                    if (pick == null) continue;
                     CurvePoint p = run.Points.ToArray().FirstOrDefault(q => q.Limit == pick.From);
                     if (p == null) continue;
                     int r = Theme.Px(front.Contains(run) ? 5 : 3.5);
@@ -723,10 +721,9 @@ namespace CoreMap
 
     /// Список блоков рядом с графиком: название, потолок под температуру с ползунка и температура на нём по кривой.
     /// Наведение на строку выводит кривую блока поверх остальных, щелчок закрепляет её.
-    class UnitList : Painted
+    class BlockList : Painted
     {
-        readonly string[] names;
-        readonly char[] kinds;
+        readonly Block[] blocks;
         CurveChoice[] picks;
         double[] joint;  // температура блока под общей нагрузкой; NaN — замера нет
         int[] delta;     // на сколько ступеней выбор ползунка отличается от действующего профиля
@@ -734,13 +731,12 @@ namespace CoreMap
 
         public Action<int> Hovered, Clicked;  // номер блока по порядку; -1 — курсор ушёл
 
-        public UnitList(string[] names, char[] kinds)
+        public BlockList(Block[] blocks)
         {
-            this.names = names;
-            this.kinds = kinds;
-            picks = new CurveChoice[names.Length];
-            joint = Enumerable.Repeat(double.NaN, names.Length).ToArray();
-            delta = new int[names.Length];
+            this.blocks = blocks;
+            picks = new CurveChoice[blocks.Length];
+            joint = Enumerable.Repeat(double.NaN, blocks.Length).ToArray();
+            delta = new int[blocks.Length];
             Cursor = Cursors.Hand;
         }
 
@@ -755,7 +751,7 @@ namespace CoreMap
             Invalidate();
         }
 
-        int Row(Point at) { return at.Y < 0 || at.Y >= Height ? -1 : Math.Min(names.Length - 1, at.Y * names.Length / Math.Max(1, Height)); }
+        int Row(Point at) { return at.Y < 0 || at.Y >= Height ? -1 : Math.Min(blocks.Length - 1, at.Y * blocks.Length / Math.Max(1, Height)); }
 
         protected override string TipAt(Point at)
         {
@@ -796,7 +792,7 @@ namespace CoreMap
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            int n = names.Length, pad = Theme.Px(6);
+            int n = blocks.Length, pad = Theme.Px(6);
             int size = Math.Max(Theme.Px(10), Math.Min(Theme.Px(13), Height / n - Theme.Px(3)));
             Font font = Theme.PixelFont(size), bold = Theme.PixelFont(size, true);
             const TextFormatFlags Flags = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
@@ -807,8 +803,8 @@ namespace CoreMap
                     using (var back = new SolidBrush(u == lit ? Theme.Cell : Theme.Button)) g.FillRectangle(back, row);
                 if (u == pinned)
                     using (var bar = new SolidBrush(Theme.Accent)) g.FillRectangle(bar, row.Left, row.Top, Theme.Px(2), row.Height);
-                TextRenderer.DrawText(g, names[u], u == lit || u == pinned ? bold : font, new Rectangle(pad, row.Top, Width * 27 / 100, row.Height),
-                                      Theme.KindText(kinds[u]), Flags);
+                TextRenderer.DrawText(g, blocks[u].Name, u == lit || u == pinned ? bold : font, new Rectangle(pad, row.Top, Width * 27 / 100, row.Height),
+                                      Theme.KindText(blocks[u].Kind), Flags);
                 CurveChoice pick = picks[u];
                 if (pick == null)
                 {

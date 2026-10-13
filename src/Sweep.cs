@@ -42,7 +42,7 @@ namespace CoreMap
         readonly Monitor monitor;
         readonly LoadManager load;
         readonly int[] lps;
-        readonly int[][] units;  // блоки: позиции их ядер в общем списке
+        readonly Block[] blocks;
         readonly int n;
         readonly int[] order;    // порядок обхода блоков
         readonly string saveDir;  // null — результат не сохранять (имитация)
@@ -55,21 +55,22 @@ namespace CoreMap
         public int[] Levels;      // подобранная сила нагрузки, 0 — ещё не подобрана
         public int Seconds = 20, PassCount = 2;
         public volatile bool Running;
-        public int Done, Current = -1, Version;
+        public int Done, Version;
+        public volatile Block Current;  // блок, который нагружен сейчас; null — никакой
         public string Finished;   // когда получены показанные данные, "ДД.ММ ЧЧ:ММ"
 
-        public int Total { get { return units.Length * PassCount; } }
+        public int Total { get { return blocks.Length * PassCount; } }
         public double Elapsed { get { return Native.Now() - startedAt; } }
 
-        public ThermalSweep(Monitor monitor, LoadManager load, int[] lps, int[][] units, double[][] positions, string saveDir)
+        public ThermalSweep(Monitor monitor, LoadManager load, int[] lps, Block[] blocks, double[][] positions, string saveDir)
         {
             this.monitor = monitor;
             this.load = load;
             this.lps = lps;
-            this.units = units;
+            this.blocks = blocks;
             this.saveDir = saveDir;
             n = lps.Length;
-            order = SpreadOrder(units.Select(u => new[] { u.Average(i => positions[i][0]), u.Average(i => positions[i][1]) }).ToArray());
+            order = SpreadOrder(blocks.Select(b => new[] { b.Members.Average(i => positions[i][0]), b.Members.Average(i => positions[i][1]) }).ToArray());
             Throttled = new bool[n];
             Levels = new int[n];
         }
@@ -156,7 +157,7 @@ namespace CoreMap
                     Probes.Add(new double[n][]);
                     // Обратный порядок во втором проходе: у каждого ядра другой предшественник.
                     foreach (int u in p % 2 == 0 ? order : order.Reverse().ToArray())
-                        if (!Measure(p, units[u], ref baseTemps, ref baseWatts)) return;
+                        if (!Measure(p, blocks[u], ref baseTemps, ref baseWatts)) return;
                 }
             }
             catch (Exception e)
@@ -167,7 +168,7 @@ namespace CoreMap
             finally
             {
                 load.StopAll();
-                Current = -1;
+                Current = null;
                 Running = false;
                 Finished = DateTime.Now.ToString("dd.MM HH:mm");
                 Version++;
@@ -177,9 +178,9 @@ namespace CoreMap
         }
 
         /// Запускает нагрузку на всех ядрах блока с подобранной для него силой.
-        void Restart(int[] members)
+        void Restart(Block block)
         {
-            foreach (int m in members)
+            foreach (int m in block.Members)
             {
                 load.Stop(m);
                 load.Start(m, Levels[m]);
@@ -190,12 +191,13 @@ namespace CoreMap
         /// сколько мощности добавилось и с какой скоростью он считает (сумма по его ядрам), и подбирает
         /// силу для основного измерения: самую тяжёлую, с которой блок по расчёту не выйдет за Ceiling.
         /// Блок остаётся под лёгкой нагрузкой.
-        void Probe(int p, int[] members, double baseTemp, double baseWatts)
+        void Probe(int p, Block block, double baseTemp, double baseWatts)
         {
-            int first = members[0];
+            int[] members = block.Members;
+            int first = block.First;
             foreach (int m in members) load.Start(m, 1);
             if (Wait(ProbeSeconds)) return;
-            double now = monitor.Typical(ProbeSeconds / 2)[first];
+            double now = block.Temp(monitor.Typical(ProbeSeconds / 2));
             if (double.IsNaN(now) || double.IsNaN(baseTemp)) return;
             double rise = now - baseTemp;
             var probe = new[]
@@ -210,14 +212,15 @@ namespace CoreMap
         }
 
         /// Нагружает один блок. false — измерение остановлено.
-        bool Measure(int p, int[] members, ref double[] baseTemps, ref double baseWatts)
+        bool Measure(int p, Block block, ref double[] baseTemps, ref double baseWatts)
         {
-            int first = members[0];
-            Current = first;
-            Probe(p, members, baseTemps[first], baseWatts);
+            int[] members = block.Members;
+            int first = block.First;
+            Current = block;
+            Probe(p, block, block.Temp(baseTemps), baseWatts);
             if (Levels[first] == 0)
                 foreach (int m in members) Levels[m] = 1;
-            Restart(members);
+            Restart(block);
             double end = Native.Now() + Seconds;
             int hotSamples = 0;
             while (Native.Now() < end && !Wait(0.5))
@@ -225,11 +228,11 @@ namespace CoreMap
                 foreach (int m in members)
                     if (monitor.Throttled[m]) Throttled[m] = true;
                 // Расчёт ошибся и блок всё же слишком горячий: ступень вниз и отсчёт времени заново.
-                hotSamples = monitor.Cur[first] >= StepDown ? hotSamples + 1 : 0;
+                hotSamples = block.Temp(monitor.Cur) >= StepDown ? hotSamples + 1 : 0;
                 if (hotSamples >= 2 && Levels[first] > 1)
                 {
                     foreach (int m in members) Levels[m]--;
-                    Restart(members);
+                    Restart(block);
                     end = Native.Now() + Seconds;
                     hotSamples = 0;
                 }
@@ -315,8 +318,8 @@ namespace CoreMap
             Func<List<double[][]>, object> rows = list => list.Select(p => (object)p.Select(r => (object)r).ToArray()).ToArray();
             Json.WriteFile(Path.Combine(saveDir, DateTime.Now.ToString("'thermal-'yyyyMMdd-HHmmss'.json'")), new Dictionary<string, object>
             {
-                { "lps", lps }, { "blocks", units.Select(u => (object)u.Select(i => lps[i]).ToArray()).ToArray() },
-                { "order", order.Select(u => lps[units[u][0]]).ToArray() }, { "load_seconds", Seconds },
+                { "lps", lps }, { "blocks", blocks.Select(b => (object)b.Members.Select(i => lps[i]).ToArray()).ToArray() },
+                { "order", order.Select(u => blocks[u].Lp).ToArray() }, { "load_seconds", Seconds },
                 { "levels", Levels }, { "throttled", Enumerable.Range(0, n).Where(i => Throttled[i]).Select(i => lps[i]).ToArray() },
                 { "passes", rows(Passes) }, { "probes", rows(Probes) },
             });
@@ -345,7 +348,7 @@ namespace CoreMap
             Passes = passes;
             Probes = probes;
             PassCount = passes.Count;
-            Done = passes.Sum(p => units.Count(u => p[u[0]] != null));
+            Done = passes.Sum(p => blocks.Count(b => p[b.First] != null));
             Finished = File.GetLastWriteTime(path).ToString("dd.MM HH:mm");
             Version++;
         }

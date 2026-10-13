@@ -86,9 +86,12 @@ namespace CoreMap
         }
     }
 
-    class DieUnit
+    /// Плитка схемы кристалла: где стоит блок и в каком порядке его ядра лежат внутри плитки.
+    /// Состав плитка не определяет — он у блока; своё у неё только место и порядок.
+    class DieTile
     {
-        public int[] Indexes;  // ядра блока: позиции в общем списке ядер
+        public Block Block;
+        public int[] Places;  // ядра блока в порядке мест на плитке: слева направо, сверху вниз
         public int Col, Row;
     }
 
@@ -98,9 +101,9 @@ namespace CoreMap
         public string Name, Note;
         public bool Confirmed;
         public int Cols, Rows;
-        public List<DieUnit> Units = new List<DieUnit>();
+        public List<DieTile> Tiles = new List<DieTile>();
 
-        public static DieLayout Pick(List<CpuCore> cores, string identifier, string folder)
+        public static DieLayout Pick(CpuCore[] cores, BlockMap blocks, string identifier, string folder)
         {
             string pattern = new string(cores.Select(c => c.Kind).ToArray());
             if (Directory.Exists(folder))
@@ -115,35 +118,40 @@ namespace CoreMap
                         Cols = Convert.ToInt32(doc["cols"]), Rows = Convert.ToInt32(doc["rows"]),
                     };
                     foreach (Dictionary<string, object> u in (IEnumerable)doc["units"])
-                        layout.Units.Add(new DieUnit
+                    {
+                        int[] places = ((IEnumerable)u["lps"]).Cast<object>()
+                            .Select(lp => Array.FindIndex(cores, c => c.Lp == Convert.ToInt32(lp))).ToArray();
+                        layout.Tiles.Add(new DieTile
                         {
-                            Indexes = ((IEnumerable)u["lps"]).Cast<object>()
-                                .Select(lp => cores.FindIndex(c => c.Lp == Convert.ToInt32(lp))).ToArray(),
+                            Block = places.Length > 0 && places[0] >= 0 ? blocks.Of(places[0]) : null, Places = places,
                             Col = Convert.ToInt32(u["col"]), Row = Convert.ToInt32(u["row"]),
                         });
-                    return layout;
+                    }
+                    if (layout.Matches(blocks)) return layout;
+                    // Схема с плитками, не совпадающими с блоками, показывала бы одно, а нагружала и меряла другое.
+                    Program.Log("схема " + Path.GetFileName(path) + " не подходит: её плитки не совпадают с блоками процессора");
                 }
-            return Linear(cores);
+            return Linear(blocks);
         }
 
-        static DieLayout Linear(List<CpuCore> cores)
+        /// Плитки схемы — ровно блоки процессора: каждому блоку одна плитка с теми же ядрами.
+        bool Matches(BlockMap blocks)
+        {
+            return Tiles.Count == blocks.All.Length && Tiles.Select(t => t.Block).Distinct().Count() == Tiles.Count &&
+                Tiles.All(t => t.Block != null && t.Places.OrderBy(i => i).SequenceEqual(t.Block.Members));
+        }
+
+        static DieLayout Linear(BlockMap blocks)
         {
             var layout = new DieLayout
             {
                 Name = "порядок нумерации Windows",
                 Note = "Для этого процессора схемы кристалла нет: ядра показаны в порядке нумерации Windows.",
             };
-            var groups = new List<List<int>>();
-            for (int i = 0; i < cores.Count; i++)
-            {
-                bool sameCluster = i > 0 && cores[i].Cluster >= 0 && cores[i].Cluster == cores[i - 1].Cluster;
-                if (!sameCluster) groups.Add(new List<int>());
-                groups[groups.Count - 1].Add(i);
-            }
-            layout.Cols = Math.Min(groups.Count, 6);
-            layout.Rows = (groups.Count + layout.Cols - 1) / layout.Cols;
-            for (int g = 0; g < groups.Count; g++)
-                layout.Units.Add(new DieUnit { Indexes = groups[g].ToArray(), Col = g % layout.Cols, Row = g / layout.Cols });
+            layout.Cols = Math.Min(blocks.All.Length, 6);
+            layout.Rows = (blocks.All.Length + layout.Cols - 1) / layout.Cols;
+            foreach (Block b in blocks.All)
+                layout.Tiles.Add(new DieTile { Block = b, Places = b.Members, Col = b.Index % layout.Cols, Row = b.Index / layout.Cols });
             return layout;
         }
 
@@ -151,11 +159,11 @@ namespace CoreMap
         public double[][] Positions(int count)
         {
             var pos = new double[count][];
-            foreach (DieUnit u in Units)
-                for (int k = 0; k < u.Indexes.Length; k++)
-                    pos[u.Indexes[k]] = u.Indexes.Length == 1
-                        ? new[] { u.Col * 2 + 0.5, u.Row * 2 + 0.5 }
-                        : new[] { u.Col * 2 + (double)(k % 2), u.Row * 2 + (double)(k / 2) };
+            foreach (DieTile t in Tiles)
+                for (int k = 0; k < t.Places.Length; k++)
+                    pos[t.Places[k]] = t.Places.Length == 1
+                        ? new[] { t.Col * 2 + 0.5, t.Row * 2 + 0.5 }
+                        : new[] { t.Col * 2 + (double)(k % 2), t.Row * 2 + (double)(k / 2) };
             return pos;
         }
     }

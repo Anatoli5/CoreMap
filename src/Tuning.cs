@@ -64,15 +64,15 @@ namespace CoreMap
         public const int Over = 4;
 
         readonly PawnIo io;   // null — имитация: значения ненастоящие, запись только меняет их в памяти
-        readonly CpuCore[] cores;
+        readonly BlockMap blocks;
         readonly int[] lps;
         public readonly int[] Fused, Current;  // 0 — процессор не ответил
         public readonly int[] Initial;         // действующие потолки на момент запуска программы
 
-        public CoreLimits(PawnIo io, CpuCore[] cores)
+        public CoreLimits(PawnIo io, CpuCore[] cores, BlockMap blocks)
         {
             this.io = io;
-            this.cores = cores;
+            this.blocks = blocks;
             lps = cores.Select(c => c.Lp).ToArray();
             Fused = new int[cores.Length];
             Current = new int[cores.Length];
@@ -142,16 +142,15 @@ namespace CoreMap
             return refusal;
         }
 
-        /// Ставит потолок ядру (для E-ядра — всему его кластеру). null — принято; иначе причина отказа.
+        /// Ставит потолок ядру, а с ним — всему его блоку: у кластера E-ядер потолок общий, процессор сам
+        /// распространяет запись на остальные ядра. null — принято; иначе причина отказа.
         public string Set(int index, int ratio)
         {
             if (!Known(index)) return "процессор не сообщил потолок этого ядра";
             if (!Choices(index).Contains(ratio)) return "потолок " + ratio + " вне допустимого: от ×" + Choices(index).Last() + " до ×" + Choices(index).First();
             if (io == null)
             {
-                for (int i = 0; i < cores.Length; i++)
-                    if (i == index || cores[i].Kind == 'E' && cores[index].Kind == 'E' && cores[i].Cluster == cores[index].Cluster)
-                        Current[i] = ratio;
+                foreach (int i in blocks.Of(index).Members) Current[i] = ratio;
                 return null;
             }
             int error;
