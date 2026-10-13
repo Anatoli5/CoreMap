@@ -2,7 +2,7 @@
 //
 // Измерение идёт в своём потоке, и в каждый момент — не больше одного: их запускает общий исполнитель (Runner).
 // Запуск, остановка, ожидание конца, перехват неожиданных ошибок и порядок завершения у всех измерений одни:
-// снять нагрузку → вернуть потолки → дописать своё → объявить, что измерение кончилось. Этот порядок
+// снять нагрузку → вернуть потолки → вернуть вентиляторы → дописать своё → объявить, что измерение кончилось. Этот порядок
 // выполняется на любом пути выхода: обычный конец, кнопка «стоп», защита от перегрева, ошибка в потоке,
 // закрытие окна. Поэтому защите и закрытию окна достаточно исполнителя — перечислять измерения им не нужно.
 using System;
@@ -19,11 +19,13 @@ namespace CoreMap
 
         public readonly LoadManager Load;
         public readonly LimitHold Hold;  // исходные потолки на время измерения; null — потолки недоступны
+        public readonly Fans Fans;       // вентиляторы: максимум на время измерения и обороты для результата; null — без них
 
-        public Runner(LoadManager load, LimitHold hold)
+        public Runner(LoadManager load, LimitHold hold, Fans fans = null)
         {
             Load = load;
             Hold = hold;
+            Fans = fans;
         }
 
         /// Измерение, которое идёт сейчас; null — никакое.
@@ -95,6 +97,13 @@ namespace CoreMap
         /// Исходные потолки. Измерение, которое двигает потолки, сначала берёт их отсюда (Take); вернёт их основа.
         protected LimitHold Hold { get { return runner.Hold; } }
 
+        /// Измерение греет процессор: на его время вентиляторы переводятся на максимум, если владелец так выбрал.
+        /// Измерение, которое не греет (задержки), вместо этого приостанавливает опрос оборотов.
+        protected virtual bool Heats { get { return true; } }
+
+        /// Обороты вентиляторов за последние seconds секунд — в результат измерения; null — неизвестны.
+        protected FanStat Air(double seconds) { return runner.Fans == null ? null : runner.Fans.Typical(seconds); }
+
         /// Измерение просят остановить.
         protected bool Stopped { get { return stopping; } }
 
@@ -128,6 +137,12 @@ namespace CoreMap
             try
             {
                 Load.StopAll();  // ручная нагрузка измерению мешает
+                if (runner.Fans != null)
+                {
+                    // Отказ вентиляторов измерение не останавливает: оно идёт при автоматических оборотах.
+                    if (Heats) runner.Fans.Engage(Wait);
+                    else runner.Fans.Hush(true);
+                }
                 body();
             }
             catch (Exception e)
@@ -143,6 +158,13 @@ namespace CoreMap
                 {
                     string refusal = Hold == null ? null : Hold.Release();
                     if (refusal != null) Error = "прежний потолок не возвращён: " + refusal;
+                });
+                // Вентиляторы — после потолков: их отказ или зависший ответ прошивки возврат потолков не задержит.
+                Safely(() =>
+                {
+                    if (runner.Fans == null) return;
+                    if (Heats) runner.Fans.Release();
+                    else runner.Fans.Hush(false);
                 });
                 Safely(Finish);
                 Finished = DateTime.Now.ToString("dd.MM HH:mm");

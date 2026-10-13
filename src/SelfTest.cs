@@ -82,7 +82,8 @@ namespace CoreMap
             var monitor = new Monitor(new SimBackend(positions, load.Active), lps.Length, 0.5);
             monitor.Start();
             string mark = Path.Combine(dir, "limits-held.json");
-            // Вентиляторы-подделка: обороты меняются сразу, «максимум» живёт в памяти.
+            // Вентиляторы-подделка: обороты меняются сразу, «максимум» живёт в памяти. Выбор — «макс при замерах»:
+            // на каждом пути выхода из измерения ниже максимум должен быть снят, а метка вентиляторов — исчезнуть.
             var simFans = new SimFans(() => 45.0) { Instant = true };
             var fans = new Fans(() => simFans, dir, true);
             fans.Start();
@@ -90,7 +91,7 @@ namespace CoreMap
             Func<bool> calm = () => !simFans.On && !File.Exists(fanMark);
             Check(Until(() => fans.Supported && fans.Rpm != null, 3), "вентиляторы: обороты читаются");
             Check(fans.SetMode(Fans.Measure) == null && calm(), "вентиляторы: «макс при замерах» вне измерения максимум не включает");
-            var runner = new Runner(load, new LimitHold(limits, blocks, lps, cpu, dir));
+            var runner = new Runner(load, new LimitHold(limits, blocks, lps, cpu, dir), fans);
             var curves = new CurveStore(limits, cpu, null);
             var ladder = new CurveTest(runner, monitor, limits, curves, true);
             var search = new LimitSearch(runner, monitor, limits, curves, true);
@@ -111,8 +112,10 @@ namespace CoreMap
             Check(!search.Running, "исполнитель: второе измерение при идущем не запускается");
             Check(Until(moved, 3), "лесенка: потолок блока сдвинут ступенью");
             Check(File.Exists(mark), "лесенка: метка лежит, пока потолок временный");
+            Check(simFans.On && File.Exists(fanMark), "вентиляторы: максимум включён до первой ступени, метка лежит");
             Check(Until(() => !runner.Busy, 15), "лесенка: дошла до конца");
             Check(back() && !File.Exists(mark) && ladder.Error == null, "обычный конец: потолки прежние, метки нет, ошибки нет");
+            Check(calm(), "обычный конец: максимум вентиляторов снят, метки нет");
 
             // 2. Кнопка «стоп» и защита от перегрева: обе просят остановиться через исполнителя.
             ladder.Start(new[] { first }, 1, double.NaN);
@@ -120,6 +123,7 @@ namespace CoreMap
             runner.Stop();
             Check(Until(() => !runner.Busy, 3), "стоп: измерение закончило за 3 с");
             Check(back() && !File.Exists(mark), "стоп: потолки прежние, метки нет");
+            Check(calm(), "стоп: максимум вентиляторов снят, метки нет");
             Check(ladder.Error == "снятие кривых остановлено", "стоп: причина названа (" + ladder.Error + ")");
 
             // 3. Закрытие окна посреди измерения.
@@ -127,12 +131,14 @@ namespace CoreMap
             Check(Until(moved, 3), "закрытие: потолок блока сдвинут");
             Check(runner.Close(3), "закрытие: поток измерения закончил за 3 с");
             Check(back() && !File.Exists(mark), "закрытие: потолки прежние, метки нет");
+            Check(calm(), "закрытие: максимум вентиляторов снят, метки нет");
 
             // 4. Неожиданная ошибка в потоке измерения.
             faulty.Start(first, false);
             Check(Until(moved, 3), "ошибка: потолок блока сдвинут");
             Check(Until(() => !runner.Busy, 8), "ошибка: измерение закончило");
             Check(back() && !File.Exists(mark), "ошибка: потолки прежние, метки нет");
+            Check(calm(), "ошибка: максимум вентиляторов снят, метки нет");
             Check(faulty.Error == "проверка прервана: нарочно", "ошибка: показана (" + faulty.Error + ")");
             Check(load.Active().All(x => !x), "ошибка: нагрузка снята");
 
@@ -141,6 +147,7 @@ namespace CoreMap
             Check(Until(() => !runner.Busy, 8), "отказ записи: измерение закончило");
             Check(faulty.Error != null && faulty.Error.Contains("999"), "отказ записи: не проглочен (" + faulty.Error + ")");
             Check(back() && !File.Exists(mark), "отказ записи: потолки прежние, метки нет");
+            Check(calm(), "отказ записи: максимум вентиляторов снят, метки нет");
 
             // 6. Поиск замером: законченному блоку найденный потолок остаётся, прерванному возвращается прежний.
             search.Start(new[] { first, second }, 1, 200);
@@ -154,6 +161,7 @@ namespace CoreMap
             Check(limits.Of(first) == found, "поиск: найденный потолок первого блока остался");
             Check(limits.Of(second) == before[second.First], "поиск: второму блоку возвращён прежний потолок");
             Check(!File.Exists(mark), "поиск: метки нет");
+            Check(calm(), "поиск: максимум вентиляторов снят, метки нет");
             Check(search.Report != null && search.Report.Contains("Блок " + second.Name + " не подобран"), "поиск: итог называет блок (" + search.Report + ")");
 
             // 7. Процесс убит посреди измерения: метка осталась, следующий запуск возвращает потолки по ней.
@@ -196,7 +204,19 @@ namespace CoreMap
             limits.Deaf = null;
             Check(limits.Refresh() == null && back(), "набор: потолок в процессор записан");
 
-            // 13. Вентиляторы. «Макс всегда»: максимум держится вне измерений; сброшенный (прошивкой по времени, другой программой)
+            // 13. Вентиляторы. Прошивка отказала в записи режима: измерение идёт при автоматических оборотах и
+            // доходит до конца, владельцу сказано.
+            limits.Set(first.First, before[first.First]);
+            limits.Set(second.First, before[second.First]);
+            Program.Told();
+            simFans.Refuse = true;
+            ladder.Start(new[] { first }, 1, 0);
+            Check(Until(() => !runner.Busy, 15) && ladder.Error == null && back(), "отказ вентиляторов: измерение дошло до конца без ошибки");
+            string fanTold = Program.Told();
+            Check(fanTold != null && fanTold.StartsWith("Вентиляторы не переведены на максимум"), "отказ вентиляторов: владельцу сказано (" + fanTold + ")");
+            Check(calm(), "отказ вентиляторов: максимум не включён, метки нет");
+            simFans.Refuse = false;
+            // «Макс всегда»: максимум держится вне измерений; сброшенный (прошивкой по времени, другой программой)
             // включается заново; «авто» снимает его.
             Check(fans.SetMode(Fans.Always) == null && simFans.On && File.Exists(fanMark), "макс всегда: максимум включён, метка лежит");
             simFans.On = false;
@@ -223,7 +243,7 @@ namespace CoreMap
             Program.Told();
             new Fans(() => simFans, dir, true).Start();
             Check(Until(calm, 3), "метка вентиляторов: оставленный максимум снят, метка убрана");
-            string fanTold = Program.Told();
+            fanTold = Program.Told();
             Check(fanTold != null && fanTold.Contains("оставил вентиляторы на максимуме"), "метка вентиляторов: владельцу сказано (" + fanTold + ")");
             // Вентиляторы недоступны (другая машина): ничего не падает и ничего не говорится, измерению они не мешают.
             var none = new Fans(() => { throw new FanException("интерфейса нет (проверка)"); }, dir, true);

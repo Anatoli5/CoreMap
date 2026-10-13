@@ -75,6 +75,10 @@ namespace CoreMap
 
         public void Start() { Launch(Run); }
 
+        // Замер задержек процессор не греет: вентиляторы на его время не трогаются, а опрос их оборотов
+        // приостанавливается — обращение к прошивке посреди замера исказило бы времена.
+        protected override bool Heats { get { return false; } }
+
         void Run()
         {
             Clear();

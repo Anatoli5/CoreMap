@@ -94,7 +94,7 @@ namespace CoreMap
             // Доступ к вентиляторам создаётся в их потоке и только после Fans.Start: без окна он не нужен.
             Fans = new Fans(simulate ? (Func<IFanBackend>)(() => new SimFans(() => Monitor == null ? 45 : Monitor.PkgCur)) : () => new HpFans(),
                 simulate ? null : Program.DataDir, simulate);
-            Runner = new Runner(Load, hold);
+            Runner = new Runner(Load, hold, Fans);
             // «Было» читается из процессора до того, как профиль запуска встанет поверх: после перезагрузки это
             // заводские потолки, и разница с профилем должна быть видна, а откат — возвращать к ним.
             if (Limits != null) was = (int[])Limits.Current.Clone();
