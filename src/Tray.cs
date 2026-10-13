@@ -656,7 +656,6 @@ namespace CoreMap
         struct Usage
         {
             public long Private, Set, PrivateSet;  // байт: выделено процессу; рабочий набор; его часть, не общая с другими процессами
-            public long Cpu;                       // процессорное время процесса с его запуска, в 100-нс тактах
             public long Heap;                      // байт занято объектами .NET
 
             public override string ToString()
@@ -672,9 +671,7 @@ namespace CoreMap
             IntPtr me = GetCurrentProcess();
             var counters = new MemoryCounters { Size = (uint)Marshal.SizeOf(typeof(MemoryCounters)) };
             GetProcessMemoryInfo(me, ref counters, counters.Size);
-            long created, exited, kernel, user;
-            GetProcessTimes(me, out created, out exited, out kernel, out user);
-            var usage = new Usage { Private = (long)counters.PrivateUsage, Set = (long)counters.WorkingSetSize, Cpu = kernel + user, Heap = GC.GetTotalMemory(false) };
+            var usage = new Usage { Private = (long)counters.PrivateUsage, Set = (long)counters.WorkingSetSize, Heap = GC.GetTotalMemory(false) };
             // Страницы рабочего набора по одной: у каждой признак, общая ли она с другими процессами. Не общие —
             // это «Память» в диспетчере задач.
             int room = (int)(usage.Set / 4096) + 4096;
@@ -691,6 +688,22 @@ namespace CoreMap
             }
             finally { Marshal.FreeHGlobal(buffer); }
             return usage;
+        }
+
+        /// Процессорное время процесса с его запуска, мс: по учёту Windows оно идёт шагами около 16 мс.
+        static double CpuTime()
+        {
+            long created, exited, kernel, user;
+            GetProcessTimes(GetCurrentProcess(), out created, out exited, out kernel, out user);
+            return (kernel + user) / 10000.0;
+        }
+
+        /// То же без шагов: такты процессора, потраченные процессом, в миллионах.
+        static double CpuCycles()
+        {
+            ulong cycles;
+            QueryProcessCycleTime(GetCurrentProcess(), out cycles);
+            return cycles / 1e6;
         }
 
         static string[] Assemblies()
@@ -715,7 +728,17 @@ namespace CoreMap
             Usage started = Measure();
             Trim();
             Usage trimmed = Measure();
+            // Простой мерится со второго захода в цикл ожидания: в первый попадают его компиляция и возврат
+            // страниц после сброса рабочего набора. Счётчики до простоя читаются последним действием перед ним,
+            // после — первым.
+            CpuTime();
+            CpuCycles();
+            Loop(0.5);
+            double idleTime = CpuTime(), idleCycles = CpuCycles();
             Loop(IdleSeconds);
+            idleCycles = CpuCycles() - idleCycles;
+            idleTime = CpuTime() - idleTime;
+            double startTime = CpuTime();
             Usage idle = Measure();
             string[] loaded = Assemblies();
 
@@ -782,11 +805,11 @@ namespace CoreMap
             lines.Add("memory, measured inside the process (GetProcessMemoryInfo, QueryWorkingSet):");
             lines.Add("  after start:                  " + started);
             lines.Add("  after working set reset:      " + trimmed);
-            lines.Add("  after " + IdleSeconds + " s in the wait loop:  " + idle);
+            lines.Add("  after " + (IdleSeconds + 0.5) + " s in the wait loop: " + idle);
             lines.Add("  after " + clicks.Count + " menu clicks:         " + used);
             lines.Add("  after reset again:            " + usedTrimmed);
-            lines.Add("cpu time in " + IdleSeconds + " s of waiting (GetProcessTimes): " + ((idle.Cpu - trimmed.Cpu) / 10000.0).ToString("0.0") + " ms" +
-                "; since process start to idle: " + (idle.Cpu / 10000.0).ToString("0") + " ms");
+            lines.Add("cpu in " + IdleSeconds + " s of waiting: " + idleTime.ToString("0.0") + " ms (GetProcessTimes), " + idleCycles.ToString("0.00") +
+                " million cycles (QueryProcessCycleTime); from process start to the end of that wait: " + startTime.ToString("0") + " ms");
             using (Process me = Process.GetCurrentProcess())
                 lines.Add("threads " + me.Threads.Count + ", handles " + me.HandleCount);
             lines.Add("assemblies loaded when idle (" + loaded.Length + "): " + string.Join(", ", loaded));
@@ -889,6 +912,7 @@ namespace CoreMap
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
         [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
         [DllImport("kernel32.dll", EntryPoint = "K32GetProcessMemoryInfo")] static extern bool GetProcessMemoryInfo(IntPtr process, ref MemoryCounters counters, uint size);
+        [DllImport("kernel32.dll")] static extern bool QueryProcessCycleTime(IntPtr process, out ulong cycles);
         [DllImport("kernel32.dll", EntryPoint = "K32QueryWorkingSet")] static extern bool QueryWorkingSet(IntPtr process, IntPtr buffer, uint size);
     }
 }

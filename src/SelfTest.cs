@@ -249,6 +249,7 @@ namespace CoreMap
             Check(Until(() => seen > was && watch.Error == null, 3), "датчики: поток опроса жив");
 
             TrayScenarios(Path.Combine(dir, "tray"), cores, blocks, lps, cpu);
+            AutostartScenarios();
         }
 
         /// 13. Резидент (Tray.cs) без значка. «Процессор» у него свой, в памяти, и при каждом создании — с
@@ -319,6 +320,31 @@ namespace CoreMap
             news = resident.Load(false);
             Check(news != null && news.StartsWith("Прошлый запуск оборвался") && resident.Limits.Same(desk.Current) &&
                 !File.Exists(Path.Combine(dir, "limits-held.json")), "резидент: потолки возвращены по метке, владельцу сказано (" + news + ")");
+        }
+
+        /// 14. Запуск резидента при входе в Windows (Autostart.cs). Описание задания отдаётся на разбор самому
+        /// планировщику; задание при этом не создаётся, и в планировщике ничего не меняется.
+        static void AutostartScenarios()
+        {
+            const string exe = "C:\\Папка с пробелом & знаком\\CoreMap.exe";
+            object task = Autostart.Parse(Autostart.Xml(exe, System.Security.Principal.WindowsIdentity.GetCurrent().User.Value));
+            object settings = Autostart.Get(task, "Settings"), principal = Autostart.Get(task, "Principal"), triggers = Autostart.Get(task, "Triggers");
+            Check(Autostart.Runs(task, exe) && !Autostart.Runs(task, "C:\\Другая папка\\CoreMap.exe"),
+                "автозапуск: описание задания принято планировщиком, запускает этот файл с --tray");
+            Check((int)Autostart.Get(triggers, "Count") == 1 && (int)Autostart.Get(Autostart.Get(triggers, "Item", 1), "Type") == 9,
+                "автозапуск: один запуск — при входе в Windows");
+            Check((int)Autostart.Get(principal, "RunLevel") == 1 && (int)Autostart.Get(principal, "LogonType") == 3,
+                "автозапуск: с наивысшими правами, в сеансе вошедшего");
+            Check(!(bool)Autostart.Get(settings, "DisallowStartIfOnBatteries") && !(bool)Autostart.Get(settings, "StopIfGoingOnBatteries"),
+                "автозапуск: от батареи запускается и не снимается");
+            Check((string)Autostart.Get(settings, "ExecutionTimeLimit") == "PT0S" && (int)Autostart.Get(settings, "MultipleInstances") == 2 &&
+                (int)Autostart.Get(settings, "Priority") == 4, "автозапуск: без предела времени, вторая копия не запускается, приоритет обычный");
+            // Этот же вопрос окно задаёт планировщику при каждом своём запуске: сколько он стоит, видно в отчёте.
+            string problem;
+            double asked = Native.Now();
+            bool on = Autostart.Enabled("CoreMap selftest no such task", out problem);
+            Check(!on && problem == null, "автозапуск: задания нет — «выключено», без ошибки (" + problem + "), ответ за " +
+                Math.Round((Native.Now() - asked) * 1000) + " мс");
         }
 
         /// Датчики-подделка: по просьбе опрос кончается ошибкой, которой настоящие датчики не дают.
