@@ -1,6 +1,7 @@
 // Самопроверка на имитации, без окна. Главное в ней — основа измерений: на каждом пути выхода из измерения
 // потолки множителей должны остаться теми, что были до него, а файл-метка — исчезнуть. Кроме того: ядро, о
-// потолке которого процессор не отвечает; нечитаемый файл данных и отказ записи; ошибки в потоке датчиков.
+// потолке которого процессор не отвечает; нечитаемый файл данных и отказ записи; ошибки в потоке датчиков;
+// вентиляторы — выбор режима, отказы, метка оставленного максимума.
 //
 // Запускает её tools\check.ps1: CoreMap.exe --simulate --snapshot <отчёт.txt> --selftest. Процессор не
 // трогается и не нагружается; файлы пишутся во временную папку, а не в data\. Первая строка отчёта — «ok»
@@ -81,6 +82,14 @@ namespace CoreMap
             var monitor = new Monitor(new SimBackend(positions, load.Active), lps.Length, 0.5);
             monitor.Start();
             string mark = Path.Combine(dir, "limits-held.json");
+            // Вентиляторы-подделка: обороты меняются сразу, «максимум» живёт в памяти.
+            var simFans = new SimFans(() => 45.0) { Instant = true };
+            var fans = new Fans(() => simFans, dir, true);
+            fans.Start();
+            string fanMark = Path.Combine(dir, "fans-held.json");
+            Func<bool> calm = () => !simFans.On && !File.Exists(fanMark);
+            Check(Until(() => fans.Supported && fans.Rpm != null, 3), "вентиляторы: обороты читаются");
+            Check(fans.SetMode(Fans.Measure) == null && calm(), "вентиляторы: «макс при замерах» вне измерения максимум не включает");
             var runner = new Runner(load, new LimitHold(limits, blocks, lps, cpu, dir));
             var curves = new CurveStore(limits, cpu, null);
             var ladder = new CurveTest(runner, monitor, limits, curves, true);
@@ -186,6 +195,43 @@ namespace CoreMap
             Check(refusal != null && refusal.Contains("не ответил"), "набор: неподтверждённая запись названа (" + refusal + ")");
             limits.Deaf = null;
             Check(limits.Refresh() == null && back(), "набор: потолок в процессор записан");
+
+            // 13. Вентиляторы. «Макс всегда»: максимум держится вне измерений; сброшенный (прошивкой по времени, другой программой)
+            // включается заново; «авто» снимает его.
+            Check(fans.SetMode(Fans.Always) == null && simFans.On && File.Exists(fanMark), "макс всегда: максимум включён, метка лежит");
+            simFans.On = false;
+            Check(Until(() => simFans.On, 3), "макс всегда: сброшенный максимум включён заново");
+            Check(fans.SetMode(Fans.Auto) == null && calm(), "авто: максимум снят, метки нет");
+            Check(Convert.ToInt32(Json.ReadFile(Path.Combine(dir, "fans.json"))["mode"]) == Fans.Auto, "выбор режима вентиляторов записан в файл");
+            // Отказ включить «макс всегда»: переключатель остаётся на прежнем выборе.
+            simFans.Refuse = true;
+            string fanRefusal = fans.SetMode(Fans.Always);
+            Check(fanRefusal != null && fans.Mode == Fans.Auto && calm(), "макс всегда при отказе: выбор прежний, причина названа (" + fanRefusal + ")");
+            simFans.Refuse = false;
+            // Обороты перестали читаться: это видно, и вслепую режим не пишется; потом опрос продолжается.
+            int fanWrites = simFans.Writes;
+            simFans.Broken = true;
+            Check(Until(() => fans.Rpm == null && fans.Error != null, 3), "обороты не читаются: показано (" + fans.Error + ")");
+            fanRefusal = fans.SetMode(Fans.Always);
+            Check(fanRefusal != null && fanRefusal.Contains("не читаются") && simFans.Writes == fanWrites && calm(),
+                "обороты не читаются: режим в прошивку не пишется (" + fanRefusal + ")");
+            simFans.Broken = false;
+            Check(Until(() => fans.Rpm != null && fans.Error == null, 3), "обороты: после сбоя читаются снова");
+            // Программу сняли при включённом ею максимуме: следующий запуск снимает его по метке и говорит об этом.
+            Json.WriteFile(fanMark, new Dictionary<string, object> { { "time", "проверка" } });
+            simFans.On = true;
+            Program.Told();
+            new Fans(() => simFans, dir, true).Start();
+            Check(Until(calm, 3), "метка вентиляторов: оставленный максимум снят, метка убрана");
+            string fanTold = Program.Told();
+            Check(fanTold != null && fanTold.Contains("оставил вентиляторы на максимуме"), "метка вентиляторов: владельцу сказано (" + fanTold + ")");
+            // Вентиляторы недоступны (другая машина): ничего не падает и ничего не говорится, измерению они не мешают.
+            var none = new Fans(() => { throw new FanException("интерфейса нет (проверка)"); }, dir, true);
+            none.Start();
+            Check(Until(() => none.Error != null, 3) && !none.Supported && none.Rpm == null, "нет вентиляторов: обороты недоступны, причина названа (" + none.Error + ")");
+            none.Engage(seconds => false);
+            none.Release();
+            Check(none.SetMode(Fans.Always) != null && none.Typical(5) == null && Program.Told() == null, "нет вентиляторов: режим не ставится, сообщений владельцу нет");
 
             // 12. Нечитаемый файл данных не пропадает: при чтении он сохраняется рядом как .bad, и запись
             // новых данных поверх него эту копию не трогает. Половина файла в хранилище не попадает.

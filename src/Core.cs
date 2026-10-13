@@ -29,6 +29,7 @@ namespace CoreMap
         public readonly Profile Profile;      // профиль, который ставится при запуске программы; null — потолки недоступны
         public readonly ProfileSets Profiles; // все сохранённые профили по названиям
         public readonly Runner Runner;        // исполнитель измерений: в каждый момент идёт не больше одного
+        public readonly Fans Fans;            // вентиляторы ноутбука; опрос начинается, когда его запустит окно (Fans.Start)
         // Кривые «температура от потолка» и три измерения по ним; null — нет потолков или датчиков.
         public readonly CurveStore Curves;    // снятые кривые и подбор потолка по ним
         public readonly CurveFit Fit;         // расчёт потолков под температуру по снятым кривым
@@ -90,6 +91,9 @@ namespace CoreMap
             // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
             string recovered = hold == null ? null : hold.Recover();
             if (recovered != null) Program.Tell(recovered);  // полоса сообщений в окне сменится, запись в журнале останется
+            // Доступ к вентиляторам создаётся в их потоке и только после Fans.Start: без окна он не нужен.
+            Fans = new Fans(simulate ? (Func<IFanBackend>)(() => new SimFans(() => Monitor == null ? 45 : Monitor.PkgCur)) : () => new HpFans(),
+                simulate ? null : Program.DataDir, simulate);
             Runner = new Runner(Load, hold);
             // «Было» читается из процессора до того, как профиль запуска встанет поверх: после перезагрузки это
             // заводские потолки, и разница с профилем должна быть видна, а откат — возвращать к ним.
@@ -463,6 +467,14 @@ namespace CoreMap
             Calibration.Start();
         }
 
+        /// Выбор владельца, когда программа сама включает вентиляторам «максимум» (Fans.Auto / Measure / Always).
+        /// null — принят; иначе причина отказа.
+        public string SetFanMode(int mode)
+        {
+            if (Busy) return "идёт измерение: режим вентиляторов сейчас менять нельзя";
+            return Fans.SetMode(mode);
+        }
+
         public void Close()
         {
             // Измерение возвращает потолки и дописывает файл в своём потоке. Без ожидания процесс завершался раньше,
@@ -470,6 +482,9 @@ namespace CoreMap
             // запуске вернёт метка (LimitHold.Recover).
             Runner.Close(3);
             Load.StopAll();
+            // Максимум, включённый программой, с её закрытием снимается. Не снялся — останется метка
+            // (data\fans-held.json), и его снимет следующий запуск.
+            Fans.Close();
         }
     }
 }

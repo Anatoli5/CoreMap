@@ -2,6 +2,7 @@
 //
 // Класс разложен по файлам — по разделам окна:
 //   MainForm.cs          сборка окна, верхняя полоса, полоса сообщений, обновление по таймеру, закрытие
+//   MainForm.Fans.cs     верхняя полоса: обороты вентиляторов и их режим на время замеров
 //   MainForm.Sizing.cs   подгонка размера содержимого под размер окна
 //   MainForm.Die.cs      схема кристалла: выбор блока, подсказка плитки, меню потолка
 //   MainForm.Profiles.cs колонка потолков: профили
@@ -140,6 +141,7 @@ namespace CoreMap
                 "Сброс максимумов и средних\nНачинает отсчёт максимальных и средних температур заново."));
             reset.Margin = new Padding(0, 0, Theme.Px(4), 0);
             bar.Controls.Add(since = Widgets.Label("", Theme.Dim, 13, false, "Время с последнего сброса максимумов"));
+            FanControls(bar);  // обороты вентиляторов и их режим на время замеров: MainForm.Fans.cs
             bar.Controls.Add(stopLoad = Widgets.Button("■", core.StopLoad, "Снять нагрузку\nОстанавливает нагрузку на всех ядрах."));
             bar.Controls.Add(level = new Segmented(LoadManager.Levels, v => Theme.LevelGlyph[v], core.SetLevel,
                 "Сила нагрузки\nНасколько тяжёлые вычисления получает нагруженное ядро.\n" +
@@ -289,6 +291,7 @@ namespace CoreMap
             bool busy = core.Busy;
             bool[] loaded = core.Load.Active();
             UpdateTop(loaded, busy);
+            UpdateFans(busy);
             UpdateDie(loaded);
             if (core.Profile != null) UpdateProfiles(busy);
             if (core.Curve != null) UpdateLimits(busy);

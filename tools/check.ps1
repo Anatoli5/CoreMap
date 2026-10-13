@@ -18,6 +18,18 @@ param([string]$Name = 'check', [switch]$BuildOnly)
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# The owner's own CoreMap shows " - " with an em dash in its window title while a real measurement runs.
+# Builds and hidden runs heat the processor and spoil that measurement, so the check waits for it to end.
+$waited = 0
+while ($true) {
+    $busy = Get-Process CoreMap -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match [string][char]0x2014 }
+    if (-not $busy) { break }
+    if ($waited -eq 0) { Write-Host 'the owner is measuring - waiting for it to end' }
+    if ($waited -ge 3600) { Write-Host 'the owner is still measuring after an hour - not started'; exit 5 }
+    Start-Sleep -Seconds 30
+    $waited += 30
+}
+
 # A string literal broken by an automatic replacement leaves a line that is only: " +
 $broken = Select-String -Path src\*.cs -Pattern '^\s*" \+\s*$'
 if ($broken) { $broken | ForEach-Object { Write-Host ("broken literal: " + $_.Path + ":" + $_.LineNumber) }; exit 3 }
@@ -31,7 +43,7 @@ function Build {
     # The compiler's messages go to the host, not into the function's result: with them in the result a failed
     # build returned a non-empty list, which counts as true, and the check went on with the previous exe.
     & $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
-        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" src\*.cs | Out-Host
+        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /r:System.Management.dll "/out:$out" src\*.cs | Out-Host
     return $LASTEXITCODE -eq 0
 }
 
@@ -42,11 +54,12 @@ if ($BuildOnly) { exit 0 }
 $dir = Join-Path 'outputs' $Name
 New-Item -ItemType Directory -Force $dir | Out-Null
 # The simulated load on a whole E-core cluster reads far above 100 C, and the overheat guard would stop the
-# measurement; d and e raise the guard limit to show the measurement itself.
+# measurement; d and e raise the guard limit to show the measurement itself. c runs with the simulated fans
+# switched to "max during measurements"; the other sets leave them on auto.
 $sets = [ordered]@{
     a = '--saved --slide 76 --size 1920x1040'
     b = '--saved --slide 76 --best --size 1920x1040'
-    c = '--curve --size 1920x1040'
+    c = '--curve --fans 1 --size 1920x1040'
     d = '--fit --limit 400 --size 1920x1040'
     e = '--joint --limit 400 --size 1920x1040'
     f = '--saved --slide 76 --size 1280x800'

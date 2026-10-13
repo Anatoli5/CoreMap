@@ -18,6 +18,7 @@
 // CoreMap.exe --best        вместе с --slide: ползунок работает «по выгоде»
 // CoreMap.exe --joint       вместе с --simulate --snapshot: вместо измерения запустить проверку под общей нагрузкой
 // CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх второго
+// CoreMap.exe --fans N      вместе с --simulate --snapshot: режим вентиляторов — 1 «макс при замерах», 2 «макс всегда»
 // CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
 // CoreMap.exe --selftest    вместе с --simulate --snapshot F: без окна проверить, что измерения на любом пути выхода
 //                           возвращают потолки, и остальное из SelfTest.cs; отчёт — текстом в файл F

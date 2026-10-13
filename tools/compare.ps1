@@ -2,7 +2,8 @@
 # Prints, per picture, how many pixels differ and the box that holds them (the timer in the top bar always differs).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\compare.ps1 -A prof2 -B merged -Keys a,b,f,h
-param([string]$A, [string]$B, [string[]]$Keys = @('a', 'b', 'f', 'h'))
+#   ... -Bands   also lists each run of differing rows with its x range
+param([string]$A, [string]$B, [string[]]$Keys = @('a', 'b', 'f', 'h'), [switch]$Bands)
 
 Add-Type -AssemblyName System.Drawing
 $root = Split-Path -Parent $PSScriptRoot
@@ -25,15 +26,29 @@ foreach ($key in $Keys) {
     $ia.UnlockBits($da); $ib.UnlockBits($db)
     $count = 0; $x0 = [int]::MaxValue; $y0 = [int]::MaxValue; $x1 = -1; $y1 = -1
     $stride = $da.Stride
+    $rows = @{}  # y -> leftmost and rightmost differing x of that row
     for ($i = 0; $i -lt $n; $i += 4) {
         if ($ba[$i] -ne $bb[$i] -or $ba[$i + 1] -ne $bb[$i + 1] -or $ba[$i + 2] -ne $bb[$i + 2]) {
             $count++
-            $x = ($i % $stride) / 4; $y = [math]::Floor($i / $stride)
+            $x = ($i % $stride) / 4; $y = [int][math]::Floor($i / $stride)
             if ($x -lt $x0) { $x0 = $x }; if ($x -gt $x1) { $x1 = $x }
             if ($y -lt $y0) { $y0 = $y }; if ($y -gt $y1) { $y1 = $y }
+            if ($rows.ContainsKey($y)) { if ($x -lt $rows[$y][0]) { $rows[$y][0] = $x }; if ($x -gt $rows[$y][1]) { $rows[$y][1] = $x } }
+            else { $rows[$y] = @($x, $x) }
         }
     }
     $ia.Dispose(); $ib.Dispose()
-    if ($count -eq 0) { Write-Host "$key : identical" }
-    else { Write-Host "$key : $count pixels differ, box x $x0-$x1, y $y0-$y1" }
+    if ($count -eq 0) { Write-Host "$key : identical"; continue }
+    Write-Host "$key : $count pixels differ, box x $x0-$x1, y $y0-$y1"
+    if (-not $Bands) { continue }
+    # Runs of differing rows (gaps of up to 3 rows are bridged), each with its own x range: shows whether the
+    # difference is one place or several far apart inside the box.
+    $from = $null; $last = $null; $bx0 = 0; $bx1 = 0
+    foreach ($y in ($rows.Keys | Sort-Object)) {
+        if ($null -ne $from -and $y - $last -gt 4) { Write-Host "    rows $from-$last, x $bx0-$bx1"; $from = $null }
+        if ($null -eq $from) { $from = $y; $bx0 = $rows[$y][0]; $bx1 = $rows[$y][1] }
+        if ($rows[$y][0] -lt $bx0) { $bx0 = $rows[$y][0] }; if ($rows[$y][1] -gt $bx1) { $bx1 = $rows[$y][1] }
+        $last = $y
+    }
+    if ($null -ne $from) { Write-Host "    rows $from-$last, x $bx0-$bx1" }
 }

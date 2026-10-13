@@ -22,6 +22,7 @@ namespace CoreMap
         readonly string snapshot;  // куда сохранить картинку окна; null — снимок не нужен
         readonly bool calibrate, run, curve, fit, joint, best, profile;
         readonly int slide;        // на сколько градусов поставить ползунок потолков; 0 — не ставить
+        readonly int fans;         // режим вентиляторов (Fans.Measure, Fans.Always); 0 — не менять
 
         public readonly Size Size;   // размер окна; пустой — обычный
         public readonly bool Saved;  // на имитации показать сохранённые настоящие замеры и кривые
@@ -49,6 +50,7 @@ namespace CoreMap
             best = simulate && has("--best");
             profile = simulate && has("--profile");
             if (simulate) int.TryParse(Program.Option(args, "--slide"), out slide);
+            if (simulate) int.TryParse(Program.Option(args, "--fans"), out fans);
             string[] size = (Program.Option(args, "--size") ?? "").Split('x');
             int width = 0, height = 0;
             if (size.Length == 2) { int.TryParse(size[0], out width); int.TryParse(size[1], out height); }
@@ -101,6 +103,7 @@ namespace CoreMap
                 else form.SweepClick();
                 return;
             }
+            if (fans > 0) core.SetFanMode(fans);
             if (profile) TwoProfiles();
             else if (slide > 0)
             {
