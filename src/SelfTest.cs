@@ -1,7 +1,7 @@
 // Самопроверка на имитации, без окна. Главное в ней — основа измерений: на каждом пути выхода из измерения
 // потолки множителей должны остаться теми, что были до него, а файл-метка — исчезнуть. Кроме того: ядро, о
 // потолке которого процессор не отвечает; нечитаемый файл данных и отказ записи; ошибки в потоке датчиков;
-// вентиляторы — выбор режима, отказы, метка оставленного максимума.
+// вентиляторы — выбор режима, отказы, метка оставленного максимума, обороты в точках кривых.
 //
 // Запускает её tools\check.ps1: CoreMap.exe --simulate --snapshot <отчёт.txt> --selftest. Процессор не
 // трогается и не нагружается; файлы пишутся во временную папку, а не в data\. Первая строка отчёта — «ok»
@@ -113,6 +113,8 @@ namespace CoreMap
             Check(Until(moved, 3), "лесенка: потолок блока сдвинут ступенью");
             Check(File.Exists(mark), "лесенка: метка лежит, пока потолок временный");
             Check(simFans.On && File.Exists(fanMark), "вентиляторы: максимум включён до первой ступени, метка лежит");
+            Check(Until(() => curves.For(first).Any(r => r.Points.Any(p => p.Air != null && p.Air.Max && p.Air.Rpm.Length == 2)), 8),
+                "вентиляторы: обороты и отметка максимума записаны в точку кривой");
             Check(Until(() => !runner.Busy, 15), "лесенка: дошла до конца");
             Check(back() && !File.Exists(mark) && ladder.Error == null, "обычный конец: потолки прежние, метки нет, ошибки нет");
             Check(calm(), "обычный конец: максимум вентиляторов снят, метки нет");
@@ -162,6 +164,8 @@ namespace CoreMap
             Check(limits.Of(second) == before[second.First], "поиск: второму блоку возвращён прежний потолок");
             Check(!File.Exists(mark), "поиск: метки нет");
             Check(calm(), "поиск: максимум вентиляторов снят, метки нет");
+            Check(curves.All(1).Any(r => r.Lp == first.Lp && r.Points.Count > 0 && r.Points.All(p => p.Air != null && p.Air.Max)),
+                "поиск: у каждой ступени на кривой записаны обороты с отметкой максимума");
             Check(search.Report != null && search.Report.Contains("Блок " + second.Name + " не подобран"), "поиск: итог называет блок (" + search.Report + ")");
 
             // 7. Процесс убит посреди измерения: метка осталась, следующий запуск возвращает потолки по ней.
@@ -262,6 +266,21 @@ namespace CoreMap
             store.Record(first, 1, new CurvePoint { Limit = 51, Ratio = 51, Temp = 64, Peak = 66, Base = 40, Watts = 12 });
             store.Flush();
             Check(File.Exists(curvesFile) && Program.Told() == null, "файлы: кривые записаны, сообщений владельцу нет");
+            // Обороты в файле кривых: точка без них записана так же, как до их появления, и читается как «неизвестны».
+            Check(!File.ReadAllText(curvesFile).Contains("fans"), "файлы: у точек без оборотов полей оборотов в файле нет");
+            store.Record(second, 1, new CurvePoint { Limit = 50, Ratio = 50, Temp = 58, Peak = 60, Base = 40, Watts = 9, Air = new FanStat { Rpm = new[] { 5810, 6100 }, Max = true } });
+            store.Record(second, 1, new CurvePoint { Limit = 51, Ratio = 51, Temp = 61, Peak = 63, Base = 40, Watts = 11, Air = new FanStat { Rpm = new[] { 5800, 6090 }, Max = true } });
+            store.Flush();
+            var aired = new CurveStore(limits, cpu, dir);
+            aired.LoadSaved();
+            CurveRun[] plain = aired.For(first), blown = aired.For(second);
+            Check(plain.Length == 1 && plain[0].Points.Count == 2 && plain[0].Points.All(p => p.Air == null), "файлы: точки без оборотов читаются как «обороты неизвестны»");
+            Check(blown.Length == 1 && blown[0].Points.Count == 2 && blown[0].Points[0].Air != null && blown[0].Points[0].Air.Max &&
+                blown[0].Points[0].Air.Rpm.SequenceEqual(new[] { 5810, 6100 }), "файлы: обороты точки записаны и прочитаны");
+            string uneven = aired.Uneven(1, blocks);
+            Check(uneven != null && uneven.Contains("на максимуме — " + second.Name) && uneven.Contains("без данных — " + first.Name),
+                "кривые при разных вентиляторах: названо (" + uneven + ")");
+            Check(new CurveStore(limits, cpu, null).Uneven(1, blocks) == null, "кривые без оборотов вовсе: предупреждения нет");
             string whole = File.ReadAllText(curvesFile);
             File.WriteAllText(curvesFile, whole.Substring(0, whole.Length / 2));  // обрыв посреди файла
             string spoiled = null;

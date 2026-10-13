@@ -78,6 +78,18 @@ namespace CoreMap
             return (onMax == 0 ? "авто, " + range : "часть на максимуме, часть на авто (" + range + ")") + gaps;
         }
 
+        /// То же коротко, для строки над графиком: «макс», «авто 2400–3100», «неизвестно», «вперемешку».
+        public static string Brief(IEnumerable<FanStat> parts)
+        {
+            List<FanStat> all = parts.ToList(), known = all.Where(p => p != null).ToList();
+            if (known.Count == 0) return "неизвестно";
+            int onMax = known.Count(p => p.Max);
+            if (known.Count < all.Count || (onMax > 0 && onMax < known.Count)) return "вперемешку";
+            if (onMax > 0) return "макс";
+            int low = Hundreds(known.Min(p => p.Mean)), high = Hundreds(known.Max(p => p.Mean));
+            return "авто " + (low == high ? low.ToString() : low + "–" + high);
+        }
+
         /// Обороты одной строкой: «5200 / 5500 об/мин, максимум».
         public override string ToString()
         {

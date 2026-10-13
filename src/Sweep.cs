@@ -46,6 +46,7 @@ namespace CoreMap
         readonly object gate = new object();
         List<double[][]> passes = new List<double[][]>();  // [проход][нагруженное ядро] → нагрев всех ядер
         List<double[][]> probes = new List<double[][]>();  // [проход][ядро] → {нагрев, прирост Вт, скорость}
+        List<double[][]> airs = new List<double[][]>();    // [проход][нагруженное ядро] → обороты вентиляторов (FanStat.Row); null — неизвестны
         bool[] throttled;  // по ядрам: под нагрузкой упёрлось в порог и сбрасывало частоту
         int[] levels;      // по ядрам: подобранная сила нагрузки, 0 — ещё не подобрана
         public int Seconds = 20, PassCount = 2;
@@ -82,6 +83,7 @@ namespace CoreMap
             {
                 passes = new List<double[][]>();
                 probes = new List<double[][]>();
+                airs = new List<double[][]>();
                 throttled = new bool[n];
                 levels = new int[n];
             }
@@ -97,6 +99,7 @@ namespace CoreMap
                 {
                     passes.Add(new double[n][]);
                     probes.Add(new double[n][]);
+                    airs.Add(new double[n][]);
                 }
                 // Обратный порядок во втором проходе: у каждого ядра другой предшественник.
                 foreach (Block block in p % 2 == 0 ? order : order.Reverse().ToArray())
@@ -181,6 +184,7 @@ namespace CoreMap
                 }
             }
             double[] hot = monitor.Typical(Seconds / 2.0);
+            double[] air = FanStat.Row(Air(Seconds / 2.0));  // обороты — за тот же участок, что и температура
             foreach (int m in members) Load.Stop(m);
             Cool(baseTemps);
             if (Wait(BaseSeconds)) return false;
@@ -189,7 +193,11 @@ namespace CoreMap
             var row = new double[n];
             for (int j = 0; j < n; j++) row[j] = Math.Round(hot[j] - Math.Min(baseTemps[j], after[j]), 1);
             lock (gate)
-                foreach (int m in members) passes[p][m] = row;
+                foreach (int m in members)
+                {
+                    passes[p][m] = row;
+                    airs[p][m] = air;
+                }
             baseTemps = after;
             baseWatts = monitor.Power(BaseSeconds);
             Done++;
@@ -275,6 +283,16 @@ namespace CoreMap
             return result;
         }
 
+        /// При каких вентиляторах снято измерение — по всем нагруженным блокам всех проходов; null — оборотов
+        /// нет ни у одного (измерение снято до их появления или вентиляторы недоступны).
+        public string FanNote()
+        {
+            List<FanStat> parts;
+            lock (gate)
+                parts = airs.SelectMany((pass, p) => blocks.Where(b => passes[p][b.First] != null).Select(b => FanStat.FromRow(b.First < pass.Length ? pass[b.First] : null))).ToList();
+            return parts.All(part => part == null) ? null : FanStat.Describe(parts);
+        }
+
         void Save()
         {
             Func<List<double[][]>, object> rows = list => list.Select(p => (object)p.Select(r => (object)r).ToArray()).ToArray();
@@ -284,6 +302,8 @@ namespace CoreMap
                 { "order", order.Select(b => b.Lp).ToArray() }, { "load_seconds", Seconds },
                 { "levels", levels }, { "throttled", Enumerable.Range(0, n).Where(i => throttled[i]).Select(i => lps[i]).ToArray() },
                 { "passes", rows(passes) }, { "probes", rows(probes) },
+                // Обороты вентиляторов под нагрузкой на каждый блок: строка {обороты по вентиляторам…, максимум 1/0}.
+                { "fans", rows(airs) },
             });
         }
 
@@ -293,6 +313,7 @@ namespace CoreMap
             if (!Json.Ints(saved["lps"]).SequenceEqual(lps)) return;
             var readPasses = new List<double[][]>();
             var readProbes = new List<double[][]>();
+            var readAirs = new List<double[][]>();
             int[] readLevels;
             var readThrottled = new bool[n];
             if (saved.ContainsKey("passes"))
@@ -302,6 +323,9 @@ namespace CoreMap
                 readLevels = Json.Ints(saved["levels"]);
                 int[] hit = Json.Ints(saved["throttled"]);
                 readThrottled = lps.Select(lp => hit.Contains(lp)).ToArray();
+                // В файлах, записанных до появления оборотов, этого поля нет: обороты неизвестны.
+                if (saved.ContainsKey("fans"))
+                    foreach (object p in (System.Collections.IEnumerable)saved["fans"]) readAirs.Add(Json.Rows(p).ToArray());
             }
             else
             {
@@ -309,10 +333,13 @@ namespace CoreMap
                 readPasses.Add(Json.Rows(saved["matrix"]).ToArray());
                 readLevels = Enumerable.Repeat(3, n).ToArray();
             }
+            // Строка оборотов нужна на каждый проход, хотя бы пустая.
+            while (readAirs.Count < readPasses.Count) readAirs.Add(new double[n][]);
             lock (gate)
             {
                 passes = readPasses;
                 probes = readProbes;
+                airs = readAirs;
                 levels = readLevels;
                 throttled = readThrottled;
             }

@@ -19,6 +19,7 @@ namespace CoreMap
         public double Ratio, Temp, Peak, Base, Watts;  // фактический множитель, средняя, наибольшая, без нагрузки, прибавка мощности
         // Средняя температура на этой ступени при подъёме по лесенке и при спуске; Temp — их среднее.
         public double TempUp = double.NaN, TempDown = double.NaN;
+        public FanStat Air;  // обороты вентиляторов за ступень; null — неизвестны (точка снята до появления оборотов)
 
         /// Множитель, на котором блок шёл на этой ступени; если он не измерен — заданный потолок.
         public double Actual { get { return double.IsNaN(Ratio) ? Limit : Ratio; } }
@@ -229,6 +230,40 @@ namespace CoreMap
             return options[0];
         }
 
+        // Обороты на автоматике, разошедшиеся между точками кривых больше чем на столько, — уже разные условия.
+        // Порог выбран без измерения: это около трети хода оборотов (примерно от 2000 до 5500 об/мин). На сколько
+        // градусов тысяча оборотов меняет температуру блока, пока неизвестно.
+        public const int FanSpread = 1000;
+
+        /// Одной строкой — если кривые на этой силе нагрузки сняты при разных вентиляторах: часть на максимуме,
+        /// часть на автоматике; часть без записанных оборотов; обороты на автоматике разошлись больше чем на
+        /// FanSpread. null — условия одинаковы либо оборотов нет ни у одной кривой (все сняты до их появления).
+        public string Uneven(int level, BlockMap blocks)
+        {
+            List<string> onMax = new List<string>(), auto = new List<string>(), mixed = new List<string>(), unknown = new List<string>();
+            var free = new List<FanStat>();  // точки, снятые на автоматике
+            lock (runs)
+                foreach (CurveRun run in runs.Where(r => r.Level == level).OrderBy(r => r.Lp))
+                {
+                    Block block = blocks.ByLp(run.Lp);
+                    if (block == null || run.Points.Count == 0) continue;
+                    List<FanStat> known = run.Points.Where(p => p.Air != null).Select(p => p.Air).ToList();
+                    free.AddRange(known.Where(a => !a.Max));
+                    bool whole = known.Count == run.Points.Count, any = known.Any(a => a.Max), all = known.All(a => a.Max);
+                    (known.Count == 0 ? unknown : !whole || (any && !all) ? mixed : all ? onMax : auto).Add(block.Name);
+                }
+            if (onMax.Count + auto.Count + mixed.Count == 0) return null;
+            bool wide = free.Count > 0 && free.Max(a => a.Mean) - free.Min(a => a.Mean) > FanSpread;
+            int kinds = new[] { onMax, auto, mixed, unknown }.Count(list => list.Count > 0);
+            if (kinds < 2 && mixed.Count == 0 && !wide) return null;
+            var parts = new List<string>();
+            if (onMax.Count > 0) parts.Add("на максимуме — " + string.Join(", ", onMax));
+            if (auto.Count > 0) parts.Add("на авто, " + FanStat.Range(free) + " — " + string.Join(", ", auto));
+            if (mixed.Count > 0) parts.Add("вперемешку — " + string.Join(", ", mixed));
+            if (unknown.Count > 0) parts.Add("без данных — " + string.Join(", ", unknown));
+            return "Кривые сняты при разных вентиляторах (" + string.Join("; ", parts) + "): температуры блоков по ним могут быть несравнимы.";
+        }
+
         // ----- файл -----
 
         void Save()
@@ -240,10 +275,15 @@ namespace CoreMap
                     list.Add(new Dictionary<string, object>
                     {
                         { "lp", r.Lp }, { "level", r.Level }, { "time", r.Time },
-                        { "points", r.Points.Select(p => (object)new Dictionary<string, object>
+                        { "points", r.Points.Select(p =>
                             {
-                                { "limit", p.Limit }, { "ratio", p.Ratio }, { "temp", p.Temp }, { "peak", p.Peak }, { "base", p.Base }, { "watts", p.Watts },
-                                { "up", p.TempUp }, { "down", p.TempDown },
+                                var point = new Dictionary<string, object>
+                                {
+                                    { "limit", p.Limit }, { "ratio", p.Ratio }, { "temp", p.Temp }, { "peak", p.Peak }, { "base", p.Base }, { "watts", p.Watts },
+                                    { "up", p.TempUp }, { "down", p.TempDown },
+                                };
+                                FanStat.Put(point, p.Air);
+                                return (object)point;
                             }).ToList() },
                     });
             Json.WriteFile(path, new Dictionary<string, object> { { "cpu", cpu }, { "runs", list } });
@@ -269,6 +309,7 @@ namespace CoreMap
                             Peak = Json.Number(p["peak"]), Base = Json.Number(p["base"]), Watts = Json.Number(p["watts"]),
                             TempUp = p.ContainsKey("up") ? Json.Number(p["up"]) : double.NaN,
                             TempDown = p.ContainsKey("down") ? Json.Number(p["down"]) : double.NaN,
+                            Air = FanStat.Get(p),
                         });
                     read.Add(run);
                 }

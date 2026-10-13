@@ -561,6 +561,8 @@ namespace CoreMap
         double cutoff = double.NaN;
         bool byPeak;  // работа идёт по наибольшей температуре ступени: её линия толстая, средняя — тонкая
         string empty = "";
+        string uneven;   // кривые сняты при разных вентиляторах (CurveStore.Uneven); null — при одинаковых или неизвестно
+        string airTip;   // подсказка строки над графиком: при каких вентиляторах сняты кривые
         readonly List<KeyValuePair<Point, string>> spots = new List<KeyValuePair<Point, string>>();
         readonly List<KeyValuePair<Point, Block>> owners = new List<KeyValuePair<Point, Block>>();  // точка кривой → её блок
         Block under;
@@ -570,8 +572,10 @@ namespace CoreMap
 
         protected override bool Data { get { return true; } }
 
-        public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty)
+        public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty,
+                         string uneven)
         {
+            this.uneven = uneven;
             this.byPeak = byPeak;
             this.front = front;
             this.back = back;
@@ -588,6 +592,8 @@ namespace CoreMap
         {
             foreach (KeyValuePair<Point, string> spot in spots)
                 if (Near(spot.Key, at)) return spot.Value;
+            // Строка над графиком — при каких вентиляторах сняты кривые; подробности под курсором.
+            if (airTip != null && at.Y < Theme.Px(15)) return airTip;
             return Theme.Help ? Help : null;
         }
 
@@ -619,6 +625,7 @@ namespace CoreMap
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
             spots.Clear();
             owners.Clear();
+            airTip = null;
             Font font = Theme.Font(10);
             // heat — температура, по которой идёт работа (толстая линия, точки, отсечка); other — вторая, тонкой линией.
             Func<CurvePoint, double> heat = p => byPeak ? p.Peak : p.Temp, other = p => byPeak ? p.Temp : p.Peak;
@@ -682,6 +689,12 @@ namespace CoreMap
                 Color color = LevelColor[Math.Max(0, Math.Min(3, run.Level))];
                 TextRenderer.DrawText(g, Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))], font, new Point(legend, 0), color, TextFormatFlags.NoPadding);
                 legend += Theme.Px(16);
+                // При каких вентиляторах снята кривая: от этого зависит, с чем её температуры можно сравнивать.
+                string air = "вент.: " + FanStat.Brief(points.Select(p => p.Air));
+                TextRenderer.DrawText(g, air, font, new Point(legend, 0), Theme.Dim, TextFormatFlags.NoPadding);
+                legend += TextRenderer.MeasureText(g, air, font, Size.Empty, TextFormatFlags.NoPadding).Width + Theme.Px(8);
+                airTip = (airTip ?? "Вентиляторы при снятии кривых") + "\n• эта кривая, сила нагрузки " +
+                    Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] + ": " + FanStat.Describe(points.Select(p => p.Air));
                 using (var thick = new Pen(color, Theme.Px(2)))
                 using (var thin = new Pen(Color.FromArgb(120, color)))
                 using (var fill = new SolidBrush(color))
@@ -713,9 +726,20 @@ namespace CoreMap
                             "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
                             "\n• без нагрузки перед замером: " + p.Base.ToString("0.0") + " °C" +
                             "\n• прибавка мощности: " + p.Watts.ToString("0.0") + " Вт" +
+                            (p.Air == null ? "" : "\n• вентиляторы: " + p.Air) +
                             "\n• снято " + run.Time));
                     }
                 }
+            }
+
+            // Кривые сняты при разных вентиляторах — заметная пометка в той же строке над графиком: высоты окну она
+            // не добавляет (лишняя строка в итоге ползунка выталкивает окно 1920×1040 в прокрутку).
+            if (uneven != null)
+            {
+                // У выделенного блока кривой может и не быть: тогда пометка стоит одна.
+                TextRenderer.DrawText(g, airTip != null ? "· у других иначе" : "вент.: у кривых разные", font, new Point(legend, 0), Theme.Accent,
+                                      TextFormatFlags.NoPadding);
+                airTip = (airTip ?? "Вентиляторы при снятии кривых") + "\n• " + uneven;
             }
 
             // Потолок, который стоит сейчас: кружок на той точке кривой блока, что снята при нём.

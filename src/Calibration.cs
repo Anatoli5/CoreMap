@@ -18,6 +18,7 @@ namespace CoreMap
         {
             public double[] Rise, Peak, Watts, Speed;
             public bool[] Throttled, Aborted;
+            public double[][] Fans;  // обороты вентиляторов под нагрузкой (FanStat.Row); null — неизвестны
         }
 
         readonly Monitor monitor;
@@ -62,7 +63,7 @@ namespace CoreMap
                 var row = new Row
                 {
                     Rise = new double[count], Peak = new double[count], Watts = new double[count], Speed = new double[count],
-                    Throttled = new bool[count], Aborted = new bool[count],
+                    Throttled = new bool[count], Aborted = new bool[count], Fans = new double[count][],
                 };
                 for (int t = 0; t < count && !Stopped; t++)
                 {
@@ -84,6 +85,7 @@ namespace CoreMap
                     double span = row.Aborted[t] ? 1 : LoadSeconds / 2;
                     row.Rise[t] = monitor.Typical(span)[i] - idle;
                     row.Watts[t] = monitor.Power(span) - idleWatts;
+                    row.Fans[t] = FanStat.Row(Air(span));
                     row.Speed[t] = Load.Rate(i);
                     Load.Stop(i);
                     if (!Stopped) Done++;
@@ -130,6 +132,8 @@ namespace CoreMap
                 {
                     { "name", Kernels.All[k].Name }, { "unit", Kernels.All[k].Unit }, { "rise", rows[k].Rise }, { "peak", rows[k].Peak },
                     { "watts", rows[k].Watts }, { "speed", rows[k].Speed }, { "throttled", rows[k].Throttled }, { "aborted", rows[k].Aborted },
+                    // По ядрам: строка {обороты по вентиляторам…, максимум 1/0}; null — обороты неизвестны.
+                    { "fans", rows[k].Fans },
                 });
             Json.WriteFile(path, new Dictionary<string, object>
             {

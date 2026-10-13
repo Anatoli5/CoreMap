@@ -17,6 +17,7 @@ namespace CoreMap
         public double Seconds, Watts;        // сколько секунд усреднялось; прибавка мощности процессора
         public int[] Limits;                 // потолки ядер, при которых снят замер
         public double[] Temp, Peak, Ratio;   // по ядрам: средняя температура, наибольшая, фактический множитель
+        public FanStat Air;                  // обороты вентиляторов за участок усреднения; null — неизвестны
     }
 
     class JointTest : Measurement
@@ -88,6 +89,7 @@ namespace CoreMap
                 Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), Level = level, Seconds = hold, Watts = monitor.Power(hold) - idleWatts,
                 Limits = (int[])limits.Current.Clone(), Temp = monitor.Typical(hold), Peak = peak,
                 Ratio = ratioSum.Select((v, i) => ratioCount[i] > 0 ? v / ratioCount[i] : double.NaN).ToArray(),
+                Air = Air(hold),
             };
             try { Save(Last); }
             catch (Exception e) { Program.Tell("Замер под общей нагрузкой не сохранён в файл: " + Program.Why(e) + ".", e); }
@@ -96,13 +98,14 @@ namespace CoreMap
         void Save(JointResult r)
         {
             if (saveDir == null) return;
-            Json.WriteFile(Path.Combine(saveDir, "joint-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json"),
-                new Dictionary<string, object>
-                {
-                    { "cpu", cpu }, { "time", r.Time }, { "level", r.Level }, { "seconds", r.Seconds }, { "watts", r.Watts },
-                    { "lps", lps.Cast<object>().ToList() }, { "limits", r.Limits.Cast<object>().ToList() },
-                    { "temp", r.Temp.Cast<object>().ToList() }, { "peak", r.Peak.Cast<object>().ToList() }, { "ratio", r.Ratio.Cast<object>().ToList() },
-                });
+            var result = new Dictionary<string, object>
+            {
+                { "cpu", cpu }, { "time", r.Time }, { "level", r.Level }, { "seconds", r.Seconds }, { "watts", r.Watts },
+                { "lps", lps.Cast<object>().ToList() }, { "limits", r.Limits.Cast<object>().ToList() },
+                { "temp", r.Temp.Cast<object>().ToList() }, { "peak", r.Peak.Cast<object>().ToList() }, { "ratio", r.Ratio.Cast<object>().ToList() },
+            };
+            FanStat.Put(result, r.Air);
+            Json.WriteFile(Path.Combine(saveDir, "joint-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json"), result);
         }
     }
 }

@@ -303,6 +303,9 @@ namespace CoreMap
                     if (eased != "") notes += "сила нагрузки «" + LevelName[lv] + "» подобрана для ядер " + eased + "\n";
                 }
             if (throttled.Any(x => x)) notes += "красный номер строки: ядро под нагрузкой упёрлось в порог и сбрасывало частоту\n";
+            // Строки нет, пока оборотов нет ни у одного блока: измерение снято до их появления.
+            string air = core.Sweep.FanNote();
+            if (air != null) notes += "вентиляторы при измерении: " + air + "\n";
             return notes.TrimEnd();
         }
 

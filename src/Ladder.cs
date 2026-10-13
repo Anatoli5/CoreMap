@@ -133,6 +133,7 @@ namespace CoreMap
             {
                 Limit = ratio, Ratio = ratioCount > 0 ? ratioSum / ratioCount : double.NaN, Peak = peak, Base = idle,
                 Temp = block.Temp(monitor.Typical(window)), Watts = monitor.Power(window) - idleWatts,
+                Air = Air(window),  // обороты — за тот же участок, что и температура
             };
         }
     }
@@ -198,6 +199,7 @@ namespace CoreMap
                         point.Ratio = double.IsNaN(again.Ratio) ? point.Ratio : double.IsNaN(point.Ratio) ? again.Ratio : (point.Ratio + again.Ratio) / 2;
                         point.Peak = Math.Max(point.Peak, again.Peak);
                         point.Watts = (point.Watts + again.Watts) / 2;
+                        point.Air = FanStat.Both(point.Air, again.Air);
                         Done++;
                         curves.Touch();
                     }
