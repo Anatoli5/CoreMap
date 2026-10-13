@@ -381,7 +381,7 @@ namespace CoreMap
             }
             if (!lower)
             {
-                var lines = new System.Collections.Generic.List<string>();
+                var lines = new List<string>();
                 foreach (int[] way in new[] { new[] { r, c }, new[] { c, r } })
                     foreach (int a in blocks[way[0]].Members)
                     {

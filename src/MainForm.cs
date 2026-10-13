@@ -19,8 +19,6 @@ namespace CoreMap
 {
     partial class MainForm : Form
     {
-        static readonly string[] LevelGlyph = { "", "▂", "▅", "█" };
-
         readonly Core core;
         readonly Block[] blocks;  // все блоки по порядку: строки и столбцы таблиц, строки списка
         readonly Timer timer = new Timer { Interval = 500 };
@@ -142,7 +140,7 @@ namespace CoreMap
             reset.Margin = new Padding(0, 0, Theme.Px(4), 0);
             bar.Controls.Add(since = Widgets.Label("", Theme.Dim, 13, false, "Время с последнего сброса максимумов"));
             bar.Controls.Add(stopLoad = Widgets.Button("■", core.StopLoad, "Снять нагрузку\nОстанавливает нагрузку на всех ядрах."));
-            bar.Controls.Add(level = new Segmented(LoadManager.Levels, v => LevelGlyph[v], core.SetLevel,
+            bar.Controls.Add(level = new Segmented(LoadManager.Levels, v => Theme.LevelGlyph[v], core.SetLevel,
                 "Сила нагрузки\nНасколько тяжёлые вычисления получает нагруженное ядро.\n" +
                 "• при щелчке по ядру — ровно эта сила\n" +
                 "• в тепловом измерении — верхняя граница: под каждое ядро сила подбирается сама\n" +

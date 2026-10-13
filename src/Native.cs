@@ -20,7 +20,6 @@ namespace CoreMap
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window, int command);
 
-        /// Привязывает текущий поток к одному логическому процессору.
         /// Привязывает текущий поток к логическому процессору. false — не удалось (например, процессу запрещено это ядро):
         /// тогда чтение и запись «по ядру» попали бы на какое-то другое ядро.
         public static bool Pin(int lp)
@@ -42,7 +41,6 @@ namespace CoreMap
             SetThreadAffinityMask(GetCurrentThread(), (UIntPtr)mask);
         }
 
-        public static void RaiseThreadPriority() { SetThreadPriority(GetCurrentThread(), 2); }
         public static void LowerThreadPriority() { SetThreadPriority(GetCurrentThread(), -1); }
 
         /// Пока идёт измерение, компьютер не уходит в сон: иначе получасовой прогон оборвётся.

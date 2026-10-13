@@ -1,4 +1,10 @@
-// Оформление и собственные элементы окна: схема кристалла, таблицы по ядрам, полоса прогресса.
+// Оформление и собственные элементы окна. Каждый элемент рисует себя сам и ничего не знает об измерениях:
+// что показать, ему даёт окно (MainForm).
+//   Theme, Widgets                 цвета, шрифты, масштаб, подсказки; кнопки, надписи, ряды и колонки
+//   PairView, StripView, BlockGrid таблицы по блокам: две половинки «блок × блок» и «блок → значение»
+//   DieView                        схема кристалла
+//   CurveView, BlockList, MeanView график кривых, список блоков рядом с ним, график среднего множителя
+//   RunBar, Slider, Segmented      полоса прогресса, ползунок, переключатель
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -13,6 +19,8 @@ namespace CoreMap
         public static readonly Color Text = Hex(0xe6e8ec), Dim = Hex(0x8b93a1), Accent = Hex(0xffd166);
         public static readonly Color Bad = Hex(0xff5d5d), BadBg = Hex(0x5c1f1f), BadText = Hex(0xffc9c9), Good = Hex(0x7bd88f);
         public static readonly Color WarnBg = Hex(0x5a3d12), WarnText = Hex(0xffd9a0);
+
+        public static readonly string[] LevelGlyph = { "", "▂", "▅", "█" };  // значки ступеней силы нагрузки: 1, 2, 3
 
         public static float Scale = 1;
         // Подсказки показываются только в режиме вопроса (кнопка «?»): сами по себе при наведении они не всплывают.
@@ -545,7 +553,6 @@ namespace CoreMap
     class CurveView : Painted
     {
         static readonly Color[] LevelColor = { Theme.Dim, Theme.KindText('E'), Theme.Accent, Theme.Bad };
-        static readonly string[] LevelGlyph = { "", "▂", "▅", "█" };
 
         CurveRun[] front = new CurveRun[0];  // кривые выделенного блока
         CurveRun[] back = new CurveRun[0];   // кривые остальных блоков на текущей силе нагрузки
@@ -606,8 +613,6 @@ namespace CoreMap
             if (Hovered != null) Hovered(b);
         }
 
-        static double Actual(CurvePoint p) { return double.IsNaN(p.Ratio) ? p.Limit : p.Ratio; }
-
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -625,7 +630,7 @@ namespace CoreMap
                                       TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
                 return;
             }
-            int x0 = (int)Math.Floor(all.Min(p => Actual(p))), x1 = Math.Max((int)Math.Ceiling(all.Max(p => Actual(p))), x0 + 1);
+            int x0 = (int)Math.Floor(all.Min(p => p.Actual)), x1 = Math.Max((int)Math.Ceiling(all.Max(p => p.Actual)), x0 + 1);
             double high = Math.Max(all.Max(p => heat(p)), ahead.Length > 0 ? ahead.Max(p => Math.Max(p.Temp, p.Peak)) : 0);
             double y0 = Math.Floor(all.Min(p => p.Temp) / 5) * 5 - 5, y1 = Math.Ceiling(high / 5) * 5 + 5;
             var plot = Rectangle.FromLTRB(Theme.Px(26), Theme.Px(16), Width - Theme.Px(10), Height - Theme.Px(18));
@@ -652,11 +657,11 @@ namespace CoreMap
             {
                 Block owner = blocks.ByLp(run.Lp);
                 if (owner == null) continue;  // кривая из файла, которой не соответствует ни один блок
-                CurvePoint[] points = run.Points.ToArray().OrderBy(p => Actual(p)).ToArray();
+                CurvePoint[] points = run.Points.ToArray().OrderBy(p => p.Actual).ToArray();
                 using (var pen = new Pen(Color.FromArgb(120, Theme.KindText(owner.Kind)), Theme.Px(1.5)))
                     for (int k = 1; k < points.Length; k++)
-                        g.DrawLine(pen, px(Actual(points[k - 1])), py(heat(points[k - 1])), px(Actual(points[k])), py(heat(points[k])));
-                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, Block>(new Point(px(Actual(p)), py(heat(p))), owner));
+                        g.DrawLine(pen, px(points[k - 1].Actual), py(heat(points[k - 1])), px(points[k].Actual), py(heat(points[k])));
+                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, Block>(new Point(px(p.Actual), py(heat(p))), owner));
             }
 
             // Отсечка — температура с ползунка.
@@ -672,10 +677,10 @@ namespace CoreMap
             foreach (CurveRun run in front)
             {
                 Block owner = blocks.ByLp(run.Lp);
-                CurvePoint[] points = run.Points.ToArray().OrderBy(p => Actual(p)).ToArray();
+                CurvePoint[] points = run.Points.ToArray().OrderBy(p => p.Actual).ToArray();
                 if (points.Length == 0) continue;
                 Color color = LevelColor[Math.Max(0, Math.Min(3, run.Level))];
-                TextRenderer.DrawText(g, LevelGlyph[Math.Max(0, Math.Min(3, run.Level))], font, new Point(legend, 0), color, TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(g, Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))], font, new Point(legend, 0), color, TextFormatFlags.NoPadding);
                 legend += Theme.Px(16);
                 using (var thick = new Pen(color, Theme.Px(2)))
                 using (var thin = new Pen(Color.FromArgb(120, color)))
@@ -684,13 +689,13 @@ namespace CoreMap
                 {
                     for (int k = 1; k < points.Length; k++)
                     {
-                        g.DrawLine(thin, px(Actual(points[k - 1])), py(other(points[k - 1])), px(Actual(points[k])), py(other(points[k])));
-                        g.DrawLine(thick, px(Actual(points[k - 1])), py(heat(points[k - 1])), px(Actual(points[k])), py(heat(points[k])));
+                        g.DrawLine(thin, px(points[k - 1].Actual), py(other(points[k - 1])), px(points[k].Actual), py(other(points[k])));
+                        g.DrawLine(thick, px(points[k - 1].Actual), py(heat(points[k - 1])), px(points[k].Actual), py(heat(points[k])));
                     }
                     int r = Theme.Px(3);
                     foreach (CurvePoint p in points)
                     {
-                        var at = new Point(px(Actual(p)), py(heat(p)));
+                        var at = new Point(px(p.Actual), py(heat(p)));
                         // Вертикальная черта — от температуры на подъёме до температуры на спуске: чем она короче,
                         // тем меньше отставание и тем надёжнее точка.
                         if (!byPeak && !double.IsNaN(p.TempUp) && !double.IsNaN(p.TempDown))
@@ -702,7 +707,7 @@ namespace CoreMap
                         spots.Add(new KeyValuePair<Point, string>(at,
                             (double.IsNaN(p.Ratio) ? "" : "Работало на множителе " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
                                 (off ? " — до потолка не дошло" : "") + "\n") +
-                            "Сила нагрузки " + LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
+                            "Сила нагрузки " + Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
                             "\n• средняя под нагрузкой: " + p.Temp.ToString("0.0") + " °C" +
                             (double.IsNaN(p.TempDown) ? "" : " (на подъёме " + p.TempUp.ToString("0.0") + ", на спуске " + p.TempDown.ToString("0.0") + ")") +
                             "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
@@ -724,8 +729,8 @@ namespace CoreMap
                     CurvePoint p = run.Points.ToArray().FirstOrDefault(q => q.Limit == pick.From);
                     if (p == null) continue;
                     int r = Theme.Px(front.Contains(run) ? 5 : 3.5);
-                    g.FillEllipse(mark, px(Actual(p)) - r, py(heat(p)) - r, 2 * r, 2 * r);
-                    g.DrawEllipse(rim, px(Actual(p)) - r, py(heat(p)) - r, 2 * r, 2 * r);
+                    g.FillEllipse(mark, px(p.Actual) - r, py(heat(p)) - r, 2 * r, 2 * r);
+                    g.DrawEllipse(rim, px(p.Actual) - r, py(heat(p)) - r, 2 * r, 2 * r);
                 }
         }
     }

@@ -1,10 +1,14 @@
-# Project check for the agent: builds the sources into CoreMapNew.exe (the owner's CoreMap.exe is not touched)
-# and takes hidden simulated window snapshots into outputs\<Name>\. Nothing appears on screen, no elevation prompt,
-# no real load. Exit code 0 = built and every snapshot was written.
+# Project check for the agent: builds the sources into CoreMapNew.exe (the owner's CoreMap.exe is not touched),
+# takes hidden simulated window snapshots into outputs\<Name>\ and runs the self-test of the measurement base.
+# Nothing appears on screen, no elevation prompt, no real load. Exit code 0 = built, every snapshot was written
+# and the self-test passed.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -Name stage1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -BuildOnly
 #
-# Compare the pictures with outputs\base\ (taken from the build before the restructuring).
+# Compare the pictures with those of an earlier run: tools\compare.ps1 -A <earlier> -B <Name>. Sets a, b, f, h
+# show no running measurement and must match pixel for pixel (the minutes in h aside); c, d, e, g are simulated
+# measurements in progress and are compared by eye.
 #
 # Smart App Control rates every fresh unsigned build anew and now and then blocks one ("An Application Control
 # policy has blocked this file"); the same sources built again usually pass. So a blocked build is rebuilt, up to

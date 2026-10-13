@@ -19,6 +19,9 @@ namespace CoreMap
         public double Ratio, Temp, Peak, Base, Watts;  // фактический множитель, средняя, наибольшая, без нагрузки, прибавка мощности
         // Средняя температура на этой ступени при подъёме по лесенке и при спуске; Temp — их среднее.
         public double TempUp = double.NaN, TempDown = double.NaN;
+
+        /// Множитель, на котором блок шёл на этой ступени; если он не измерен — заданный потолок.
+        public double Actual { get { return double.IsNaN(Ratio) ? Limit : Ratio; } }
     }
 
     class CurveRun
@@ -207,7 +210,7 @@ namespace CoreMap
                 int limit = Settle(p.Limit, p.Ratio, ascending);
                 return new CurveChoice
                 {
-                    Limit = limit, From = p.Limit, Temp = temps[k], Ratio = Math.Min(Actual(p), limit),
+                    Limit = limit, From = p.Limit, Temp = temps[k], Ratio = Math.Min(p.Actual, limit),
                     Top = k == points.Length - 1 && p.Limit < limits.Fused[index],
                 };
             }).ToArray();
@@ -224,8 +227,6 @@ namespace CoreMap
             options[0].Hot = true;
             return options[0];
         }
-
-        static double Actual(CurvePoint p) { return double.IsNaN(p.Ratio) ? p.Limit : p.Ratio; }
 
         // ----- файл -----
 
