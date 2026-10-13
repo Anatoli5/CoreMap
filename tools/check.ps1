@@ -5,6 +5,10 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -Name stage1
 #
 # Compare the pictures with outputs\base\ (taken from the build before the restructuring).
+#
+# Smart App Control rates every fresh unsigned build anew and now and then blocks one ("An Application Control
+# policy has blocked this file"); the same sources built again usually pass. So a blocked build is rebuilt, up to
+# four times.
 param([string]$Name = 'check', [switch]$BuildOnly)
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -18,9 +22,14 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $out = Join-Path $root 'CoreMapNew.exe'
 $icon = @()
 if (Test-Path assets\coremap.ico) { $icon = @('/win32icon:assets\coremap.ico') }
-& $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" src\*.cs
-if ($LASTEXITCODE -ne 0) { Write-Host 'build failed'; exit 1 }
+
+function Build {
+    & $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
+        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" src\*.cs
+    return $LASTEXITCODE -eq 0
+}
+
+if (-not (Build)) { Write-Host 'build failed'; exit 1 }
 Write-Host 'build ok'
 if ($BuildOnly) { exit 0 }
 
@@ -37,9 +46,25 @@ $sets = [ordered]@{
 }
 $env:__COMPAT_LAYER = 'RunAsInvoker'
 $stamp = Get-Date
-$procs = foreach ($key in $sets.Keys) {
-    Start-Process -FilePath $out -ArgumentList ("--simulate --snapshot $dir\$key.png " + $sets[$key]) -PassThru
+$procs = $null
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    $procs = @()
+    $blocked = $false
+    foreach ($key in $sets.Keys) {
+        try {
+            $procs += Start-Process -FilePath $out -ArgumentList ("--simulate --snapshot $dir\$key.png " + $sets[$key]) -PassThru -ErrorAction Stop
+        }
+        catch { $blocked = $true; Write-Host ("start refused: " + $_.Exception.Message); break }
+    }
+    if (-not $blocked) { break }
+    foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill() } }
+    $procs = $null
+    Start-Sleep -Seconds 2
+    if (-not (Build)) { Write-Host 'build failed'; exit 1 }
+    Write-Host "rebuilt, attempt $($attempt + 1)"
 }
+if ($null -eq $procs) { Write-Host 'the build was refused four times'; exit 4 }
+
 $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
