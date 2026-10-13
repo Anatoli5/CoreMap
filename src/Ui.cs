@@ -447,9 +447,9 @@ namespace CoreMap
             if (e.Button == MouseButtons.Right && Menu != null) Menu(hit, e.Location);
         }
 
-        /// Наибольшее из значений по ядрам блока; NaN — ни одного нет. Это только показ на плитке: в измерениях
-        /// температура и множитель блока берутся по Block.Temp и Block.Ratio.
-        static double Highest(double[] values, int[] members)
+        /// Наибольшее из значений по ядрам блока; NaN — ни одного нет. Это только показ: так считаются числа на
+        /// плитке и в её подсказке. В измерениях температура и множитель блока берутся по Block.Temp и Block.Ratio.
+        public static double Highest(double[] values, int[] members)
         {
             double top = double.NaN;
             if (values != null)

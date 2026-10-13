@@ -99,20 +99,26 @@ namespace CoreMap
 
         string TileTip(Block block)
         {
-            int i = block.First;  // числа подсказки — по первому ядру блока
+            // Числа подсказки — те же, что на плитке под курсором: наибольшее по ядрам блока (DieView.Highest).
+            // Потолок у блока общий и читается по первому ядру.
+            int i = block.First;
+            int[] members = block.Members;
+            double cur = DieView.Highest(die.Cur, members), max = DieView.Highest(die.Max, members);
+            double average = DieView.Highest(die.Avg, members);
+            double ratio = DieView.Highest(die.Ratio, members), loadRatio = DieView.Highest(core.LoadRatio, members);
             string text = block.Members.Length > 1
                 ? Capital(block.Title) + "\n" +
                     (block.Members.Any(k => die.Loaded[k]) ? "Щелчок снимает нагрузку со всего блока." : "Щелчок даёт нагрузку на все ядра блока разом.")
                 : Capital(block.Title) + " (" + block.Kind + ")\n" +
                     (die.Loaded[i] ? "Щелчок снимает нагрузку с этого ядра." : "Щелчок даёт нагрузку на это ядро.");
-            if (!double.IsNaN(die.Cur[i])) text += "\n• сейчас: " + die.Cur[i] + " °C\n• ▲ максимум с последнего сброса: " + die.Max[i] + " °C";
-            if (!double.IsNaN(core.LoadAverage[i]))
-                text += "\n• ⌀ средняя под нагрузкой: " + core.LoadAverage[i].ToString("0.0") + " °C — считается, только пока это ядро само " +
+            if (!double.IsNaN(cur)) text += "\n• сейчас: " + cur + " °C\n• ▲ максимум с последнего сброса: " + max + " °C";
+            if (!double.IsNaN(average))
+                text += "\n• ⌀ средняя под нагрузкой: " + average.ToString("0.0") + " °C — считается, только пока это ядро само " +
                     "нагружено, с момента, когда последний раз менялись нагруженные ядра, сила нагрузки или потолки; без нагрузки стоит на месте";
-            if (die.Throttled[i]) text += "\n• сейчас сбрасывает частоту из-за перегрева";
-            if (core.Monitor != null && !double.IsNaN(core.Monitor.Ratio[i]))
-                text += "\n• сейчас работает на множителе " + core.Monitor.Ratio[i].ToString("0.0") +
-                    (double.IsNaN(core.LoadRatio[i]) ? "" : ", в среднем под нагрузкой — " + core.LoadRatio[i].ToString("0.0"));
+            if (members.Any(k => die.Throttled[k])) text += "\n• сейчас сбрасывает частоту из-за перегрева";
+            if (!double.IsNaN(ratio))
+                text += "\n• сейчас работает на множителе " + ratio.ToString("0.0") +
+                    (double.IsNaN(loadRatio) ? "" : ", в среднем под нагрузкой — " + loadRatio.ToString("0.0"));
             if (core.Limits != null && core.Limits.Known(i))
                 text += "\n• потолок множителя: ×" + core.Limits.Current[i] + ", заводской предел ×" + core.Limits.Fused[i] +
                     (core.Limits.Current[i] == core.BaseLimits[i] ? "" : "\n• в базе ×" + core.BaseLimits[i] + ": число после потолка на плитке — разница с базой") +
