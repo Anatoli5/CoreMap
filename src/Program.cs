@@ -18,7 +18,9 @@
 // CoreMap.exe --best        вместе с --slide: ползунок работает «по выгоде»
 // CoreMap.exe --joint       вместе с --simulate --snapshot: вместо измерения запустить проверку под общей нагрузкой
 // CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх базы
-// CoreMap.exe --size WxH   вместе с --snapshot: размер окна в пикселях, например 1280x800
+// CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
+// CoreMap.exe --selftest    вместе с --simulate --snapshot F: без окна проверить, что измерения на любом пути выхода
+//                           возвращают потолки (SelfTest.cs); отчёт — текстом в файл F
 using System;
 using System.Globalization;
 using System.IO;
@@ -30,7 +32,7 @@ namespace CoreMap
     static class Program
     {
         public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
-        public static readonly string DataDir = Path.Combine(Root, "data");
+        public static string DataDir = Path.Combine(Root, "data");  // проверка --selftest подставляет временную папку
         public static int TestSlide;  // проверка на имитации с ключом --slide: ползунок потолков ставится на это значение
         public static bool TestBest;  // проверка на имитации с ключом --best: ползунок делит температуру «по выгоде»
         public static bool TestJoint;  // проверка на имитации с ключом --joint
@@ -60,6 +62,7 @@ namespace CoreMap
             CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;  // и в потоках измерений тоже
             if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
             bool simulate = Array.IndexOf(args, "--simulate") >= 0;
+            if (simulate && Array.IndexOf(args, "--selftest") >= 0 && Option(args, "--snapshot") != null) return SelfTest.Run(Option(args, "--snapshot"));
             TestFit = simulate && Array.IndexOf(args, "--fit") >= 0;
             if (simulate) int.TryParse(Option(args, "--slide"), out TestSlide);
             TestBest = simulate && Array.IndexOf(args, "--best") >= 0;
@@ -92,10 +95,13 @@ namespace CoreMap
                     string[] size = (Option(args, "--size") ?? "").Split('x');
                     int width = 0, height = 0;
                     if (size.Length == 2) { int.TryParse(size[0], out width); int.TryParse(size[1], out height); }
-                    Application.Run(form = new MainForm(core, Option(args, "--snapshot"),
-                                                        width > 0 && height > 0 ? new System.Drawing.Size(width, height) : System.Drawing.Size.Empty,
-                                                        Array.IndexOf(args, "--calibrate") >= 0, Array.IndexOf(args, "--run") >= 0,
-                                                        simulate && Array.IndexOf(args, "--curve") >= 0));
+                    form = new MainForm(core, Option(args, "--snapshot"),
+                                        width > 0 && height > 0 ? new System.Drawing.Size(width, height) : System.Drawing.Size.Empty,
+                                        Array.IndexOf(args, "--calibrate") >= 0, Array.IndexOf(args, "--run") >= 0,
+                                        simulate && Array.IndexOf(args, "--curve") >= 0);
+                    // Потолки возвращены после оборванного измерения: владелец видит это в полосе сообщений.
+                    if (core.Notice != null) form.Problem = core.Notice;
+                    Application.Run(form);
                 }
                 catch (Exception e)
                 {

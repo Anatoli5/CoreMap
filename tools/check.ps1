@@ -66,6 +66,11 @@ for ($attempt = 1; $attempt -le 4; $attempt++) {
 }
 if ($null -eq $procs) { Write-Host 'the build was refused four times'; exit 4 }
 
+# Self-test of the measurement base (src\SelfTest.cs): no window, simulated limits, files go to a temp folder.
+# It checks that every way out of a measurement puts the multiplier limits back. First line of the report: ok / FAILED.
+$report = Join-Path $dir 'selftest.txt'
+$procs += Start-Process -FilePath $out -ArgumentList "--simulate --snapshot $report --selftest" -PassThru
+
 $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
@@ -73,6 +78,13 @@ foreach ($key in $sets.Keys) {
     $file = Get-Item (Join-Path $dir "$key.png") -ErrorAction SilentlyContinue
     if (-not $file -or $file.LastWriteTime -lt $stamp) { Write-Host "no snapshot: $key ($($sets[$key]))"; $failed++ }
 }
+$tested = Get-Item $report -ErrorAction SilentlyContinue
+if (-not $tested -or $tested.LastWriteTime -lt $stamp) { Write-Host 'no self-test report'; $failed++ }
+elseif ((Get-Content $report -TotalCount 1) -ne 'ok') {
+    Write-Host "self-test failed, see $report"
+    Select-String -Path $report -Pattern '^FAILED  ' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
+    $failed++
+}
 if ($failed -gt 0) { exit 2 }
-Write-Host "snapshots ok: $dir"
+Write-Host "snapshots and self-test ok: $dir"
 exit 0

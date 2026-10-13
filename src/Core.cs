@@ -25,7 +25,13 @@ namespace CoreMap
         public readonly CoreLimits Limits;    // null — потолки недоступны (нет доступа к процессору)
         public readonly Profile Profile;      // база: профиль, который ставится при запуске; null — потолки недоступны
         public readonly ProfileSets Profiles; // все сохранённые профили по названиям
-        public readonly CurveTest Curve;      // кривые «температура от потолка»; null — нет потолков или датчиков
+        public readonly Runner Runner;        // исполнитель измерений: в каждый момент идёт не больше одного
+        // Кривые «температура от потолка» и три измерения по ним; null — нет потолков или датчиков.
+        public readonly CurveStore Curves;    // снятые кривые и подбор потолка по ним
+        public readonly CurveTest Curve;      // лесенка: снятие кривой
+        public readonly LimitSearch Search;   // поиск потолков замером под температуру
+        public readonly JointTest Joint;      // проверка под общей нагрузкой
+        public readonly string Notice;        // что сделано с потолками при запуске после оборванного измерения; null — ничего
         public readonly bool Simulated;
         public readonly string SensorProblem; // почему датчики недоступны
         public readonly int ThrottleAt, Limit;
@@ -38,7 +44,7 @@ namespace CoreMap
         string averageKey;
         volatile bool averageReset;
 
-        public bool Busy { get { return Sweep.Running || Latency.Running || Calibration.Running || Curve != null && Curve.Running; } }
+        public bool Busy { get { return Runner.Busy; } }
 
         /// showSaved — проверка окна на имитации: показать и сохранённую тепловую таблицу с настоящих датчиков.
         public Core(bool simulate, int limit, bool showSaved = false)
@@ -75,6 +81,13 @@ namespace CoreMap
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
 
+            LimitHold hold = Limits == null ? null : new LimitHold(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
+            // Прошлый запуск мог оборваться посреди измерения и оставить блоку потолок ступени. Он возвращается
+            // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
+            if (hold != null) Notice = hold.Recover();
+            if (Notice != null) Program.Log(Notice);  // полоса сообщений в окне сменится, запись останется
+            Runner = new Runner(Load, hold);
+
             if (Limits != null)
             {
                 Profile = new Profile(Limits, Lps, CpuName, simulate ? null : Program.DataDir);
@@ -102,15 +115,19 @@ namespace CoreMap
                 Monitor = new Monitor(backend, Lps.Length, 0.5) { OnSample = Guard };
                 Monitor.Start();
             }
-            Sweep = new ThermalSweep(Monitor, Load, Lps, Blocks.All, positions, simulate ? null : Program.DataDir);
-            Latency = new LatencyTest(Load, Lps, Program.DataDir);
-            Calibration = new Calibration(Monitor, Load, Cores, CpuName, simulate ? null : Program.DataDir);
+            string saveDir = simulate ? null : Program.DataDir;  // имитация ничего не пишет: её числа ненастоящие
+            Sweep = new ThermalSweep(Runner, Monitor, Lps, Blocks.All, positions, saveDir);
+            Latency = new LatencyTest(Runner, Lps, simulate, saveDir);
+            Calibration = new Calibration(Runner, Monitor, Cores, CpuName, saveDir);
             try { Calibration.LoadSaved(); }
             catch (Exception e) { Program.Log("не прочитан прошлый подбор нагрузки: " + e); }
             if (Limits != null && Monitor != null)
             {
-                Curve = new CurveTest(Monitor, Load, Limits, Lps, CpuName, simulate ? null : Program.DataDir);
-                try { Curve.LoadSaved(simulate && showSaved ? Path.Combine(Program.DataDir, "curves.json") : null); }
+                Curves = new CurveStore(Limits, CpuName, saveDir);
+                Curve = new CurveTest(Runner, Monitor, Limits, Curves, simulate);
+                Search = new LimitSearch(Runner, Monitor, Limits, Curves, simulate);
+                Joint = new JointTest(Runner, Monitor, Limits, Curves, Lps, CpuName, saveDir);
+                try { Curves.LoadSaved(simulate && showSaved ? Path.Combine(Program.DataDir, "curves.json") : null); }
                 catch (Exception e) { Program.Log("не прочитаны сохранённые кривые: " + e); }
             }
             if (!simulate || showSaved) LoadLatest("thermal-*.json", Sweep.LoadSaved);
@@ -183,11 +200,13 @@ namespace CoreMap
             return Native.Now() - blindSince >= GuardSeconds;
         }
 
-        /// Снимает нагрузку, если ядро держится на пределе или датчики замолчали.
+        /// Снимает нагрузку и останавливает измерение, если ядро держится на пределе или датчики замолчали.
         void Guard(double[] temps)
         {
             Average(temps);
-            if (!Load.Any()) { hotSince = double.NaN; return; }
+            // Идущее измерение — тоже нагрузка, даже когда у LoadManager пусто: измерение задержек занимает ядра
+            // своими потоками.
+            if (!Load.Any() && !Runner.Busy) { hotSince = double.NaN; return; }
             string reason;
             if (temps == null) reason = "датчики перестали отвечать";
             else if (Blind(temps)) reason = "датчик нагруженного ядра перестал отвечать";
@@ -199,9 +218,7 @@ namespace CoreMap
                 if (Native.Now() - hotSince < GuardSeconds) return;
                 reason = "ядро " + Lps[hottest] + " держалось на " + temps[hottest] + " °C";
             }
-            Sweep.Stop();
-            Calibration.Stop();
-            if (Curve != null) Curve.Stop();
+            Runner.Stop();
             Load.StopAll();
             Trip = reason;
         }
@@ -240,7 +257,12 @@ namespace CoreMap
             Sweep.Start(seconds, passes);
         }
 
-        public void StartLatency() { if (!Busy) Latency.Start(); }
+        public void StartLatency()
+        {
+            if (Busy) return;
+            Trip = null;
+            Latency.Start();
+        }
 
         // Профили. Состояний два: база и то, что стоит в процессоре сейчас. База — профиль, который ставится при
         // запуске программы (Profile), а без него — заводские потолки. Всё, что показывает разницу потолков,
@@ -389,7 +411,7 @@ namespace CoreMap
             if (Limits == null || Curve == null) return "потолки множителей недоступны";
             if (Busy) return "идёт измерение: дождись его конца";
             Trip = null;
-            Curve.StartSearch(SpreadBlocks(), Load.Level, maxTemp);
+            Search.Start(SpreadBlocks(), Load.Level, maxTemp);
             return null;
         }
 
@@ -398,9 +420,9 @@ namespace CoreMap
         public CurveChoice[] ChooseAll(double maxTemp, bool best = false)
         {
             bool[] known = Blocks.All.Select(b => Curve != null && Limits != null && Limits.Known(b.First)).ToArray();
-            CurveChoice[] even = Blocks.All.Select(b => known[b.Index] ? Curve.Choose(b, Load.Level, maxTemp) : null).ToArray();
+            CurveChoice[] even = Blocks.All.Select(b => known[b.Index] ? Curves.Choose(b, Load.Level, maxTemp) : null).ToArray();
             if (!best) return even;
-            return Rebalance(even, Blocks.All.Select(b => known[b.Index] ? Curve.Options(b, Load.Level) : null).ToArray(), maxTemp);
+            return Rebalance(even, Blocks.All.Select(b => known[b.Index] ? Curves.Options(b, Load.Level) : null).ToArray(), maxTemp);
         }
 
         public const double Spread = 6;  // на сколько градусов блок при переделе может уйти выше температуры с ползунка
@@ -473,7 +495,7 @@ namespace CoreMap
                 if (!Limits.Known(index)) continue;
                 CurveChoice choice = picks[block.Index];
                 if (choice == null) { none.Add(block.Name); continue; }
-                if (Limits.Current[index] != choice.Limit) refusal = Limits.Set(index, choice.Limit) ?? refusal;
+                if (Limits.Of(block) != choice.Limit) refusal = Limits.Set(index, choice.Limit) ?? refusal;
                 set++;
                 if (choice.Hot) hot.Add(block.Name + " (×" + choice.Limit + " — " + choice.Temp.ToString("0") + "°)");
                 else if (choice.Top) top.Add(block.Name);
@@ -493,7 +515,7 @@ namespace CoreMap
         {
             if (Busy || Curve == null) return;
             Trip = null;
-            Curve.StartJoint(Load.Level);
+            Joint.Start(Load.Level);
         }
 
         /// Температура блока по его снятой кривой при потолке, который стоит сейчас; NaN — кривой нет или потолок вне её.
@@ -501,8 +523,8 @@ namespace CoreMap
         {
             int index = block.First;
             if (Curve == null || Limits == null || !Limits.Known(index)) return double.NaN;
-            CurveChoice[] options = Curve.Options(block, Load.Level);
-            CurveChoice at = options == null ? null : options.LastOrDefault(o => o.Limit == Limits.Current[index]);
+            CurveChoice[] options = Curves.Options(block, Load.Level);
+            CurveChoice at = options == null ? null : options.LastOrDefault(o => o.Limit == Limits.Of(block));
             return at == null ? double.NaN : at.Temp;
         }
 
@@ -515,13 +537,10 @@ namespace CoreMap
 
         public void Close()
         {
-            if (Curve != null) Curve.Stop();
-            Sweep.Stop();
-            Calibration.Stop();
-            Latency.Stop();
-            // Измерение возвращает потолок и дописывает файл в своём потоке. Без ожидания процесс завершался раньше,
-            // и ядро оставалось с потолком текущей ступени.
-            for (double end = Native.Now() + 3; Busy && Native.Now() < end; ) System.Threading.Thread.Sleep(50);
+            // Измерение возвращает потолки и дописывает файл в своём потоке. Без ожидания процесс завершался раньше,
+            // и ядро оставалось с потолком текущей ступени. Не дождались за три секунды — потолки при следующем
+            // запуске вернёт метка (LimitHold.Recover).
+            Runner.Close(3);
             Load.StopAll();
         }
     }
