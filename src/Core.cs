@@ -117,7 +117,7 @@ namespace CoreMap
             }
             string saveDir = simulate ? null : Program.DataDir;  // имитация ничего не пишет: её числа ненастоящие
             Sweep = new ThermalSweep(Runner, Monitor, Lps, Blocks.All, positions, saveDir);
-            Latency = new LatencyTest(Runner, Lps, Program.DataDir);
+            Latency = new LatencyTest(Runner, Lps, simulate, saveDir);
             Calibration = new Calibration(Runner, Monitor, Cores, CpuName, saveDir);
             try { Calibration.LoadSaved(); }
             catch (Exception e) { Program.Log("не прочитан прошлый подбор нагрузки: " + e); }
@@ -204,7 +204,9 @@ namespace CoreMap
         void Guard(double[] temps)
         {
             Average(temps);
-            if (!Load.Any()) { hotSince = double.NaN; return; }
+            // Идущее измерение — тоже нагрузка, даже когда у LoadManager пусто: измерение задержек занимает ядра
+            // своими потоками.
+            if (!Load.Any() && !Runner.Busy) { hotSince = double.NaN; return; }
             string reason;
             if (temps == null) reason = "датчики перестали отвечать";
             else if (Blind(temps)) reason = "датчик нагруженного ядра перестал отвечать";
@@ -255,7 +257,12 @@ namespace CoreMap
             Sweep.Start(seconds, passes);
         }
 
-        public void StartLatency() { if (!Busy) Latency.Start(); }
+        public void StartLatency()
+        {
+            if (Busy) return;
+            Trip = null;
+            Latency.Start();
+        }
 
         /// Сохраняет действующие потолки профилем с данным названием и делает его действующим.
         /// null — сделано; иначе причина отказа.

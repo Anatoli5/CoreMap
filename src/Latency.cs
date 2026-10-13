@@ -5,6 +5,9 @@
 // только от пары ядер: на 275HX одна и та же пара даёт от 28 до 43 нс для разных строк, и на одной
 // строке какое-то ядро выглядит «быстрым» со всеми. Поэтому каждая пара меряется на многих
 // строках, разбросанных по большому массиву, и усредняется.
+//
+// Нагрузку здесь дают сами потоки замера, а не LoadManager: два ядра заняты, пока меряется их пара.
+// Защита от перегрева снимает это измерение наравне с остальными — через исполнителя измерений.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -25,17 +28,21 @@ namespace CoreMap
 
         readonly int[] lps;
         readonly int n;
-        readonly string saveDir;
+        readonly bool dry;        // имитация: ядра не нагружаются, числа ненастоящие
+        readonly string saveDir;  // null — результат не сохранять (имитация)
 
         public double[][] Matrix, Lowest, Highest;  // среднее, лучшая и худшая строка; NaN — не измерено
         public int Done;
 
         public int Total { get { return n * (n - 1) / 2; } }
 
-        public LatencyTest(Runner runner, int[] lps, string saveDir)
+        /// dry — как у LoadManager: в имитации температуры ненастоящие, защита от перегрева их не видит,
+        /// поэтому настоящую нагрузку давать нельзя.
+        public LatencyTest(Runner runner, int[] lps, bool dry, string saveDir)
             : base(runner, null)
         {
             this.lps = lps;
+            this.dry = dry;
             this.saveDir = saveDir;
             n = lps.Length;
             Clear();
@@ -56,18 +63,19 @@ namespace CoreMap
             Clear();
             Done = 0;
             Version++;
+            var fake = new Random(3);
             try
             {
                 for (int a = 0; a < n && !Stopped; a++)
                     for (int b = a + 1; b < n && !Stopped; b++)
                     {
-                        Native.Pin(lps[a]);
+                        if (!dry) Native.Pin(lps[a]);
                         double sum = 0, lo = double.MaxValue, hi = 0;
                         for (int k = 0; k < LineCount; k++)
                         {
                             // 521 взаимно просто с числом строк: строки разбросаны по всему массиву.
                             int cell = (k * 521 + 37) % TotalLines * WordsPerLine;
-                            double ns = MeasureLine(cell, lps[b], k == 0 ? 10 : 0);
+                            double ns = dry ? 30 + 12 * fake.NextDouble() : MeasureLine(cell, lps[b], k == 0 ? 10 : 0);
                             sum += ns;
                             lo = Math.Min(lo, ns);
                             hi = Math.Max(hi, ns);
@@ -77,9 +85,10 @@ namespace CoreMap
                         Highest[a][b] = Highest[b][a] = Math.Round(hi, 1);
                         Done++;
                         Version++;
+                        if (dry) Wait(0.02);  // чтобы в окне был виден ход измерения
                     }
-                if (Done == Total) Save();
-                else Error = "измерение прервано, таблица неполная";
+                if (Done != Total) Error = "измерение прервано, таблица неполная";
+                else if (saveDir != null) Save();
             }
             finally { Native.Unpin(lps); }
         }
