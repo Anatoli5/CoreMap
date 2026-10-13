@@ -24,10 +24,9 @@ namespace CoreMap
         bool fitApplied;     // ползунок в этом запуске уже ставил потолки: смена способа ставит их заново
         string fitReport;    // итог последнего подбора потолков по температуре
         bool wasJoint;       // в прошлый опрос шёл замер под общей нагрузкой
-        string meanKey;      // по чему посчитан график среднего множителя
-        double[] meanEven = new double[0], meanBest = new double[0];
-        bool[] meanRough = new bool[0];
-        string[] meanReadout = new string[0];
+        MeanCurve mean;      // средний множитель от температуры — график над ползунком; null — ещё не считался
+        string meanKey;      // по чему он посчитан
+        string[] meanReadout = new string[0];  // числа под курсором на этом графике, по градусам
 
         // «Кривая · блок».
         Label curveTitle, curveStatus;
@@ -109,7 +108,7 @@ namespace CoreMap
                 "Как делить температуру между блоками\nОба способа берут потолки из снятых кривых.\n" +
                 "• ровно — каждому блоку самый высокий потолок, при котором он не горячее температуры с ползунка\n" +
                 "• по выгоде — та же средняя температура по блокам, но поделена иначе: блок, которому градус даёт много " +
-                "частоты, поднимается выше отсечки (не больше чем на " + Core.Spread + " °C), а ступени, которые стоят градусов " +
+                "частоты, поднимается выше отсечки (не больше чем на " + CurveFit.Spread + " °C), а ступени, которые стоят градусов " +
                 "и частоты не добавляют, срезаются\n" +
                 "• на графике над ползунком белая линия — «ровно», бирюзовая — «по выгоде»\n" +
                 "• расчёт по кривым одиночной нагрузки: под общей нагрузкой блоки греют друг друга, это ещё не учтено"));
@@ -311,67 +310,54 @@ namespace CoreMap
         {
             CurveStore curve = core.Curves;
             int level = core.Load.Level, target = fitSlider.Value;
-            CurveChoice[] picks = core.ChooseAll(target, fitBest);
+            CurveChoice[] picks = core.Fit.Choose(level, target, fitBest);
             // График и список показывают то, что стоит в процессоре; выбор ползунка в них попадает, когда ползунок
             // его поставил. От положения ползунка, пока он ничего не ставил, зависят только отсечка и средний множитель.
-            CurveChoice[] standing = Standing(picks);
+            CurveChoice[] standing = core.Fit.Standing(level, picks);
             curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
                            core.Blocks, target, standing, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
             blockList.Show(standing, selected.Index, shown.Index, JointTemps(), Delta());
+            ShowMean(level, target, picks);
+        }
 
-            double[] now = Means(picks);
-            double even = fitBest ? Means(core.ChooseAll(target))[0] : double.NaN;
+        /// Строка «средний множитель» под ползунком и график среднего множителя над ним.
+        void ShowMean(int level, int target, CurveChoice[] picks)
+        {
+            CurveStore curve = core.Curves;
+            double[] now = core.Fit.Means(picks);
+            double even = fitBest ? core.Fit.Means(core.Fit.Choose(level, target))[0] : double.NaN;
             fitMean.Text = double.IsNaN(now[0]) ? "" : "средний множитель ×" + now[0].ToString("0.00") +
                 (double.IsNaN(even) ? "" : " (ровно ×" + even.ToString("0.00") + ")") +
                 (double.IsNaN(now[1]) ? "" : " · P ×" + now[1].ToString("0.0")) + (double.IsNaN(now[2]) ? "" : " · E ×" + now[2].ToString("0.0"));
             meanView.Value = target;
-            // Кривая среднего множителя пересчитывается по готовым кривым: пока идёт измерение, она не трогается
-            // (иначе полный пересчёт шёл бы на каждой ступени) и обновляется, когда оно закончилось.
-            string meanNow = curve.Version + "/" + level + "/" + curve.ByPeak;
-            if (meanKey != meanNow && !(core.Busy && meanEven.Length > 0 && meanKey != null && meanKey.EndsWith("/" + level + "/" + curve.ByPeak)))
+            // График пересчитывается по готовым кривым: пока идёт измерение, он не трогается (иначе полный
+            // пересчёт шёл бы на каждой ступени) и обновляется, когда оно закончилось.
+            string key = curve.Version + "/" + level + "/" + curve.ByPeak;
+            bool waits = core.Busy && mean != null && meanKey.EndsWith("/" + level + "/" + curve.ByPeak);
+            if (meanKey != key && !waits)
             {
-                meanKey = meanNow;
-                int count = FitHigh - FitLow + 1;
-                meanEven = new double[count];
-                meanBest = new double[count];
-                meanRough = new bool[count];
-                meanReadout = new string[count];
-                for (int k = 0; k < count; k++)
-                {
-                    CurveChoice[] at = core.ChooseAll(FitLow + k);
-                    double[] m = Means(at);
-                    meanEven[k] = m[0];
-                    meanBest[k] = Means(core.ChooseAll(FitLow + k, true))[0];
-                    meanRough[k] = at.Any(c => c != null && c.Hot);
-                    if (double.IsNaN(m[0])) continue;
-                    meanReadout[k] = (FitLow + k) + " °C · средний множитель ×" + m[0].ToString("0.00") +
-                        "\n• по выгоде: ×" + meanBest[k].ToString("0.00") +
-                        (double.IsNaN(m[1]) ? "" : "\n• P-ядра: ×" + m[1].ToString("0.00")) +
-                        (double.IsNaN(m[2]) ? "" : "\n• блоки E-ядер: ×" + m[2].ToString("0.00")) +
-                        "\n• блоков с кривой: " + at.Count(c => c != null) + " из " + blocks.Length +
-                        (meanRough[k] ? "\n• часть блоков горячее этой температуры уже на нижней точке кривой: среднее завышено" : "");
-                }
+                meanKey = key;
+                mean = core.Fit.Mean(level, FitLow, FitHigh);
+                meanReadout = MeanReadout(mean);
             }
-            meanView.Show(meanEven, meanBest, fitBest, meanRough, meanReadout, Knee(meanEven, meanRough));
+            meanView.Show(mean.Even, mean.Best, fitBest, mean.Rough, meanReadout, mean.Knee);
         }
 
-        /// Что кривые говорят о потолке, который стоит у каждого блока сейчас. Если он совпал с выбором ползунка,
-        /// берётся этот выбор; иначе — точка кривой, снятая при таком потолке. Кривой нет или потолок вне её —
-        /// запись без температуры; null — потолок блока неизвестен.
-        CurveChoice[] Standing(CurveChoice[] picks)
+        /// Числа под курсором на графике среднего множителя: по строке на каждый градус; null — кривых нет.
+        string[] MeanReadout(MeanCurve mean)
         {
-            int level = core.Load.Level;
-            return blocks.Select(b =>
+            var readout = new string[mean.Even.Length];
+            for (int k = 0; k < readout.Length; k++)
             {
-                if (!core.Limits.Known(b.First)) return null;
-                int now = core.Limits.Current[b.First];
-                if (picks[b.Index] != null && picks[b.Index].Limit == now) return picks[b.Index];
-                CurveChoice[] options = core.Curves.Options(b, level) ?? new CurveChoice[0];
-                CurveChoice at = options.FirstOrDefault(o => o.From == now) ?? options.LastOrDefault(o => o.Limit == now);
-                // В записи кривой потолок может стоять ниже снятого (блок до него не дошёл); в списке нужен тот, что стоит.
-                return at == null ? new CurveChoice { Limit = now, From = now, Temp = double.NaN, Ratio = double.NaN }
-                    : new CurveChoice { Limit = now, From = at.From, Temp = at.Temp, Ratio = at.Ratio };
-            }).ToArray();
+                if (double.IsNaN(mean.Even[k])) continue;
+                readout[k] = (mean.Low + k) + " °C · средний множитель ×" + mean.Even[k].ToString("0.00") +
+                    "\n• по выгоде: ×" + mean.Best[k].ToString("0.00") +
+                    (double.IsNaN(mean.P[k]) ? "" : "\n• P-ядра: ×" + mean.P[k].ToString("0.00")) +
+                    (double.IsNaN(mean.E[k]) ? "" : "\n• блоки E-ядер: ×" + mean.E[k].ToString("0.00")) +
+                    "\n• блоков с кривой: " + mean.Known[k] + " из " + blocks.Length +
+                    (mean.Rough[k] ? "\n• часть блоков горячее этой температуры уже на нижней точке кривой: среднее завышено" : "");
+            }
+            return readout;
         }
 
         /// Приписка к итогу ползунка: как вернуть потолки, которые стояли до него.
@@ -399,7 +385,7 @@ namespace CoreMap
                 if (b.Temp(heat) > hottest.Temp(heat)) hottest = b;
                 double ratio = b.Ratio(joint.Ratio);
                 if (!double.IsNaN(ratio)) ratios.Add(ratio);
-                double alone = core.CurveTemp(b);
+                double alone = core.Fit.CurveTemp(b, core.Load.Level);
                 if (!double.IsNaN(alone)) above.Add(b.Temp(heat) - alone);
             }
             return "Под общей нагрузкой: самый горячий блок " + hottest.Name + " — " + hottest.Temp(heat).ToString("0") + " °C" +
@@ -407,44 +393,6 @@ namespace CoreMap
                     " до " + above.Max().ToString("+0;−0") + ")" : "") +
                 (ratios.Count > 0 ? "; средний множитель ×" + ratios.Average().ToString("0.00") : "") +
                 "; прибавка мощности " + joint.Watts.ToString("0") + " Вт. По блокам — в списке после стрелки.";
-        }
-
-        /// Средний фактический множитель по блокам с кривой: по всем, по P-ядрам и по блокам E-ядер; NaN — таких нет.
-        double[] Means(CurveChoice[] picks)
-        {
-            var all = new List<double>();
-            var p = new List<double>();
-            var e = new List<double>();
-            for (int u = 0; u < blocks.Length; u++)
-            {
-                if (picks[u] == null) continue;
-                all.Add(picks[u].Ratio);
-                (blocks[u].Kind == 'P' ? p : e).Add(picks[u].Ratio);
-            }
-            return new[] { all, p, e }.Select(v => v.Count > 0 ? v.Average() : double.NaN).ToArray();
-        }
-
-        /// Перегиб кривой «средний множитель от температуры»: точка, дальше всего отстоящая вверх от прямой между
-        /// началом достоверной части и местом, где кривые кончаются. Правее него градус даёт меньше множителя, чем левее.
-        /// Возвращает температуру; -1 — перегиба нет.
-        static int Knee(double[] mean, bool[] rough)
-        {
-            int a = -1, b = -1;
-            for (int k = 0; k < mean.Length; k++)
-            {
-                if (double.IsNaN(mean[k])) continue;
-                if (a < 0 && !rough[k]) a = k;
-                if (k > 0 && mean[k] != mean[k - 1]) b = k;
-            }
-            if (a < 0 || b - a < 4) return -1;
-            int best = -1;
-            double far = 0.05;
-            for (int k = a + 1; k < b; k++)
-            {
-                double above = mean[k] - (mean[a] + (mean[b] - mean[a]) * (k - a) / (b - a));
-                if (above > far) { far = above; best = k; }
-            }
-            return best < 0 ? -1 : FitLow + best;
         }
     }
 }

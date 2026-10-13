@@ -28,6 +28,7 @@ namespace CoreMap
         public readonly Runner Runner;        // исполнитель измерений: в каждый момент идёт не больше одного
         // Кривые «температура от потолка» и три измерения по ним; null — нет потолков или датчиков.
         public readonly CurveStore Curves;    // снятые кривые и подбор потолка по ним
+        public readonly CurveFit Fit;         // расчёт потолков под температуру по снятым кривым
         public readonly CurveTest Curve;      // лесенка: снятие кривой
         public readonly LimitSearch Search;   // поиск потолков замером под температуру
         public readonly JointTest Joint;      // проверка под общей нагрузкой
@@ -124,6 +125,7 @@ namespace CoreMap
             if (Limits != null && Monitor != null)
             {
                 Curves = new CurveStore(Limits, CpuName, saveDir);
+                Fit = new CurveFit(Blocks, Limits, Curves);
                 Curve = new CurveTest(Runner, Monitor, Limits, Curves, simulate);
                 Search = new LimitSearch(Runner, Monitor, Limits, Curves, simulate);
                 Joint = new JointTest(Runner, Monitor, Limits, Curves, Lps, CpuName, saveDir);
@@ -415,99 +417,13 @@ namespace CoreMap
             return null;
         }
 
-        /// Что снятые кривые говорят о потолке каждого блока под температуру; null на месте блока — кривой нет.
-        /// best — не ровная отсечка, а передел: см. Rebalance.
-        public CurveChoice[] ChooseAll(double maxTemp, bool best = false)
-        {
-            bool[] known = Blocks.All.Select(b => Curve != null && Limits != null && Limits.Known(b.First)).ToArray();
-            CurveChoice[] even = Blocks.All.Select(b => known[b.Index] ? Curves.Choose(b, Load.Level, maxTemp) : null).ToArray();
-            if (!best) return even;
-            return Rebalance(even, Blocks.All.Select(b => known[b.Index] ? Curves.Options(b, Load.Level) : null).ToArray(), maxTemp);
-        }
-
-        public const double Spread = 6;  // на сколько градусов блок при переделе может уйти выше температуры с ползунка
-
-        /// Передел потолков «по выгоде» (идея владельца): сумма температур блоков остаётся той же, что при ровной
-        /// отсечке even, но делится иначе — так, чтобы сумма множителей была наибольшей. Блок, которому градус даёт
-        /// много частоты, поднимается выше отсечки (не больше чем на Spread), блок, у которого ступень стоит
-        /// градусов и частоты не добавляет, опускается. Перебор точный: вариантов на блок — по числу ступеней его
-        /// кривой, температуры считаются в десятых долях градуса.
-        static CurveChoice[] Rebalance(CurveChoice[] even, CurveChoice[][] options, double maxTemp)
-        {
-            int n = even.Length;
-            var allowed = new CurveChoice[n][];
-            var weight = new int[n][];
-            int room = 0;  // сколько десятых градуса можно раздать сверх самых низких вариантов
-            for (int u = 0; u < n; u++)
-            {
-                if (even[u] == null || options[u] == null) continue;
-                // Самый низкий вариант разрешён всегда: иначе блоку, горячему уже на нижней точке, нечего было бы дать.
-                allowed[u] = options[u].Where((o, k) => k == 0 || o.Temp <= maxTemp + Spread).ToArray();
-                weight[u] = allowed[u].Select(o => (int)Math.Round((o.Temp - allowed[u][0].Temp) * 10)).ToArray();
-                room += (int)Math.Round((even[u].Temp - allowed[u][0].Temp) * 10);
-            }
-            var value = new double[room + 1];
-            var pick = new int[n][];
-            for (int u = 0; u < n; u++)
-            {
-                if (allowed[u] == null) continue;
-                var next = new double[room + 1];
-                pick[u] = new int[room + 1];
-                for (int c = 0; c <= room; c++)
-                {
-                    next[c] = double.NegativeInfinity;
-                    for (int k = 0; k < allowed[u].Length; k++)
-                    {
-                        if (weight[u][k] > c) continue;
-                        double v = value[c - weight[u][k]] + allowed[u][k].Ratio;
-                        if (v > next[c] + 1e-9) { next[c] = v; pick[u][c] = k; }
-                    }
-                }
-                value = next;
-            }
-            var result = new CurveChoice[n];
-            for (int u = n - 1, c = room; u >= 0; u--)
-            {
-                if (allowed[u] == null) continue;
-                int k = pick[u][c];
-                result[u] = allowed[u][k];
-                result[u].Hot = k == 0 && result[u].Temp > maxTemp;
-                c -= weight[u][k];
-            }
-            return result;
-        }
-
-        /// Ставит блокам потолки под температуру по уже снятым кривым, без нагрузки; блоки без кривой не трогает.
+        /// Ставит блокам потолки под температуру по уже снятым кривым, без нагрузки (ползунок); best — «по выгоде».
         /// Возвращает итог одной строкой.
         public string FitFromCurves(double maxTemp, bool best = false)
         {
-            if (Limits == null || Curve == null) return "Потолки множителей недоступны.";
+            if (Fit == null) return "Потолки множителей недоступны.";
             if (Busy) return "Идёт измерение: потолки сейчас менять нельзя.";
-            var none = new List<string>();
-            var hot = new List<string>();
-            var top = new List<string>();
-            string refusal = null;
-            int set = 0;
-            CurveChoice[] picks = ChooseAll(maxTemp, best);
-            foreach (Block block in Blocks.All)
-            {
-                int index = block.First;
-                if (!Limits.Known(index)) continue;
-                CurveChoice choice = picks[block.Index];
-                if (choice == null) { none.Add(block.Name); continue; }
-                if (Limits.Of(block) != choice.Limit) refusal = Limits.Set(index, choice.Limit) ?? refusal;
-                set++;
-                if (choice.Hot) hot.Add(block.Name + " (×" + choice.Limit + " — " + choice.Temp.ToString("0") + "°)");
-                else if (choice.Top) top.Add(block.Name);
-            }
-            if (set == 0) return "Под " + maxTemp + " °C ничего не поставлено: на выбранной силе нагрузки кривых нет — сними их кнопкой ▶▶.";
-            string report = "Под " + maxTemp + " °C по кривым" + (best ? ", по выгоде," : "") + " поставлено блоков: " + set + " из " + Blocks.All.Length +
-                ". Это проба: чтобы потолки остались, сохрани профиль.";
-            if (none.Count > 0) report += " Нет кривой: " + string.Join(", ", none) + ".";
-            if (hot.Count > 0) report += " Горячее цели и на нижней точке кривой: " + string.Join(", ", hot) + ".";
-            if (top.Count > 0) report += " Кривая выше не снята: " + string.Join(", ", top) + ".";
-            if (refusal != null) report += " Отказ: " + refusal + ".";
-            return report;
+            return Fit.Apply(Load.Level, maxTemp, best).Describe();
         }
 
         /// Замер под общей нагрузкой: все блоки разом при потолках, которые стоят сейчас, на текущей силе нагрузки.
@@ -516,16 +432,6 @@ namespace CoreMap
             if (Busy || Curve == null) return;
             Trip = null;
             Joint.Start(Load.Level);
-        }
-
-        /// Температура блока по его снятой кривой при потолке, который стоит сейчас; NaN — кривой нет или потолок вне её.
-        public double CurveTemp(Block block)
-        {
-            int index = block.First;
-            if (Curve == null || Limits == null || !Limits.Known(index)) return double.NaN;
-            CurveChoice[] options = Curves.Options(block, Load.Level);
-            CurveChoice at = options == null ? null : options.LastOrDefault(o => o.Limit == Limits.Of(block));
-            return at == null ? double.NaN : at.Temp;
         }
 
         public void StartCalibration()
