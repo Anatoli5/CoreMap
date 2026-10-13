@@ -49,6 +49,9 @@ namespace CoreMap
                 input[0] = msr;
                 int hr = pawnio_execute(handle, "ioctl_read_msr", input, (UIntPtr)1, output, (UIntPtr)1, out got);
                 if (hr != 0) throw new SensorException("чтение регистра 0x" + msr.ToString("X") + " не удалось, код 0x" + hr.ToString("X8"));
+                // Драйвер сообщает, сколько слов ответа записал. Ни одного — в output осталось значение прошлого
+                // чтения, и оно ушло бы за показание этого регистра.
+                if (got == UIntPtr.Zero) throw new SensorException("чтение регистра 0x" + msr.ToString("X") + ": драйвер вернул пустой ответ");
                 return output[0];
             }
         }

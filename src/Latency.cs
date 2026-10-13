@@ -122,15 +122,19 @@ namespace CoreMap
         static double MeasureLine(int cell, int lpB, int warmMs)
         {
             memory[cell] = Pong;
-            var ready = new ManualResetEventSlim(false);
-            var responder = new Thread(() =>
+            Thread responder;
+            // Событие нужно только до старта ответчика; на пару ядер таких замеров 48, поэтому оно освобождается сразу.
+            using (var ready = new ManualResetEventSlim(false))
             {
-                Native.Pin(lpB);
-                ready.Set();
-                while (Interlocked.CompareExchange(ref memory[cell], Pong, Ping) != Quit) { }
-            }) { IsBackground = true };
-            responder.Start();
-            ready.Wait();
+                responder = new Thread(() =>
+                {
+                    Native.Pin(lpB);
+                    ready.Set();
+                    while (Interlocked.CompareExchange(ref memory[cell], Pong, Ping) != Quit) { }
+                }) { IsBackground = true };
+                responder.Start();
+                ready.Wait();
+            }
 
             // Разгон: ядра выходят из простоя и поднимают частоту.
             Stopwatch warm = Stopwatch.StartNew();

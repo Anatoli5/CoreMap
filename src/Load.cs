@@ -17,7 +17,8 @@ namespace CoreMap
     }
 
     /// Рабочая память одного потока нагрузки. Помещается в кэш ядра: оперативная память не участвует.
-    class Scratch
+    /// Создаётся на каждый запуск нагрузки и освобождается с её концом: внутри — системный объект хэша.
+    class Scratch : IDisposable
     {
         public readonly byte[] Bytes = new byte[64 * 1024];
         public readonly long[] Words = new long[16 * 1024];
@@ -31,6 +32,8 @@ namespace CoreMap
             new Random(7).NextBytes(Bytes);
             for (int i = 0; i < State.Length; i++) State[i] = A * (ulong)(i + 1) ^ B;
         }
+
+        public void Dispose() { Sha.Dispose(); }
     }
 
     static class Kernels
@@ -224,18 +227,20 @@ namespace CoreMap
             // Пониженный приоритет оставляет систему отзывчивой; на нагрев ядра он не влияет
             // (замер на 275HX: 70 °C и 71 °C при пониженном и обычном приоритете).
             Native.LowerThreadPriority();
-            var scratch = new Scratch();
-            int done = 0;
-            double since = Native.Now();
-            while (!w.Stop)
+            using (var scratch = new Scratch())
             {
-                w.Kernel.Chunk(scratch);
-                if ((++done & 15) != 0) continue;
-                double now = Native.Now();
-                if (now - since < 0.5) continue;
-                w.Rate = (float)(done / (now - since));
-                done = 0;
-                since = now;
+                int done = 0;
+                double since = Native.Now();
+                while (!w.Stop)
+                {
+                    w.Kernel.Chunk(scratch);
+                    if ((++done & 15) != 0) continue;
+                    double now = Native.Now();
+                    if (now - since < 0.5) continue;
+                    w.Rate = (float)(done / (now - since));
+                    done = 0;
+                    since = now;
+                }
             }
         }
 
