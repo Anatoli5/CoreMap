@@ -34,10 +34,6 @@ namespace CoreMap
         const double ProbeSeconds = 5;
         const double Ceiling = 88;        // выше этой расчётной температуры ядро не нагружается
         const double StepDown = 92;       // если ядро всё же дошло до этой температуры — ступень вниз
-        // Во сколько раз нагрев под силой 2 и 3 больше, чем под силой 1. Здесь значения до подбора;
-        // подбор нагрузки (Calibration) ставит измеренные.
-        public static readonly double[] Rise = { 0, 1.0, 1.5, 1.9 };
-
         readonly Monitor monitor;
         readonly int[] lps;
         readonly Block[] blocks;
@@ -50,8 +46,8 @@ namespace CoreMap
         readonly object gate = new object();
         List<double[][]> passes = new List<double[][]>();  // [проход][нагруженное ядро] → нагрев всех ядер
         List<double[][]> probes = new List<double[][]>();  // [проход][ядро] → {нагрев, прирост Вт, скорость}
-        public bool[] Throttled;  // под нагрузкой упёрлось в порог и сбрасывало частоту
-        public int[] Levels;      // подобранная сила нагрузки, 0 — ещё не подобрана
+        bool[] throttled;  // по ядрам: под нагрузкой упёрлось в порог и сбрасывало частоту
+        int[] levels;      // по ядрам: подобранная сила нагрузки, 0 — ещё не подобрана
         public int Seconds = 20, PassCount = 2;
         public int Done;
         public volatile Block Current;  // блок, который нагружен сейчас; null — никакой
@@ -68,8 +64,8 @@ namespace CoreMap
             this.saveDir = saveDir;
             n = lps.Length;
             this.order = order;
-            Throttled = new bool[n];
-            Levels = new int[n];
+            throttled = new bool[n];
+            levels = new int[n];
         }
 
         public void Start(int seconds, int passes)
@@ -86,9 +82,9 @@ namespace CoreMap
             {
                 passes = new List<double[][]>();
                 probes = new List<double[][]>();
+                throttled = new bool[n];
+                levels = new int[n];
             }
-            Throttled = new bool[n];
-            Levels = new int[n];
             Done = 0;
             startedAt = Native.Now();
             Version++;
@@ -116,13 +112,19 @@ namespace CoreMap
             catch (Exception e) { Program.Log("тепловое измерение не сохранено: " + e); }
         }
 
+        void SetLevel(Block block, int level)
+        {
+            lock (gate)
+                foreach (int m in block.Members) levels[m] = level;
+        }
+
         /// Запускает нагрузку на всех ядрах блока с подобранной для него силой.
         void Restart(Block block)
         {
             foreach (int m in block.Members)
             {
                 Load.Stop(m);
-                Load.Start(m, Levels[m]);
+                Load.Start(m, levels[m]);
             }
         }
 
@@ -146,9 +148,9 @@ namespace CoreMap
             lock (gate)
                 foreach (int m in members) probes[p][m] = probe;
             Version++;
-            if (Levels[first] != 0) return;
-            int level = LoadManager.Levels.Where(lv => lv <= Load.Level && baseTemp + rise * Rise[lv] <= Ceiling).DefaultIfEmpty(1).Max();
-            foreach (int m in members) Levels[m] = level;
+            if (levels[first] != 0) return;
+            double[] gain = Kernels.Rise;
+            SetLevel(block, LoadManager.Levels.Where(lv => lv <= Load.Level && baseTemp + rise * gain[lv] <= Ceiling).DefaultIfEmpty(1).Max());
         }
 
         /// Нагружает один блок. false — измерение остановлено.
@@ -158,20 +160,21 @@ namespace CoreMap
             int first = block.First;
             Current = block;
             Probe(p, block, block.Temp(baseTemps), baseWatts);
-            if (Levels[first] == 0)
-                foreach (int m in members) Levels[m] = 1;
+            if (levels[first] == 0) SetLevel(block, 1);
             Restart(block);
             double end = Native.Now() + Seconds;
             int hotSamples = 0;
             while (Native.Now() < end && !Wait(0.5))
             {
-                foreach (int m in members)
-                    if (monitor.Throttled[m]) Throttled[m] = true;
+                bool[] hit = monitor.Throttled;
+                lock (gate)
+                    foreach (int m in members)
+                        if (hit[m]) throttled[m] = true;
                 // Расчёт ошибся и блок всё же слишком горячий: ступень вниз и отсчёт времени заново.
                 hotSamples = block.Temp(monitor.Cur) >= StepDown ? hotSamples + 1 : 0;
-                if (hotSamples >= 2 && Levels[first] > 1)
+                if (hotSamples >= 2 && levels[first] > 1)
                 {
-                    foreach (int m in members) Levels[m]--;
+                    SetLevel(block, levels[first] - 1);
                     Restart(block);
                     end = Native.Now() + Seconds;
                     hotSamples = 0;
@@ -250,6 +253,17 @@ namespace CoreMap
             }
         }
 
+        /// Копии для окна: сила нагрузки, подобранная каждому ядру (0 — ещё не подобрана), и какие ядра
+        /// под нагрузкой упёрлись в порог.
+        public void Marks(out int[] levels, out bool[] throttled)
+        {
+            lock (gate)
+            {
+                levels = (int[])this.levels.Clone();
+                throttled = (bool[])this.throttled.Clone();
+            }
+        }
+
         /// Среднее по проходам для пробы каждого ядра: 0 — нагрев, 1 — прирост мощности, 2 — скорость.
         public double[] Own(int what)
         {
@@ -268,7 +282,7 @@ namespace CoreMap
             {
                 { "lps", lps }, { "blocks", blocks.Select(b => (object)b.Members.Select(i => lps[i]).ToArray()).ToArray() },
                 { "order", order.Select(b => b.Lp).ToArray() }, { "load_seconds", Seconds },
-                { "levels", Levels }, { "throttled", Enumerable.Range(0, n).Where(i => Throttled[i]).Select(i => lps[i]).ToArray() },
+                { "levels", levels }, { "throttled", Enumerable.Range(0, n).Where(i => throttled[i]).Select(i => lps[i]).ToArray() },
                 { "passes", rows(passes) }, { "probes", rows(probes) },
             });
         }
@@ -279,24 +293,28 @@ namespace CoreMap
             if (!Json.Ints(saved["lps"]).SequenceEqual(lps)) return;
             var readPasses = new List<double[][]>();
             var readProbes = new List<double[][]>();
+            int[] readLevels;
+            var readThrottled = new bool[n];
             if (saved.ContainsKey("passes"))
             {
                 foreach (object p in (System.Collections.IEnumerable)saved["passes"]) readPasses.Add(Json.Rows(p).ToArray());
                 foreach (object p in (System.Collections.IEnumerable)saved["probes"]) readProbes.Add(Json.Rows(p).ToArray());
-                Levels = Json.Ints(saved["levels"]);
-                int[] throttled = Json.Ints(saved["throttled"]);
-                Throttled = lps.Select(lp => throttled.Contains(lp)).ToArray();
+                readLevels = Json.Ints(saved["levels"]);
+                int[] hit = Json.Ints(saved["throttled"]);
+                readThrottled = lps.Select(lp => hit.Contains(lp)).ToArray();
             }
             else
             {
                 // Первый вариант измерения: один проход, все ядра на полной силе, пробы не было.
                 readPasses.Add(Json.Rows(saved["matrix"]).ToArray());
-                Levels = Enumerable.Repeat(3, n).ToArray();
+                readLevels = Enumerable.Repeat(3, n).ToArray();
             }
             lock (gate)
             {
                 passes = readPasses;
                 probes = readProbes;
+                levels = readLevels;
+                throttled = readThrottled;
             }
             PassCount = readPasses.Count;
             Done = readPasses.Sum(p => blocks.Count(b => p[b.First] != null));

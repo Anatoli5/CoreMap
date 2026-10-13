@@ -146,11 +146,32 @@ namespace CoreMap
             new Kernel { Name = "sponge", Chunk = Sponge, Units = 25 * Rounds / 1e6, Unit = "млн оп./с" },
         };
 
-        // Сила 1, 2, 3 — какие виды вычислений им соответствуют. Здесь значения до подбора;
-        // подбор нагрузки (Calibration) ставит выбранные по замеру.
-        public static readonly int[] ByLevel = { 0, 0, 2, 3 };
+        /// Что значат ступени силы 1, 2, 3: какой вид вычислений каждой соответствует и во сколько раз нагрев
+        /// под ней больше, чем под силой 1. Набор после публикации не меняется.
+        class LevelSet
+        {
+            public int[] Kernel;
+            public double[] Rise;
+        }
 
-        public static Kernel ForLevel(int level) { return All[ByLevel[level]]; }
+        // Здесь значения до подбора; подбор нагрузки (Calibration) в своём потоке ставит выбранные по замеру —
+        // новым набором целиком, чтобы ступени из старого и нового набора вперемешку никто не увидел.
+        static volatile LevelSet levels = new LevelSet { Kernel = new[] { 0, 0, 2, 3 }, Rise = new[] { 0, 1.0, 1.5, 1.9 } };
+
+        public static Kernel ForLevel(int level) { return All[levels.Kernel[level]]; }
+
+        /// Во сколько раз нагрев под силой 1, 2, 3 больше, чем под силой 1; по номеру ступени. Массив не менять.
+        public static double[] Rise { get { return levels.Rise; } }
+
+        /// Ставит ступени по замеру: kernels — виды вычислений (номера в All) для силы 1, 2, 3, heat — нагрев на них.
+        public static void Assign(int[] kernels, double[] heat)
+        {
+            levels = new LevelSet
+            {
+                Kernel = new[] { kernels[0], kernels[0], kernels[1], kernels[2] },
+                Rise = new[] { 0, 1.0, heat[1] / heat[0], heat[2] / heat[0] },
+            };
+        }
     }
 
     class LoadManager

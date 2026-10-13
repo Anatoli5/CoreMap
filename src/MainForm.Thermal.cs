@@ -25,9 +25,12 @@ namespace CoreMap
 
         int seconds = 20, passes = 2, unit;  // unit: 0 — проценты, 1 — градусы
         int drawnSweep = -1, drawnLatency = -1;  // по какой версии результата нарисованы таблицы
+        // Копии результатов на момент последней перерисовки таблиц: измерение пишет своё в другом потоке, а
+        // подсказки по ячейкам должны показывать те же числа, что и таблица.
         double[][] sweepShown;  // нагрев по ядрам в выбранных единицах (% или °C): [нагруженное][нагревшееся]
         double[][] sweepMean;   // то же в °C, как измерено
         int[] sweepLevels;      // сила нагрузки, подобранная каждому ядру в этом измерении
+        double[][] latencyMean, latencyLow, latencyHigh;  // задержки по парам ядер: средняя, лучшая и худшая строка кэша
 
         Control SweepPanel(int cell)
         {
@@ -172,7 +175,7 @@ namespace CoreMap
 
             sweepBar.Set(sw.Running && sw.Total > 0 ? (double)sw.Done / sw.Total : 0);
             sweepStatus.Text = SweepStatus();
-            sweepStatus.ForeColor = sw.Running ? Theme.Text : Theme.Dim;
+            sweepStatus.ForeColor = sw.Running ? Theme.Text : sw.Error != null ? Theme.Bad : Theme.Dim;
             latencyBar.Set(lat.Running ? (double)lat.Done / lat.Total : 0);
             latencyStatus.Text = LatencyStatus();
             latencyStatus.ForeColor = lat.Running ? Theme.Text : lat.Error != null ? Theme.Bad : Theme.Dim;
@@ -194,6 +197,7 @@ namespace CoreMap
                     text += " · осталось около " + Math.Max(1, Math.Round(sw.Elapsed / sw.Done * (sw.Total - sw.Done) / 60)) + " мин";
                 return text;
             }
+            if (sw.Error != null) return Capital(sw.Error) + " · " + sw.Finished + " · готово " + sw.Done + " из " + sw.Total;
             if (sw.Finished != null)
                 return "Измерение " + (sw.Done >= sw.Total ? "закончено " : "остановлено ") + sw.Finished + " · готово " + sw.Done + " из " + sw.Total;
             return "Измерений ещё не было — нажми ▶";
@@ -215,8 +219,8 @@ namespace CoreMap
             ThermalSweep sw = core.Sweep;
             double[][] mean, spread;
             sw.Combined(out mean, out spread);
-            sweepLevels = sw.Levels;
-            bool[] throttled = sw.Throttled;
+            bool[] throttled;
+            sw.Marks(out sweepLevels, out throttled);
             sweepMean = mean;
             sweepShown = ShownRows(mean);
             DrawCoupling(sweepShown, mean, spread, throttled);
@@ -318,7 +322,8 @@ namespace CoreMap
         void DrawLatency()
         {
             // Под диагональю: средняя задержка между ядрами двух блоков.
-            double[][] m = core.Latency.Matrix;
+            core.Latency.Taken(out latencyMean, out latencyLow, out latencyHigh);
+            double[][] m = latencyMean;
             int count = blocks.Length;
             var pair = new double[count, count];
             double lo = double.MaxValue, hi = 0;
@@ -373,7 +378,7 @@ namespace CoreMap
                                 (sweepLevels[a] > 0 ? ", сила " + LevelName[sweepLevels[a]] : "");
                 if (lower && blocks[r].Members.Length > 1)
                 {
-                    double[] inside = blocks[r].Members.SelectMany(a => blocks[r].Members.Where(b => b != a).Select(b => core.Latency.Matrix[a][b]))
+                    double[] inside = blocks[r].Members.SelectMany(a => blocks[r].Members.Where(b => b != a).Select(b => latencyMean[a][b]))
                         .Where(v => !double.IsNaN(v)).ToArray();
                     if (inside.Length > 0) text += "\n• задержка между ядрами блока: " + inside.Average().ToString("0.0") + " нс";
                 }
@@ -392,11 +397,10 @@ namespace CoreMap
                 return "Тепловая связь: " + blocks[r].Title + " и " + blocks[c].Title + "\nВ ячейке — наибольшее из значений ниже" +
                     (unit == 0 ? "; проценты — от собственного нагрева нагруженного ядра." : ".") + "\n" + string.Join("\n", lines);
             }
-            LatencyTest lat = core.Latency;
-            double[] mean = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Matrix[a][b])).Where(v => !double.IsNaN(v)).ToArray();
+            double[] mean = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => latencyMean[a][b])).Where(v => !double.IsNaN(v)).ToArray();
             if (mean.Length == 0) return null;
-            double lo = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Lowest[a][b])).Where(v => !double.IsNaN(v)).Min();
-            double hi = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => lat.Highest[a][b])).Where(v => !double.IsNaN(v)).Max();
+            double lo = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => latencyLow[a][b])).Where(v => !double.IsNaN(v)).Min();
+            double hi = blocks[r].Members.SelectMany(a => blocks[c].Members.Select(b => latencyHigh[a][b])).Where(v => !double.IsNaN(v)).Max();
             return "Задержка: " + blocks[r].Title + " и " + blocks[c].Title + "\n• в среднем " + mean.Average().ToString("0.0") + " нс" +
                 "\n• от " + lo.ToString("0.0") + " до " + hi.ToString("0.0") + " нс для разных пар ядер и участков памяти";
         }

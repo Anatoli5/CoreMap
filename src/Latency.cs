@@ -31,7 +31,9 @@ namespace CoreMap
         readonly bool dry;        // имитация: ядра не нагружаются, числа ненастоящие
         readonly string saveDir;  // null — результат не сохранять (имитация)
 
-        public double[][] Matrix, Lowest, Highest;  // среднее, лучшая и худшая строка; NaN — не измерено
+        // Результат пишет поток измерения, читает окно: записи идут под замком, окну отдаются копии (Taken).
+        readonly object gate = new object();
+        double[][] matrix, lowest, highest;  // среднее, лучшая и худшая строка; NaN — не измерено
         public int Done;
 
         public int Total { get { return n * (n - 1) / 2; } }
@@ -51,9 +53,23 @@ namespace CoreMap
         void Clear()
         {
             Func<double[][]> empty = () => Enumerable.Range(0, n).Select(i => Enumerable.Repeat(double.NaN, n).ToArray()).ToArray();
-            Matrix = empty();
-            Lowest = empty();
-            Highest = empty();
+            lock (gate)
+            {
+                matrix = empty();
+                lowest = empty();
+                highest = empty();
+            }
+        }
+
+        /// Копии результата для окна: средняя задержка пары ядер, лучшая и худшая строка кэша; NaN — не измерено.
+        public void Taken(out double[][] mean, out double[][] low, out double[][] high)
+        {
+            lock (gate)
+            {
+                mean = matrix.Select(row => (double[])row.Clone()).ToArray();
+                low = lowest.Select(row => (double[])row.Clone()).ToArray();
+                high = highest.Select(row => (double[])row.Clone()).ToArray();
+            }
         }
 
         public void Start() { Launch(Run); }
@@ -80,9 +96,12 @@ namespace CoreMap
                             lo = Math.Min(lo, ns);
                             hi = Math.Max(hi, ns);
                         }
-                        Matrix[a][b] = Matrix[b][a] = Math.Round(sum / LineCount, 1);
-                        Lowest[a][b] = Lowest[b][a] = Math.Round(lo, 1);
-                        Highest[a][b] = Highest[b][a] = Math.Round(hi, 1);
+                        lock (gate)
+                        {
+                            matrix[a][b] = matrix[b][a] = Math.Round(sum / LineCount, 1);
+                            lowest[a][b] = lowest[b][a] = Math.Round(lo, 1);
+                            highest[a][b] = highest[b][a] = Math.Round(hi, 1);
+                        }
                         Done++;
                         Version++;
                         if (dry) Wait(0.02);  // чтобы в окне был виден ход измерения
@@ -138,7 +157,7 @@ namespace CoreMap
                 lo.Select((row, i) => (object)row.Select((v, j) => double.IsNaN(v) ? null : (object)new[] { v, hi[i][j] }).ToArray()).ToArray();
             Json.WriteFile(Path.Combine(saveDir, DateTime.Now.ToString("'latency-'yyyyMMdd-HHmmss'.json'")), new Dictionary<string, object>
             {
-                { "lps", lps }, { "lines", LineCount }, { "matrix", Matrix }, { "spans", spans(Lowest, Highest) },
+                { "lps", lps }, { "lines", LineCount }, { "matrix", matrix }, { "spans", spans(lowest, highest) },
             });
         }
 
@@ -147,7 +166,9 @@ namespace CoreMap
             Dictionary<string, object> saved = Json.ReadFile(path);
             // Файлы без "lines" — первый вариант замера на одной строке кэша; он вводил в заблуждение.
             if (!Json.Ints(saved["lps"]).SequenceEqual(lps) || !saved.ContainsKey("lines")) return;
-            Matrix = Json.Rows(saved["matrix"]).ToArray();
+            double[][] readMatrix = Json.Rows(saved["matrix"]).ToArray();
+            double[][] low = readMatrix.Select(row => Enumerable.Repeat(double.NaN, n).ToArray()).ToArray();
+            double[][] high = readMatrix.Select(row => Enumerable.Repeat(double.NaN, n).ToArray()).ToArray();
             int i = 0;
             foreach (System.Collections.IEnumerable row in (System.Collections.IEnumerable)saved["spans"])
             {
@@ -155,11 +176,17 @@ namespace CoreMap
                 foreach (object span in row)
                 {
                     double[] pair = Json.Row(span);
-                    Lowest[i][j] = pair == null ? double.NaN : pair[0];
-                    Highest[i][j] = pair == null ? double.NaN : pair[1];
+                    low[i][j] = pair == null ? double.NaN : pair[0];
+                    high[i][j] = pair == null ? double.NaN : pair[1];
                     j++;
                 }
                 i++;
+            }
+            lock (gate)
+            {
+                matrix = readMatrix;
+                lowest = low;
+                highest = high;
             }
             Done = Total;
             Finished = File.GetLastWriteTime(path).ToString("dd.MM HH:mm");

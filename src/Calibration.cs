@@ -26,8 +26,8 @@ namespace CoreMap
 
         public int Done;
         public string Current;
-        public bool Fitted;                          // ступени силы выбраны замером на этом процессоре
-        public readonly double[] Heat = new double[4];  // нагрев ядра на ступенях 1–3, °C
+        public volatile bool Fitted;                     // ступени силы выбраны замером на этом процессоре
+        public volatile double[] Heat = new double[4];   // нагрев ядра на ступенях 1–3, °C; меняется целиком
 
         public int Total { get { return Kernels.All.Length * targets.Length; } }
 
@@ -117,13 +117,8 @@ namespace CoreMap
 
         void Set(int[] kernels, double[] heat)
         {
-            for (int level = 1; level <= 3; level++)
-            {
-                Kernels.ByLevel[level] = kernels[level - 1];
-                ThermalSweep.Rise[level] = heat[level - 1] / heat[0];
-                Heat[level] = heat[level - 1];
-            }
-            Kernels.ByLevel[0] = kernels[0];
+            Kernels.Assign(kernels, heat);
+            Heat = new[] { 0, heat[0], heat[1], heat[2] };
             Fitted = true;
         }
 
