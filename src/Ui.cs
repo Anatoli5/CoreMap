@@ -556,6 +556,7 @@ namespace CoreMap
 
         CurveRun[] front = new CurveRun[0];  // кривые выделенного блока
         CurveRun[] back = new CurveRun[0];   // кривые остальных блоков на текущей силе нагрузки
+        CurveRun[] scale = new CurveRun[0];  // кривые, по которым строятся оси: все снятые, какая бы ни была выделена
         BlockMap blocks;                     // чья кривая: блок находится по CurveRun.Lp
         CurveChoice[] picks = new CurveChoice[0];  // потолок, стоящий у каждого блока, и его точка на кривой; null — неизвестен
         double cutoff = double.NaN;
@@ -580,11 +581,15 @@ namespace CoreMap
             Invalidate();
         }
 
-        public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty)
+        /// scale — кривые, по которым строятся оси. Они не должны зависеть от того, какой блок выделен: иначе
+        /// наведение на точку меняет масштаб, точка уезжает из-под курсора, выделение снимается, масштаб
+        /// возвращается — и график дёргается под неподвижным курсором.
+        public void Show(CurveRun[] front, CurveRun[] back, CurveRun[] scale, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty)
         {
             this.byPeak = byPeak;
             this.front = front;
             this.back = back;
+            this.scale = scale;
             this.blocks = blocks;
             this.cutoff = cutoff;
             this.picks = picks;
@@ -592,7 +597,13 @@ namespace CoreMap
             Invalidate();
         }
 
-        static bool Near(Point a, Point b) { return Math.Abs(a.X - b.X) <= Theme.Px(7) && Math.Abs(a.Y - b.Y) <= Theme.Px(7); }
+        public static bool Near(Point a, Point b) { return Math.Abs(a.X - b.X) <= Theme.Px(7) && Math.Abs(a.Y - b.Y) <= Theme.Px(7); }
+
+        // Для проверки наведения без мыши (MainForm.HoverCheck): точки графика с их блоками, движение курсора
+        // в точку и текст подсказки в ней.
+        public KeyValuePair<Point, Block>[] Hotspots() { return owners.ToArray(); }
+        public void MouseAt(Point at) { OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, at.X, at.Y, 0)); }
+        public string TipText(Point at) { return TipAt(at); }
 
         protected override string TipAt(Point at)
         {
@@ -644,9 +655,13 @@ namespace CoreMap
                                       TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
                 return;
             }
-            int x0 = (int)Math.Floor(all.Min(p => p.Actual)), x1 = Math.Max((int)Math.Ceiling(all.Max(p => p.Actual)), x0 + 1);
-            double high = Math.Max(all.Max(p => heat(p)), ahead.Length > 0 ? ahead.Max(p => Math.Max(p.Temp, p.Peak)) : 0);
-            double y0 = Math.Floor(all.Min(p => p.Temp) / 5) * 5 - 5, y1 = Math.Ceiling(high / 5) * 5 + 5;
+            // Оси — по всем снятым кривым и по обеим температурам точки: у любой выделенной кривой помещаются и
+            // толстая линия, и тонкая, а масштаб от выделения не зависит.
+            CurvePoint[] span = all.Concat(scale.SelectMany(r => r.Points.ToArray())).Where(p => !double.IsNaN(p.Temp)).ToArray();
+            if (span.Length == 0) span = all;
+            int x0 = (int)Math.Floor(span.Min(p => p.Actual)), x1 = Math.Max((int)Math.Ceiling(span.Max(p => p.Actual)), x0 + 1);
+            double high = span.Max(p => double.IsNaN(p.Peak) ? p.Temp : Math.Max(p.Temp, p.Peak));
+            double y0 = Math.Floor(span.Min(p => p.Temp) / 5) * 5 - 5, y1 = Math.Ceiling(high / 5) * 5 + 5;
             var plot = Rectangle.FromLTRB(Theme.Px(26), Theme.Px(16), Width - Theme.Px(10), Height - Theme.Px(18));
             Func<double, int> px = v => plot.Left + (int)Math.Round((v - x0) / (x1 - x0) * plot.Width);
             Func<double, int> py = v => plot.Bottom - (int)Math.Round((v - y0) / (y1 - y0) * plot.Height);
@@ -666,6 +681,27 @@ namespace CoreMap
                                           TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding);
             }
 
+            // Числа точки для подсказки. Они есть у точек всех кривых, а не только выделенной: подсказка появляется
+            // сразу и не меняется оттого, что кривая под курсором вышла вперёд.
+            Func<CurveRun, CurvePoint, Block, string> describe = (run, p, owner) =>
+            {
+                bool fell = !double.IsNaN(p.Ratio) && Math.Abs(p.Ratio - p.Limit) > CurveStore.Reached;
+                return (owner == null ? "" : char.ToUpper(owner.Title[0]) + owner.Title.Substring(1) + " · ") +
+                    (double.IsNaN(p.Ratio) ? "потолок ×" + p.Limit : "множитель " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
+                        (fell ? " — до потолка не дошло" : "")) + "\n" +
+                    "Сила нагрузки " + Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
+                    "\n• средняя под нагрузкой: " + p.Temp.ToString("0.0") + " °C" +
+                    (double.IsNaN(p.TempDown) ? "" : " (на подъёме " + p.TempUp.ToString("0.0") + ", на спуске " + p.TempDown.ToString("0.0") + ")") +
+                    "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
+                    "\n• без нагрузки перед замером: " + p.Base.ToString("0.0") + " °C" +
+                    "\n• прибавка мощности: " + p.Watts.ToString("0.0") + " Вт" +
+                    "\n• снято " + run.Time;
+            };
+            // Точки остальных кривых идут в списки после точек выделенной: где они накладываются, курсор
+            // относится к выделенной, и выделение не перескакивает на соседа.
+            var backSpots = new List<KeyValuePair<Point, string>>();
+            var backOwners = new List<KeyValuePair<Point, Block>>();
+
             // Остальные блоки — приглушёнными линиями без точек.
             foreach (CurveRun run in back)
             {
@@ -675,7 +711,12 @@ namespace CoreMap
                 using (var pen = new Pen(Color.FromArgb(120, Theme.KindText(owner.Kind)), Theme.Px(1.5)))
                     for (int k = 1; k < points.Length; k++)
                         g.DrawLine(pen, px(points[k - 1].Actual), py(heat(points[k - 1])), px(points[k].Actual), py(heat(points[k])));
-                foreach (CurvePoint p in points) owners.Add(new KeyValuePair<Point, Block>(new Point(px(p.Actual), py(heat(p))), owner));
+                foreach (CurvePoint p in points)
+                {
+                    var at = new Point(px(p.Actual), py(heat(p)));
+                    backOwners.Add(new KeyValuePair<Point, Block>(at, owner));
+                    backSpots.Add(new KeyValuePair<Point, string>(at, describe(run, p, owner)));
+                }
             }
 
             // Отсечка — температура с ползунка.
@@ -718,19 +759,12 @@ namespace CoreMap
                         g.FillEllipse(off ? hollow : fill, at.X - r, at.Y - r, 2 * r, 2 * r);
                         g.DrawEllipse(thick, at.X - r, at.Y - r, 2 * r, 2 * r);
                         if (owner != null) owners.Add(new KeyValuePair<Point, Block>(at, owner));
-                        spots.Add(new KeyValuePair<Point, string>(at,
-                            (double.IsNaN(p.Ratio) ? "" : "Работало на множителе " + p.Ratio.ToString("0.0") + " при потолке ×" + p.Limit +
-                                (off ? " — до потолка не дошло" : "") + "\n") +
-                            "Сила нагрузки " + Theme.LevelGlyph[Math.Max(0, Math.Min(3, run.Level))] +
-                            "\n• средняя под нагрузкой: " + p.Temp.ToString("0.0") + " °C" +
-                            (double.IsNaN(p.TempDown) ? "" : " (на подъёме " + p.TempUp.ToString("0.0") + ", на спуске " + p.TempDown.ToString("0.0") + ")") +
-                            "\n• наибольшая: " + p.Peak.ToString("0") + " °C" +
-                            "\n• без нагрузки перед замером: " + p.Base.ToString("0.0") + " °C" +
-                            "\n• прибавка мощности: " + p.Watts.ToString("0.0") + " Вт" +
-                            "\n• снято " + run.Time));
+                        spots.Add(new KeyValuePair<Point, string>(at, describe(run, p, owner)));
                     }
                 }
             }
+            owners.AddRange(backOwners);
+            spots.AddRange(backSpots);
 
             // Потолок, который стоит сейчас: кружок на той точке кривой блока, что снята при нём.
             using (var mark = new SolidBrush(Theme.Accent))

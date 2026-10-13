@@ -97,6 +97,12 @@ $procs += Start-Process -FilePath $out -ArgumentList "--simulate --snapshot $rep
 $tray = Join-Path $dir 'tray.txt'
 $procs += Start-Process -FilePath $out -ArgumentList "--simulate --tray --saved --snapshot $tray" -PassThru
 
+# Hover on the curve graph without a mouse (MainForm.HoverCheck): the cursor is put on every point twice, with a
+# repaint after each; the highlighted block must not change, the point must stay under the cursor and have a tooltip.
+# First line of the report: ok / FAILED.
+$hover = Join-Path $dir 'hover.txt'
+$procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover --snapshot $hover --size 1920x1040" -PassThru
+
 $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
@@ -118,6 +124,13 @@ elseif ((Get-Content $tray -TotalCount 1) -ne 'ok') {
     Select-String -Path $tray -Pattern '^FAILED' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
     $failed++
 }
+$hovered = Get-Item $hover -ErrorAction SilentlyContinue
+if (-not $hovered -or $hovered.LastWriteTime -lt $stamp) { Write-Host 'no hover report'; $failed++ }
+elseif ((Get-Content $hover -TotalCount 1) -ne 'ok') {
+    Write-Host "hover check failed, see $hover"
+    Get-Content $hover -Encoding UTF8 -TotalCount 6 | ForEach-Object { Write-Host $_ }
+    $failed++
+}
 if ($failed -gt 0) { exit 2 }
-Write-Host "snapshots, self-test and resident check ok: $dir"
+Write-Host "snapshots, self-test, resident and hover checks ok: $dir"
 exit 0

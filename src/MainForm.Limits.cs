@@ -299,6 +299,42 @@ namespace CoreMap
             ShowCurves();
         }
 
+        /// Проверка наведения на график кривых без мыши и без экрана. Курсор «ставится» на каждую точку графика
+        /// дважды, с перерисовкой после каждого раза. Точка годится, если под курсором оба раза оказался один и тот же
+        /// блок, его точка после перерисовки осталась под курсором и у неё есть подсказка. Иначе график от наведения
+        /// сдвигается сам под собой: выделение скачет, подсказка появляется и пропадает.
+        /// Первая строка отчёта — ok или FAILED.
+        public string HoverCheck()
+        {
+            var bad = new List<string>();
+            Action paint = () =>
+            {
+                using (var picture = new Bitmap(Math.Max(1, curveView.Width), Math.Max(1, curveView.Height)))
+                    curveView.DrawToBitmap(picture, new Rectangle(Point.Empty, curveView.Size));
+            };
+            paint();
+            KeyValuePair<Point, Block>[] spots = curveView.Hotspots();
+            if (spots.Length == 0) bad.Add("на графике нет точек: проверять нечего");
+            foreach (KeyValuePair<Point, Block> spot in spots)
+            {
+                Point at = spot.Key;
+                curveView.MouseAt(at);
+                paint();
+                Block first = hovered;
+                curveView.MouseAt(at);
+                paint();
+                Block second = hovered;
+                string where = "точка " + at.X + "," + at.Y + " блока " + spot.Value.Name + ": ";
+                if (first == null) bad.Add(where + "наведение не выделило ни один блок");
+                else if (second != first) bad.Add(where + "выделение сменилось с " + first.Name + " на " + (second == null ? "ничего" : second.Name));
+                else if (!curveView.Hotspots().Any(o => o.Value == first && CurveView.Near(o.Key, at))) bad.Add(where + "после перерисовки точка блока " + first.Name + " ушла из-под курсора");
+                else if (curveView.TipText(at) == null) bad.Add(where + "нет подсказки");
+            }
+            curveView.MouseAt(new Point(-100, -100));
+            return (bad.Count == 0 ? "ok" : "FAILED") + "\r\nточек на графике: " + spots.Length + ", с дефектом: " + bad.Count +
+                (bad.Count == 0 ? "" : "\r\n" + string.Join("\r\n", bad)) + "\r\n";
+        }
+
         /// Ход измерения по блокам: полоса с делениями по блокам в ряду кнопок, строка на графике («блок 3 из 12 ·
         /// шаг 5 из 16 · осталось ≈ 6 мин») и зелёные точки у пройденных блоков в списке. Какой блок меряется, видно
         /// по заголовку раздела и по самой кривой: график идёт за ним.
@@ -373,7 +409,9 @@ namespace CoreMap
             // График и список показывают то, что стоит в процессоре; выбор ползунка в них попадает, когда ползунок
             // его поставил. От положения ползунка, пока он ничего не ставил, зависят только отсечка и средний множитель.
             CurveChoice[] standing = core.Fit.Standing(level, picks);
-            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(),
+            // Оси графика — по всем кривым всех блоков: от выделенного блока они не зависят.
+            CurveRun[] everything = blocks.SelectMany(b => curve.For(b)).Concat(curve.All(level)).ToArray();
+            curveView.Show(curve.For(shown), curve.All(level).Where(r => r.Lp != shown.Lp).ToArray(), everything,
                            core.Blocks, target, standing, curve.ByPeak, "Кривых ещё нет — нажми ▶▶, чтобы снять все");
             blockList.Show(standing, selected.Index, shown.Index, JointTemps(), Delta());
             ShowMean(level, target, picks);
