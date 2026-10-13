@@ -323,8 +323,10 @@ namespace CoreMap
             calibrationStatus.ForeColor = cal.Running ? Theme.Text : cal.Error != null ? Theme.Bad : cal.Fitted ? Theme.Dim : Theme.Accent;
         }
 
-        /// Заголовок окна: какое измерение идёт.
-        string Title()
+        /// Заголовок окна: какое измерение идёт и какая это сборка — по заголовку видно, с какой версией имеешь дело.
+        string Title() { return Doing() + " · сборка " + Program.Build; }
+
+        string Doing()
         {
             ThermalSweep sw = core.Sweep;
             LatencyTest lat = core.Latency;

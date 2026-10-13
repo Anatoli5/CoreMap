@@ -17,7 +17,7 @@
 // CoreMap.exe --slide N     вместе с --simulate --saved --snapshot: вместо измерения поставить ползунок потолков на N °C
 // CoreMap.exe --best        вместе с --slide: ползунок работает «по выгоде»
 // CoreMap.exe --joint       вместе с --simulate --snapshot: вместо измерения запустить проверку под общей нагрузкой
-// CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх базы
+// CoreMap.exe --profile     вместе с --simulate --snapshot: вместо измерения сохранить два профиля и открыть первый поверх второго
 // CoreMap.exe --size WxH    вместе с --snapshot: размер окна в пикселях, например 1280x800
 // CoreMap.exe --selftest    вместе с --simulate --snapshot F: без окна проверить, что измерения на любом пути выхода
 //                           возвращают потолки, и остальное из SelfTest.cs; отчёт — текстом в файл F
@@ -36,6 +36,22 @@ namespace CoreMap
     static class Program
     {
         public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
+        public static readonly string Build = BuildStamp();  // когда собран этот exe: «13.10.26 05:15»; показан в заголовке окна
+
+        /// Время сборки из заголовка самого exe: его пишет компилятор, и от копирования файла оно не меняется.
+        static string BuildStamp()
+        {
+            try
+            {
+                byte[] head = new byte[4096];
+                using (FileStream file = File.OpenRead(System.Reflection.Assembly.GetExecutingAssembly().Location))
+                    file.Read(head, 0, head.Length);
+                int pe = BitConverter.ToInt32(head, 0x3C);
+                DateTime built = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(BitConverter.ToUInt32(head, pe + 8));
+                return built.ToLocalTime().ToString("dd.MM.yy HH:mm");
+            }
+            catch (Exception) { return "неизвестна"; }
+        }
         public static string DataDir = Path.Combine(Root, "data");  // проверка --selftest подставляет временную папку
 
         public static void Log(string text)

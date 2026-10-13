@@ -20,12 +20,16 @@ namespace CoreMap
         bool built, fitting;      // окно собрано; идёт подгонка
         bool sizing;              // владелец тянет границу окна: подгонка откладывается до конца
         Size sizedFrom;           // размер клиентской области в начале перетаскивания
+        Size fittedFor;           // размер окна, под который содержимое подогнано в последний раз
 
         protected override void OnClientSizeChanged(EventArgs e)
         {
             base.OnClientSizeChanged(e);
             // Пока тянут границу, подгонка не идёт: каждая перебирает несколько размеров ячейки с полной раскладкой окна.
-            if (!sizing) Fit();
+            // Заново она идёт, только когда изменился размер самого окна. Клиентская область меняется ещё и оттого,
+            // что надпись выросла на строку и появилась полоса прокрутки: подгонка по этому поводу переводила всё
+            // окно на другой размер ячеек — оно «прыгало» из-за одной строки текста.
+            if (!sizing && Size != fittedFor) Fit();
         }
 
         protected override void OnResizeBegin(EventArgs e)
@@ -92,6 +96,7 @@ namespace CoreMap
         {
             if (!built || fitting || WindowState == FormWindowState.Minimized) return;
             fitting = true;
+            fittedFor = Size;
             try
             {
                 // Появление полос прокрутки само меняет место в окне, поэтому подбор повторяется.

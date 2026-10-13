@@ -78,12 +78,12 @@ namespace CoreMap
             var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, Font = Theme.Font(13) };
             menu.Items.Add(new ToolStripLabel("Потолок множителя: " + (block.Kind == 'E' ? "кластер ядра " : "ядро ") + block.Lp));
             menu.Items.Add(new ToolStripSeparator());
-            int[] baseline = core.BaseLimits;
+            int[] baseline = core.Was;
             foreach (int ratio in limits.Choices(i))
             {
                 int value = ratio;
                 string text = "×" + value + (value == limits.Fused[i] ? "  заводской предел" : value > limits.Fused[i] ? "  выше заводского" : "") +
-                    (value == baseline[i] && value != limits.Fused[i] ? "  база" : "");
+                    (value == baseline[i] && value != limits.Fused[i] ? "  было" : "");
                 var item = new ToolStripMenuItem(text) { Checked = value == limits.Current[i], Enabled = !core.Busy };
                 item.Click += (s, e) =>
                 {
@@ -121,7 +121,7 @@ namespace CoreMap
                     (double.IsNaN(loadRatio) ? "" : ", в среднем под нагрузкой — " + loadRatio.ToString("0.0"));
             if (core.Limits != null && core.Limits.Known(i))
                 text += "\n• потолок множителя: ×" + core.Limits.Current[i] + ", заводской предел ×" + core.Limits.Fused[i] +
-                    (core.Limits.Current[i] == core.BaseLimits[i] ? "" : "\n• в базе ×" + core.BaseLimits[i] + ": число после потолка на плитке — разница с базой") +
+                    (core.Limits.Current[i] == core.Was[i] ? "" : "\n• было ×" + core.Was[i] + ": число после потолка на плитке — разница с тем, что было") +
                     "\n• правая кнопка — изменить потолок" + (block.Kind == 'E' ? " (общий для кластера)" : "") +
                     "\n• потолок выше заводского показан красным; частоту ограничивает ещё таблица «по числу работающих ядер»";
             if (core.Busy) text += "\n• идёт измерение: ручная нагрузка недоступна";

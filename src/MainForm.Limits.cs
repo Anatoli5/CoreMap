@@ -299,7 +299,7 @@ namespace CoreMap
             Block shown = hovered ?? selected;  // блок, чья кривая поверх остальных
             curveTitle.Text = "Кривая · " + shown.Title;
             string key = curve.Version + "/" + shown.Index + "/" + selected.Index + "/" + fitSlider.Value + "/" + core.Load.Level + "/" + fitBest + "/" + curve.ByPeak +
-                "/" + string.Join(",", core.Limits.Current) + "/" + string.Join(",", core.BaseLimits);
+                "/" + string.Join(",", core.Limits.Current) + "/" + string.Join(",", core.Was);
             if (drawnKey == key) return;
             drawnKey = key;
             DrawCurves(shown);
@@ -361,7 +361,7 @@ namespace CoreMap
         }
 
         /// Приписка к итогу ползунка: как вернуть потолки, которые стояли до него.
-        const string BackHint = " Отменить — кнопка «вернуть базу».";
+        const string BackHint = " Отменить — кнопка «откатить».";
 
         /// Температура каждого блока в последнем замере под общей нагрузкой; NaN — замера нет или потолки с тех пор менялись.
         double[] JointTemps()
