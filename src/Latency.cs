@@ -23,6 +23,7 @@ namespace CoreMap
         const int Iterations = 3000;   // передач туда-обратно в одном замере
         const int SampleCount = 2;     // замеров на строку, берётся лучший
         const long Ping = 1, Pong = 2, Quit = 3;
+        const string Unpinned = "поток замера не удалось привязать к процессору ";
         const int WordsPerLine = 8, TotalLines = 8192;  // массив 512 КБ
         static readonly long[] memory = new long[TotalLines * WordsPerLine];
 
@@ -85,7 +86,8 @@ namespace CoreMap
                 for (int a = 0; a < n && !Stopped; a++)
                     for (int b = a + 1; b < n && !Stopped; b++)
                     {
-                        if (!dry) Native.Pin(lps[a]);
+                        // Непривязанный поток мерил бы задержку между какими-то другими ядрами.
+                        if (!dry && !Native.Pin(lps[a])) throw new InvalidOperationException(Unpinned + lps[a]);
                         double sum = 0, lo = double.MaxValue, hi = 0;
                         for (int k = 0; k < LineCount; k++)
                         {
@@ -123,17 +125,24 @@ namespace CoreMap
         {
             memory[cell] = Pong;
             Thread responder;
+            bool pinned = false;
             // Событие нужно только до старта ответчика; на пару ядер таких замеров 48, поэтому оно освобождается сразу.
             using (var ready = new ManualResetEventSlim(false))
             {
                 responder = new Thread(() =>
                 {
-                    Native.Pin(lpB);
+                    pinned = Native.Pin(lpB);
                     ready.Set();
+                    if (!pinned) return;
                     while (Interlocked.CompareExchange(ref memory[cell], Pong, Ping) != Quit) { }
                 }) { IsBackground = true };
                 responder.Start();
                 ready.Wait();
+            }
+            if (!pinned)
+            {
+                responder.Join();
+                throw new InvalidOperationException(Unpinned + lpB);
             }
 
             // Разгон: ядра выходят из простоя и поднимают частоту.
