@@ -32,6 +32,9 @@ namespace CoreMap
         Label curveTitle, curveStatus;
         FlowLayoutPanel curveRow;
         Button curveButton, curveAllButton;
+        RunBar curveBar;         // ход измерения по блокам: лесенка, поиск замером, проверка под общей нагрузкой
+        Measurement timed;       // измерение, для которого идёт отсчёт времени
+        double timedSince;       // когда оно началось
         NumericUpDown curveTemp;  // предел, до которого греется блок при снятии кривой, °C
         CurveView curveView;
         BlockList blockList;
@@ -184,6 +187,8 @@ namespace CoreMap
             Label degrees = Widgets.Label("°C", Theme.Dim, 13);
             degrees.Margin = Padding.Empty;
             row.Controls.Add(degrees);
+            // Полоса хода стоит в ряду кнопок: своей строки у неё нет, чтобы окно не росло в высоту.
+            row.Controls.Add(curveBar = new RunBar(Theme.Px(BarMin)) { Margin = new Padding(Theme.Px(10), 0, 0, 0) });
             foreach (Control c in row.Controls) c.Anchor = AnchorStyles.Left;
             panel.Controls.Add(row);
             FlowLayoutPanel graph = Widgets.Row();
@@ -210,8 +215,15 @@ namespace CoreMap
             curveStatus.Margin = new Padding(0, Theme.Px(4), 0, 0);
         }
 
+        const int BarMin = 60;  // наименьшая ширина полосы хода: с ней считается ширина колонки
+
+        /// Перед расчётом ширины колонки полоса хода сжимается до наименьшей: иначе ряд кнопок, по которому
+        /// эта ширина считается, рос бы вместе с ней.
+        void ShrinkBar() { if (curveBar != null) curveBar.Width = Theme.Px(BarMin); }
+
         void SizeLimits(int side, int list, int cell)
         {
+            curveBar.Width = Math.Max(Theme.Px(BarMin), side - (curveRow.PreferredSize.Width - curveBar.Width));
             // Высота — чтобы двенадцать строк списка оставались читаемыми и при наименьшей ячейке.
             curveView.Size = new Size(side - list, Math.Max(cell * 8, Theme.Px(192)));
             blockList.Size = new Size(Theme.Px(170), curveView.Height);
@@ -272,15 +284,12 @@ namespace CoreMap
             wasJoint = joint.Running;
             fitMode.Show(fitBest ? 1 : 0, !busy);
             heatMode.Show(core.Curves.ByPeak ? 1 : 0, !busy);
-            curveStatus.Text = joint.Running ? "Идёт проверка под общей нагрузкой: нагружены все блоки разом."
-                : search.Running ? "Идёт подбор потолков по температуре — пройденные ступени добавляются на кривые."
-                : curve.Running
-                ? (curve.BlockTotal > 1 ? "Снимаю кривые · блок " + Math.Min(curve.BlockDone + 1, curve.BlockTotal) + " из " + curve.BlockTotal + " · шаг "
-                    : "Снимаю кривую · шаг ") + Math.Min(curve.Done + 1, curve.Total) + " из " + curve.Total +
-                    (curve.Current != null ? " · " + curve.Current : "")
-                : curve.Error ?? "";
+            ShowProgress(curve, search, joint);
+            // Строка под графиком — только для ошибки: ход измерения написан на самом графике и в полосе,
+            // а появлявшаяся на время прогона строка удлиняла окно.
+            curveStatus.Text = curve.Running || search.Running || joint.Running ? "" : curve.Error ?? "";
             curveStatus.Visible = curveStatus.Text != "";
-            curveStatus.ForeColor = curve.Running ? Theme.Text : curve.Error != null ? Theme.Bad : Theme.Dim;
+            curveStatus.ForeColor = Theme.Bad;
             fitStatus.Text = joint.Running
                 ? "Все блоки под нагрузкой · " + (joint.Current ?? "") + " · " + Math.Min(joint.Done, joint.Total) + " с из " + joint.Total
                 : search.Running
@@ -288,6 +297,56 @@ namespace CoreMap
                     (search.Current != null ? " · " + search.Current : "")
                 : fitReport ?? search.Report ?? "Ползунок ставит потолки по снятым кривым, кнопка — замером под нагрузкой.";
             ShowCurves();
+        }
+
+        /// Ход измерения по блокам: полоса с делениями по блокам в ряду кнопок, строка на графике («блок 3 из 12 ·
+        /// шаг 5 из 16 · осталось ≈ 6 мин») и зелёные точки у пройденных блоков в списке. Какой блок меряется, видно
+        /// по заголовку раздела и по самой кривой: график идёт за ним.
+        void ShowProgress(CurveTest curve, LimitSearch search, JointTest joint)
+        {
+            StepTest step = curve.Running ? (StepTest)curve : search.Running ? search : null;
+            Measurement running = step ?? (joint.Running ? joint : (Measurement)null);
+            if (running != timed)
+            {
+                timed = running;
+                timedSince = Native.Now();
+            }
+            if (running == null)
+            {
+                curveBar.Set(0);
+                curveView.Progress(null);
+                blockList.Mark(null);
+                return;
+            }
+            double fraction;
+            string where;
+            if (step != null)
+            {
+                int total = Math.Max(1, step.BlockTotal), done = Math.Min(step.BlockDone, total);
+                double inside = step.StepTotal > 0 ? Math.Min(1.0, (double)step.StepDone / step.StepTotal) : 0;
+                fraction = Math.Min(1.0, (done + (done < total ? inside : 0)) / total);
+                where = (total > 1 ? "блок " + Math.Min(done + 1, total) + " из " + total + " · " : "") +
+                    (step.StepTotal > 0 ? "шаг " + Math.Min(step.StepDone + 1, step.StepTotal) + " из " + step.StepTotal : step.Current ?? "");
+                Block[] order = step.Order ?? new Block[0];
+                blockList.Mark(blocks.Select(b => { int at = Array.IndexOf(order, b); return at >= 0 && at < done; }).ToArray());
+                curveBar.Set(fraction, total);
+            }
+            else
+            {
+                fraction = joint.Total > 0 ? Math.Min(1.0, (double)joint.Done / joint.Total) : 0;
+                where = "все блоки разом · " + Math.Min(joint.Done, joint.Total) + " с из " + joint.Total;
+                blockList.Mark(null);
+                curveBar.Set(fraction);
+            }
+            // Остаток — по тому, сколько времени ушло на пройденную долю. Пока пройдено мало, оценка скачет: не показывается.
+            double spent = Native.Now() - timedSince;
+            string left = fraction >= 0.05 && spent >= 10 ? " · осталось ≈ " + Remaining(spent * (1 - fraction) / fraction) : "";
+            curveView.Progress(where + left);
+        }
+
+        static string Remaining(double seconds)
+        {
+            return seconds < 90 ? Math.Max(5, (int)Math.Round(seconds / 5) * 5) + " с" : (int)Math.Round(seconds / 60) + " мин";
         }
 
         /// Обновляет заголовок и график кривых, если изменилось то, от чего они зависят. Наведение мыши на блок

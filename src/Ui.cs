@@ -559,6 +559,7 @@ namespace CoreMap
         BlockMap blocks;                     // чья кривая: блок находится по CurveRun.Lp
         CurveChoice[] picks = new CurveChoice[0];  // потолок, стоящий у каждого блока, и его точка на кривой; null — неизвестен
         double cutoff = double.NaN;
+        string progress;  // ход идущего измерения — строка в правом верхнем углу графика; null — не идёт
         bool byPeak;  // работа идёт по наибольшей температуре ступени: её линия толстая, средняя — тонкая
         string empty = "";
         readonly List<KeyValuePair<Point, string>> spots = new List<KeyValuePair<Point, string>>();
@@ -569,6 +570,15 @@ namespace CoreMap
         public string Help;          // описание графика: показывается в режиме вопроса, когда курсор не на точке
 
         protected override bool Data { get { return true; } }
+
+        /// Ход идущего измерения: где оно сейчас и сколько осталось. Пишется на самом графике — туда и смотрят,
+        /// пока идёт прогон, — и не занимает отдельной строки окна.
+        public void Progress(string text)
+        {
+            if (text == progress) return;
+            progress = text;
+            Invalidate();
+        }
 
         public void Show(CurveRun[] front, CurveRun[] back, BlockMap blocks, double cutoff, CurveChoice[] picks, bool byPeak, string empty)
         {
@@ -624,6 +634,10 @@ namespace CoreMap
             Func<CurvePoint, double> heat = p => byPeak ? p.Peak : p.Temp, other = p => byPeak ? p.Temp : p.Peak;
             CurvePoint[] ahead = front.SelectMany(r => r.Points.ToArray()).ToArray();
             CurvePoint[] all = ahead.Concat(back.SelectMany(r => r.Points.ToArray())).ToArray();
+            // Ход измерения — справа над графиком, в той же строке, что значки силы нагрузки слева.
+            if (progress != null)
+                TextRenderer.DrawText(g, progress, Theme.Font(11, true), new Rectangle(0, 0, Width - Theme.Px(4), Theme.Px(16)), Theme.Text,
+                                      TextFormatFlags.Right | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
             if (all.Length == 0)
             {
                 TextRenderer.DrawText(g, empty, Theme.Font(11), ClientRectangle, Theme.Dim,
@@ -744,6 +758,7 @@ namespace CoreMap
         CurveChoice[] picks;  // потолок, который стоит у блока сейчас, и что о нём говорит кривая; null — потолок неизвестен
         double[] joint;  // температура блока под общей нагрузкой; NaN — замера нет
         int[] delta;     // на сколько ступеней потолок блока отличается от того, что было
+        bool[] done;     // блок пройден идущим измерением; null — измерение по блокам не идёт
         int pinned = -1, under = -1, lit = -1;
 
         public Action<int> Hovered, Clicked;  // номер блока по порядку; -1 — курсор ушёл
@@ -768,6 +783,15 @@ namespace CoreMap
             Invalidate();
         }
 
+        /// Какие блоки идущее измерение уже прошло; null — измерение по блокам не идёт.
+        public void Mark(bool[] done)
+        {
+            bool same = done == null ? this.done == null : this.done != null && done.SequenceEqual(this.done);
+            if (same) return;
+            this.done = done;
+            Invalidate();
+        }
+
         int Row(Point at) { return at.Y < 0 || at.Y >= Height ? -1 : Math.Min(blocks.Length - 1, at.Y * blocks.Length / Math.Max(1, Height)); }
 
         protected override string TipAt(Point at)
@@ -778,7 +802,8 @@ namespace CoreMap
                 "• красная температура — ползунок поставил нижнюю точку кривой, а блок и на ней горячее цели\n" +
                 "• ▲ — ползунок взял верхнюю точку кривой: выше она не снята\n" +
                 "• после стрелки — температура блока, когда нагружены все блоки разом (кнопка «проверить все разом»)\n" +
-                "• прочерк вместо температуры — кривой блока нет или при таком потолке она не снималась";
+                "• прочерк вместо температуры — кривой блока нет или при таком потолке она не снималась\n" +
+                "• зелёная точка перед названием — блок уже пройден идущим измерением";
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -820,6 +845,10 @@ namespace CoreMap
                     using (var back = new SolidBrush(u == lit ? Theme.Cell : Theme.Button)) g.FillRectangle(back, row);
                 if (u == pinned)
                     using (var bar = new SolidBrush(Theme.Accent)) g.FillRectangle(bar, row.Left, row.Top, Theme.Px(2), row.Height);
+                // Пройденный идущим измерением блок — зелёная точка перед названием.
+                if (done != null && done[u])
+                    using (var dot = new SolidBrush(Theme.Good))
+                        g.FillEllipse(dot, Theme.Px(1), row.Top + row.Height / 2 - Theme.Px(2), Theme.Px(4), Theme.Px(4));
                 TextRenderer.DrawText(g, blocks[u].Name, u == lit || u == pinned ? bold : font, new Rectangle(pad, row.Top, Width * 27 / 100, row.Height),
                                       Theme.KindText(blocks[u].Kind), Flags);
                 CurveChoice pick = picks[u];
@@ -940,10 +969,12 @@ namespace CoreMap
         }
     }
 
-    /// Полоса прогресса измерения.
+    /// Полоса прогресса измерения. Parts — на сколько равных частей она поделена чёрточками (блоки запуска);
+    /// 0 — без делений.
     class RunBar : Painted
     {
         double fraction;
+        int parts;
 
         public RunBar(int width)
         {
@@ -951,10 +982,11 @@ namespace CoreMap
             Margin = new Padding(0, 0, 0, Theme.Px(4));
         }
 
-        public void Set(double value)
+        public void Set(double value, int parts = 0)
         {
-            if (value == fraction) return;
+            if (value == fraction && parts == this.parts) return;
             fraction = value;
+            this.parts = parts;
             Invalidate();
         }
 
@@ -964,6 +996,8 @@ namespace CoreMap
         {
             using (var back = new SolidBrush(Theme.Cell)) e.Graphics.FillRectangle(back, ClientRectangle);
             using (var fill = new SolidBrush(Theme.Accent)) e.Graphics.FillRectangle(fill, 0, 0, (int)(Width * fraction), Height);
+            using (var gap = new Pen(Theme.Panel))
+                for (int k = 1; k < parts; k++) e.Graphics.DrawLine(gap, Width * k / parts, 0, Width * k / parts, Height);
         }
     }
 

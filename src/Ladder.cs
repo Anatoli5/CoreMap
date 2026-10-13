@@ -27,6 +27,8 @@ namespace CoreMap
 
         public int Done, Total;            // сколько ступеней пройдено и сколько всего в этом запуске
         public int BlockDone, BlockTotal;  // то же по блокам
+        public int StepDone, StepTotal;    // ступени блока, который меряется сейчас; StepTotal = 0 — заранее неизвестно
+        public volatile Block[] Order;     // блоки этого запуска в порядке обхода: окно отмечает пройденные
         public string Current;             // что делается сейчас, для строки состояния
         public volatile Block Active;      // блок, который меряется сейчас; null — никакой
 
@@ -59,8 +61,9 @@ namespace CoreMap
         protected void Begin(Block[] blocks, int level, int steps)
         {
             Level = level;
-            Done = BlockDone = 0;
+            Done = BlockDone = StepDone = StepTotal = 0;
             Total = steps;
+            Order = blocks.Where(b => limits.Known(b.First)).ToArray();
             BlockTotal = blocks.Length;
             Hold.Take();
         }
@@ -164,6 +167,8 @@ namespace CoreMap
             int[] ratios = limits.Factory(block.First).Take(Steps).Reverse().ToArray();
             var run = new CurveRun { Lp = block.Lp, Level = Level, Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm") };
             bool whole = false;
+            StepDone = 0;
+            StepTotal = 2 * ratios.Length;
             curves.Begin(run);
             try
             {
@@ -181,8 +186,10 @@ namespace CoreMap
                         curves.Add(run, point);
                         climbed.Add(point);
                         Done++;
+                        StepDone++;
                         if (curves.Heat(point) > maxTemp) break;
                     }
+                    StepTotal = 2 * climbed.Count;  // подъём мог кончиться раньше верхней ступени: спуск — по пройденным
                     // Вниз по тем же ступеням; температура ступени — среднее подъёма и спуска.
                     for (int k = climbed.Count - 1; k >= 0 && !Stopped && Error == null; k--)
                     {
@@ -199,6 +206,7 @@ namespace CoreMap
                         point.Peak = Math.Max(point.Peak, again.Peak);
                         point.Watts = (point.Watts + again.Watts) / 2;
                         Done++;
+                        StepDone++;
                         curves.Touch();
                     }
                     whole = !Stopped && Error == null;

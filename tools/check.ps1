@@ -18,6 +18,18 @@ param([string]$Name = 'check', [switch]$BuildOnly)
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# The owner's own CoreMap shows " - " with an em dash in its window title while a real measurement runs.
+# Builds and hidden runs heat the processor and spoil that measurement, so the check waits for it to end.
+$waited = 0
+while ($true) {
+    $busy = Get-Process CoreMap -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match [string][char]0x2014 }
+    if (-not $busy) { break }
+    if ($waited -eq 0) { Write-Host 'the owner is measuring - waiting for it to end' }
+    if ($waited -ge 3600) { Write-Host 'the owner is still measuring after an hour - not started'; exit 5 }
+    Start-Sleep -Seconds 30
+    $waited += 30
+}
+
 # A string literal broken by an automatic replacement leaves a line that is only: " +
 $broken = Select-String -Path src\*.cs -Pattern '^\s*" \+\s*$'
 if ($broken) { $broken | ForEach-Object { Write-Host ("broken literal: " + $_.Path + ":" + $_.LineNumber) }; exit 3 }
