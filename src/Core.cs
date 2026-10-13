@@ -85,30 +85,16 @@ namespace CoreMap
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
 
-            LimitHold hold = Limits == null ? null : new LimitHold(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
-            // Прошлый запуск мог оборваться посреди измерения и оставить блоку потолок ступени. Он возвращается
-            // до профиля: тот сверяет свои потолки с действующими и решает, применять ли себя.
-            string recovered = hold == null ? null : hold.Recover();
-            if (recovered != null) Program.Tell(recovered);  // полоса сообщений в окне сменится, запись в журнале останется
-            Runner = new Runner(Load, hold);
-
-            if (Limits != null)
+            // Возврат потолков по метке оборванного измерения, затем профиль «при запуске» — общий путь окна
+            // и резидента, см. Startup.cs.
+            LimitsStartup startup = Limits == null ? null : new LimitsStartup(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
+            if (startup != null)
             {
-                Profile = new Profile(Limits, Lps, CpuName, simulate ? null : Program.DataDir);
-                Profiles = new ProfileSets(Lps, CpuName, simulate ? null : Program.DataDir);
-                try
-                {
-                    Profiles.Read();
-                    Profile.Startup();
-                    // Профиль, сохранённый до появления названий, попадает в общий список.
-                    if (Profile.Exists && Profiles.Get(Profile.Name) == null) Profiles.Put(Profile.Name, Profile.Ratios);
-                }
-                catch (Exception e)
-                {
-                    Program.Log("профиль потолков не прочитан: " + e);
-                    Profile.Note = "профиль не прочитан: " + e.Message;
-                }
+                if (startup.Recovered != null) Program.Tell(startup.Recovered);  // полоса сообщений в окне сменится, запись в журнале останется
+                Profile = startup.Profile;
+                Profiles = startup.Profiles;
             }
+            Runner = new Runner(Load, startup == null ? null : startup.Hold);
 
             if (backend != null)
             {
