@@ -4,8 +4,8 @@
 // Результат хранится по ядрам: у всех ядер блока строка одна и та же.
 //
 // Как устроено и от чего защищено:
-// - порядок вразброс: следующее ядро берётся подальше от двух предыдущих, чтобы остаточное тепло
-//   не попадало на соседей измеряемого ядра;
+// - порядок вразброс (DieLayout.Spread): следующий блок берётся подальше от двух предыдущих, чтобы
+//   остаточное тепло не попадало на соседей измеряемого;
 // - перед каждым ядром весь кристалл должен вернуться к исходной температуре;
 // - исходная температура берётся до и после нагрузки, в расчёт идёт меньшая: фоновые задачи только греют;
 // - проба одинаковой лёгкой нагрузкой на каждом ядре: второй тест (кто как греется при равной
@@ -42,7 +42,7 @@ namespace CoreMap
         readonly int[] lps;
         readonly Block[] blocks;
         readonly int n;
-        readonly int[] order;    // порядок обхода блоков
+        readonly Block[] order;  // порядок обхода блоков: вразброс по схеме (DieLayout.Spread)
         readonly string saveDir;  // null — результат не сохранять (имитация)
         double startedAt;
 
@@ -59,7 +59,7 @@ namespace CoreMap
         public int Total { get { return blocks.Length * PassCount; } }
         public double Elapsed { get { return Native.Now() - startedAt; } }
 
-        public ThermalSweep(Runner runner, Monitor monitor, int[] lps, Block[] blocks, double[][] positions, string saveDir)
+        public ThermalSweep(Runner runner, Monitor monitor, int[] lps, Block[] blocks, Block[] order, string saveDir)
             : base(runner, "тепловое измерение прервано")
         {
             this.monitor = monitor;
@@ -67,54 +67,9 @@ namespace CoreMap
             this.blocks = blocks;
             this.saveDir = saveDir;
             n = lps.Length;
-            order = SpreadOrder(blocks.Select(b => new[] { b.Members.Average(i => positions[i][0]), b.Members.Average(i => positions[i][1]) }).ToArray());
+            this.order = order;
             Throttled = new bool[n];
             Levels = new int[n];
-        }
-
-        /// Порядок обхода, в котором каждое следующее ядро далеко на схеме от двух предыдущих.
-        /// Жадный выбор «самое дальнее» оставляет соседей на конец обхода, поэтому перебирается
-        /// несколько сотен случайных вариантов и берётся тот, где самая близкая пара подряд идущих
-        /// ядер дальше всего. Зерно фиксировано: порядок одинаков от запуска к запуску.
-        static int[] SpreadOrder(double[][] pos)
-        {
-            int count = pos.Length;
-            Func<int, int, double> dist = (a, b) =>
-                Math.Sqrt(Math.Pow(pos[a][0] - pos[b][0], 2) + Math.Pow(pos[a][1] - pos[b][1], 2));
-            Func<List<int>, double[]> quality = o =>
-            {
-                double near = double.MaxValue, skip = double.MaxValue, sum = 0;
-                for (int i = 0; i + 1 < o.Count; i++) { double d = dist(o[i], o[i + 1]); near = Math.Min(near, d); sum += d; }
-                for (int i = 0; i + 2 < o.Count; i++) skip = Math.Min(skip, dist(o[i], o[i + 2]));
-                return new[] { near, skip, sum };
-            };
-            Func<double[], double[], bool> better = (a, b) =>
-            {
-                for (int i = 0; i < 3; i++) if (a[i] != b[i]) return a[i] > b[i];
-                return false;
-            };
-            var rng = new Random(0);
-            List<int> best = Enumerable.Range(0, count).ToList();
-            double[] bestQuality = quality(best);
-            for (int attempt = 0; attempt < 500; attempt++)
-            {
-                List<int> rest = Enumerable.Range(0, count).ToList();
-                var o = new List<int>();
-                int first = rng.Next(rest.Count);
-                o.Add(rest[first]);
-                rest.RemoveAt(first);
-                while (rest.Count > 0)
-                {
-                    int from = Math.Max(0, o.Count - 2);
-                    rest = rest.OrderByDescending(c => Enumerable.Range(from, o.Count - from).Min(k => dist(c, o[k]))).ToList();
-                    int pick = rng.Next(Math.Min(3, rest.Count));
-                    o.Add(rest[pick]);
-                    rest.RemoveAt(pick);
-                }
-                double[] q = quality(o);
-                if (better(q, bestQuality)) { best = o; bestQuality = q; }
-            }
-            return best.ToArray();
         }
 
         public void Start(int seconds, int passes)
@@ -148,8 +103,8 @@ namespace CoreMap
                     probes.Add(new double[n][]);
                 }
                 // Обратный порядок во втором проходе: у каждого ядра другой предшественник.
-                foreach (int u in p % 2 == 0 ? order : order.Reverse().ToArray())
-                    if (!Measure(p, blocks[u], ref baseTemps, ref baseWatts)) return;
+                foreach (Block block in p % 2 == 0 ? order : order.Reverse().ToArray())
+                    if (!Measure(p, block, ref baseTemps, ref baseWatts)) return;
             }
         }
 
@@ -312,7 +267,7 @@ namespace CoreMap
             Json.WriteFile(Path.Combine(saveDir, DateTime.Now.ToString("'thermal-'yyyyMMdd-HHmmss'.json'")), new Dictionary<string, object>
             {
                 { "lps", lps }, { "blocks", blocks.Select(b => (object)b.Members.Select(i => lps[i]).ToArray()).ToArray() },
-                { "order", order.Select(u => blocks[u].Lp).ToArray() }, { "load_seconds", Seconds },
+                { "order", order.Select(b => b.Lp).ToArray() }, { "load_seconds", Seconds },
                 { "levels", Levels }, { "throttled", Enumerable.Range(0, n).Where(i => Throttled[i]).Select(i => lps[i]).ToArray() },
                 { "passes", rows(passes) }, { "probes", rows(probes) },
             });

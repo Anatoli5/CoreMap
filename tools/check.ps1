@@ -39,11 +39,13 @@ if ($BuildOnly) { exit 0 }
 
 $dir = Join-Path 'outputs' $Name
 New-Item -ItemType Directory -Force $dir | Out-Null
+# The simulated load on a whole E-core cluster reads far above 100 C, and the overheat guard would stop the
+# measurement; d and e raise the guard limit to show the measurement itself.
 $sets = [ordered]@{
     a = '--saved --slide 76 --size 1920x1040'
     b = '--saved --slide 76 --best --size 1920x1040'
     c = '--curve --size 1920x1040'
-    d = '--fit --size 1920x1040'
+    d = '--fit --limit 400 --size 1920x1040'
     e = '--joint --limit 400 --size 1920x1040'
     f = '--saved --slide 76 --size 1280x800'
     g = '--size 1920x1040'

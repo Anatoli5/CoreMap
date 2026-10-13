@@ -155,6 +155,56 @@ namespace CoreMap
             return layout;
         }
 
+        /// Порядок обхода блоков в измерениях — вразброс: каждый следующий блок далеко на схеме от двух
+        /// предыдущих, чтобы остаточное тепло не попадало на соседей измеряемого. Порядок один для теплового
+        /// измерения, снятия кривых и поиска замером.
+        /// Жадный выбор «самый дальний» оставляет соседей на конец обхода, поэтому перебирается
+        /// несколько сотен случайных вариантов и берётся тот, где самая близкая пара подряд идущих
+        /// блоков дальше всего. Зерно фиксировано: порядок одинаков от запуска к запуску.
+        public Block[] Spread(BlockMap blocks)
+        {
+            double[][] cores = Positions(blocks.All.Sum(b => b.Members.Length));
+            // Место блока — середина между его ядрами.
+            double[][] pos = blocks.All.Select(b => new[] { b.Members.Average(i => cores[i][0]), b.Members.Average(i => cores[i][1]) }).ToArray();
+            int count = pos.Length;
+            Func<int, int, double> dist = (a, b) =>
+                Math.Sqrt(Math.Pow(pos[a][0] - pos[b][0], 2) + Math.Pow(pos[a][1] - pos[b][1], 2));
+            Func<List<int>, double[]> quality = o =>
+            {
+                double near = double.MaxValue, skip = double.MaxValue, sum = 0;
+                for (int i = 0; i + 1 < o.Count; i++) { double d = dist(o[i], o[i + 1]); near = Math.Min(near, d); sum += d; }
+                for (int i = 0; i + 2 < o.Count; i++) skip = Math.Min(skip, dist(o[i], o[i + 2]));
+                return new[] { near, skip, sum };
+            };
+            Func<double[], double[], bool> better = (a, b) =>
+            {
+                for (int i = 0; i < 3; i++) if (a[i] != b[i]) return a[i] > b[i];
+                return false;
+            };
+            var rng = new Random(0);
+            List<int> best = Enumerable.Range(0, count).ToList();
+            double[] bestQuality = quality(best);
+            for (int attempt = 0; attempt < 500; attempt++)
+            {
+                List<int> rest = Enumerable.Range(0, count).ToList();
+                var o = new List<int>();
+                int first = rng.Next(rest.Count);
+                o.Add(rest[first]);
+                rest.RemoveAt(first);
+                while (rest.Count > 0)
+                {
+                    int from = Math.Max(0, o.Count - 2);
+                    rest = rest.OrderByDescending(c => Enumerable.Range(from, o.Count - from).Min(k => dist(c, o[k]))).ToList();
+                    int pick = rng.Next(Math.Min(3, rest.Count));
+                    o.Add(rest[pick]);
+                    rest.RemoveAt(pick);
+                }
+                double[] q = quality(o);
+                if (better(q, bestQuality)) { best = o; bestQuality = q; }
+            }
+            return best.Select(u => blocks.All[u]).ToArray();
+        }
+
         /// Условные координаты каждого ядра на схеме, шаг — половина клетки.
         public double[][] Positions(int count)
         {

@@ -19,6 +19,7 @@ namespace CoreMap
         public readonly BlockMap Blocks;
         public readonly string CpuName;
         public readonly DieLayout Layout;
+        readonly Block[] spread;              // порядок обхода блоков в измерениях: вразброс по схеме
         public readonly LoadManager Load;
         public readonly Monitor Monitor;      // null — датчики недоступны
         public readonly ThermalSweep Sweep;
@@ -65,6 +66,7 @@ namespace CoreMap
             Topology.Identity(out CpuName, out identifier);
             Layout = DieLayout.Pick(Cores, Blocks, identifier, Path.Combine(Program.Root, "layouts"));
             double[][] positions = Layout.Positions(Lps.Length);
+            spread = Layout.Spread(Blocks);
             Load = new LoadManager(Lps, simulate);
             Simulated = simulate;
 
@@ -119,7 +121,7 @@ namespace CoreMap
                 Monitor.Start();
             }
             string saveDir = simulate ? null : Program.DataDir;  // имитация ничего не пишет: её числа ненастоящие
-            Sweep = new ThermalSweep(Runner, Monitor, Lps, Blocks.All, positions, saveDir);
+            Sweep = new ThermalSweep(Runner, Monitor, Lps, Blocks.All, spread, saveDir);
             Latency = new LatencyTest(Runner, Lps, simulate, saveDir);
             Calibration = new Calibration(Runner, Monitor, Cores, CpuName, saveDir);
             try { Calibration.LoadSaved(); }
@@ -391,14 +393,7 @@ namespace CoreMap
         {
             if (Busy || Curve == null) return;
             Trip = null;
-            Curve.Start(SpreadBlocks(), Load.Level, maxTemp);
-        }
-
-        /// Порядок обхода блоков, в котором соседние по списку блоки разнесены: половины списка чередуются.
-        Block[] SpreadBlocks()
-        {
-            int half = (Blocks.All.Length + 1) / 2;
-            return Blocks.All.OrderBy(b => b.Index < half ? 2 * b.Index : 2 * (b.Index - half) + 1).ToArray();
+            Curve.Start(spread, Load.Level, maxTemp);
         }
 
         /// Подбирает каждому блоку под нагрузкой текущей силы самый высокий потолок, при котором средняя
@@ -408,7 +403,7 @@ namespace CoreMap
             if (Limits == null || Curve == null) return "потолки множителей недоступны";
             if (Busy) return "идёт измерение: дождись его конца";
             Trip = null;
-            Search.Start(SpreadBlocks(), Load.Level, maxTemp);
+            Search.Start(spread, Load.Level, maxTemp);
             return null;
         }
 
