@@ -208,7 +208,7 @@ namespace CoreMap
             reread.Flush();
             Check(File.ReadAllText(curvesFile + ".bad").Length == whole.Length / 2, "файлы: новая запись копию .bad не тронула");
             // Файл разбирается, но поля нет: это тоже нечитаемый файл.
-            File.WriteAllText(curvesFile, "{\"cpu\": " + new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(cpu) + "}");
+            File.WriteAllText(curvesFile, "{\"cpu\": " + Json.Quote(cpu) + "}");
             spoiled = null;
             reread = new CurveStore(limits, cpu, dir);
             try { reread.LoadSaved(); }
