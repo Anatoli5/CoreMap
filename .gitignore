@@ -26,3 +26,7 @@ modules/*.zip
 
 # Скачанный пакет Microsoft WebView2: в работе нужны только три библиотеки из него, они лежат в webview2/
 packages/
+
+# Страница нового окна: исходники — в ui/, сборка (tools/page.ps1) кладёт её в page/; библиотеки — в node_modules/
+page/
+node_modules/

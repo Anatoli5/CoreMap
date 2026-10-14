@@ -50,6 +50,9 @@ function Build {
 
 if (-not (Build)) { Write-Host 'build failed'; exit 1 }
 Write-Host 'build ok'
+# The new window's page: type check and build into page\ (tools\page.ps1). A type error fails the check here.
+& (Join-Path $PSScriptRoot 'page.ps1')
+if ($LASTEXITCODE -ne 0) { Write-Host 'page build failed'; exit 6 }
 if ($BuildOnly) { exit 0 }
 
 $dir = Join-Path 'outputs' $Name

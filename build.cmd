@@ -2,6 +2,8 @@
 rem Builds CoreMap.exe with the C# compiler that ships with Windows (.NET Framework 4.x). Nothing to install.
 setlocal
 cd /d "%~dp0"
+rem The new window's page (page\) is built first: TypeScript compiler from node_modules\, see tools\page.ps1.
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\page.ps1 || exit /b 2
 set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 set ICON=
 if exist assets\coremap.ico set ICON=/win32icon:assets\coremap.ico

@@ -1064,14 +1064,15 @@ namespace CoreMap
                 "следующее окно получило то же «было», вернуло заводские — и они снова «было» у резидента; код " + code);
 
             // 4. Новое окно (WebWindow.cs): вторая копия в роли окна со страницей. Она подключается к каналу, страница
-            // знакомится с движком и рисует первое состояние. Картинка страницы ложится рядом с отчётом: её смотрит
-            // агент — как выглядит страница, проверка не судит.
-            string picture = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)), "page.png");
-            File.Delete(picture);  // картинка прошлого прохода не должна сойти за нынешнюю
-            code = RunCopy("--simulate --window --pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null);
+            // знакомится с движком, рисует состояние и проходит свою проверку (ui/src/check.ts): правки только на
+            // изменившиеся числа, щелчок по плитке, меню потолка. Картинки страницы ложатся рядом с отчётом: их
+            // смотрит агент — как выглядит страница, проверка не судит.
+            string outputs = Path.GetDirectoryName(Path.GetFullPath(path)), picture = Path.Combine(outputs, "page.png");
+            foreach (string old in Directory.GetFiles(outputs, "page*.png")) File.Delete(old);  // картинки прошлого прохода не должны сойти за нынешние
+            code = RunCopy("--simulate --window --pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 90, null);
             Pump(() => !engine.Alive, 10);
             check(code == 0 && File.Exists(picture) && !engine.Alive,
-                "новое окно показало страницу с состоянием от движка и вышло, Core остановлен; код " + code);
+                "новое окно показало страницу с состоянием от движка, прошло проверку страницы и вышло, Core остановлен; код " + code);
             check(told.Count == 0, "уведомлений владельцу за проверку не было" + (told.Count == 0 ? "" : ": " + string.Join(" | ", told)));
 
             // Покой в самом конце: потоки, которые система заводила под обмен по каналу, к этому времени должны уйти.

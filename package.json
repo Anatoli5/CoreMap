@@ -1,0 +1,13 @@
+{
+  "name": "coremap-page",
+  "private": true,
+  "description": "The page of CoreMap's new window. Built by tools/page.ps1; versions chosen in DECISIONS #27.",
+  "dependencies": {
+    "preact": "10.29.8",
+    "@preact/signals": "2.11.3",
+    "@preact/signals-core": "1.14.4"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

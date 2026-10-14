@@ -4,10 +4,12 @@
 // сообщениях не понимает: что пришло из канала — отдаёт странице как есть, что прислала страница — кладёт в канал
 // как есть. Кто что значит, знают двое: движок (Feed.cs, Commands.cs) и страница.
 //
-// Своих слов у окна три:
+// Своих слов у окна немного:
 //   страница → окно, строкой:   "ready" — страница слушает
-//                               "drawn" — первое состояние нарисовано (нужно только скрытой проверке)
 //   окно → страница, объектом:  {"t":"link","up":true} или {"t":"link","up":false,"why":"…"} — есть ли канал к движку
+// и ещё два — только у скрытой проверки (страница открыта с ?check, её шаги — в ui/src/check.ts):
+//   страница → окно:            "shot:<имя>" — снять картинку страницы; "done:<строки отчёта>" — проверка кончилась
+//   окно → страница:            {"t":"shot","name":"<имя>"} — картинка снята
 // Объект от страницы — всегда сообщение движку. Строка — всегда слово окну.
 //
 // Порядок: окно молчит, пока страница не сказала "ready"; потом сообщает ей о канале; на «канал есть» страница
@@ -91,10 +93,11 @@ namespace CoreMap
 
         // Только скрытой проверке.
         readonly List<string> faults = new List<string>();
-        readonly Timer deadline = new Timer { Interval = 30000 };
+        readonly Timer deadline = new Timer { Interval = 60000 };
         double readyAt = -1, linkedAt = -1, drawnAt = -1;
         int toPage, toEngine, browser;
         string version = "?";
+        string[] pageLines = new string[0];  // отчёт страницы: её строки "ok …" / "FAILED  …"
 
         /// 0 — окно отработало; у проверки — страница нарисовала состояние, ошибок не было.
         public int Outcome = 1;
@@ -119,7 +122,7 @@ namespace CoreMap
                 ShowInTaskbar = false;
                 Location = new Point(-20000, -20000);
                 ClientSize = Sized(size);
-                deadline.Tick += (s, e) => Finish("страница не нарисовала состояние за " + deadline.Interval / 1000 + " с");
+                deadline.Tick += (s, e) => Finish("проверка страницы не кончилась за " + deadline.Interval / 1000 + " с");
                 deadline.Start();
             }
             else
@@ -175,7 +178,7 @@ namespace CoreMap
                 web.NewWindowRequested += (s, a) => a.Handled = true;
                 web.WebMessageReceived += FromPage;
                 if (snapshot != null) await Watch(web);
-                web.Navigate(Origin + "index.html");
+                web.Navigate(Origin + (snapshot == null ? "index.html" : "index.html?check"));
             }
             catch (Exception error) { Broken("окно не открылось: " + Program.Why(error)); }
         }
@@ -224,10 +227,11 @@ namespace CoreMap
                 Drop();
                 Connect();
             }
-            else if (word == "drawn" && snapshot != null && drawnAt < 0)
+            else if (snapshot != null && word.StartsWith("shot:")) Shoot(word.Substring(5));
+            else if (snapshot != null && word.StartsWith("done:"))
             {
-                drawnAt = clock.Elapsed.TotalSeconds;
-                Shoot();
+                pageLines = word.Substring(5).Split('\n');
+                Finish(null);
             }
         }
 
@@ -327,16 +331,20 @@ namespace CoreMap
 
         static string Short(string text) { return text.Length <= 600 ? text : text.Substring(0, 600) + "…"; }
 
-        async void Shoot()
+        /// Картинка страницы: "main" — в файл проверки, другие — рядом, с именем через дефис («page-menu.png»).
+        async void Shoot(string name)
         {
+            if (drawnAt < 0) drawnAt = clock.Elapsed.TotalSeconds;
+            string file = name == "main" ? snapshot
+                : Path.Combine(Path.GetDirectoryName(snapshot), Path.GetFileNameWithoutExtension(snapshot) + "-" + name + ".png");
             try
             {
                 using (var stream = new MemoryStream())
                 {
                     await view.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream);
-                    File.WriteAllBytes(snapshot, stream.ToArray());
+                    File.WriteAllBytes(file, stream.ToArray());
                 }
-                Finish(null);
+                Post(Json.Text(new Dictionary<string, object> { { "t", "shot" }, { "name", name } }));
             }
             catch (Exception e) { Finish("картинка страницы не снята: " + Program.Why(e)); }
         }
@@ -346,13 +354,16 @@ namespace CoreMap
             if (gone) return;
             deadline.Stop();
             if (failure != null) faults.Add(failure);
-            var lines = new List<string> { faults.Count == 0 ? "ok" : "FAILED" };
+            bool failed = faults.Count > 0 || pageLines.Length == 0 || Array.Exists(pageLines, l => l.StartsWith("FAILED"));
+            var lines = new List<string> { failed ? "FAILED" : "ok" };
             foreach (string fault in faults) lines.Add("FAILED  " + fault);
+            if (pageLines.Length == 0) lines.Add("FAILED  страница не прислала отчёт проверки");
             lines.Add("WebView2 " + version + ", page " + ClientSize.Width + "x" + ClientSize.Height);
-            lines.Add("seconds from the window's start: page listening " + Seconds(readyAt) + ", pipe connected " + Seconds(linkedAt) + ", first state drawn " + Seconds(drawnAt));
+            lines.Add("seconds from the window's start: page listening " + Seconds(readyAt) + ", pipe connected " + Seconds(linkedAt) + ", first picture " + Seconds(drawnAt));
             lines.Add("messages relayed: to the page " + toPage + ", to the engine " + toEngine);
+            lines.AddRange(pageLines);
             File.WriteAllLines(snapshot + ".txt", lines);
-            Outcome = faults.Count == 0 ? 0 : 1;
+            Outcome = failed ? 1 : 0;
             Close();
         }
 
