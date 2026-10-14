@@ -1,0 +1,53 @@
+# Rust part of CoreMap (DECISIONS #28). For now one member: the window; the engine follows part by part.
+# How the code is written and checked: AGENTS.md in this folder.
+[workspace]
+members = ["window"]
+resolver = "3"
+
+[profile.release]
+# The window is small; size and start-up matter more than the last percent of speed.
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Lints for every crate (members say `[lints] workspace = true`). Base: Microsoft's Pragmatic Rust Guidelines,
+# M-STATIC-VERIFICATION; additions are the owner's points of 14.10 (copies, unwrap, unsafe without a reason).
+# `cargo clippy -- -D warnings` in tools\rust.ps1 turns every warning here into a failed gate.
+[workspace.lints.rust]
+unsafe_code = "deny"                 # unsafe only in a module that opts in with #![expect(unsafe_code, reason = "...")]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+ambiguous_negative_literals = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+# unsafe: every block says why it is sound, one unsafe operation per block
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+# copies: a needless clone, a hidden pointer copy, a value taken by move only to be read
+redundant_clone = "warn"
+clone_on_ref_ptr = "warn"
+implicit_clone = "warn"
+needless_pass_by_value = "warn"
+# errors: no unwrap outside tests, no error thrown away in map_err
+unwrap_used = "warn"
+map_err_ignore = "warn"
+# overrides must be #[expect(..., reason = "...")] so a stale one is reported (M-LINT-OVERRIDE-EXPECT)
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Not used: the window has no published API, so documentation lints for it are noise.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+multiple_crate_versions = "allow"    # decided per case with cargo tree -d, see AGENTS.md "Dependencies"
+cargo_common_metadata = "allow"      # not published

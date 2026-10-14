@@ -955,7 +955,14 @@ namespace CoreMap
         /// Вторая копия программы с такими ключами; ждёт её в цикле ожидания резидента. Код выхода; -1 — не вышла.
         static int RunCopy(string arguments, double seconds, Action each)
         {
-            using (Process child = Process.Start(new ProcessStartInfo(Exe, arguments) { UseShellExecute = false, WorkingDirectory = Program.Root }))
+            return RunProcess(Exe, arguments, seconds, each);
+        }
+
+        /// Программа file с ключами; ждёт её в цикле ожидания резидента, чтобы сообщения движка доходили.
+        /// Код выхода; -1 — не вышла за seconds.
+        static int RunProcess(string file, string arguments, double seconds, Action each)
+        {
+            using (Process child = Process.Start(new ProcessStartInfo(file, arguments) { UseShellExecute = false, WorkingDirectory = Program.Root }))
             {
                 bool exited = Pump(() =>
                 {
@@ -1063,16 +1070,19 @@ namespace CoreMap
             check(code == 0 && !engine.Alive && Same(resident.Was, fused) && Same(resident.Limits.Current, fused),
                 "следующее окно получило то же «было», вернуло заводские — и они снова «было» у резидента; код " + code);
 
-            // 4. Новое окно (WebWindow.cs): вторая копия в роли окна со страницей. Она подключается к каналу, страница
-            // знакомится с движком, рисует состояние и проходит свою проверку (ui/src/check.ts): правки только на
-            // изменившиеся числа, щелчок по плитке, меню потолка. Картинки страницы ложатся рядом с отчётом: их
-            // смотрит агент — как выглядит страница, проверка не судит.
-            string outputs = Path.GetDirectoryName(Path.GetFullPath(path)), picture = Path.Combine(outputs, "page.png");
-            foreach (string old in Directory.GetFiles(outputs, "page*.png")) File.Delete(old);  // картинки прошлого прохода не должны сойти за нынешние
-            code = RunCopy("--simulate --window --pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 90, null);
+            // 4. Окно на Rust (rust\window, DECISIONS #28): CoreMapWindow.exe рядом с программой, его кладёт туда
+            // tools\rust.ps1. Оно подключается к каналу, знакомится с движком, рисует состояние в память, без окна на
+            // экране, и проходит свою проверку (rust\window\src\check.rs): перерисовки только на изменившееся, щелчок
+            // по плитке, меню потолка. Картинки ложатся рядом с отчётом: их смотрит агент — проверка о виде не судит.
+            // Веб-окно (WebWindow.cs) этой проверкой больше не запускается: оно сохранено, но не развивается.
+            string outputs = Path.GetDirectoryName(Path.GetFullPath(path)), picture = Path.Combine(outputs, "window.png");
+            string windowExe = Path.Combine(Program.Root, "CoreMapWindow.exe");
+            foreach (string old in Directory.GetFiles(outputs, "window*.png")) File.Delete(old);  // картинки прошлого прохода не должны сойти за нынешние
+            code = File.Exists(windowExe) ? RunProcess(windowExe, "--pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null) : -2;
             Pump(() => !engine.Alive, 10);
             check(code == 0 && File.Exists(picture) && !engine.Alive,
-                "новое окно показало страницу с состоянием от движка, прошло проверку страницы и вышло, Core остановлен; код " + code);
+                "окно на Rust показало состояние от движка, прошло свою проверку и вышло, Core остановлен; код " + code +
+                (code == -2 ? " (нет CoreMapWindow.exe: его собирает tools\\rust.ps1)" : ""));
             check(told.Count == 0, "уведомлений владельцу за проверку не было" + (told.Count == 0 ? "" : ": " + string.Join(" | ", told)));
 
             // Покой в самом конце: потоки, которые система заводила под обмен по каналу, к этому времени должны уйти.
@@ -1118,7 +1128,7 @@ namespace CoreMap
             }
 
             report.Add("");
-            report.Add("--- the new window: the page in WebView2, picture " + picture + " ---");
+            report.Add("--- the Rust window (Slint, drawn in memory), picture " + picture + " ---");
             if (File.Exists(picture + ".txt"))
             {
                 report.AddRange(File.ReadAllLines(picture + ".txt"));

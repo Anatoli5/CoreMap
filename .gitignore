@@ -30,3 +30,6 @@ packages/
 # Страница нового окна: исходники — в ui/, сборка (tools/page.ps1) кладёт её в page/; библиотеки — в node_modules/
 page/
 node_modules/
+
+# Сборка Rust-части (cargo)
+rust/target/

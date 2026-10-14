@@ -1,0 +1,4 @@
+# Formatting of the Rust part (cargo fmt). Wider lines than the default 100: the project's C# code uses long lines,
+# and short wrapped lines would make the two halves look different for no gain.
+edition = "2024"
+max_width = 120

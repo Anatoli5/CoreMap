@@ -1,0 +1,329 @@
+// Окно CoreMap (DECISIONS #28): верхняя полоса, строка отказа, раздел «Кристалл» и меню потолка.
+// Что и каким цветом показывать, решает Rust (src/view.rs): сюда приходят готовые строки и цвета, отсюда уходят
+// щелчки. Плитка перерисовывается, только когда Rust заменил её строку модели, — а он заменяет только изменившуюся.
+
+export struct NumData {
+    text: string,
+    color: color,
+    col: int,   // место номера на плитке кластера: 2 × 2
+    row: int,
+}
+
+export struct TileData {
+    block: int,
+    col: int,
+    row: int,
+    nums: [NumData],
+    stats: string,     // «⌀ 72  ▲ 85»
+    temp: string,      // «45°»
+    fill: color,       // по температуре
+    pair: string,      // «52.4 / ×53»
+    pair-color: color, // жёлтый — потолок ниже заводского, красный — выше
+    delta: string,     // разница с «было»: «−2»
+    loaded: bool,
+    selected: bool,
+}
+
+export struct MenuEntry {
+    ratio: int,
+    text: string,
+    hint: string,
+    checked: bool,
+}
+
+export global Palette {
+    out property <color> bg: #14161a;
+    out property <color> panel: #1c1f25;
+    out property <color> cell: #2a2e36;
+    out property <color> text: #e6e8ec;
+    out property <color> dim: #8b93a1;
+    out property <color> accent: #ffd166;
+    out property <color> bad: #ff5d5d;
+    out property <color> warn-bg: #5a3d12;
+    out property <color> warn-text: #ffd9a0;
+}
+
+component TileView inherits Rectangle {
+    in property <TileData> data;
+    callback clicked();
+    callback menu(length, length);  // правая кнопка: где, в координатах окна
+
+    property <length> pad: self.height * 0.07;
+    property <length> small: self.height * 0.125;
+
+    background: data.fill;
+    border-radius: 6px;
+
+    for num in data.nums: Text {
+        x: root.pad + num.col * root.height * 0.25;
+        y: root.pad + num.row * root.height * 0.17;
+        text: num.text;
+        color: num.color;
+        font-size: data.nums.length > 1 ? root.height * 0.115 : root.small;
+    }
+
+    Text {
+        x: 0;
+        y: root.pad;
+        width: root.width - root.pad;
+        horizontal-alignment: right;
+        text: data.stats;
+        color: Palette.text;
+        font-size: root.small;
+    }
+
+    Text {
+        x: root.pad;
+        y: root.height - root.pad - self.height;
+        text: data.temp;
+        color: Palette.text;
+        font-size: root.height * 0.29;
+        font-weight: 600;
+    }
+
+    HorizontalLayout {
+        x: 0;
+        y: root.height - root.pad - self.height;
+        width: root.width - root.pad;
+        height: root.small * 1.25;
+        alignment: end;
+        spacing: root.pad * 0.7;
+        Text {
+            text: data.pair;
+            color: data.pair-color;
+            font-size: root.small;
+            vertical-alignment: bottom;
+        }
+        if data.delta != "": Text {
+            text: data.delta;
+            color: Palette.text;
+            font-size: root.small;
+            vertical-alignment: bottom;
+        }
+    }
+
+    if data.selected: Rectangle {
+        border-width: 1px;
+        border-color: Palette.text;
+        border-radius: 6px;
+    }
+    if data.loaded: Rectangle {
+        border-width: max(2px, root.height * 0.03);
+        border-color: Palette.accent;
+        border-radius: 6px;
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.menu(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "CoreMap";
+    background: Palette.bg;
+    default-font-family: "Segoe UI";
+    default-font-size: 14px;
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 480px;
+    min-height: 360px;
+
+    in property <string> cpu;
+    in property <string> pkg;
+    in property <string> watts;
+    in property <string> fans;
+    in property <string> link;
+    in property <bool> link-down;
+    in property <string> problem;
+    in property <int> cols: 2;
+    in property <int> rows: 6;
+    in property <[TileData]> tiles;
+    in property <string> note;
+    in property <string> menu-title;
+    in property <[MenuEntry]> menu-entries;
+    in property <bool> busy;
+
+    callback tile-clicked(int);
+    callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
+    callback limit-chosen(int);
+    callback problem-dismissed();
+
+    // Раскладка — числами, а не вложенными раскладками: по ним же скрытая проверка (src/check.rs) целится щелчками.
+    property <length> top-h: 36px;
+    property <length> problem-h: root.problem != "" ? 30px : 0px;
+    property <length> margin: 12px;
+    property <length> head-h: 30px;
+    property <length> note-h: root.note != "" ? 52px : 0px;
+    out property <length> gap: 8px;
+    property <float> ratio: (root.cols * 158 - 8) / (root.rows * 104 - 8);
+    property <length> room-h: root.height - root.top-h - root.problem-h - 2 * root.margin - root.head-h - 12px - root.note-h;
+    property <length> room-w: root.width - 2 * root.margin - 24px;
+    property <length> die-h: min(root.room-h, root.room-w / root.ratio);
+    property <length> die-w: root.die-h * root.ratio;
+    out property <length> die-x: root.margin + 12px;
+    out property <length> die-y: root.top-h + root.problem-h + root.margin + root.head-h;
+    out property <length> tile-w: (root.die-w - (root.cols - 1) * root.gap) / root.cols;
+    out property <length> tile-h: (root.die-h - (root.rows - 1) * root.gap) / root.rows;
+
+    out property <length> menu-x;
+    out property <length> menu-y;
+    out property <bool> menu-shown;
+    out property <length> menu-head-h: 33px;
+    out property <length> entry-h: 26px;
+    property <length> menu-w: 250px;
+    out property <length> menu-left: min(root.menu-x, root.width - root.menu-w);
+    out property <length> menu-top: max(0px, min(root.menu-y, root.height - root.menu-head-h - 8px - root.menu-entries.length * root.entry-h));
+
+    // Верхняя полоса
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.top-h;
+        background: Palette.panel;
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 24px;
+            Text { text: root.cpu; color: Palette.dim; vertical-alignment: center; }
+            Text { text: root.pkg; color: Palette.text; vertical-alignment: center; }
+            Text { text: root.watts; color: Palette.text; vertical-alignment: center; }
+            Text { text: root.fans; color: Palette.text; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: root.link; color: root.link-down ? Palette.bad : Palette.dim; vertical-alignment: center; }
+        }
+    }
+
+    // Почему движок не выполнил последнюю команду; щелчок убирает строку.
+    if root.problem != "": Rectangle {
+        x: 0;
+        y: root.top-h;
+        width: root.width;
+        height: root.problem-h;
+        background: Palette.warn-bg;
+        Text {
+            x: 16px;
+            text: root.problem;
+            color: Palette.warn-text;
+            vertical-alignment: center;
+            height: parent.height;
+        }
+        TouchArea { clicked => { root.problem-dismissed(); } }
+    }
+
+    // Раздел «Кристалл»
+    Rectangle {
+        x: root.margin;
+        y: root.top-h + root.problem-h + root.margin;
+        width: root.die-w + 24px;
+        height: root.head-h + root.die-h + 12px + root.note-h;
+        background: Palette.panel;
+        border-radius: 8px;
+        Text {
+            x: 12px;
+            y: 9px;
+            text: "Кристалл";
+            color: Palette.dim;
+            font-weight: 600;
+        }
+        if root.note != "": Text {
+            x: 12px;
+            y: root.head-h + root.die-h + 6px;
+            width: root.die-w;
+            height: root.note-h - 6px;
+            text: root.note;
+            color: Palette.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+
+    for tile in root.tiles: TileView {
+        x: root.die-x + tile.col * (root.tile-w + root.gap);
+        y: root.die-y + tile.row * (root.tile-h + root.gap);
+        width: root.tile-w;
+        height: root.tile-h;
+        data: tile;
+        clicked => { root.tile-clicked(tile.block); }
+        menu(x, y) => {
+            root.menu-x = x;
+            root.menu-y = y;
+            root.tile-menu(tile.block);
+            root.menu-shown = true;
+            keys.focus();
+        }
+    }
+
+    // Меню потолка — слой поверх окна, а не PopupWindow: в Slint 1.18 всплывающее окно не сообщает, что его
+    // закрыли щелчком мимо, а Rust и скрытой проверке нужно знать, открыто ли меню. Закрывают его щелчок мимо и Esc.
+    keys := FocusScope {
+        width: 0;
+        height: 0;
+        key-pressed(event) => {
+            if (root.menu-shown && event.text == Key.Escape) {
+                root.menu-shown = false;
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if root.menu-shown: TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.menu-shown = false;
+            }
+        }
+    }
+
+    if root.menu-shown: Rectangle {
+        x: root.menu-left;
+        y: root.menu-top;
+        width: root.menu-w;
+        height: root.menu-head-h + root.menu-entries.length * root.entry-h + 4px;
+        background: Palette.panel;
+        border-color: Palette.cell;
+        border-width: 1px;
+        border-radius: 6px;
+        TouchArea { }  // щелчок по заголовку меню не проваливается в слой под ним и не закрывает меню
+        VerticalLayout {
+            padding-top: 4px;
+            padding-bottom: 4px;
+            HorizontalLayout {
+                padding-left: 12px;
+                height: root.menu-head-h - 5px;
+                Text { text: root.menu-title; color: Palette.dim; vertical-alignment: center; }
+            }
+            Rectangle { height: 1px; background: Palette.cell; }
+            for entry in root.menu-entries: Rectangle {
+                height: root.entry-h;
+                background: touch.has-hover && !root.busy ? Palette.cell : transparent;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    Text { text: entry.checked ? "✓" : ""; width: 14px; color: Palette.text; vertical-alignment: center; }
+                    Text { text: entry.text; color: root.busy ? Palette.dim : Palette.text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: entry.hint; color: Palette.dim; vertical-alignment: center; }
+                }
+                touch := TouchArea {
+                    enabled: !root.busy;
+                    clicked => {
+                        root.limit-chosen(entry.ratio);
+                        root.menu-shown = false;
+                    }
+                }
+            }
+        }
+    }
+}

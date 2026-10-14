@@ -50,9 +50,10 @@ function Build {
 
 if (-not (Build)) { Write-Host 'build failed'; exit 1 }
 Write-Host 'build ok'
-# The new window's page: type check and build into page\ (tools\page.ps1). A type error fails the check here.
-& (Join-Path $PSScriptRoot 'page.ps1')
-if ($LASTEXITCODE -ne 0) { Write-Host 'page build failed'; exit 6 }
+# The Rust window (rust\, DECISIONS #28): its gate and release build (tools\rust.ps1), copied next to the exe as
+# CoreMapWindow.exe, where the engine check below starts it. A failed step fails the check here.
+& (Join-Path $PSScriptRoot 'rust.ps1')
+if ($LASTEXITCODE -ne 0) { Write-Host 'rust window failed'; exit 6 }
 if ($BuildOnly) { exit 0 }
 
 $dir = Join-Path 'outputs' $Name

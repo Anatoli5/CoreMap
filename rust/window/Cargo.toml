@@ -1,0 +1,24 @@
+[package]
+name = "coremap-window"
+version = "0.1.0"
+edition = "2024"
+description = "CoreMap's window: shows the engine's state and sends the owner's commands over the bridge pipe."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "CoreMapWindow"
+path = "src/main.rs"
+
+[dependencies]
+# The window itself; renderer-software also draws the hidden check's pictures without any window on screen.
+slint = { version = "=1.18.1", features = ["renderer-software"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
