@@ -30,10 +30,14 @@
 // CoreMap.exe --simulate --tray --snapshot F   проверка резидента: значка нет, запуск на имитации, щелчки по
 //                           пунктам меню, замер памяти и процессорного времени; отчёт — текстом в файл F.
 //                           С --saved — на копии сохранённых профилей из data\
-// CoreMap.exe --simulate --engine --snapshot F   проверка моста: движок на имитации без окна открывает канал и
-//                           запускает вторую копию программы, которая проходит по протоколу как окно
-//                           (BridgeCheck.cs); отчёт — текстом в файл F
-// CoreMap.exe --simulate --bridge-client N --snapshot F   та вторая копия: N — имя канала; сама по себе не нужна
+// CoreMap.exe --tray --bridge   резидент в роли движка: ещё и слушает канал моста и держит Core, пока к нему
+//                           подключено окно или идёт измерение (Engine.cs). Пока так его никто не запускает:
+//                           окна, которому нужен канал, ещё нет
+// CoreMap.exe --simulate --tray --bridge --snapshot F   проверка движка и моста: к резиденту на имитации
+//                           подключается вторая копия программы и проходит по протоколу как окно; Core создаётся
+//                           и останавливается, мерится память резидента до, во время и после; отчёт — в файл F
+// CoreMap.exe --simulate --bridge-client N --snapshot F   та вторая копия: N — имя канала; сама по себе не нужна.
+//                           С --as <роль> — короткий проход вместо полного (BridgeCheck.Client)
 // CoreMap.exe --bridge-check N --out F   сторона без прав в проверке моста кнопкой владельца: её запускает окно
 //
 // Права администратора программа просит сама (Launch.Elevate), когда они нужны: при любом запуске без
@@ -175,17 +179,23 @@ namespace CoreMap
             string snapshot = Option(args, "--snapshot");
             // Стороны моста без прав администратора: им процессор не нужен, и прав они не просят.
             if (Option(args, "--bridge-check") != null) return BridgeCheck.Below(Option(args, "--bridge-check"), Option(args, "--out"));
-            if (simulate && Option(args, "--bridge-client") != null && snapshot != null) return BridgeCheck.Client(Option(args, "--bridge-client"), snapshot);
+            if (simulate && Option(args, "--bridge-client") != null && snapshot != null)
+                return BridgeCheck.Client(Option(args, "--bridge-client"), snapshot,
+                    Option(args, "--as") ?? "");
             // Всё остальное без имитации работает с процессором, а это только с правами администратора. Манифест
             // их не требует (у программы есть роли без прав), поэтому запрос Windows вызывает сама программа.
             if (!simulate && !Launch.Elevated()) return Launch.Elevate(args);
             if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
             if (simulate && Array.IndexOf(args, "--selftest") >= 0 && snapshot != null) return SelfTest.Run(snapshot);
-            if (simulate && Array.IndexOf(args, "--engine") >= 0 && snapshot != null) return BridgeCheck.Host(snapshot);
             AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
             // Резидент уходит в свой файл до всего, что касается окна: само упоминание окна в этом методе
             // загрузило бы в его процесс библиотеки интерфейса.
-            if (Array.IndexOf(args, "--tray") >= 0) return Tray.Run(simulate, snapshot, Array.IndexOf(args, "--saved") >= 0);
+            if (Array.IndexOf(args, "--tray") >= 0)
+            {
+                int guard;
+                int.TryParse(Option(args, "--limit"), out guard);
+                return Tray.Run(simulate, snapshot, Array.IndexOf(args, "--saved") >= 0, Array.IndexOf(args, "--bridge") >= 0, guard);
+            }
             return Window(args, simulate);
         }
 
@@ -203,6 +213,14 @@ namespace CoreMap
                 if (!first)
                 {
                     Native.ActivateOtherCopy();
+                    return 0;
+                }
+                if (!quiet && Engine.CoreAlive())
+                {
+                    // У движка жив свой Core: к нему подключено новое окно или он ведёт измерение. Два Core разом
+                    // недопустимы — второй вернул бы потолки посреди замера первого (см. шапку Engine.cs).
+                    MessageBox.Show("К программе подключено новое окно CoreMap или идёт измерение, запущенное из него.\n\n" +
+                        "Прежнее окно откроется, когда новое будет закрыто, а измерение кончится.", "CoreMap", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return 0;
                 }
                 if (!quiet) Tray.Announce();  // резидент с этого момента потолки не трогает

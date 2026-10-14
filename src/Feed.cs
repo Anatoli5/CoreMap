@@ -34,6 +34,11 @@ namespace CoreMap
         int[] sentFused, sentWas, seenCurrent;
         string sentProfiles;
         volatile bool touched;        // исполнена команда: профили могли измениться
+        string sentUnread;
+
+        /// Почему потолки не перечитались из процессора два раза подряд; null — перечитались. Тогда в состоянии
+        /// стоят прежние потолки, а не то, что в процессоре. Ставит движок (Engine.Changed).
+        public volatile string Unread;
         bool wasBusy;
 
         public Feed(Core core)
@@ -91,7 +96,7 @@ namespace CoreMap
                 }
                 if (core.Limits != null)
                 {
-                    if (!Same(sentFused, core.Limits.Fused) || !Same(sentWas, core.Was)) messages.Add(Limits());
+                    if (!Same(sentFused, core.Limits.Fused) || !Same(sentWas, core.Was) || Unread != sentUnread) messages.Add(Limits());
                     // Профили пересчитываются не на каждый опрос: только после команды, смены потолков или начала и
                     // конца измерения — больше им меняться не от чего.
                     bool moved = !Same(seenCurrent, core.Limits.Current);
@@ -156,8 +161,9 @@ namespace CoreMap
         {
             sentFused = (int[])core.Limits.Fused.Clone();
             sentWas = (int[])core.Was.Clone();
+            sentUnread = Unread;
             return Json.Text(Map(
-                "t", "limits", "fused", sentFused, "was", sentWas,
+                "t", "limits", "fused", sentFused, "was", sentWas, "unread", sentUnread,
                 // Что можно поставить блоку вручную, по убыванию. Правило — у CoreLimits; окно его не повторяет.
                 "choices", core.Blocks.All.Select(b => (object)core.Limits.Choices(b.First)).ToList()));
         }

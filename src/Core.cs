@@ -8,6 +8,17 @@ using System.Linq;
 
 namespace CoreMap
 {
+    /// То, что Core получает от движка (Engine.cs) вместо собственного запуска. У окна в своём процессе запуск
+    /// Core — это запуск программы: читаются потолки, ставится профиль «при запуске». У движка программа уже
+    /// запущена резидентом, и Core появляется, когда подключается окно: потолки и доступ к процессору у него
+    /// общие с резидентом, профиль заново не ставится, а «было» — то, что помнит движок.
+    class Inherited
+    {
+        public PawnIo Io;          // null — открыть свой (у резидента драйвер не открылся) или имитация
+        public CoreLimits Limits;  // null — прочитать свои
+        public int[] Was;          // null — взять то, что стоит в процессоре сейчас
+    }
+
     class Core
     {
         const int GuardMargin = 5;       // предел по умолчанию: на столько ниже порога, где процессор сам сбрасывает частоту
@@ -50,8 +61,11 @@ namespace CoreMap
 
         public bool Busy { get { return Runner.Busy; } }
 
+        readonly PawnIo io;  // доступ к процессору; null — имитация или драйвер не открылся
+
         /// showSaved — проверка окна на имитации: показать и сохранённую тепловую таблицу с настоящих датчиков.
-        public Core(bool simulate, int limit, bool showSaved = false)
+        /// inherited — Core создаёт движок для подключившегося окна, а не запуск программы: см. Inherited.
+        public Core(bool simulate, int limit, bool showSaved = false, Inherited inherited = null)
         {
             Cores = Topology.Read().ToArray();
             Lps = Cores.Select(c => c.Lp).ToArray();
@@ -71,24 +85,31 @@ namespace CoreMap
             Simulated = simulate;
 
             ISensorBackend backend = null;
+            CoreLimits shared = inherited == null ? null : inherited.Limits;
             if (simulate)
             {
                 backend = new SimBackend(positions, Load.Active);
-                Limits = new CoreLimits(null, Cores, Blocks);
+                Limits = shared ?? new CoreLimits(null, Cores, Blocks);  // «процессор» имитации — массив в памяти: у движка он один
             }
             else
                 try
                 {
-                    var io = new PawnIo(Path.Combine(Program.Root, "modules", "IntelMSR.bin"));
+                    io = inherited != null && inherited.Io != null ? inherited.Io : new PawnIo(Path.Combine(Program.Root, "modules", "IntelMSR.bin"));
                     backend = new LiveBackend(io, Lps);
-                    try { Limits = new CoreLimits(io, Cores, Blocks); }
+                    try
+                    {
+                        Limits = shared ?? new CoreLimits(io, Cores, Blocks);
+                        // Резидент читал потолки при своём последнем действии: с тех пор их мог сбросить сон.
+                        if (shared != null) shared.Refresh();
+                    }
                     catch (SensorException e) { Program.Tell("Потолки множителей недоступны: " + Program.Why(e) + "."); }
                 }
                 catch (SensorException e) { SensorProblem = e.Message; }
 
             // Возврат потолков по метке оборванного измерения, затем профиль «при запуске» — общий путь окна
-            // и резидента, см. Startup.cs.
-            LimitsStartup startup = Limits == null ? null : new LimitsStartup(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir);
+            // и резидента, см. Startup.cs. У движка профиль уже поставлен резидентом: здесь он только читается.
+            LimitsStartup startup = Limits == null ? null
+                : new LimitsStartup(Limits, Blocks, Lps, CpuName, simulate ? null : Program.DataDir, inherited == null);
             if (startup != null)
             {
                 if (startup.Recovered != null) Program.Tell(startup.Recovered);  // полоса сообщений в окне сменится, запись в журнале останется
@@ -96,7 +117,8 @@ namespace CoreMap
                 Profiles = startup.Profiles;
                 // «Было» — то, что стояло в процессоре до того, как профиль запуска встал поверх: после перезагрузки
                 // это заводские потолки, и разница с профилем должна быть видна, а откат — возвращать к ним.
-                was = startup.Was;
+                // У движка «было» переживает окно: его помнит движок.
+                was = inherited != null && inherited.Was != null ? (int[])inherited.Was.Clone() : startup.Was;
             }
             // Доступ к вентиляторам создаётся в их потоке и только после Fans.Start: без окна он не нужен.
             Fans = new Fans(simulate ? (Func<IFanBackend>)(() => new SimFans(() => Monitor == null ? 45 : Monitor.PkgCur)) : () => new HpFans(),
@@ -502,6 +524,18 @@ namespace CoreMap
             return Fans.SetMode(mode);
         }
 
+        /// Какое измерение идёт, словами для владельца: «тепловое измерение 3 из 24»; null — никакое.
+        /// Одни слова для заголовка окна и для подсказки значка у часов.
+        public string Doing()
+        {
+            return Sweep.Running ? "тепловое измерение " + Sweep.Done + " из " + Sweep.Total
+                : Latency.Running ? "измерение задержек"
+                : Calibration.Running ? "подбор нагрузки " + Calibration.Done + " из " + Calibration.Total
+                : Search != null && Search.Running ? "подбор, блок " + (Search.BlockDone + 1) + " из " + Search.BlockTotal
+                : Joint != null && Joint.Running ? "проверка под общей нагрузкой"
+                : Curve != null && Curve.Running ? "кривая " + Curve.Done + " из " + Curve.Total : null;
+        }
+
         public void Close()
         {
             // Измерение возвращает потолки и дописывает файл в своём потоке. Без ожидания процесс завершался раньше,
@@ -512,6 +546,10 @@ namespace CoreMap
             // Максимум, включённый программой, с её закрытием снимается. Не снялся — останется метка
             // (data\fans-held.json), и его снимет следующий запуск.
             Fans.Close();
+            // Дальше — то, что нужно движку: его процесс живёт и после Core, и без окна и измерения ни датчики,
+            // ни драйвер ему не нужны. Окну в своём процессе это не мешает: он за этим кончается.
+            if (Monitor != null) Monitor.Stop();
+            if (io != null) io.Close();
         }
     }
 }

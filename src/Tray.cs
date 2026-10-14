@@ -55,7 +55,16 @@ namespace CoreMap
 
         public CoreLimits Limits { get; private set; }  // null — потолки недоступны
         /// Открыто окно программы: потолки и профили меняются в нём, резидент их не трогает и о них не говорит.
+        /// То же — пока у движка жив Core (к нему подключено окно или идёт измерение без окна).
         public bool WindowOpen;
+        /// Какое измерение идёт у движка без окна, для подсказки значка; null — никакое.
+        public string Doing;
+        /// «Было»: потолки, которые стояли в процессоре при запуске резидента до профиля «при запуске», а дальше —
+        /// поставленные из меню значка или принятые в окне. Движок отдаёт их Core (Inherited). null — неизвестны.
+        public int[] Was;
+
+        /// Доступ к процессору, которым резидент делится с Core движка; null — имитация или драйвер не открылся.
+        public PawnIo Io { get { return io; } }
 
         /// saveDir — папка файлов профилей и метки. simulate — «процессор» в памяти, как в окне с --simulate.
         public Resident(bool simulate, string saveDir)
@@ -97,6 +106,7 @@ namespace CoreMap
                 var startup = new LimitsStartup(Limits, blocks, lps, cpu, saveDir, apply);
                 profile = startup.Profile;
                 profiles = startup.Profiles;
+                if (apply || Was == null) Was = startup.Was;
                 // Уведомления стоит только то, что профиль при запуске не встал. Встал с оговоркой (после прошлого
                 // применения в журнале Windows был сбой) — оговорка остаётся в подсказке и меню.
                 string attention = apply && !(profile.Exists && profile.InEffect && refusal == null) ? Attention() : null;
@@ -136,6 +146,7 @@ namespace CoreMap
         /// Подсказка значка: что стоит в процессоре и, если есть, что не так.
         public string Tip()
         {
+            if (Doing != null) return "CoreMap — " + Doing;
             if (WindowOpen) return "CoreMap — открыто окно программы";
             string attention = Attention();
             if (!Available) return "CoreMap — " + attention;
@@ -208,6 +219,7 @@ namespace CoreMap
                 // Профиль запуска, который и так стоит, заново не записывается: это обнулило бы его испытательный срок
                 // (то же правило у окна — Core.Accept).
                 else if (!(profile.Exists && Same(profile.Name, name)) || profile.Disabled) profile.Save(name);
+                Was = (int[])Limits.Current.Clone();  // поставить из меню — то же, что открыть и принять в окне
                 return refusal = null;
             }
             catch (Exception e)
@@ -228,10 +240,19 @@ namespace CoreMap
         const string Single = "Local\\CoreMap.Tray";    // одна копия резидента; у окна программы одиночка своя
         const uint IconMessage = 0x8001;                // от значка: lParam — что сделала мышь
         const uint WindowOpened = 0x8002;               // от окна программы: оно запустилось, wParam — номер его процесса
+        const uint EngineIdle = 0x8003;                 // от движка: проверить, не пора ли остановить Core, и обновить подсказку
         const int RetryTimes = 3;                       // столько раз повторяется то, что не вышло при запуске (драйвер не
         const uint RetryAfter = 10000;                  // открылся, значок не встал), и через столько миллисекунд
 
         static Resident resident;
+        // Движок (Engine.cs): канал моста и Core на то время, пока к нему подключено окно или идёт измерение.
+        // null — резидент запущен без роли движка (--tray без --bridge) или канал не открылся.
+        static Engine engine;
+        static readonly object sync = new object();  // действия резидента с процессором и создание Core — по одному
+        static int guardLimit;                   // свой защитный предел температуры для Core движка (--limit); 0 — обычный
+        static bool engineWanted;                // резидент запущен в роли движка
+        static int stops;                        // скрытая проверка: сколько раз Core движка останавливался
+        static readonly List<string> asked = new List<string>();  // скрытая проверка: о чём «спросили владельца»
         static bool simulate, hidden;
         static IntPtr window, icon;
         static IntPtr watched;                 // процесс открытого окна программы: резидент ждёт его конца; Zero — не ждёт
@@ -248,11 +269,15 @@ namespace CoreMap
 
         /// Режим --tray. snapshot — скрытая проверка (только с --simulate): значка нет, резидент проходит запуск
         /// на имитации, пишет отчёт в файл и выходит; saved — с копией сохранённых профилей из data\.
-        public static int Run(bool simulated, string snapshot, bool saved)
+        /// bridge — роль движка (--bridge): резидент ещё и слушает канал моста и держит Core, пока тот нужен;
+        /// limit — свой защитный предел температуры для этого Core.
+        public static int Run(bool simulated, string snapshot, bool saved, bool bridge = false, int limit = 0)
         {
             if (snapshot != null && !simulated) return 1;  // проверка на настоящем процессоре не предусмотрена
             simulate = simulated;
             hidden = snapshot != null;
+            guardLimit = limit;
+            engineWanted = bridge;
             bool first = true;
             // Скрытая проверка копией резидента не считается и настоящему резиденту не мешает.
             using (hidden ? null : new Mutex(true, Single, out first))
@@ -274,6 +299,7 @@ namespace CoreMap
                         WatchRunning();
                     }
                     else Reload();
+                    if (bridge) StartEngine();
                     if (hidden)
                     {
                         if (!resident.Available) Notify(resident.Attention());
@@ -297,11 +323,72 @@ namespace CoreMap
                 }
                 finally
                 {
+                    // Выход из резидента при живом Core — это закрытие программы: измерение останавливается и
+                    // возвращает потолки, вентиляторы отпускаются (Core.Close).
+                    try { if (engine != null) engine.Dispose(); }
+                    catch (Exception e) { Program.Log("резидент, остановка движка: " + e); }
                     RemoveIcon();
                     try { if (temp != null) Directory.Delete(temp, true); }
                     catch (Exception) { }
                 }
             }
+        }
+
+        // ----- движок -----
+
+        /// Открывает канал моста. Не открылся (имя занято другой программой) — резидент работает как без роли движка.
+        static void StartEngine()
+        {
+            int process = GetCurrentProcessId();
+            var site = new EngineSite
+            {
+                Create = CreateCore,
+                Refuse = () => OldWindowOpen() ? "открыто прежнее окно CoreMap: закрой его, и это окно подключится" : null,
+                Idle = () => PostMessage(window, EngineIdle, IntPtr.Zero, IntPtr.Zero),
+                // «Было» живёт у резидента: Core берёт его при создании и отдаёт при остановке.
+                Ended = core => { if (core.Was != null) resident.Was = (int[])core.Was.Clone(); },
+                // Скрытая проверка владельца не спрашивает: на первый вопрос «он» отвечает «нет», дальше — «да».
+                Confirm = hidden ? (Func<string, bool>)(question => { lock (asked) { asked.Add(question); return asked.Count > 1; } }) : Native.Ask,
+                LogPath = Path.Combine(Program.DataDir, "bridge.log"),
+                // Скрытая проверка ни именем канала, ни мьютексом не мешает программе владельца.
+                MutexName = hidden ? Engine.CoreMutex + ".Check." + process : Engine.CoreMutex,
+            };
+            try
+            {
+                engine = new Engine(hidden ? "CoreMap.Check." + process : Engine.PipeName(), Access.SessionUser(), site);
+                engine.Start();
+            }
+            catch (Exception e)
+            {
+                engine = null;
+                Program.Log("резидент, канал моста: " + e);
+                Notify("Канал для окна программы не открыт: " + Program.Why(e));
+            }
+        }
+
+        /// Core для подключившегося окна — в потоке чтения моста. Процессор, потолки и «было» у него общие с резидентом.
+        static Core CreateCore()
+        {
+            Core core;
+            lock (sync)
+                core = new Core(simulate, guardLimit, false, new Inherited { Io = resident.Io, Limits = resident.Limits, Was = resident.Was });
+            return core;
+        }
+
+        /// По просьбе движка, в потоке резидента: Core больше не нужен — остановить его и снова стать хозяином
+        /// потолков; нужен — обновить подсказку значка (идёт измерение без окна).
+        static void EngineTick()
+        {
+            if (engine == null) return;
+            // Замок резидента здесь не берётся: Core создаётся под замком движка и уже внутри него берёт замок
+            // резидента (CreateCore) — обратный порядок запер бы оба потока.
+            bool stopped = engine.StopIfIdle();
+            if (stopped) stops++;
+            resident.Doing = engine.Attached ? null : engine.Doing;  // при окне ход измерения показывает оно
+            resident.WindowOpen = WindowIsOpen();
+            if (stopped && !resident.WindowOpen) Reload();
+            ShowTip();
+            if (stopped) Trim();
         }
 
         static string TempCopy(bool saved)
@@ -316,9 +403,13 @@ namespace CoreMap
 
         // ----- связь с окном программы -----
 
-        /// Открыто ли окно программы: резидент ждёт конца его процесса либо жив его мьютекс-одиночка.
-        /// Скрытая проверка на окно владельца не смотрит.
-        static bool WindowIsOpen() { return !hidden && (watched != IntPtr.Zero || WindowRunning()); }
+        /// Потолками и профилями сейчас распоряжается не резидент: открыто прежнее окно программы либо у движка
+        /// жив Core (к нему подключено окно или идёт измерение без окна).
+        static bool WindowIsOpen() { return OldWindowOpen() || engine != null && engine.Alive; }
+
+        /// Открыто ли прежнее окно программы (отдельный процесс со своим Core): резидент ждёт конца его процесса
+        /// либо жив его мьютекс-одиночка. Скрытая проверка на окно владельца не смотрит.
+        static bool OldWindowOpen() { return watched != IntPtr.Zero || !hidden && WindowRunning(); }
 
         static bool WindowRunning()
         {
@@ -401,6 +492,12 @@ namespace CoreMap
                 Native.ActivateOtherCopy();
                 return;
             }
+            if (engine != null && engine.Alive)
+            {
+                // Два Core разом недопустимы (см. шапку Engine.cs); прежнее окно и само отказалось бы открыться.
+                Notify("Прежнее окно сейчас не открыть: к программе подключено новое окно или идёт измерение");
+                return;
+            }
             try
             {
                 // Резидент работает с правами администратора, поэтому запроса Windows не будет.
@@ -420,7 +517,8 @@ namespace CoreMap
         static void Reload()
         {
             bool start = !applied;
-            string news = resident.Load(start);
+            string news;
+            lock (sync) news = resident.Load(start);
             if (resident.Available) applied = true;
             // Оговорка запуска, о которой уведомления нет, остаётся в журнале.
             if (start && news == null && resident.Available && resident.Attention() != null) Program.Log("резидент: " + resident.Attention());
@@ -449,7 +547,7 @@ namespace CoreMap
             // Перед меню всё перечитывается: потолки мог сбросить сон или сменить другая программа, а окно,
             // запущенное с ярлыка, — изменить профили. Поэтому в меню то, что есть, а не то, что было.
             resident.WindowOpen = WindowIsOpen();
-            if (resident.WindowOpen && watched == IntPtr.Zero) WatchRunning();
+            if (OldWindowOpen() && watched == IntPtr.Zero) WatchRunning();
             if (!resident.WindowOpen) Reload();
             ShowTip();
             IntPtr menu = CreatePopupMenu();
@@ -490,8 +588,11 @@ namespace CoreMap
             {
                 string name = resident.NameOf(id);
                 if (name == null) return;
-                resident.WindowOpen = WindowIsOpen();  // окно могли открыть, пока висело меню
-                Notify(resident.Switch(name));
+                lock (sync)
+                {
+                    resident.WindowOpen = WindowIsOpen();  // окно могли открыть или подключить, пока висело меню
+                    Notify(resident.Switch(name));
+                }
             }
         }
 
@@ -527,6 +628,7 @@ namespace CoreMap
                     return IntPtr.Zero;
                 }
                 if (message == WindowOpened) { announced++; Watch((int)(long)wParam); return IntPtr.Zero; }
+                if (message == EngineIdle) { EngineTick(); return IntPtr.Zero; }
                 // Панель задач создана заново (перезапуск Проводника) или только что появилась после входа в Windows.
                 if (message == taskbarCreated && taskbarCreated != 0) { shown = false; AddIcon(); return IntPtr.Zero; }
                 if (message == Destroy) { RemoveIcon(); PostQuitMessage(0); return IntPtr.Zero; }
@@ -792,6 +894,13 @@ namespace CoreMap
             }
             check(closed == 1 && watched == IntPtr.Zero && !resident.WindowOpen, "конец процесса окна замечен, профили снова доступны");
 
+            var engineLines = new List<string>();
+            if (engineWanted)
+            {
+                if (engine == null) check(false, "канал моста не открылся: " + string.Join(" | ", told));
+                else EngineCheck(check, engineLines, path);
+            }
+
             lines.Add("");
             lines.Add("notifications at start: " + startNews);
             lines.Add("tip at start: " + startTip.Replace("\n", " / "));
@@ -813,9 +922,189 @@ namespace CoreMap
             lines.Add("assemblies loaded when idle (" + loaded.Length + "): " + string.Join(", ", loaded));
             string[] later = Assemblies().Except(loaded).ToArray();
             lines.Add("assemblies added by menu clicks and this report: " + (later.Length == 0 ? "none" : string.Join(", ", later)));
+            lines.AddRange(engineLines);
             lines.Insert(0, failed == 0 ? "ok" : "FAILED: " + failed);
             File.WriteAllLines(path, lines);
             return failed == 0 ? 0 : 1;
+        }
+
+        // ----- скрытая проверка роли движка -----
+
+        static long PrivateBytes()
+        {
+            var counters = new MemoryCounters { Size = (uint)Marshal.SizeOf(typeof(MemoryCounters)) };
+            GetProcessMemoryInfo(GetCurrentProcess(), ref counters, counters.Size);
+            return (long)counters.PrivateUsage;
+        }
+
+        /// Ждёт условия в настоящем цикле ожидания резидента (сообщения движка должны доходить); false — не дождался.
+        static bool Pump(Func<bool> condition, double seconds)
+        {
+            for (double until = Native.Now() + seconds; Native.Now() < until; Loop(0.1))
+                if (condition()) return true;
+            return condition();
+        }
+
+        /// Вторая копия программы в роли окна (BridgeCheck.Client). each — что делать, пока она работает.
+        /// Возвращает её код выхода; -1 — не вышла за seconds.
+        static int RunWindow(string pipe, string report, string keys, double seconds, Action each)
+        {
+            using (Process child = Process.Start(new ProcessStartInfo(Exe, "--simulate --bridge-client " + pipe + " --snapshot \"" + report + "\"" + keys)
+                { UseShellExecute = false, WorkingDirectory = Program.Root }))
+            {
+                bool exited = Pump(() =>
+                {
+                    if (each != null) each();
+                    return child.HasExited;
+                }, seconds);
+                if (exited) return child.ExitCode;
+                child.Kill();
+                return -1;
+            }
+        }
+
+        static bool Same(int[] a, int[] b) { return a.SequenceEqual(b); }
+
+        /// Резидент в роли движка: окно подключается и уходит — Core появляется и исчезает, а резидент остаётся
+        /// лёгким; окно уходит посреди измерения — оно идёт дальше и возвращает потолки само. Условия — в check,
+        /// числа и отчёт стороны окна — в report.
+        static void EngineCheck(Action<bool, string> check, List<string> report, string path)
+        {
+            int process = GetCurrentProcessId();
+            string pipe = "CoreMap.Check." + process, mutex = Engine.CoreMutex + ".Check." + process, windowReport = path + ".window";
+            Func<bool> held = () =>
+            {
+                Mutex other;
+                if (!Mutex.TryOpenExisting(mutex, out other)) return false;
+                other.Dispose();
+                return true;
+            };
+            Func<int> threads = () => { using (Process me = Process.GetCurrentProcess()) return me.Threads.Count; };
+            told.Clear();
+
+            Trim();
+            Usage before = Measure();
+            int threadsBefore = threads();
+            string[] loadedBefore = Assemblies();
+            string security = engine.Bridge.Security, user = Access.SessionUser().Value;
+            check(security.Contains("(A;;0x12019b;;;" + user + ")") && security.Contains("(D;;FA;;;NU)") && security.Contains("ML;;NW;;;ME"),
+                "доступ к каналу, прочитанный обратно: пользователь сеанса — чтение и запись, сети — отказ, метка средняя");
+            check(!engine.Alive && !held(), "до первого окна Core нет и мьютекса движка нет");
+
+            // 0. Пока открыто прежнее окно, движок новому окну отказывает. «Прежнее окно» здесь — сам резидент:
+            // его процесс не кончится, пока идёт проверка.
+            watched = OpenProcess(Synchronize, false, process);
+            int code = RunWindow(pipe, windowReport + "0", " --as refused", 20, null);
+            CloseHandle(watched);
+            watched = IntPtr.Zero;
+            check(code == 0 && !engine.Alive, "пока открыто прежнее окно, движок новому окну отказывает, Core не создаётся; код " + code);
+
+            // 1. Окно проходит по всему протоколу и уходит.
+            Program.Tell("проверка моста: сообщение владельцу");
+            long peak = 0;
+            bool sawMutex = false;
+            string tipWithWindow = null;
+            code = RunWindow(pipe, windowReport, "", 120, () =>
+            {
+                if (!engine.Alive) return;
+                peak = Math.Max(peak, PrivateBytes());
+                if (!sawMutex) sawMutex = held();
+                if (engine.Attached && tipWithWindow == null && resident.WindowOpen) tipWithWindow = resident.Tip();
+            });
+            check(code == 0, "вторая копия программы прошла по протоколу как окно и вышла сама, код " + code);
+            check(peak > 0 && sawMutex, "пока окно подключено, Core жив и мьютекс движка существует");
+            check(tipWithWindow != null && tipWithWindow.Contains("открыто окно"), "подсказка значка при окне: " + (tipWithWindow ?? "не менялась"));
+            check(asked.Count == 2 && asked[0].Contains("выше заводского"),
+                "о потолке выше заводского владельца спросили дважды (отказ и согласие): " + string.Join(" | ", asked));
+            Pump(() => !engine.Alive, 10);
+            check(!engine.Alive && !held() && stops >= 1, "окно ушло — Core остановлен, мьютекс снят; остановок за проход: " + stops);
+            check(resident.Available && !resident.WindowOpen && resident.Switch("") == null, "меню значка снова распоряжается потолками");
+            Trim();
+            Usage after = Measure();
+            int threadsAfter = threads();
+            CpuTime();
+            CpuCycles();
+            Loop(0.5);
+            double idleTime = CpuTime(), idleCycles = CpuCycles();
+            Loop(3);
+            idleCycles = CpuCycles() - idleCycles;
+            idleTime = CpuTime() - idleTime;
+            check(idleTime < 20, "без окна резидент снова не тратит процессорное время: " + idleTime.ToString("0.0") + " мс за 3 с");
+            string[] added = Assemblies().Except(loadedBefore).ToArray();
+
+            // 2. Окно запускает измерение и уходит: Core живёт до конца измерения и останавливается сам.
+            int[] standing = (int[])resident.Limits.Current.Clone();
+            int stopsBefore = stops;
+            code = RunWindow(pipe, windowReport + "2", " --as leave", 30, null);
+            check(code == 0, "второе окно запустило лесенку и вышло, код " + code);
+            Pump(() => resident.Doing != null, 2);
+            check(engine.Alive && !engine.Attached && held(), "окно ушло посреди измерения — Core жив");
+            check(resident.Tip().Contains("кривая"), "подсказка значка без окна говорит об измерении: " + resident.Tip().Replace("\n", " / "));
+            check(resident.Switch("") != null, "меню значка на это время потолки не трогает");
+            check(Pump(() => !Same(resident.Limits.Current, standing), 10), "измерение идёт: потолок блока двигается");
+            bool ended = Pump(() => !engine.Alive, 90);
+            check(ended && stops == stopsBefore + 1 && !held(), "измерение кончилось — Core остановился сам");
+            check(Same(resident.Limits.Current, standing), "потолки после измерения прежние");
+            check(resident.Tip().IndexOf("кривая") < 0, "подсказка значка вернулась: " + resident.Tip().Replace("\n", " / "));
+
+            // 3. «Было» переживает Core: одно окно оставляет его отличным от «сейчас», следующее получает таким же.
+            int[] fused = resident.Limits.Fused;
+            code = RunWindow(pipe, windowReport + "3", " --as mark", 20, null);
+            Pump(() => !engine.Alive, 10);
+            check(code == 0 && !engine.Alive && resident.Was != null && !Same(resident.Was, fused) && !Same(resident.Was, resident.Limits.Current),
+                "после окна «было» у резидента — не заводские и не то, что стоит сейчас; код " + code);
+            code = RunWindow(pipe, windowReport + "4", " --as was", 20, null);
+            Pump(() => !engine.Alive, 10);
+            check(code == 0 && !engine.Alive && Same(resident.Was, fused) && Same(resident.Limits.Current, fused),
+                "следующее окно получило то же «было», вернуло заводские — и они снова «было» у резидента; код " + code);
+            check(told.Count == 0, "уведомлений владельцу за проверку не было" + (told.Count == 0 ? "" : ": " + string.Join(" | ", told)));
+
+            // Покой в самом конце: потоки, которые система заводила под обмен по каналу, к этому времени должны уйти.
+            Trim();
+            Usage last = Measure();
+            CpuTime();
+            CpuCycles();
+            Loop(0.5);
+            double lastTime = CpuTime(), lastCycles = CpuCycles();
+            Loop(3);
+            lastCycles = CpuCycles() - lastCycles;
+            lastTime = CpuTime() - lastTime;
+
+            report.Add("");
+            report.Add("engine role (--bridge): the resident also listens on the pipe and holds Core while a window is connected");
+            report.Add("  listening, before the first window: " + before);
+            report.Add("  highest while Core was alive:        private bytes " + (peak / 1048576.0).ToString("0.0") + " MB");
+            report.Add("  after the first Core stopped:        " + after + "  (left behind: " + ((after.Private - before.Private) / 1048576.0).ToString("0.0") + " MB private)");
+            report.Add("  at the end, after every Core life:   " + last + "  (left behind: " + ((last.Private - before.Private) / 1048576.0).ToString("0.0") + " MB private)");
+            report.Add("  cpu in 3 s of waiting after the first stop: " + idleTime.ToString("0.0") + " ms (GetProcessTimes), " + idleCycles.ToString("0.00") + " million cycles");
+            report.Add("  cpu in 3 s of waiting at the end:           " + lastTime.ToString("0.0") + " ms (GetProcessTimes), " + lastCycles.ToString("0.00") + " million cycles");
+            report.Add("  threads: before the first window " + threadsBefore + ", after the first stop " + threadsAfter + ", at the end " + threads() +
+                "; pipe sessions " + engine.Bridge.Sessions + "; Core stops " + stops);
+            report.Add("  assemblies added by Core: " + (added.Length == 0 ? "none" : string.Join(", ", added)));
+            report.Add("  pipe: " + security);
+            var sides = new Dictionary<string, string>
+            {
+                { "0", "refused while the old window is open" }, { "", "the whole protocol" }, { "2", "leaving in the middle of a measurement" },
+                { "3", "leaving accepted and current ceilings that differ" }, { "4", "finding them in the next Core" },
+            };
+            foreach (KeyValuePair<string, string> side in sides)
+            {
+                report.Add("");
+                report.Add("--- the window's side: " + side.Value + " ---");
+                if (File.Exists(windowReport + side.Key))
+                {
+                    string[] theirs = File.ReadAllLines(windowReport + side.Key);
+                    check(theirs.All(l => !l.StartsWith("FAILED")), "у стороны окна отказов нет (" + side.Value + ")");
+                    report.AddRange(theirs);
+                    File.Delete(windowReport + side.Key);
+                }
+                else check(false, "отчёта стороны окна нет (" + side.Value + ")");
+            }
+
+            // 3. Путь кнопки «мост» из окна программы — здесь без прав администратора с обеих сторон.
+            report.Add("");
+            report.Add("--- the code path of the owner's bridge button ---");
+            BridgeCheck.Button(check, report);
         }
 
         // ----- вызовы Windows -----

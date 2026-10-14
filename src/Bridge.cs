@@ -32,8 +32,10 @@ namespace CoreMap
     /// Хозяин моста: тот, чьё состояние по нему уходит и кто исполняет пришедшие команды.
     abstract class BridgeHost
     {
-        /// Сообщения сразу после знакомства: «hello» и всё, что дальше шлётся только по изменению.
-        public abstract IEnumerable<string> Greeting();
+        /// Клиент назвал себя: принять ли его. null — принят, и greeting — сообщения сразу после знакомства
+        /// («hello» и всё, что дальше шлётся только по изменению). Иначе причина отказа: она уйдёт клиенту
+        /// ответом, после чего канал закроется. who — что о клиенте известно Windows.
+        public abstract string Admit(string who, out IEnumerable<string> greeting);
 
         /// Команду нельзя ставить в очередь за другими: она исполняется в потоке чтения и должна быть мгновенной.
         public virtual bool Urgent(string command) { return false; }
@@ -47,8 +49,7 @@ namespace CoreMap
         /// Пишет сообщение «состояние». false — слать сейчас нечего. Зовёт поток записи.
         public virtual bool State(StringBuilder text) { return false; }
 
-        /// Клиент назвал себя; who — что о нём известно Windows. Клиент ушёл; how — как.
-        public virtual void Joined(string who) { }
+        /// Принятый клиент ушёл; how — как.
         public virtual void Left(string how) { }
     }
 
@@ -77,6 +78,7 @@ namespace CoreMap
         byte[] bytes = new byte[8192];
         NamedPipeServerStream pipe;
         volatile bool done, accepted, spoke, greeted, closing, due;  // spoke — клиент прислал первое сообщение
+        bool admitted;  // хозяин принял клиента: об уходе ему надо сказать (только поток чтения)
         volatile int session;
         double acceptedAt;
 
@@ -87,6 +89,8 @@ namespace CoreMap
         /// Уровень целостности этого клиента (Access.Medium, Access.High); null — неизвестен.
         public volatile string ClientIntegrity;
         public int Sessions { get { return session; } }
+        /// Клиент подключён и принят.
+        public bool Connected { get { return greeted; } }
 
         public Bridge(string name, SecurityIdentifier admit, BridgeHost host)
         {
@@ -147,7 +151,8 @@ namespace CoreMap
                 catch (ObjectDisposedException) { how = "канал закрыт"; }
                 catch (InvalidOperationException e) { how = "отключён: " + Program.Why(e); }
                 catch (OperationCanceledException) { how = "отключён мостом"; }
-                bool known = greeted;
+                bool known = admitted;
+                admitted = false;
                 accepted = spoke = greeted = closing = due = false;
                 Client = ClientIntegrity = null;
                 lock (outbox) outbox.Clear();
@@ -194,17 +199,28 @@ namespace CoreMap
                     object proto;
                     bool spoken = request.Fields.TryGetValue("proto", out proto) && proto is int && (int)proto == Protocol;
                     string who = Describe();
+                    // Отказ (версия протокола не та — после замены exe остался работать прежний движок; хозяин моста
+                    // не принял) клиенту говорится с причиной, и только потом канал рвётся: иначе он видел бы просто обрыв.
+                    string refusal = spoken ? null : "движок говорит на протоколе " + Protocol + ", окно — на другом";
+                    IEnumerable<string> greeting = null;
+                    if (refusal == null)
+                    {
+                        try { refusal = host.Admit(who, out greeting); }
+                        catch (Exception e)
+                        {
+                            Program.Log("мост, знакомство: " + e);
+                            refusal = "движок не готов: " + Program.Why(e);
+                        }
+                        admitted = refusal == null;
+                    }
                     lock (outbox)
                     {
-                        // Версия протокола не та (после замены exe остался работать прежний движок): клиенту говорится
-                        // почему, и только потом канал рвётся — иначе он видел бы просто обрыв.
-                        outbox.Enqueue(Reply(request.Id, spoken ? null : "движок говорит на протоколе " + Protocol + ", окно — на другом", null));
-                        if (spoken)
-                            foreach (string message in host.Greeting()) outbox.Enqueue(message);
+                        outbox.Enqueue(Reply(request.Id, refusal, null));
+                        if (refusal == null && greeting != null)
+                            foreach (string message in greeting) outbox.Enqueue(message);
                     }
-                    if (!spoken) { closing = true; wake.Set(); continue; }
+                    if (refusal != null) { closing = true; wake.Set(); continue; }
                     Client = who;
-                    host.Joined(who);
                     greeted = due = true;
                     wake.Set();
                     continue;
@@ -309,7 +325,7 @@ namespace CoreMap
                 try
                 {
                     if (!Flush()) continue;
-                    if (closing) { Drop("версия протокола"); continue; }
+                    if (closing) { Drop("отказано в знакомстве"); continue; }
                     if (!greeted)
                     {
                         if (!spoke && Native.Now() - acceptedAt >= GreetWithin) Drop("клиент молчит " + GreetWithin + " с");

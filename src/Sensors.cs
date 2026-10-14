@@ -290,15 +290,28 @@ namespace CoreMap
             Throttled = new bool[count];
         }
 
+        Thread thread;
+        volatile bool stop;
+
         public void Start()
         {
             // Высокий приоритет: иначе под полной нагрузкой опрос ждал бы своей очереди на каждом занятом ядре.
-            new Thread(Run) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "sensors" }.Start();
+            thread = new Thread(Run) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "sensors" };
+            thread.Start();
+        }
+
+        /// Кончает опрос: поток датчиков доделывает идущий опрос и выходит. Нужен движку, который живёт дольше,
+        /// чем окно: без окна и измерения датчики никто не читает (Core.Close). Ждёт выхода не дольше двух секунд;
+        /// из самого потока датчиков не ждёт.
+        public void Stop()
+        {
+            stop = true;
+            if (thread != null && thread != Thread.CurrentThread) thread.Join(2000);
         }
 
         void Run()
         {
-            while (true)
+            while (!stop)
             {
                 double started = Native.Now();
                 double[] temps = null;

@@ -1,17 +1,18 @@
 // Проверки моста.
 //
-// 1. Скрытая, для агента (tools\check.ps1): CoreMap.exe --simulate --engine --snapshot <отчёт>. Движок на
-//    имитации без окна открывает канал и запускает вторую копию программы (--bridge-client) — она проходит по
-//    протоколу как окно: знакомство, состояние, каждая команда, отказы, измерение с остановкой, негодные
-//    сообщения. Первая строка отчёта — «ok» или «FAILED». Обе копии без прав администратора: главное —
-//    канал между процессом с правами и процессом без них — так проверить нельзя.
+// 1. Скрытая, для агента (tools\check.ps1): CoreMap.exe --simulate --tray --bridge --snapshot <отчёт>. Резидент
+//    на имитации в роли движка открывает канал; хозяйская часть проверки — в Tray.cs (память и остановка Core),
+//    а здесь то, что делает вторая копия программы (--bridge-client): она проходит по протоколу как окно —
+//    знакомство, состояние, каждая команда, отказы, измерение с остановкой, негодные сообщения. С --leave —
+//    запускает измерение и уходит, не дожидаясь конца. Обе копии без прав администратора: главное — канал
+//    между процессом с правами и процессом без них — так проверить нельзя.
 // 2. Кнопка владельца в окне программы (Owner): то самое главное. Окно с правами создаёт пробный канал с
 //    одной пустой командой, просит оболочку Windows запустить копию программы без прав (--bridge-check), та
 //    подключается и шлёт двадцать команд. Итог — строкой в окне, подробности — в data\bridge-check.txt.
 //    Настоящий канал протокола на настоящем процессоре при этом не открывается (DECISIONS.md, п. 25).
 //    Кнопка временная: уйдёт, когда появится окно без прав, которое и будет такой проверкой.
-// Тот же путь кнопки проходит и скрытая проверка — без прав, чтобы в коде, который нажмёт владелец, не было
-// ни одной строки, не исполненной до него.
+// Тот же путь кнопки проходит и скрытая проверка (Button) — без прав, чтобы в коде, который нажмёт владелец,
+// не было ни одной строки, не исполненной до него.
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -37,76 +38,16 @@ namespace CoreMap
             lines.Add((ok ? "ok      " : "FAILED  ") + what);
         }
 
-        // ----- скрытая проверка: движок -----
-
-        public static int Host(string reportPath)
+        /// Путь кнопки владельца в скрытой проверке: обе стороны без прав, поэтому итог обязан сказать, что
+        /// главного он не показал. check — куда отдать условия, report — куда приложить подробности.
+        public static void Button(Action<bool, string> check, List<string> report)
         {
-            string dir = Path.Combine(Path.GetTempPath(), "coremap-bridge-" + Process.GetCurrentProcess().Id);
-            Directory.CreateDirectory(dir);
-            Program.DataDir = dir;  // журнал и отчёт кнопки — сюда, а не в data\ владельца
-            try { Hosted(reportPath); }
-            catch (Exception e) { Check(false, "проверка оборвалась: " + e); }
-            try { Directory.Delete(dir, true); }
-            catch (Exception) { }
-            lines.Insert(0, failed == 0 ? "ok" : "FAILED: " + failed);
-            File.WriteAllLines(reportPath, lines);
-            return failed == 0 ? 0 : 1;
-        }
-
-        static void Hosted(string reportPath)
-        {
-            // Предел защиты поднят: имитация под нагрузкой показывает больше ста градусов, а проверяется здесь не защита.
-            var core = new Core(true, 400);
-            string name = "CoreMap.Check." + Process.GetCurrentProcess().Id, clientReport = reportPath + ".client";
-            SecurityIdentifier user = Access.SessionUser();
-            var questions = new List<string>();
-            // На первый вопрос о потолке выше заводского «владелец» отвечает «нет», дальше — «да».
-            Func<string, bool> confirm = question =>
-            {
-                lock (questions) questions.Add(question);
-                return questions.Count > 1;
-            };
-            using (var engine = new Engine(core, name, user, confirm))
-            {
-                Program.Tell("проверка моста: сообщение владельцу");
-                bool exited;
-                int code = -1;
-                using (Process child = Process.Start(new ProcessStartInfo(Launch.Exe, "--simulate --bridge-client " + name + " --snapshot \"" + clientReport + "\"")
-                    { UseShellExecute = false, WorkingDirectory = Program.Root }))
-                {
-                    exited = child.WaitForExit(90000);
-                    if (exited) code = child.ExitCode;
-                    else child.Kill();
-                }
-                Check(exited && code == 0, "вторая копия программы прошла по протоколу и вышла сама" + (exited ? ", код " + code : " — не вышла за 90 с"));
-                string security = engine.Bridge.Security;
-                Check(security.Contains("(A;;0x12019b;;;" + user.Value + ")") && security.Contains("(D;;FA;;;NU)") && security.Contains("ML;;NW;;;ME"),
-                    "доступ к каналу, прочитанный обратно: пользователь сеанса — чтение и запись, сети — отказ, метка средняя");
-                Check(questions.Count == 2 && questions[0].Contains("выше заводского"),
-                    "о потолке выше заводского владельца спросили дважды (отказ и согласие): " + string.Join(" | ", questions));
-                lines.Add("");
-                lines.Add("канал: " + security);
-                lines.Add("подключений за проверку: " + engine.Bridge.Sessions);
-                lines.Add("");
-                lines.Add("--- сторона окна ---");
-                if (File.Exists(clientReport))
-                {
-                    lines.AddRange(File.ReadAllLines(clientReport));
-                    File.Delete(clientReport);
-                }
-                else Check(false, "отчёта стороны окна нет");
-            }
-            core.Close();
-
-            // Путь кнопки владельца. Здесь обе стороны без прав, поэтому итог обязан сказать, что главного он не показал.
-            lines.Add("");
-            lines.Add("--- путь кнопки «мост» ---");
             string verdict = Owner();
             string[] details = File.ReadAllLines(Path.Combine(Program.DataDir, "bridge-check.txt"));
-            Check(verdict.StartsWith("Мост: канал и команды работают") && verdict.Contains("без прав администратора"), "итог кнопки без прав: " + verdict);
-            Check(details.Any(l => l.StartsWith("сторона без прав")) && details.Any(l => l.Contains("команд " + Pings + " из " + Pings)),
+            check(verdict.StartsWith("Мост: канал и команды работают") && verdict.Contains("без прав администратора"), "итог кнопки без прав: " + verdict);
+            check(details.Any(l => l.StartsWith("сторона без прав")) && details.Any(l => l.Contains("команд " + Pings + " из " + Pings)),
                 "копия, запущенная оболочкой Windows, подключилась и прислала " + Pings + " команд");
-            lines.AddRange(details.Select(l => "    " + l));
+            report.AddRange(details.Select(l => "    " + l));
         }
 
         // ----- скрытая проверка: сторона окна -----
@@ -145,12 +86,75 @@ namespace CoreMap
 
         static string Row(Dictionary<string, object> state, string row) { return string.Join(",", List(state[row]).Select(v => Convert.ToString(v))); }
 
-        public static int Client(string name, string reportPath)
+        /// Вторая копия программы в роли окна. mode: "" — пройти по всему протоколу; "refused" — убедиться, что
+        /// движок отказывает в знакомстве; "leave" — запустить измерение и уйти, не дожидаясь его конца;
+        /// "mark" и "was" — пара: первое окно оставляет «было», отличное от «сейчас», второе проверяет, что
+        /// новому Core они достались такими же, и возвращает заводские потолки.
+        public static int Client(string name, string reportPath, string mode)
         {
-            try { Script(name); }
+            try
+            {
+                if (mode == "leave") Leave(name);
+                else if (mode == "refused") Turned(name);
+                else if (mode == "mark") Mark(name, false);
+                else if (mode == "was") Mark(name, true);
+                else Script(name);
+            }
             catch (Exception e) { Check(false, "проверка оборвалась: " + e); }
             File.WriteAllLines(reportPath, lines);
             return failed == 0 ? 0 : 1;
+        }
+
+        /// Окно, которому движок должен отказать: открыто прежнее окно программы.
+        static void Turned(string name)
+        {
+            using (var client = new BridgeClient(name))
+            {
+                string refusal = client.Connect(5000);
+                Dictionary<string, object> answer = refusal == null ? client.Hello() : null;
+                Check(Refused(answer, "прежнее окно") && client.Wait(() => client.Closed, 2), "в знакомстве отказано с причиной, канал закрыт: " + Why(answer));
+            }
+        }
+
+        /// Пара окон про «было»: первое (after = false) ставит блоку потолок на три ниже заводского, принимает
+        /// его и опускает ещё на два; второе (after = true) должно увидеть ровно это — «было» на три ниже,
+        /// «сейчас» на пять ниже — и вернуть заводские.
+        static void Mark(string name, bool after)
+        {
+            using (var client = new BridgeClient(name))
+            {
+                string refusal = client.Connect(5000);
+                Check(refusal == null && Ok(client.Hello()) && client.Wait(() => client.Last("hello") != null && client.Last("limits") != null &&
+                    client.Last("profiles") != null && client.Last("state") != null, 3), "окно подключилось" + (refusal == null ? "" : ": " + refusal));
+                if (refusal != null || client.Last("hello") == null || client.Last("limits") == null || client.Last("profiles") == null) return;
+                int first = (int)Map(List(client.Last("hello")["blocks"])[1])["first"];
+                int fused = Convert.ToInt32(List(client.Last("limits")["fused"])[first]);
+                Func<int> was = () => Convert.ToInt32(List(client.Last("limits")["was"])[first]);
+                if (!after)
+                {
+                    Check(Ok(client.Ask("limit.set", "block", 1, "ratio", fused - 3)) && Ok(client.Ask("profile.accept")) &&
+                        Ok(client.Ask("limit.set", "block", 1, "ratio", fused - 5)) && client.Wait(() => was() == fused - 3, 2) &&
+                        Seen(client, s => At(s, "limit", first) == fused - 5),
+                        "блоку 1 оставлено: «было» ×" + (fused - 3) + ", «сейчас» ×" + (fused - 5));
+                    return;
+                }
+                Check(was() == fused - 3 && At(client.Last("state"), "limit", first) == fused - 5 && (bool)client.Last("profiles")["canAccept"],
+                    "новому Core достались прежние «было» ×" + was() + " и «сейчас» ×" + At(client.Last("state"), "limit", first));
+                Check(Ok(client.Ask("profile.open", "name", "")) && Ok(client.Ask("profile.accept")) && client.Wait(() => was() == fused, 2), "заводские потолки возвращены и приняты");
+            }
+        }
+
+        /// Окно, которое запустило лесенку одного блока и закрылось: измерение должно идти дальше без него.
+        static void Leave(string name)
+        {
+            using (var client = new BridgeClient(name))
+            {
+                string refusal = client.Connect(5000);
+                Check(refusal == null && Ok(client.Hello()), "окно подключилось" + (refusal == null ? "" : ": " + refusal));
+                if (refusal != null) return;
+                Check(Ok(client.Ask("run.start", "kind", "curve", "block", 0, "maxTemp", 80)) &&
+                    Seen(client, s => s["run"] != null && (string)Map(s["run"])["kind"] == "curve"), "лесенка запущена — окно уходит, не дожидаясь её конца");
+            }
         }
 
         static void Script(string name)
@@ -294,7 +298,13 @@ namespace CoreMap
             public volatile string Who, Integrity;
             public Bridge Bridge;
 
-            public override IEnumerable<string> Greeting() { return new[] { "{\"t\":\"hello\",\"proto\":" + Bridge.Protocol + ",\"check\":true}" }; }
+            public override string Admit(string who, out IEnumerable<string> greeting)
+            {
+                Who = who;
+                Integrity = Bridge.ClientIntegrity;
+                greeting = new[] { "{\"t\":\"hello\",\"proto\":" + Bridge.Protocol + ",\"check\":true}" };
+                return null;
+            }
 
             public override string Execute(string command, Dictionary<string, object> fields, out string note)
             {
@@ -303,12 +313,6 @@ namespace CoreMap
                 if (command == "ping") { Count++; return null; }
                 if (command == "done" && fields.TryGetValue("medianUs", out median) && median is int) { MedianUs = (int)median; return null; }
                 return "неизвестная команда";
-            }
-
-            public override void Joined(string who)
-            {
-                Who = who;
-                Integrity = Bridge.ClientIntegrity;
             }
         }
 

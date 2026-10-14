@@ -108,15 +108,18 @@ $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
 
-# The bridge (src\Bridge.cs, Feed.cs, Commands.cs; check in src\BridgeCheck.cs): a windowless simulated engine opens
-# the pipe and starts a second copy of the exe, which walks the protocol the way a window would - greeting, state,
-# every command, refusals, a measurement stopped half way, malformed clients. Then the code path of the owner's
-# "bridge" button, here with both sides unelevated. It runs after the snapshots, not beside them: it counts state
+# The engine and the bridge (src\Engine.cs, Bridge.cs, Feed.cs, Commands.cs; checks in src\Tray.cs EngineCheck and
+# src\BridgeCheck.cs): the resident on simulation in the engine role opens the pipe; second copies of the exe connect
+# the way a window would - one is refused while "the old window is open", one walks the whole protocol (greeting,
+# state, every command, refusals, a measurement stopped half way, malformed clients), one starts a measurement and
+# leaves, two check that the accepted ceilings survive from one Core to the next. The resident measures its own
+# memory before the first window, with Core alive and after Core stopped. Last comes the code path of the owner's
+# "bridge" button, with both sides unelevated. It runs after the snapshots, not beside them: it counts state
 # messages per second and waits for replies, and eight parallel windows would make that timing flaky.
 # First line of the report: ok / FAILED.
 $bridge = Join-Path $dir 'bridge.txt'
-$bridged = Start-Process -FilePath $out -ArgumentList "--simulate --engine --snapshot $bridge" -PassThru
-if (-not $bridged.WaitForExit(150000)) { $bridged.Kill(); $failed++; Write-Host 'the bridge check did not finish' }
+$bridged = Start-Process -FilePath $out -ArgumentList "--simulate --tray --bridge --saved --snapshot $bridge" -PassThru
+if (-not $bridged.WaitForExit(240000)) { $bridged.Kill(); $failed++; Write-Host 'the bridge check did not finish' }
 $file = Get-Item $bridge -ErrorAction SilentlyContinue
 if (-not $file -or $file.LastWriteTime -lt $stamp) { Write-Host 'no bridge report'; $failed++ }
 elseif ((Get-Content $bridge -TotalCount 1) -ne 'ok') {

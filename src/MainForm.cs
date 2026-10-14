@@ -372,15 +372,8 @@ namespace CoreMap
 
         string Doing()
         {
-            ThermalSweep sw = core.Sweep;
-            LatencyTest lat = core.Latency;
-            Calibration cal = core.Calibration;
-            return sw.Running ? "CoreMap — тепловое измерение " + sw.Done + " из " + sw.Total
-                : lat.Running ? "CoreMap — измерение задержек"
-                : cal.Running ? "CoreMap — подбор нагрузки " + cal.Done + " из " + cal.Total
-                : core.Search != null && core.Search.Running ? "CoreMap — подбор, блок " + (core.Search.BlockDone + 1) + " из " + core.Search.BlockTotal
-                : core.Joint != null && core.Joint.Running ? "CoreMap — проверка под общей нагрузкой"
-                : core.Curve != null && core.Curve.Running ? "CoreMap — кривая " + core.Curve.Done + " из " + core.Curve.Total : "CoreMap";
+            string doing = core.Doing();
+            return doing == null ? "CoreMap" : "CoreMap — " + doing;
         }
 
         string CalibrationStatus()

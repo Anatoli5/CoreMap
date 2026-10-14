@@ -52,6 +52,17 @@ namespace CoreMap
 
         public static void Flash(IntPtr window) { FlashWindow(window, true); }
 
+        /// Спрашивает владельца «да / нет» окошком Windows поверх остальных окон; по умолчанию — «нет».
+        /// Нужно движку, у которого своего окна нет: в окошко процесса с правами администратора другая программа
+        /// щёлкнуть не может, поэтому «да» здесь — это «да» владельца.
+        public static bool Ask(string question)
+        {
+            const uint YesNo = 0x4, Warning = 0x30, SecondDefault = 0x100, Foreground = 0x10000, Topmost = 0x40000;
+            return MessageBox(IntPtr.Zero, question, "CoreMap", YesNo | Warning | SecondDefault | Foreground | Topmost) == 6;  // 6 — «да»
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int MessageBox(IntPtr owner, string text, string caption, uint type);
+
         /// Показывает окно уже запущенной копии программы.
         public static void ActivateOtherCopy()
         {
