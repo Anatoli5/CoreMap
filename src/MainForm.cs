@@ -33,6 +33,7 @@ namespace CoreMap
         bool autostartOn;        // что ответил планировщик Windows; своей записи об этом у программы нет
         Segmented level;
         public string Problem;  // ошибка программы или отказ действия, показывается в полосе сообщений
+        volatile string note;   // итог действия, который не ошибка (проверка моста); в той же полосе, пока нет ошибки
 
         bool wasBusy;           // в прошлый опрос шло измерение
         int sinceRefresh;       // тактов с последнего перечитывания потолков из процессора
@@ -144,8 +145,8 @@ namespace CoreMap
             reset.Margin = new Padding(0, 0, Theme.Px(4), 0);
             bar.Controls.Add(since = Widgets.Label("", Theme.Dim, 13, false, "Время с последнего сброса максимумов"));
             FanControls(bar);  // обороты вентиляторов и их режим на время замеров: MainForm.Fans.cs
-            bar.Controls.Add(stopLoad = Widgets.Button("■", core.StopLoad, "Снять нагрузку\nОстанавливает нагрузку на всех ядрах."));
-            bar.Controls.Add(level = new Segmented(LoadManager.Levels, v => Theme.LevelGlyph[v], core.SetLevel,
+            bar.Controls.Add(stopLoad = Widgets.Button("■", () => core.StopLoad(), "Снять нагрузку\nОстанавливает нагрузку на всех ядрах."));
+            bar.Controls.Add(level = new Segmented(LoadManager.Levels, v => Theme.LevelGlyph[v], v => core.SetLevel(v),
                 "Сила нагрузки\nНасколько тяжёлые вычисления получает нагруженное ядро.\n" +
                 "• при щелчке по ядру — ровно эта сила\n" +
                 "• в тепловом измерении — верхняя граница: под каждое ядро сила подбирается сама\n" +
@@ -175,6 +176,7 @@ namespace CoreMap
             // Имитация систему не меняет: выключатель в ней не работает и планировщик не спрашивается.
             autostartButton.Enabled = !core.Simulated;
             if (!core.Simulated) ReadAutostart();
+            BridgeControls(bar);  // временная кнопка проверки моста: MainForm.Bridge.cs
             bar.Controls.Add(helpButton = Widgets.Button("?", () => help.Set(true),
                 "Режим вопроса\nПока он включён, при наведении на любой элемент окна показывается подсказка о нём.\n" +
                 "• первый щелчок в окне выключает режим и ничего не нажимает\n" +
@@ -227,6 +229,7 @@ namespace CoreMap
         void Report(string refusal)
         {
             Problem = refusal == null ? null : "Не сделано: " + refusal;
+            note = null;
             Tick();
         }
 
@@ -313,6 +316,7 @@ namespace CoreMap
             else if (core.Monitor != null && core.Monitor.Error != null) text = "Ошибка датчиков: " + core.Monitor.Error;
             else if (limitsUnread != null) text = "Потолки не перечитаны из процессора: " + limitsUnread + ". На плитках — прежние значения.";
             else if (Problem != null) text = Problem;
+            else if (note != null) { text = note; bad = false; }
             else if (core.Simulated) { text = "ИМИТАЦИЯ — температуры ненастоящие, нагрузка на процессор не подаётся"; bad = false; }
             else if (core.Monitor == null) { text = "Датчики недоступны: " + core.SensorProblem + ". Нагрузка на ядра без датчиков не даётся."; bad = false; }
             banner.Visible = text != null;

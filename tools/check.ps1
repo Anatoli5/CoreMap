@@ -1,7 +1,7 @@
 # Project check for the agent: builds the sources into CoreMapNew.exe (the owner's CoreMap.exe is not touched),
-# takes hidden simulated window snapshots into outputs\<Name>\, runs the self-test of the measurement base and the
-# hidden check of the tray resident. Nothing appears on screen, no elevation prompt, no real load. Exit code 0 =
-# built, every snapshot was written, the self-test and the resident check passed.
+# takes hidden simulated window snapshots into outputs\<Name>\, runs the self-test of the measurement base, the
+# hidden checks of the tray resident, of hover and of the bridge. Nothing appears on screen, no elevation prompt,
+# no real load. Exit code 0 = built, every snapshot was written, every check passed.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -Name stage1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -BuildOnly
@@ -107,6 +107,23 @@ $procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover
 $procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
+
+# The bridge (src\Bridge.cs, Feed.cs, Commands.cs; check in src\BridgeCheck.cs): a windowless simulated engine opens
+# the pipe and starts a second copy of the exe, which walks the protocol the way a window would - greeting, state,
+# every command, refusals, a measurement stopped half way, malformed clients. Then the code path of the owner's
+# "bridge" button, here with both sides unelevated. It runs after the snapshots, not beside them: it counts state
+# messages per second and waits for replies, and eight parallel windows would make that timing flaky.
+# First line of the report: ok / FAILED.
+$bridge = Join-Path $dir 'bridge.txt'
+$bridged = Start-Process -FilePath $out -ArgumentList "--simulate --engine --snapshot $bridge" -PassThru
+if (-not $bridged.WaitForExit(150000)) { $bridged.Kill(); $failed++; Write-Host 'the bridge check did not finish' }
+$file = Get-Item $bridge -ErrorAction SilentlyContinue
+if (-not $file -or $file.LastWriteTime -lt $stamp) { Write-Host 'no bridge report'; $failed++ }
+elseif ((Get-Content $bridge -TotalCount 1) -ne 'ok') {
+    Write-Host "bridge check failed, see $bridge"
+    Select-String -Path $bridge -Pattern '^FAILED  ' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
+    $failed++
+}
 foreach ($key in $sets.Keys) {
     $file = Get-Item (Join-Path $dir "$key.png") -ErrorAction SilentlyContinue
     if (-not $file -or $file.LastWriteTime -lt $stamp) { Write-Host "no snapshot: $key ($($sets[$key]))"; $failed++ }
@@ -133,5 +150,5 @@ elseif ((Get-Content $hover -TotalCount 1) -ne 'ok') {
     $failed++
 }
 if ($failed -gt 0) { exit 2 }
-Write-Host "snapshots, self-test, resident and hover checks ok: $dir"
+Write-Host "snapshots, self-test, resident, hover and bridge checks ok: $dir"
 exit 0

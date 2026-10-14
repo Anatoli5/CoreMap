@@ -1,6 +1,6 @@
 // Запуск программы.
 //
-// CoreMap.exe               обычная работа (нужны права администратора: без них датчики недоступны)
+// CoreMap.exe               обычная работа (с правами администратора: без них датчики недоступны)
 // CoreMap.exe --limit N     свой защитный предел температуры, °C
 // CoreMap.exe --simulate    имитация температур, без датчиков и без настоящей нагрузки
 // CoreMap.exe --probe       опрос процессора без изменений: потолки множителей по ядрам, доступные регистры;
@@ -30,6 +30,14 @@
 // CoreMap.exe --simulate --tray --snapshot F   проверка резидента: значка нет, запуск на имитации, щелчки по
 //                           пунктам меню, замер памяти и процессорного времени; отчёт — текстом в файл F.
 //                           С --saved — на копии сохранённых профилей из data\
+// CoreMap.exe --simulate --engine --snapshot F   проверка моста: движок на имитации без окна открывает канал и
+//                           запускает вторую копию программы, которая проходит по протоколу как окно
+//                           (BridgeCheck.cs); отчёт — текстом в файл F
+// CoreMap.exe --simulate --bridge-client N --snapshot F   та вторая копия: N — имя канала; сама по себе не нужна
+// CoreMap.exe --bridge-check N --out F   сторона без прав в проверке моста кнопкой владельца: её запускает окно
+//
+// Права администратора программа просит сама (Launch.Elevate), когда они нужны: при любом запуске без
+// --simulate, кроме сторон моста. В манифесте их требования нет: окну без прав и проверкам моста они ни к чему.
 //
 // Ключи, по которым программа что-то делает сама (--run, --calibrate, --snapshot и всё, что идёт вместе с ним),
 // исполняет Scenario.cs: за запуск — один сценарий. Для владельца они не нужны: всё, чем он пользуется, есть в окне.
@@ -100,7 +108,34 @@ namespace CoreMap
         public static void Tell(string text, Exception e = null)
         {
             Log(e == null ? text : text + "\r\n" + e);
-            lock (logged) told = told == null ? text : told + " " + text;
+            lock (logged)
+            {
+                told = told == null ? text : told + " " + text;
+                notices.Add(new KeyValuePair<int, string>(++noticeLast, text));
+                if (notices.Count > NoticesKept) notices.RemoveAt(0);
+            }
+        }
+
+        // Те же сообщения для окна на другом конце моста (Feed.cs): с номерами и без «прочитал — пропало». Окно
+        // подтверждает показанное (Seen); неподтверждённое уйдёт ему снова после переподключения. Список
+        // ограничен: без окна сообщения остаются в журнале, а здесь — только последние.
+        const int NoticesKept = 20;
+        static readonly List<KeyValuePair<int, string>> notices = new List<KeyValuePair<int, string>>();
+        static volatile int noticeLast;
+
+        /// Номер последнего сообщения владельцу; 0 — их не было.
+        public static int NoticeLast { get { return noticeLast; } }
+
+        /// Сообщения владельцу с номером больше after, по порядку.
+        public static KeyValuePair<int, string>[] NoticesAfter(int after)
+        {
+            lock (logged) return notices.FindAll(n => n.Key > after).ToArray();
+        }
+
+        /// Окно показало сообщения по номер seq включительно: больше они ему не нужны.
+        public static void NoticesSeen(int seq)
+        {
+            lock (logged) notices.RemoveAll(n => n.Key <= seq);
         }
 
         /// Причина ошибки для сообщения владельцу: одной строкой, без точки в конце и не длиннее сотни с небольшим
@@ -136,13 +171,21 @@ namespace CoreMap
         {
             Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;  // числа с точкой, а не с запятой
             CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;  // и в потоках измерений тоже
-            if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
             bool simulate = Array.IndexOf(args, "--simulate") >= 0;
-            if (simulate && Array.IndexOf(args, "--selftest") >= 0 && Option(args, "--snapshot") != null) return SelfTest.Run(Option(args, "--snapshot"));
+            string snapshot = Option(args, "--snapshot");
+            // Стороны моста без прав администратора: им процессор не нужен, и прав они не просят.
+            if (Option(args, "--bridge-check") != null) return BridgeCheck.Below(Option(args, "--bridge-check"), Option(args, "--out"));
+            if (simulate && Option(args, "--bridge-client") != null && snapshot != null) return BridgeCheck.Client(Option(args, "--bridge-client"), snapshot);
+            // Всё остальное без имитации работает с процессором, а это только с правами администратора. Манифест
+            // их не требует (у программы есть роли без прав), поэтому запрос Windows вызывает сама программа.
+            if (!simulate && !Launch.Elevated()) return Launch.Elevate(args);
+            if (Array.IndexOf(args, "--probe") >= 0) return Probe.Run();  // без окна; работает и при открытой программе
+            if (simulate && Array.IndexOf(args, "--selftest") >= 0 && snapshot != null) return SelfTest.Run(snapshot);
+            if (simulate && Array.IndexOf(args, "--engine") >= 0 && snapshot != null) return BridgeCheck.Host(snapshot);
             AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
             // Резидент уходит в свой файл до всего, что касается окна: само упоминание окна в этом методе
             // загрузило бы в его процесс библиотеки интерфейса.
-            if (Array.IndexOf(args, "--tray") >= 0) return Tray.Run(simulate, Option(args, "--snapshot"), Array.IndexOf(args, "--saved") >= 0);
+            if (Array.IndexOf(args, "--tray") >= 0) return Tray.Run(simulate, snapshot, Array.IndexOf(args, "--saved") >= 0);
             return Window(args, simulate);
         }
 

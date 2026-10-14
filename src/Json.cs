@@ -57,6 +57,17 @@ namespace CoreMap
             else File.Move(fresh, path);
         }
 
+        /// Одно значение из текста — сообщение моста (Bridge.cs). Ошибку разбора отдаёт как есть: решает тот, кто звал.
+        public static object Parse(string text) { return new Reader(text).Whole(); }
+
+        /// Значение текстом JSON — сообщение моста, которое шлётся по изменению.
+        public static string Text(object value)
+        {
+            var text = new StringBuilder();
+            Write(text, value);
+            return text.ToString();
+        }
+
         static void Write(StringBuilder text, object value)
         {
             if (value == null) { text.Append("null"); return; }

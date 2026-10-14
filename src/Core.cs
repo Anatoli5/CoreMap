@@ -239,38 +239,61 @@ namespace CoreMap
         }
 
         // Команды интерфейса. Пока идёт измерение, ручная нагрузка и её настройки не меняются.
+        // Каждая команда отвечает: null — сделано, иначе причина отказа. Окну в том же процессе причина не нужна
+        // (его кнопки в это время и так серые); окну на другом конце моста (Commands.cs) она уходит ответом.
+
+        const string BusyNow = "идёт измерение: дождись его конца";
+        const string NoSensors = "датчики недоступны";
+        const string NoLimits = "потолки множителей или датчики недоступны";
 
         /// Включает или снимает нагрузку со всех ядер блока разом: если хоть одно нагружено — снимает.
-        public void ToggleLoad(Block block)
+        public string ToggleLoad(Block block)
         {
-            if (Busy || Monitor == null) return;  // без датчиков нет и защиты от перегрева: нагрузку не даём
+            if (Busy) return BusyNow;
+            if (Monitor == null) return NoSensors + ": без них нет защиты от перегрева, нагрузка не даётся";
             bool[] active = Load.Active();
             if (block.Members.Any(i => active[i]))
             {
                 foreach (int i in block.Members) Load.Stop(i);
-                return;
+                return null;
             }
             Trip = null;
             foreach (int i in block.Members) Load.Start(i);
+            return null;
         }
 
-        public void StopLoad() { if (!Busy) Load.StopAll(); }
-
-        public void SetLevel(int level) { if (!Busy) Load.SetLevel(level); }
-
-        public void StartSweep(int seconds, int passes)
+        public string StopLoad()
         {
-            if (Busy) return;
+            if (Busy) return BusyNow;
+            Load.StopAll();
+            return null;
+        }
+
+        public string SetLevel(int level)
+        {
+            if (Busy) return BusyNow;
+            Load.SetLevel(level);
+            return null;
+        }
+
+        public string StartSweep(int seconds, int passes)
+        {
+            if (Busy) return BusyNow;
             Trip = null;
             Sweep.Start(seconds, passes);
+            return null;
         }
 
-        public void StartLatency()
+        public string StartLatency()
         {
-            if (Busy) return;
+            if (Busy) return BusyNow;
             Trip = null;
             Latency.Start();
+            return null;
         }
+
+        /// Просит идущее измерение остановиться — любое: заканчивает оно само, в своём потоке (Runner.Stop).
+        public void StopRun() { Runner.Stop(); }
 
         // Профили. Состояний два, оба — потолки в процессоре: «было» и «сейчас».
         // «Было» — то, что прочитано из процессора при запуске программы (до того как профиль запуска встал
@@ -285,6 +308,11 @@ namespace CoreMap
 
         /// Потолки, которые были: прочитанные из процессора при запуске или принятые последними; null — потолки недоступны.
         public int[] Was { get { return was; } }
+
+        /// Профиль, который владелец открыл или сохранил последним. Когда одни и те же потолки записаны под
+        /// несколькими названиями, из них называется этот (см. Named). Окно в том же процессе передаёт своё поле
+        /// названия само; окну на другом конце моста его заменяет это значение.
+        public volatile string Preferred;
 
         /// Набор совпадает с другим (ядра, о которых процессор не ответил, не в счёт).
         bool Equal(int[] a, int[] b)
@@ -322,6 +350,7 @@ namespace CoreMap
                 was = (int[])Limits.Current.Clone();
             }
             catch (Exception e) { return e.Message; }
+            Preferred = name.Trim();
             return null;
         }
 
@@ -333,7 +362,9 @@ namespace CoreMap
             if (Busy) return "идёт измерение: потолки сейчас менять нельзя";
             int[] ratios = name == "" ? Limits.Fused : Profiles.Get(name);
             if (ratios == null) return "профиля «" + name + "» нет";
-            return Limits.Apply(ratios);
+            string refusal = Limits.Apply(ratios);
+            if (refusal == null && name != "") Preferred = name.Trim();
+            return refusal;
         }
 
         /// Есть ли что принимать: «сейчас» отличается от «было», либо стоит набор, который ещё не профиль запуска
@@ -397,19 +428,31 @@ namespace CoreMap
         }
 
         /// Снимает кривую «температура от множителя» для блока на текущей силе нагрузки.
-        public void StartCurve(Block block, double maxTemp)
+        public string StartCurve(Block block, double maxTemp)
         {
-            if (Busy || Curve == null) return;
+            if (Curve == null) return NoLimits;
+            if (Busy) return BusyNow;
             Trip = null;
             Curve.Start(new[] { block }, Load.Level, maxTemp);
+            return null;
         }
 
         /// Снимает кривые всех блоков подряд.
-        public void StartAllCurves(double maxTemp)
+        public string StartAllCurves(double maxTemp)
         {
-            if (Busy || Curve == null) return;
+            if (Curve == null) return NoLimits;
+            if (Busy) return BusyNow;
             Trip = null;
             Curve.Start(spread, Load.Level, maxTemp);
+            return null;
+        }
+
+        /// По какой температуре ступени идёт работа с кривыми: по наибольшей (true) или по средней.
+        public string SetByPeak(bool byPeak)
+        {
+            if (Curves == null) return NoLimits;
+            Curves.ByPeak = byPeak;
+            return null;
         }
 
         /// Подбирает каждому блоку под нагрузкой текущей силы самый высокий потолок, при котором средняя
@@ -417,7 +460,7 @@ namespace CoreMap
         public string FitLimits(double maxTemp)
         {
             if (Limits == null || Curve == null) return "потолки множителей недоступны";
-            if (Busy) return "идёт измерение: дождись его конца";
+            if (Busy) return BusyNow;
             Trip = null;
             Search.Start(spread, Load.Level, maxTemp);
             return null;
@@ -433,18 +476,22 @@ namespace CoreMap
         }
 
         /// Замер под общей нагрузкой: все блоки разом при потолках, которые стоят сейчас, на текущей силе нагрузки.
-        public void StartJoint()
+        public string StartJoint()
         {
-            if (Busy || Curve == null) return;
+            if (Curve == null) return NoLimits;
+            if (Busy) return BusyNow;
             Trip = null;
             Joint.Start(Load.Level);
+            return null;
         }
 
-        public void StartCalibration()
+        public string StartCalibration()
         {
-            if (Busy) return;
+            if (Monitor == null) return NoSensors;
+            if (Busy) return BusyNow;
             Trip = null;
             Calibration.Start();
+            return null;
         }
 
         /// Выбор владельца, когда программа сама включает вентиляторам «максимум» (Fans.Auto / Measure / Always).

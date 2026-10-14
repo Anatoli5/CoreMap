@@ -10,7 +10,7 @@ namespace CoreMap
 {
     partial class MainForm
     {
-        const int FitLow = 55, FitHigh = 95;  // пределы ползунка температуры, °C
+        const int FitLow = CurveFit.Low, FitHigh = CurveFit.High;  // пределы ползунка температуры, °C
 
         Segmented heatMode;  // по какой температуре ступени работать: по средней или по наибольшей
 
@@ -177,7 +177,7 @@ namespace CoreMap
             row.Controls.Add(Widgets.Label("греть до", Theme.Dim, 13));
             curveTemp = new NumericUpDown
             {
-                Minimum = 55, Maximum = 95, Value = 80, Width = Theme.Px(54), Font = Theme.Font(13), BackColor = Theme.Button,
+                Minimum = FitLow, Maximum = FitHigh, Value = 80, Width = Theme.Px(54), Font = Theme.Font(13), BackColor = Theme.Button,
                 ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center,
                 Margin = new Padding(0, 0, Theme.Px(4), 0),
             };

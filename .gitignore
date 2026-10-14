@@ -6,6 +6,7 @@
 data/
 
 # Рабочие записи и отчёты: локальные, в репозиторий не идут
+AGENTS.md
 CLAUDE.md
 KNOWLEDGE.md
 DECISIONS.md

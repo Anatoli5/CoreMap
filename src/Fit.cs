@@ -53,6 +53,9 @@ namespace CoreMap
     class CurveFit
     {
         public const double Spread = 6;  // на сколько градусов блок при переделе может уйти выше температуры с ползунка
+        // Пределы температуры, °C: под какую подбираются потолки и до какой греет лесенка. Одни для окна и для
+        // команд моста (Commands.cs).
+        public const int Low = 55, High = 95;
 
         readonly BlockMap blocks;
         readonly CoreLimits limits;

@@ -31,6 +31,13 @@ namespace CoreMap
         /// Измерение, которое идёт сейчас; null — никакое.
         public Measurement Active { get { return active; } }
 
+        /// Номер последнего запущенного измерения и когда оно запущено (Native.Now): по ним окно на другом конце
+        /// моста отличает новый запуск от прежнего и считает, сколько он идёт.
+        public volatile int Runs;
+        public double StartedAt;
+        /// Последнее запущенное измерение, идёт оно или уже кончилось; null — их не было.
+        public volatile Measurement Last;
+
         public bool Busy { get { return active != null; } }
 
         /// Занимает исполнителя под измерение и запускает его поток. false — идёт другое измерение.
@@ -39,7 +46,9 @@ namespace CoreMap
             lock (gate)
             {
                 if (active != null) return false;
-                active = measurement;
+                StartedAt = Native.Now();
+                Runs++;
+                active = Last = measurement;
                 // До запуска потока: просьба остановиться, пришедшая сразу после запуска, не должна потеряться.
                 measurement.Prepare();
                 thread = new Thread(() => measurement.Execute(body)) { IsBackground = true, Name = measurement.GetType().Name };
