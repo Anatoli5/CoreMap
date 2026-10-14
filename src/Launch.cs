@@ -64,10 +64,16 @@ namespace CoreMap
             return target.GetType().InvokeMember(property, BindingFlags.GetProperty, null, target, null);
         }
 
-        /// Запускает копию программы без прав администратора, через оболочку рабочего стола. Нет оболочки —
+        /// Запускает копию программы без прав администратора, через оболочку рабочего стола.
+        public static void Unelevated(string arguments)
+        {
+            Unelevated(Exe, arguments);
+        }
+
+        /// Запускает программу file без прав администратора, через оболочку рабочего стола. Нет оболочки —
         /// исключение (тогда нет и значка у часов). Обращение по названиям, без библиотеки типов, — как
         /// к планировщику в Autostart.cs.
-        public static void Unelevated(string arguments)
+        public static void Unelevated(string file, string arguments)
         {
             const int Desktop = 0 /* CSIDL_DESKTOP */, DesktopWindow = 8 /* SWC_DESKTOP */, NeedDispatch = 1 /* SWFO_NEEDDISPATCH */;
             object shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application", true));
@@ -80,7 +86,7 @@ namespace CoreMap
             object view = Get(desktop, "Document");         // вид папки рабочего стола — объект внутри Проводника
             object application = Get(view, "Application");  // его собственный Shell.Application
             application.GetType().InvokeMember("ShellExecute", BindingFlags.InvokeMethod, null, application,
-                new object[] { Exe, arguments, Program.Root, "open", 1 });
+                new object[] { file, arguments, Program.Root, "open", 1 });
         }
     }
 }

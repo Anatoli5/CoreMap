@@ -5,6 +5,7 @@
 //   CoreMapWindow.exe --pipe N              то же с каналом N
 //   CoreMapWindow.exe --pipe N --snapshot F [--size WxH]
 //                                           скрытая проверка (src/check.rs): без окна на экране, картинки и отчёт
+//   CoreMapWindow.exe --probe               ничего не делает и выходит: пустил ли Windows свежую сборку (tools\rust.ps1)
 #![windows_subsystem = "windows"]
 
 // Код, который Slint строит из ui/app.slint. Его приведения типов задевают строгие проверки рабочего пространства
@@ -56,6 +57,10 @@ thread_local! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Пробный запуск после сборки (tools\rust.ps1): пустил ли Windows файл. Ничего не делает и выходит.
+    if args.iter().any(|a| a == "--probe") {
+        return;
+    }
     let pipe = arg(&args, "--pipe").unwrap_or_else(pipe::engine_pipe);
     if let Some(snapshot) = arg(&args, "--snapshot") {
         let size = arg(&args, "--size")
@@ -67,7 +72,13 @@ fn main() {
         std::process::exit(check::run(pipe, &snapshot, size));
     }
 
+    // Рисует процессор, и только изменившиеся участки: тем же способом окно проверено на картинках (src/check.rs).
+    // Рисование видеокартой — открытый выбор, его решит замер (DECISIONS #28). Не выбрался — остаётся способ Slint
+    // по умолчанию, который AppWindow::new возьмёт сам; окно от этого не теряется.
+    let _ = slint::BackendSelector::new().renderer_name("software".into()).select();
     let ui = AppWindow::new().expect("окно");
+    // После «|» — метка, которая только делает файл другим при пересборке (tools\rust.ps1); в заголовок не идёт.
+    ui.set_built(env!("COREMAP_BUILT").split('|').next().unwrap_or_default().into());
     // События канала приходят в его потоке и передаются в поток окна по порядку.
     let link = pipe::Link::start(pipe, |event| {
         // Ошибка здесь значит, что цикл окна уже кончился (окно закрыто): событие больше некому показать.

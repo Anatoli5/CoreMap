@@ -16,6 +16,10 @@
 // его мьютекс-одиночка (Program.WindowMutex); окно при запуске ещё и сообщает резиденту номер своего процесса
 // (Announce), и тот ждёт его конца, чтобы перечитать файлы профилей и потолки — без опроса.
 //
+// Новое окно (CoreMapWindow.exe, rust\window; DECISIONS #29). Его открывает резидент в роли движка, без прав
+// администратора, через оболочку рабочего стола: по кнопке «новое окно» в прежнем окне (тогда прежнее окно
+// закрывается, а новое открывается, когда его процесс кончился — два Core разом недопустимы) или пунктом меню.
+//
 // Resident — всё, что не касается значка: потолки, профили, что показать в подсказке и меню. Его проверяет
 // самопроверка (SelfTest.cs). Tray — значок, меню и ожидание сообщений.
 using System;
@@ -38,7 +42,7 @@ namespace CoreMap
 
     class Resident
     {
-        public const int OpenId = 1, ExitId = 2, FactoryId = 100;  // 101 и дальше — профили в порядке списка
+        public const int OpenId = 1, ExitId = 2, NewId = 3, FactoryId = 100;  // 101 и дальше — профили в порядке списка
 
         readonly bool simulate;
         readonly string saveDir;
@@ -188,7 +192,8 @@ namespace CoreMap
                 }
                 items.Add(new TrayItem());
             }
-            items.Add(new TrayItem { Id = OpenId, Text = "Открыть CoreMap", Enabled = true, Default = true });
+            items.Add(new TrayItem { Id = NewId, Text = "Новое окно", Enabled = true });
+            items.Add(new TrayItem { Id = OpenId, Text = "Открыть прежнее окно", Enabled = true, Default = true });
             items.Add(new TrayItem { Id = ExitId, Text = "Выход", Enabled = true });
             return items;
         }
@@ -241,6 +246,7 @@ namespace CoreMap
         const uint IconMessage = 0x8001;                // от значка: lParam — что сделала мышь
         const uint WindowOpened = 0x8002;               // от окна программы: оно запустилось, wParam — номер его процесса
         const uint EngineIdle = 0x8003;                 // от движка: проверить, не пора ли остановить Core, и обновить подсказку
+        const uint OpenNew = 0x8004;                    // от прежнего окна: открыть новое окно, когда прежнее закроется
         const int RetryTimes = 3;                       // столько раз повторяется то, что не вышло при запуске (драйвер не
         const uint RetryAfter = 10000;                  // открылся, значок не встал), и через столько миллисекунд
 
@@ -266,12 +272,16 @@ namespace CoreMap
         static WindowProc proc;                // держит делегат живым, пока жив класс окна
         static readonly List<string> told = new List<string>();  // скрытая проверка: что ушло бы уведомлениями
         static int announced, closed;          // скрытая проверка: сколько раз окно программы сообщило о себе и закрылось
+        static bool newPending;                // новое окно просили открыть, а прежнее ещё открыто: откроется, когда оно закроется
+        static bool onDemand;                  // запущен кнопкой «новое окно» на время настройки: после неё выходит (DECISIONS #30)
+        static int launches;                   // скрытая проверка: сколько раз новое окно было бы открыто
 
         /// Режим --tray. snapshot — скрытая проверка (только с --simulate): значка нет, резидент проходит запуск
         /// на имитации, пишет отчёт в файл и выходит; saved — с копией сохранённых профилей из data\.
         /// bridge — роль движка (--bridge): резидент ещё и слушает канал моста и держит Core, пока тот нужен;
-        /// limit — свой защитный предел температуры для этого Core.
-        public static int Run(bool simulated, string snapshot, bool saved, bool bridge = false, int limit = 0)
+        /// limit — свой защитный предел температуры для этого Core; open — сразу открыть новое окно (его просит
+        /// кнопка прежнего окна, которое после этого закрывается).
+        public static int Run(bool simulated, string snapshot, bool saved, bool bridge = false, int limit = 0, bool open = false)
         {
             if (snapshot != null && !simulated) return 1;  // проверка на настоящем процессоре не предусмотрена
             simulate = simulated;
@@ -291,6 +301,11 @@ namespace CoreMap
                     if (simulate) Program.DataDir = temp = TempCopy(saved);
                     resident = new Resident(simulate, Program.DataDir);
                     CreateWindow();
+                    // Запущен кнопкой прежнего окна: метку и профиль при своём запуске уже отработало оно, а само оно
+                    // может закрыться раньше, чем резидент это проверит, — без этого он принял бы себя за новый запуск
+                    // программы и поставил бы профиль «при запуске» поверх потолков, выставленных в окне.
+                    if (open) applied = true;
+                    onDemand = open && !hidden;
                     if (WindowIsOpen())
                     {
                         // Резидента запустили при открытом окне (выключателем в нём): метку и профиль при своём
@@ -300,6 +315,7 @@ namespace CoreMap
                     }
                     else Reload();
                     if (bridge) StartEngine();
+                    if (open) OpenNewWindow();
                     if (hidden)
                     {
                         if (!resident.Available) Notify(resident.Attention());
@@ -384,6 +400,13 @@ namespace CoreMap
             // резидента (CreateCore) — обратный порядок запер бы оба потока.
             bool stopped = engine.StopIfIdle();
             if (stopped) stops++;
+            // Движок на время настройки после неё не остаётся: новое окно закрыто, измерения нет — логика и канал уходят
+            // вместе с процессом (принцип владельца, DECISIONS #30). Значок при входе в Windows — другой процесс.
+            if (stopped && onDemand && !newPending)
+            {
+                DestroyWindow(window);
+                return;
+            }
             resident.Doing = engine.Attached ? null : engine.Doing;  // при окне ход измерения показывает оно
             resident.WindowOpen = WindowIsOpen();
             if (stopped && !resident.WindowOpen) Reload();
@@ -440,6 +463,64 @@ namespace CoreMap
             catch (Exception e) { return "значок не запущен: " + Program.Why(e); }
         }
 
+        /// Новое окно вместо прежнего: резидент уже есть — он сам станет движком, если ещё не был, и откроет новое
+        /// окно, когда прежнее закроется; нет — запускается резидент в роли движка, который сделает то же. Зовёт
+        /// кнопка «новое окно» прежнего окна; после null оно закрывается. null — сделано.
+        public static string RequestNewWindow(bool simulated)
+        {
+            IntPtr tray = FindWindow(WindowClass, null);
+            if (tray != IntPtr.Zero)
+            {
+                PostMessage(tray, OpenNew, IntPtr.Zero, IntPtr.Zero);
+                return null;
+            }
+            try
+            {
+                // Прежнее окно работает с правами администратора, резидент их унаследует: запроса Windows не будет.
+                using (Process.Start(new ProcessStartInfo(Exe, (simulated ? "--simulate " : "") + "--tray --bridge --open")
+                    { UseShellExecute = false, WorkingDirectory = Program.Root })) { }
+                return null;
+            }
+            catch (Exception e) { return "движок не запущен: " + Program.Why(e); }
+        }
+
+        /// Пункт меню, просьба прежнего окна или ключ --open: новое окно — у движка; пока открыто прежнее окно
+        /// со своим Core, новое откроется после его закрытия (WindowClosed).
+        static void OpenNewWindow()
+        {
+            if (engine == null) StartEngine();
+            if (engine == null) return;  // канал не открылся — о причине уже сказано
+            if (OldWindowOpen())
+            {
+                newPending = true;
+                if (watched == IntPtr.Zero) WatchRunning();  // ждать конца его процесса, чтобы открыть новое вовремя
+                return;
+            }
+            LaunchNewWindow();
+        }
+
+        /// Открывает CoreMapWindow.exe без прав администратора; уже открыто — второе не открывается.
+        static void LaunchNewWindow()
+        {
+            newPending = false;
+            string file = Path.Combine(Program.Root, "CoreMapWindow.exe");
+            if (!File.Exists(file))
+            {
+                Notify("Новое окно не открыть: рядом с программой нет CoreMapWindow.exe");
+                return;
+            }
+            if (hidden) { launches++; return; }  // скрытая проверка окна на экран не выводит
+            Process[] running = Process.GetProcessesByName("CoreMapWindow");
+            foreach (Process p in running) p.Dispose();
+            if (running.Length > 0) return;
+            try { CoreMap.Launch.Unelevated(file, ""); }
+            catch (Exception e)
+            {
+                Program.Log("резидент, запуск нового окна: " + e);
+                Notify("Новое окно не открылось: " + Program.Why(e));
+            }
+        }
+
         /// Просит резидента выйти. Зовёт окно, когда владелец выключает резидента.
         public static void Dismiss()
         {
@@ -482,6 +563,7 @@ namespace CoreMap
             Reload();
             ShowTip();
             Trim();
+            if (newPending) LaunchNewWindow();
         }
 
         /// «Открыть CoreMap»: окно — отдельный процесс, чтобы память резидента не росла от интерфейса.
@@ -583,6 +665,7 @@ namespace CoreMap
         static void Command(int id)
         {
             if (id == Resident.OpenId) OpenWindow();
+            else if (id == Resident.NewId) OpenNewWindow();
             else if (id == Resident.ExitId) DestroyWindow(window);
             else if (id >= Resident.FactoryId)
             {
@@ -629,6 +712,7 @@ namespace CoreMap
                 }
                 if (message == WindowOpened) { announced++; Watch((int)(long)wParam); return IntPtr.Zero; }
                 if (message == EngineIdle) { EngineTick(); return IntPtr.Zero; }
+                if (message == OpenNew) { OpenNewWindow(); return IntPtr.Zero; }
                 // Панель задач создана заново (перезапуск Проводника) или только что появилась после входа в Windows.
                 if (message == taskbarCreated && taskbarCreated != 0) { shown = false; AddIcon(); return IntPtr.Zero; }
                 if (message == Destroy) { RemoveIcon(); PostQuitMessage(0); return IntPtr.Zero; }
@@ -885,17 +969,26 @@ namespace CoreMap
             Loop(0.2);
             check(announced == 1, "сообщение окна программы доходит до резидента");
             // Вместо окна программы — процесс, который сразу кончается: резидент ждёт его конца без опроса.
-            using (Process child = Process.Start(new ProcessStartInfo("cmd.exe", "/c exit") { UseShellExecute = false, CreateNoWindow = true }))
+            // Заодно — кнопка «новое окно»: просьба приходит, пока прежнее окно ещё открыто; новое открывается, когда
+            // его процесс кончился (у резидента без роли движка канал открывается тут же).
+            using (Process child = Process.Start(new ProcessStartInfo("cmd.exe", "/c ping -n 2 127.0.0.1 >nul") { UseShellExecute = false, CreateNoWindow = true }))
             {
                 Watch(child.Id);
                 check(resident.WindowOpen && resident.Tip().Contains("открыто окно") && resident.Switch("") != null,
                     "пока «окно» открыто, резидент профили не переключает");
-                Loop(1);
+                PostMessage(window, OpenNew, IntPtr.Zero, IntPtr.Zero);
+                Loop(0.2);
+                check(newPending && launches == 0, "просьба о новом окне при открытом прежнем: новое ждёт его закрытия");
+                Pump(() => watched == IntPtr.Zero, 5);
             }
             check(closed == 1 && watched == IntPtr.Zero && !resident.WindowOpen, "конец процесса окна замечен, профили снова доступны");
+            check(engine != null && launches == 1 && !newPending,
+                "прежнее закрылось — новое окно открыто, движок есть (открытий " + launches + ")");
+            Command(Resident.NewId);
+            check(launches == 2, "пункт меню «Новое окно» открывает его сразу, когда прежнего окна нет");
 
             var engineLines = new List<string>();
-            if (engineWanted)
+            if (engineWanted)  // роль, с которой резидент запущен; просьба о новом окне выше открывает канал и без неё
             {
                 if (engine == null) check(false, "канал моста не открылся: " + string.Join(" | ", told));
                 else EngineCheck(check, engineLines, path);
@@ -1078,11 +1171,13 @@ namespace CoreMap
             string outputs = Path.GetDirectoryName(Path.GetFullPath(path)), picture = Path.Combine(outputs, "window.png");
             string windowExe = Path.Combine(Program.Root, "CoreMapWindow.exe");
             foreach (string old in Directory.GetFiles(outputs, "window*.png")) File.Delete(old);  // картинки прошлого прохода не должны сойти за нынешние
-            code = File.Exists(windowExe) ? RunProcess(windowExe, "--pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null) : -2;
+            string refused = null;
+            try { code = File.Exists(windowExe) ? RunProcess(windowExe, "--pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null) : -2; }
+            catch (System.ComponentModel.Win32Exception e) { code = -3; refused = e.Message; }  // Smart App Control не пустил файл
             Pump(() => !engine.Alive, 10);
             check(code == 0 && File.Exists(picture) && !engine.Alive,
                 "окно на Rust показало состояние от движка, прошло свою проверку и вышло, Core остановлен; код " + code +
-                (code == -2 ? " (нет CoreMapWindow.exe: его собирает tools\\rust.ps1)" : ""));
+                (code == -2 ? " (нет CoreMapWindow.exe: его собирает tools\\rust.ps1)" : refused != null ? " (не запустилось: " + refused + ")" : ""));
             check(told.Count == 0, "уведомлений владельцу за проверку не было" + (told.Count == 0 ? "" : ": " + string.Join(" | ", told)));
 
             // Покой в самом конце: потоки, которые система заводила под обмен по каналу, к этому времени должны уйти.

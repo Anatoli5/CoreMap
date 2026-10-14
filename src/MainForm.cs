@@ -176,7 +176,7 @@ namespace CoreMap
             // Имитация систему не меняет: выключатель в ней не работает и планировщик не спрашивается.
             autostartButton.Enabled = !core.Simulated;
             if (!core.Simulated) ReadAutostart();
-            BridgeControls(bar);  // временная кнопка проверки моста: MainForm.Bridge.cs
+            NewWindowControls(bar);  // временная кнопка «новое окно»: MainForm.NewWindow.cs
             bar.Controls.Add(helpButton = Widgets.Button("?", () => help.Set(true),
                 "Режим вопроса\nПока он включён, при наведении на любой элемент окна показывается подсказка о нём.\n" +
                 "• первый щелчок в окне выключает режим и ничего не нажимает\n" +
