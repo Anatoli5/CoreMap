@@ -39,6 +39,11 @@
 // CoreMap.exe --simulate --bridge-client N --snapshot F   та вторая копия: N — имя канала; сама по себе не нужна.
 //                           С --as <роль> — короткий проход вместо полного (BridgeCheck.Client)
 // CoreMap.exe --bridge-check N --out F   сторона без прав в проверке моста кнопкой владельца: её запускает окно
+// CoreMap.exe --window      новое окно: страница из page\ в окне без прав администратора, с движком говорит по
+//                           каналу моста (WebWindow.cs). С --pipe N — по каналу с этим именем. Пока его никто не
+//                           запускает: движок на машине владельца ещё не включён
+// CoreMap.exe --simulate --window --pipe N --snapshot F   проверка нового окна: окно за краем экрана, картинка
+//                           страницы в файл F, отчёт — в F.txt; с --size WxH. Запускает её проверка движка
 //
 // Права администратора программа просит сама (Launch.Elevate), когда они нужны: при любом запуске без
 // --simulate, кроме сторон моста. В манифесте их требования нет: окну без прав и проверкам моста они ни к чему.
@@ -182,6 +187,13 @@ namespace CoreMap
             if (simulate && Option(args, "--bridge-client") != null && snapshot != null)
                 return BridgeCheck.Client(Option(args, "--bridge-client"), snapshot,
                     Option(args, "--as") ?? "");
+            if (Array.IndexOf(args, "--window") >= 0)
+            {
+                // На имитации новое окно — только скрытая проверка: без файла для картинки оно стало бы видимым
+                // окном на экране владельца, поэтому без него не запускается вовсе.
+                if (simulate && snapshot == null) return 1;
+                return WebHost.Run(Option(args, "--pipe"), simulate ? snapshot : null, Option(args, "--size"));
+            }
             // Всё остальное без имитации работает с процессором, а это только с правами администратора. Манифест
             // их не требует (у программы есть роли без прав), поэтому запрос Windows вызывает сама программа.
             if (!simulate && !Launch.Elevated()) return Launch.Elevate(args);

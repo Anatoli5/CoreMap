@@ -3,8 +3,8 @@
 // Сейчас ею пользуются проверки (BridgeCheck.cs); она же станет концом моста у нового окна. Подключение — с
 // правом «узнать, кто я» (Identification): движок может спросить Windows, кто клиент, но действовать от его
 // имени не может — как не смог бы и тот, кто занял бы имя канала вместо движка.
-// Здесь каждое пришедшее сообщение разбирается: проверкам нужны его поля. Окно разбирать не будет — оно отдаёт
-// текст странице как есть.
+// Проверкам нужны поля пришедшего сообщения, и для них оно разбирается. Окно (WebWindow.cs) не разбирает: оно
+// задаёт Text и получает текст каждого сообщения как есть — для страницы.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -28,6 +28,12 @@ namespace CoreMap
 
         /// Канал закрыт движком или оборван; до подключения — false.
         public volatile bool Closed;
+
+        /// Задано — сообщения не разбираются, а отдаются сюда текстом, в потоке чтения. Задаётся до Connect.
+        public Action<string> Text;
+
+        /// Вызывается один раз, в потоке чтения, когда канал закрылся. Задаётся до Connect.
+        public Action Lost;
 
         /// server — «.» для этой машины; другое имя нужно только проверке, что по сети канал не открывается.
         public BridgeClient(string name, string server = ".")
@@ -78,7 +84,13 @@ namespace CoreMap
                 int offset, length;
                 while (frames.Next(pipe, out offset, out length))
                 {
-                    var message = Json.Parse(Encoding.UTF8.GetString(frames.Buffer, offset, length)) as Dictionary<string, object>;
+                    string text = Encoding.UTF8.GetString(frames.Buffer, offset, length);
+                    if (Text != null)
+                    {
+                        Text(text);
+                        continue;
+                    }
+                    var message = Json.Parse(text) as Dictionary<string, object>;
                     object topic;
                     if (message == null || !message.TryGetValue("t", out topic) || !(topic is string)) continue;
                     lock (last)
@@ -98,6 +110,7 @@ namespace CoreMap
             catch (Exception) { }  // обрыв канала и сообщение, которое не разобралось, для этой стороны одно: связи больше нет
             Closed = true;
             arrived.Set();
+            if (Lost != null) Lost();
         }
 
         /// Шлёт в канал байты как есть — проверке, что движок переживает негодное сообщение.

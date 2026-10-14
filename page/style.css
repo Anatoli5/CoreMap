@@ -1,0 +1,18 @@
+/* Цвета — те же, что у прежнего окна (Theme в src/Ui.cs). --bg повторён в src/WebWindow.cs: цвет окна до первой отрисовки. */
+:root {
+  --bg: #14161a; --panel: #1c1f25; --cell: #2a2e36; --text: #e6e8ec; --dim: #8b93a1; --accent: #ffd166; --bad: #ff5d5d;
+  color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+  font: 15px/1.3 "Segoe UI Variable Text", "Segoe UI", sans-serif; font-variant-numeric: tabular-nums;
+  user-select: none; overflow: hidden;
+}
+header { display: flex; gap: 24px; padding: 10px 16px; background: var(--panel); }
+#link { margin-left: auto; color: var(--dim); }
+#link.down { color: var(--bad); }
+#die { flex: 1; display: grid; gap: 8px; padding: 16px; min-height: 0; }
+.tile { display: flex; flex-direction: column; justify-content: center; align-items: center; background: var(--cell); border-radius: 8px; min-width: 0; }
+.tile b { font-size: 28px; font-weight: 600; }
+.tile span { color: var(--dim); }

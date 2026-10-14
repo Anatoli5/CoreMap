@@ -949,8 +949,13 @@ namespace CoreMap
         /// Возвращает её код выхода; -1 — не вышла за seconds.
         static int RunWindow(string pipe, string report, string keys, double seconds, Action each)
         {
-            using (Process child = Process.Start(new ProcessStartInfo(Exe, "--simulate --bridge-client " + pipe + " --snapshot \"" + report + "\"" + keys)
-                { UseShellExecute = false, WorkingDirectory = Program.Root }))
+            return RunCopy("--simulate --bridge-client " + pipe + " --snapshot \"" + report + "\"" + keys, seconds, each);
+        }
+
+        /// Вторая копия программы с такими ключами; ждёт её в цикле ожидания резидента. Код выхода; -1 — не вышла.
+        static int RunCopy(string arguments, double seconds, Action each)
+        {
+            using (Process child = Process.Start(new ProcessStartInfo(Exe, arguments) { UseShellExecute = false, WorkingDirectory = Program.Root }))
             {
                 bool exited = Pump(() =>
                 {
@@ -1057,6 +1062,16 @@ namespace CoreMap
             Pump(() => !engine.Alive, 10);
             check(code == 0 && !engine.Alive && Same(resident.Was, fused) && Same(resident.Limits.Current, fused),
                 "следующее окно получило то же «было», вернуло заводские — и они снова «было» у резидента; код " + code);
+
+            // 4. Новое окно (WebWindow.cs): вторая копия в роли окна со страницей. Она подключается к каналу, страница
+            // знакомится с движком и рисует первое состояние. Картинка страницы ложится рядом с отчётом: её смотрит
+            // агент — как выглядит страница, проверка не судит.
+            string picture = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path)), "page.png");
+            File.Delete(picture);  // картинка прошлого прохода не должна сойти за нынешнюю
+            code = RunCopy("--simulate --window --pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null);
+            Pump(() => !engine.Alive, 10);
+            check(code == 0 && File.Exists(picture) && !engine.Alive,
+                "новое окно показало страницу с состоянием от движка и вышло, Core остановлен; код " + code);
             check(told.Count == 0, "уведомлений владельцу за проверку не было" + (told.Count == 0 ? "" : ": " + string.Join(" | ", told)));
 
             // Покой в самом конце: потоки, которые система заводила под обмен по каналу, к этому времени должны уйти.
@@ -1101,7 +1116,16 @@ namespace CoreMap
                 else check(false, "отчёта стороны окна нет (" + side.Value + ")");
             }
 
-            // 3. Путь кнопки «мост» из окна программы — здесь без прав администратора с обеих сторон.
+            report.Add("");
+            report.Add("--- the new window: the page in WebView2, picture " + picture + " ---");
+            if (File.Exists(picture + ".txt"))
+            {
+                report.AddRange(File.ReadAllLines(picture + ".txt"));
+                File.Delete(picture + ".txt");
+            }
+            else check(false, "отчёта нового окна нет");
+
+            // 5. Путь кнопки «мост» из окна программы — здесь без прав администратора с обеих сторон.
             report.Add("");
             report.Add("--- the code path of the owner's bridge button ---");
             BridgeCheck.Button(check, report);
