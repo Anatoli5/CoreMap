@@ -1,4 +1,4 @@
-// Что показывают панели «Профили» и «Статистика» и перемычки соседей на схеме: из сообщений движка и сводки
+// Что показывают панели «Профили» и «Статистика» и полосы тепловой связи соседей на схеме: из сообщений движка и сводки
 // статистики (store.rs) — строки, цвета и точки для ui/app.slint. Здесь нет ни Slint-окна, ни потоков: функции
 // получают данные и возвращают, что показать, — их проверяют модульные тесты.
 use std::fmt::Write as _;
@@ -18,7 +18,6 @@ pub fn rgb(hex: u32) -> Color {
 }
 
 const TEXT: u32 = 0x00e6_e8ec;
-const DIM: u32 = 0x008b_93a1;
 const PEAK: u32 = 0x00ff_8a7a;
 const E_TEXT: u32 = 0x006f_d0c8;
 
@@ -871,26 +870,36 @@ fn rpm_u64(rpm: f64) -> u64 {
     rpm.max(0.0).round() as u64
 }
 
-// ----- перемычки соседей -----
+// ----- тепловая связь соседей -----
 
-/// Сила связи соседей, °C → цвет: серый (нет разницы), через оранжевый к красному на 6 °C и выше.
+/// Шкала связи соседей, °C → цвет: точки шкалы, между ними — плавный переход (владелец 15.10: «почему не плавные
+/// градации»). 0 — разницы нет (серый), 6 °C и больше — красный. Те же точки — у полосы-легенды под схемой (app.slint).
+const LINK_SCALE: [(f32, u32); 4] = [
+    (0.0, 0x005b_616d),
+    (1.5, 0x00e8_c547),
+    (3.5, 0x00ff_9f43),
+    (6.0, 0x00ff_5d5d),
+];
+
+/// Сила связи соседей, °C → цвет по шкале `LINK_SCALE`, без ступеней.
 pub fn link_color(delta: f64) -> Color {
-    let grey = rgb(DIM);
-    let orange = rgb(0x00ff_b347);
-    let red = rgb(0x00ff_5d5d);
     let d = f(delta);
-    if d <= 0.5 {
-        grey
-    } else if d <= 3.0 {
-        orange.mix(&grey, (d - 0.5) / 2.5)
-    } else {
-        red.mix(&orange, ((d - 3.0) / 3.0).min(1.0))
+    let mut lower = LINK_SCALE[0];
+    for upper in LINK_SCALE {
+        if d <= upper.0 {
+            let span = upper.0 - lower.0;
+            let k = if span > 0.0 { (d - lower.0) / span } else { 1.0 };
+            // mix: доля k — у первого цвета, остальное — у второго.
+            return rgb(upper.1).mix(&rgb(lower.1), k.clamp(0.0, 1.0));
+        }
+        lower = upper;
     }
+    rgb(lower.1)
 }
 
-/// Толщина перемычки (пиксели при масштабе 1): 3 при нуле, до 10 на 6 °C.
+/// Толщина полосы (пиксели при масштабе 1): 2 при нуле, растёт ровно до полного промежутка на 6 °C.
 pub fn link_thickness(delta: f64) -> f32 {
-    3.0 + f(delta.clamp(0.0, 6.0)) * 7.0 / 6.0
+    2.0 + f(delta.clamp(0.0, 6.0)) * (crate::die::BAND_MAX - 2.0) / 6.0
 }
 
 /// Перемычки между соседями, где есть с чем сравнить; Some(°C) — средняя по двум направлениям.
@@ -1452,8 +1461,23 @@ mod tests {
 
     #[test]
     fn link_strength_grows_with_the_difference() {
-        assert_eq!(link_color(0.0), rgb(DIM));
+        assert_eq!(link_color(0.0), rgb(LINK_SCALE[0].1));
+        assert_eq!(
+            link_color(-1.0),
+            rgb(LINK_SCALE[0].1),
+            "холоднее с соседом — как без разницы"
+        );
+        assert_eq!(link_color(9.0), rgb(LINK_SCALE[3].1));
         assert!(link_thickness(6.0) > link_thickness(3.0) && link_thickness(3.0) > link_thickness(0.0));
+        // Плавно: на каждой сотой градуса цвет меняется мало, ступеней нет — и на точках шкалы тоже.
+        let channels = |c: Color| [i32::from(c.red()), i32::from(c.green()), i32::from(c.blue())];
+        let mut previous = channels(link_color(0.0));
+        for step in 1..=700 {
+            let now = channels(link_color(f64::from(step) / 100.0));
+            let jump = now.iter().zip(&previous).map(|(a, b)| (a - b).abs()).max().unwrap_or(0);
+            assert!(jump <= 3, "скачок цвета {jump} на {} °C", f64::from(step) / 100.0);
+            previous = now;
+        }
         assert_eq!(link_thickness(20.0), link_thickness(6.0));
         assert_ne!(link_color(3.0), link_color(6.0));
     }

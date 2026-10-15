@@ -34,8 +34,8 @@ use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NIM_SETVERSION, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
-    SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
+    NIM_SETVERSION, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT, NINF_KEY,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE,
@@ -48,8 +48,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW,
     SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WM_DESTROY, WM_ENDSESSION, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_TIMER,
+    WNDCLASSW, WS_EX_TOOLWINDOW,
 };
 
 /// Сообщение значка (как `IconMessage` в Tray.cs).
@@ -62,7 +62,9 @@ pub const WINDOW_OPENED: u32 = 0x8002;
 pub enum Event {
     /// Правый щелчок по значку или клавиша меню: показать меню в точке.
     Menu(i32, i32),
-    /// Двойной щелчок по значку.
+    /// Щелчок по значку (или Enter на нём): открыть окно. Одиночный, как у других программ у часов (владелец 15.10:
+    /// «все остальные утилиты… разворачиваются одинарным щелчком»); двойной даёт два таких события — второе
+    /// программа пропускает (app.rs, `CLICK_GAP`).
     Open,
     /// Курсор над значком: подсказку пора обновить.
     Hover,
@@ -137,7 +139,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
             // Значок версии 4: младшее слово lparam — событие мыши, wparam — точка экрана (x, y).
             match low_word(lparam.cast_unsigned()) {
                 WM_CONTEXTMENU => push(Event::Menu(signed_word(wparam), signed_word(wparam >> 16))),
-                WM_LBUTTONDBLCLK => push(Event::Open),
+                // Значок версии 4 на щелчок шлёт и WM_LBUTTONUP, и NIN_SELECT; с клавиатуры — NIN_SELECT | NINF_KEY.
+                WM_LBUTTONUP | NIN_SELECT => push(Event::Open),
+                k if k == NIN_SELECT | NINF_KEY => push(Event::Open),
                 WM_MOUSEMOVE => push(Event::Hover),
                 NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT | NIN_BALLOONUSERCLICK => push(Event::BalloonDone),
                 _ => {}

@@ -368,7 +368,7 @@ impl Check {
         self.check(
             expected.is_none() || (count > 0 && count == all && close),
             format!(
-                "перемычек соседей {count}; разница «сосед занят / свободен» {} °C (в придуманных срезах {LINK_EFFECT} °C)",
+                "полос связи соседей {count}; разница «сосед занят / свободен» {} °C (в придуманных срезах {LINK_EFFECT} °C)",
                 deltas.iter().map(|d| format!("{d:.1}")).collect::<Vec<_>>().join(", ")
             ),
         );

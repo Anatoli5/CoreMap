@@ -1,4 +1,4 @@
-// Схема кристалла: где какая плитка и где перемычки между соседями — в долях схемы, чтобы ui/app.slint растягивал
+// Схема кристалла: где какая плитка и где полосы тепловой связи соседей — в долях схемы, чтобы ui/app.slint растягивал
 // её под окно одним множителем. Раскладка — из знакомства движка (layouts\*.json: столбец и строка блока).
 //
 // Ряд, где есть кластер E-ядер, выше ряда P-ядер (владелец 15.10: «графически разделить… блоки энергоэффективных
@@ -10,10 +10,13 @@ use crate::wire::{Hello, Tile};
 pub const TILE_W: f32 = 172.0;
 pub const P_ROW: f32 = 72.0;
 pub const E_ROW: f32 = 104.0;
-/// Промежуток между плитками: в нём рисуются перемычки соседей.
-pub const GAP: f32 = 12.0;
-/// На сколько перемычка заходит на плитки с каждой стороны: видно, что она соединяет именно эти две.
-const LINK_OVER: f32 = 6.0;
+/// Промежуток между плитками: в нём лежит полоса тепловой связи соседей.
+pub const GAP: f32 = 14.0;
+/// Полоса связи — в промежутке между соседями, вдоль их общей стороны, на эту долю её длины (владелец 15.10: «в
+/// промежутках между тайлами… а не перемычку с тайл на тайл»).
+const BAND: f32 = 0.6;
+/// Самая толстая полоса — промежуток без пикселя с каждой стороны: полоса не касается плиток.
+pub const BAND_MAX: f32 = GAP - 2.0;
 
 /// Место в долях схемы: x, y, ширина, высота.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -35,26 +38,26 @@ pub struct Geometry {
     pub links: Vec<Link>,
 }
 
-/// Перемычка между соседними плитками `a` и `b` (номера в раскладке): середина промежутка между ними.
+/// Полоса связи соседних плиток `a` и `b` (номера в раскладке): середина промежутка между ними.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Link {
     pub a: usize,
     pub b: usize,
-    /// Соседи слева-справа (перемычка горизонтальная) или сверху-снизу.
+    /// Соседи слева-справа (полоса стоит вертикально в промежутке между ними) или сверху-снизу (лежит).
     pub across: bool,
-    /// Середина перемычки и её длина (в пикселях при масштабе 1).
+    /// Середина полосы и её длина вдоль общей стороны (в пикселях при масштабе 1).
     pub cx: f32,
     pub cy: f32,
     pub length: f32,
 }
 
 impl Link {
-    /// Место перемычки толщиной `thick` пикселей (при масштабе 1) в долях схемы.
+    /// Место полосы толщиной `thick` пикселей (при масштабе 1) в долях схемы.
     pub fn place(&self, thick: f32, width: f32, height: f32) -> Place {
         let (w, h) = if self.across {
-            (self.length, thick)
-        } else {
             (thick, self.length)
+        } else {
+            (self.length, thick)
         };
         Place {
             x: (self.cx - w / 2.0) / width,
@@ -114,7 +117,7 @@ pub fn geometry(hello: &Hello) -> Geometry {
             if dc + dr != 1 {
                 continue;
             }
-            // Перемычка — от левой (или верхней) плитки пары через промежуток: в одном ряду плитки одной высоты.
+            // Полоса — в промежутке за левой (или под верхней) плиткой пары: в одном ряду плитки одной высоты.
             let first = if (tb.row, tb.col) < (ta.row, ta.col) { tb } else { ta };
             let (x, y, w, h) = pixel(first);
             links.push(Link {
@@ -123,7 +126,7 @@ pub fn geometry(hello: &Hello) -> Geometry {
                 across: dc == 1,
                 cx: if dc == 1 { x + w + GAP / 2.0 } else { x + w / 2.0 },
                 cy: if dc == 1 { y + h / 2.0 } else { y + h + GAP / 2.0 },
-                length: GAP + 2.0 * LINK_OVER,
+                length: BAND * if dc == 1 { h } else { w },
             });
         }
     }
@@ -212,13 +215,26 @@ mod tests {
         assert_eq!(pairs.len(), 7);
         assert!(pairs.contains(&(0, 1, true)) && pairs.contains(&(0, 2, false)) && pairs.contains(&(3, 5, false)));
         assert!(!pairs.iter().any(|&(a, b, _)| (a, b) == (0, 3) || (a, b) == (1, 2)));
-        // Перемычка лежит в промежутке между своими плитками.
+        // Полоса — в промежутке между своими плитками и не заходит на них даже самой толстой.
+        let eps = 1e-6;
         let l = g.links.iter().find(|l| (l.a, l.b) == (0, 2)).expect("0–2");
-        let p = l.place(4.0, g.width, g.height);
+        let p = l.place(BAND_MAX, g.width, g.height);
         let (top, below) = (g.tiles[0], g.tiles[2]);
         assert!(
-            p.y < top.y + top.h && p.y + p.h > below.y - 1e-6,
-            "перемычка заходит на обе плитки"
+            p.y >= top.y + top.h - eps && p.y + p.h <= below.y + eps,
+            "полоса 0–2 в промежутке"
         );
+        assert!(
+            p.x > top.x && p.x + p.w < top.x + top.w,
+            "полоса 0–2 короче общей стороны"
+        );
+        let l = g.links.iter().find(|l| (l.a, l.b) == (0, 1)).expect("0–1");
+        let p = l.place(BAND_MAX, g.width, g.height);
+        let (left, right) = (g.tiles[0], g.tiles[1]);
+        assert!(
+            p.x >= left.x + left.w - eps && p.x + p.w <= right.x + eps,
+            "полоса 0–1 в промежутке"
+        );
+        assert!(p.h < left.h, "полоса 0–1 короче общей стороны");
     }
 }

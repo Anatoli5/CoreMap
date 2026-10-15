@@ -1221,7 +1221,7 @@ impl App {
 
     // ----- окно на экране -----
 
-    /// «Окно» в меню значка и двойной щелчок: открыть окно или вывести вперёд уже открытое.
+    /// «Окно» в меню значка и щелчок по значку: открыть окно или вывести вперёд уже открытое.
     pub(super) fn open_window(&mut self, shell: &mut Shell) {
         if self.serving.server.is_none() {
             let why = self.serving.trouble.clone().unwrap_or_default();

@@ -1,5 +1,5 @@
 // Окно CoreMap (DECISIONS #28, #32 шаг 2): верхняя полоса, строка отказа, три раздела — «Кристалл» (плитки блоков и
-// перемычки соседей), «Профили», «Статистика» выбранного блока — и меню потолка.
+// полосы тепловой связи соседей), «Профили», «Статистика» выбранного блока — и меню потолка.
 // Что и каким цветом показывать, решает Rust (src/view.rs, src/panels.rs): сюда приходят готовые строки, цвета и
 // места в долях, отсюда уходят щелчки. Строка модели перерисовывается, только когда Rust её заменил, — а он заменяет
 // только изменившуюся.
@@ -579,7 +579,7 @@ export component AppWindow inherits Window {
     in property <string> problem;
     in property <[TileData]> tiles;
     in property <[LinkData]> links;
-    in property <bool> link-legend;   // есть перемычки — под схемой их расшифровка
+    in property <bool> link-legend;   // есть полосы связи — под схемой их шкала
     in property <string> note;        // приписка к раскладке (не подтверждена) — подсказкой у заголовка
     in property <string> menu-title;
     in property <[MenuEntry]> menu-entries;
@@ -846,12 +846,16 @@ export component AppWindow inherits Window {
             y: root.head-h + root.die-h + 4px;
             height: root.legend-h - 4px;
             spacing: 6px;
-            Text { text: "перемычка — сосед занят тоже, ядро горячее на"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 14px; height: 3px; y: (parent.height - self.height) / 2; background: #8b93a1; }
-            Text { text: "1°"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 14px; height: 5px; y: (parent.height - self.height) / 2; background: #ffb347; }
-            Text { text: "3°"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 14px; height: 8px; y: (parent.height - self.height) / 2; background: #ff5d5d; }
+            // Шкала полос связи — та же, что LINK_SCALE в src/panels.rs: плавная, от серого (0°) до красного (6° и больше).
+            Text { text: "сосед занят — ядро горячее на"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Text { text: "0°"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle {
+                width: 72px;
+                height: 6px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 3px;
+                background: @linear-gradient(90deg, #5b616d 0%, #e8c547 25%, #ff9f43 58%, #ff5d5d 100%);
+            }
             Text { text: "6°+"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
         }
     }
@@ -882,10 +886,9 @@ export component AppWindow inherits Window {
         y: root.die-y + link.y * root.die-h;
         width: link.w * root.die-w;
         height: link.h * root.die-h;
+        // Полоса в промежутке между соседями: толще и краснее — сильнее связь (src/panels.rs, link_color).
         background: link.color;
         border-radius: min(self.width, self.height) / 2;
-        border-width: 1.5px;
-        border-color: Palette.panel;
         TouchArea {
             changed has-hover => {
                 root.tip(self.has-hover, "link" + i, link.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);

@@ -303,7 +303,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
             r.check(
                 seen.iter()
                     .any(|i| i.id == WINDOW_ID && i.default && i.text.as_deref() == Some("Окно")),
-                "по умолчанию — «Окно» (двойной щелчок по значку открывает новое окно)",
+                "по умолчанию — «Окно» (щелчок по значку открывает новое окно)",
             );
             let old = seen.iter().filter(|i| {
                 i.text
@@ -520,7 +520,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     app.wake_repair(shell);
     r.check(app.said.len() == said, "второй раз о той же правке не говорит");
 
-    // 9. «Окно» запускает окно на Rust с каналом программы входа (в проверке только записывается), двойной щелчок по
+    // 9. «Окно» запускает окно на Rust с каналом программы входа (в проверке только записывается), щелчок по
     //    значку — то же; второе, пока первое ещё открывается, не запускается. C#-частей программа не запускает.
     let pipe = app.serving().pipe.clone();
     app.command(shell, WINDOW_ID);
@@ -529,12 +529,26 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         &format!("«Окно» запускает CoreMapWindow.exe --pipe {pipe}"),
     );
     let said = app.said.len();
-    // Двойной щелчок по значку: сообщение значка, как его шлёт Проводник (младшее слово — WM_LBUTTONDBLCLK).
-    shell.post(0x8001, 0, 0x203);
+    // Щелчок по значку, как его шлёт Проводник значку версии 4 (младшее слово — WM_LBUTTONUP, затем NIN_SELECT):
+    // окно ещё открывается после «Окна» — второе не запускается, владелец видит почему; второе сообщение того же
+    // щелчка и двойной щелчок — не повторяют ни запуск, ни сообщение.
+    shell.post(0x8001, 0, 0x202);
+    shell.post(0x8001, 0, 0x400);
+    pump(shell, app, Duration::from_millis(100));
+    let told = app.said[said..]
+        .iter()
+        .filter(|s| s.contains("ещё открывается"))
+        .count();
+    r.check(
+        app.launched.len() == 1 && told == 1,
+        &format!("щелчок, пока окно открывается, — второе не запускается, сказано {told} раз"),
+    );
+    let said = app.said.len();
+    shell.post(0x8001, 0, 0x400);
     pump(shell, app, Duration::from_millis(100));
     r.check(
-        app.launched.len() == 1 && app.said[said..].iter().any(|s| s.contains("ещё открывается")),
-        "двойной щелчок, пока окно открывается, — второе не запускается",
+        app.launched.len() == 1 && app.said.len() == said,
+        "второй щелчок двойного — ни запуска, ни сообщения",
     );
     r.note(&format!("запуски: {:?}", app.launched));
     r.check(

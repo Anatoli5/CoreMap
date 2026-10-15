@@ -1,6 +1,6 @@
 // Программа входа: что она делает с потолками и когда (DECISIONS #31, #32). Вызовы Windows — в shell.rs, железо и
 // правила защиты — в библиотеке machine; здесь — решения. Окно CoreMapWindow.exe говорит с этой программой по
-// каналу (app/serve.rs): она его открывает («Окно» в меню, двойной щелчок по значку) и одна им владеет.
+// каналу (app/serve.rs): она его открывает («Окно» в меню, щелчок по значку) и одна им владеет.
 //
 // При входе в Windows: возврат потолков по метке оборванного замера, затем профиль запуска по правилам защиты
 // (machine::profile::startup). Дальше программа спит до действия владельца: меню значка, щелчок по набору,
@@ -42,7 +42,7 @@ use crate::shell::{Event, Item, Loop, Menu, Shell};
 pub use auto::{AUTO_ON, AutoTiming, DEPTH_ID, LIMIT_ID};
 pub use serve::Confirm;
 
-/// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — двойной щелчок по значку).
+/// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — щелчок по значку).
 pub const WINDOW_ID: u32 = 1;
 pub const EXIT_ID: u32 = 2;
 pub const FACTORY_ID: u32 = 100; // 101 и дальше — наборы в порядке последнего меню
@@ -53,6 +53,9 @@ const WAKE: usize = 3;
 const RETRIES: u8 = 3;
 const RETRY_EVERY: Duration = Duration::from_secs(10);
 const HOVER_GAP: Duration = Duration::from_secs(1);
+/// Щелчки по значку чаще этого — один щелчок: на одно нажатие Проводник шлёт два сообщения (`WM_LBUTTONUP` и
+/// `NIN_SELECT`), двойной щелчок — ещё два; окно открывается один раз и без «ещё открывается».
+const CLICK_GAP: Duration = Duration::from_millis(800);
 
 /// Настройки запуска: где лежит программа и данные, имена меток, задержки.
 #[derive(Debug, Clone)]
@@ -181,6 +184,7 @@ pub struct App {
     retries: u8,
     last_wake: Option<Instant>,
     last_hover: Option<Instant>,
+    last_click: Option<Instant>,
     /// Скрытая проверка: что было бы запущено и что было бы сказано всплывающим сообщением.
     pub launched: Vec<String>,
     pub said: Vec<String>,
@@ -231,6 +235,7 @@ impl App {
             retries: 0,
             last_wake: None,
             last_hover: None,
+            last_click: None,
             launched: Vec::new(),
             said: Vec::new(),
         })
@@ -638,7 +643,7 @@ impl App {
     }
 
     /// Меню значка (Resident.Menu в C#): пояснение, наборы с галочкой на стоящем, автомодуль, «Окно» (по умолчанию —
-    /// оно же по двойному щелчку), «Выход». Прежнее окно на C# отсюда не открывается: это отдельная программа, владелец
+    /// оно же по щелчку по значку), «Выход». Прежнее окно на C# отсюда не открывается: это отдельная программа, владелец
     /// запускает её сам (его слово 15.10: «не надо чтобы из нового резидента запускалась старое окно»).
     pub fn menu(&mut self) -> Vec<Item> {
         let other = self.other();
@@ -893,7 +898,12 @@ impl App {
                     Err(e) => self.journal.error(&e),
                 }
             }
-            Event::Open => self.command(shell, WINDOW_ID),
+            Event::Open => {
+                if self.last_click.is_none_or(|t| t.elapsed() >= CLICK_GAP) {
+                    self.command(shell, WINDOW_ID);
+                }
+                self.last_click = Some(Instant::now());
+            }
             Event::Hover => {
                 if self.last_hover.is_none_or(|t| t.elapsed() >= HOVER_GAP) {
                     self.last_hover = Some(Instant::now());
