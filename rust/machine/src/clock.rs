@@ -157,7 +157,7 @@ impl Stamp {
         }
     }
 
-    /// Местное время по образцу: «dd.MM HH:mm», «HH:mm», «yyyy-MM-dd HH:mm:ss».
+    /// Местное время по образцу: «dd.MM HH:mm», «HH:mm», «yyyy-MM-dd HH:mm:ss», «yyyy-MM-dd».
     #[must_use]
     pub fn local(self, pattern: Pattern) -> String {
         let local = self.0 + self.offset().unwrap_or(0);
@@ -171,6 +171,7 @@ impl Stamp {
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
             ),
+            Pattern::Date => format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
         }
     }
 
@@ -193,6 +194,8 @@ pub enum Pattern {
     DayTime,
     Time,
     Log,
+    /// Имя дневного файла.
+    Date,
 }
 
 /// Отметка из FILETIME (журнал Windows отдаёт время событий так).

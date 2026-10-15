@@ -78,6 +78,19 @@ pub fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
     fs::rename(&fresh, path)
 }
 
+/// Дописывает строку в конец файла (журналы автомодуля): папки и файла нет — создаются. Строка уходит одной записью,
+/// так что обрыв не оставит в файле половину строки поверх целых.
+pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut text = String::with_capacity(line.len() + 1);
+    text.push_str(line);
+    text.push('\n');
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    io::Write::write_all(&mut file, text.as_bytes())
+}
+
 /// Удаляет файл и его .bak (метку и профиль запуска после «заводских»). Файла нет — не ошибка.
 pub fn delete_with_backup(path: &Path) -> io::Result<()> {
     let mut backup = path.as_os_str().to_owned();

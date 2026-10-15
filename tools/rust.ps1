@@ -1,20 +1,23 @@
 # Gate for the Rust part (rust\AGENTS.md, "The gate"): format, lints, tests, advisories, release build; the built
-# window is copied next to CoreMap.exe as CoreMapWindow.exe, where the engine check starts it; the logon program as
-# CoreMapTrayNew.exe, where the logon check (tools\check.ps1) starts it - CoreMapTray.exe may be running on the owner's
-# machine, so a check never replaces it; swapping it in is a delivery step, like CoreMapNew.exe for CoreMap.exe.
+# CoreMapWindow.exe and CoreMapTray.exe are copied into build\, where tools\check.ps1 starts them. The owner's programs
+# in the project root are never touched here: they change only through tools\deliver.ps1 (DECISIONS #33).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\rust.ps1
 #
 # Exit code 0 = every step passed. Steps whose tool is not installed are reported as skipped, not passed.
 # tools\check.ps1 calls this script in its own session, so the current folder is restored on every way out.
 #
-# Build stamp (rust\window\build.rs, rust\tray\build.rs): the build time for the window title and the logon log. It is
-# renewed when a file under rust\ (outside target\) changed, and again when Smart App Control refuses the fresh exe: a rebuild of unchanged Rust code is
-# the same file and would get the same verdict, so the stamp also carries a tick count that makes the file differ.
+# Version (file VERSION in the project root, owner's demand 15.10: a number, not a build time): shown in the window
+# title, the tray tooltip and the logon log. Every build handed to the owner gets the next number (DECISIONS #33).
+# Build stamp (rust\window\build.rs, rust\tray\build.rs): internal only. It is renewed when a file under rust\
+# (outside target\) changed, and again when Smart App Control refuses the fresh exe: a rebuild of unchanged Rust code
+# is the same file and would get the same verdict, so the stamp carries a tick count that makes the file differ.
 $root = Split-Path -Parent $PSScriptRoot
 $env:PATH = (Join-Path $env:USERPROFILE '.cargo\bin') + ';' + $env:PATH
 $stampFile = Join-Path $root 'rust\target\coremap-stamp.txt'
-$exes = [ordered]@{ 'CoreMapWindow.exe' = 'CoreMapWindow.exe'; 'CoreMapTray.exe' = 'CoreMapTrayNew.exe' }
+$build = Join-Path $root 'build'
+New-Item -ItemType Directory -Force $build | Out-Null
+$exes = @('CoreMapWindow.exe', 'CoreMapTray.exe')
 
 function NewStamp {
     $text = (Get-Date -Format 'dd.MM.yy HH:mm') + '|' + [DateTime]::Now.Ticks
@@ -23,6 +26,7 @@ function NewStamp {
     return $text
 }
 
+$env:COREMAP_VERSION = (Get-Content (Join-Path $root 'VERSION') -TotalCount 1).Trim()
 $newest = (Get-ChildItem (Join-Path $root 'rust') -Recurse -File | Where-Object { $_.FullName -notmatch '\\target\\' } | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime
 if ((Test-Path $stampFile) -and (Get-Item $stampFile).LastWriteTime -ge $newest) { $env:COREMAP_STAMP = (Get-Content $stampFile -TotalCount 1) }
 else { $env:COREMAP_STAMP = NewStamp }
@@ -46,9 +50,16 @@ try {
             if (-not (Step 'build' { cargo build --release })) { $failed = 'build'; break }
             try {
                 # Each exe is copied and probe-started (--probe returns before anything else, no rights asked).
-                foreach ($name in $exes.Keys) {
-                    $exe = Join-Path $root $exes[$name]
-                    Copy-Item (Join-Path $root ("rust\target\x86_64-pc-windows-msvc\release\" + $name)) $exe -Force
+                foreach ($name in $exes) {
+                    $exe = Join-Path $build $name
+                    $built = Join-Path $root ("rust\target\x86_64-pc-windows-msvc\release\" + $name)
+                    try { Copy-Item $built $exe -Force -ErrorAction Stop }
+                    catch [System.IO.IOException] {
+                        # A hidden check still runs from build\ (Windows locks a running exe): not a Smart App
+                        # Control refusal, so no rebuild - the gate stops and says so.
+                        $failed = "build\$name is in use by a running check"
+                        break
+                    }
                     $probe = Start-Process -FilePath $exe -ArgumentList '--probe' -PassThru -Wait -ErrorAction Stop
                     if ($probe.ExitCode -ne 0) { $failed = "$name probe run, exit code " + $probe.ExitCode }
                 }
@@ -65,5 +76,5 @@ try {
 }
 finally { Pop-Location }
 if ($failed) { Write-Host "rust: $failed FAILED"; exit 2 }
-Write-Host ('rust ok, build ' + $env:COREMAP_STAMP)
+Write-Host ('rust ok, version ' + $env:COREMAP_VERSION + ', build ' + $env:COREMAP_STAMP)
 exit 0

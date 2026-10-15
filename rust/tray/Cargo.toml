@@ -16,6 +16,16 @@ path = "src/main.rs"
 machine = { package = "coremap-machine", path = "../machine" }
 # data\tray.json (the auto module's settings) and its marker; already in the workspace through the library.
 serde_json = "1"
+# Fan RPM from HP firmware through WMI (src/fans.rs, DECISIONS #32): COM interfaces (IWbemServices and the rest),
+# VARIANT and SAFEARRAY, which windows-sys does not have. Already in Cargo.lock through Slint, no build script.
+# Rpc is left out: the two numbers CoSetProxyBlanket needs from it are constants in fans.rs.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -1,7 +1,9 @@
-# Project check for the agent: builds the sources into CoreMapNew.exe (the owner's CoreMap.exe is not touched),
-# takes hidden simulated window snapshots into outputs\<Name>\, runs the self-test of the measurement base, the
-# hidden checks of the tray resident, of hover and of the bridge. Nothing appears on screen, no elevation prompt,
-# no real load. Exit code 0 = built, every snapshot was written, every check passed.
+# Project check for the agent: builds every program into build\ (CoreMap.exe here, the Rust ones by tools\rust.ps1),
+# never into the project root - the owner's programs there change only through tools\deliver.ps1 (DECISIONS #33).
+# build\ gets its own copy of data\, layouts\ and modules\, so hidden runs read the owner's saved data but never
+# write into it. Then hidden simulated window snapshots into outputs\<Name>\, the self-test of the measurement base,
+# the hidden checks of the tray resident, of the logon program, of hover and of the bridge. Nothing appears on screen,
+# no elevation prompt, no real load. Exit code 0 = built, every snapshot was written, every check passed.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -Name stage1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1 -BuildOnly
@@ -22,7 +24,7 @@ Set-Location $root
 # Builds and hidden runs heat the processor and spoil that measurement, so the check waits for it to end.
 $waited = 0
 while ($true) {
-    $busy = Get-Process CoreMap -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match [string][char]0x2014 }
+    $busy = Get-Process CoreMap -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $root 'CoreMap.exe') -and $_.MainWindowTitle -match [string][char]0x2014 }
     if (-not $busy) { break }
     if ($waited -eq 0) { Write-Host 'the owner is measuring - waiting for it to end' }
     if ($waited -ge 3600) { Write-Host 'the owner is still measuring after an hour - not started'; exit 5 }
@@ -35,7 +37,17 @@ $broken = Select-String -Path src\*.cs -Pattern '^\s*" \+\s*$'
 if ($broken) { $broken | ForEach-Object { Write-Host ("broken literal: " + $_.Path + ":" + $_.LineNumber) }; exit 3 }
 
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$out = Join-Path $root 'CoreMapNew.exe'
+$build = Join-Path $root 'build'
+$out = Join-Path $build 'CoreMap.exe'
+foreach ($part in 'data', 'layouts', 'modules') {
+    # robocopy /MIR makes build\<part> an exact copy; it deletes only inside build\. Exit codes below 8 are success.
+    robocopy (Join-Path $root $part) (Join-Path $build $part) /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Host "copy of $part into build failed"; exit 1 }
+}
+# The version number (file VERSION) goes into the exe as a constant (Program.Build).
+$version = (Get-Content (Join-Path $root 'VERSION') -TotalCount 1).Trim()
+$versionCs = Join-Path $build 'Version.cs'
+Set-Content -Path $versionCs -Encoding ASCII -Value ('namespace CoreMap { static class Version { public const string Number = "' + $version + '"; } }')
 $icon = @()
 if (Test-Path assets\coremap.ico) { $icon = @('/win32icon:assets\coremap.ico') }
 
@@ -44,19 +56,19 @@ function Build {
     # build returned a non-empty list, which counts as true, and the check went on with the previous exe.
     & $csc /nologo /codepage:65001 /target:winexe /optimize+ /platform:x64 /win32manifest:app.manifest @icon `
         /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll `
-        /r:webview2\Microsoft.Web.WebView2.Core.dll /r:webview2\Microsoft.Web.WebView2.WinForms.dll "/out:$out" src\*.cs | Out-Host
+        /r:webview2\Microsoft.Web.WebView2.Core.dll /r:webview2\Microsoft.Web.WebView2.WinForms.dll "/out:$out" src\*.cs $versionCs | Out-Host
     return $LASTEXITCODE -eq 0
 }
 
 if (-not (Build)) { Write-Host 'build failed'; exit 1 }
 Write-Host 'build ok'
-# The Rust window (rust\, DECISIONS #28): its gate and release build (tools\rust.ps1), copied next to the exe as
-# CoreMapWindow.exe, where the engine check below starts it. A failed step fails the check here.
+# The Rust programs (rust\, DECISIONS #28, #31): their gate and release build (tools\rust.ps1), copied into build\
+# next to CoreMap.exe, where the engine check and the logon check below start them. A failed step fails the check here.
 & (Join-Path $PSScriptRoot 'rust.ps1')
 if ($LASTEXITCODE -ne 0) { Write-Host 'rust window failed'; exit 6 }
 if ($BuildOnly) { exit 0 }
 
-$dir = Join-Path 'outputs' $Name
+$dir = Join-Path $root (Join-Path 'outputs' $Name)  # full path: second copies run with build as their folder
 New-Item -ItemType Directory -Force $dir | Out-Null
 # The simulated load on a whole E-core cluster reads far above 100 C, and the overheat guard would stop the
 # measurement; d and e raise the guard limit to show the measurement itself. c runs with the simulated fans
@@ -106,12 +118,12 @@ $procs += Start-Process -FilePath $out -ArgumentList "--simulate --tray --saved 
 # Hover on the curve graph without a mouse (MainForm.HoverCheck): the cursor is put on every point twice, with a
 # repaint after each; the highlighted block must not change, the point must stay under the cursor and have a tooltip.
 # First line of the report: ok / FAILED.
-# The logon program (rust\tray, CoreMapTrayNew.exe here; DECISIONS #31) on simulated ceilings, a temp copy of the
+# The logon program (rust\tray, build\CoreMapTray.exe; DECISIONS #31) on simulated ceilings, a temp copy of the
 # saved profiles and check-only names for every Windows object: no tray icon, no rights. It walks who may write ceilings
 # when (old window, engine, lease), the marker after a broken measurement, repair after sleep, a foreign change, its
 # menu as Windows holds it, and its own memory and idle CPU. First line of the report: ok / FAILED.
 $logon = Join-Path $dir 'logon.txt'
-$procs += Start-Process -FilePath (Join-Path $root 'CoreMapTrayNew.exe') -ArgumentList "--simulate --saved --snapshot $logon" -PassThru
+$procs += Start-Process -FilePath (Join-Path $build 'CoreMapTray.exe') -ArgumentList "--simulate --saved --snapshot $logon" -PassThru
 
 $hover = Join-Path $dir 'hover.txt'
 $procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover --snapshot $hover --size 1920x1040" -PassThru

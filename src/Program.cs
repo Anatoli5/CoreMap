@@ -71,22 +71,9 @@ namespace CoreMap
         public const string WindowMutex = "Local\\CoreMap.SingleInstance";
 
         public static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
-        public static readonly string Build = BuildStamp();  // когда собран этот exe: «13.10.26 05:15»; показан в заголовке окна
-
-        /// Время сборки из заголовка самого exe: его пишет компилятор, и от копирования файла оно не меняется.
-        static string BuildStamp()
-        {
-            try
-            {
-                byte[] head = new byte[4096];
-                using (FileStream file = File.OpenRead(System.Reflection.Assembly.GetExecutingAssembly().Location))
-                    file.Read(head, 0, head.Length);
-                int pe = BitConverter.ToInt32(head, 0x3C);
-                DateTime built = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(BitConverter.ToUInt32(head, pe + 8));
-                return built.ToLocalTime().ToString("dd.MM.yy HH:mm");
-            }
-            catch (Exception) { return "неизвестна"; }
-        }
+        /// Номер версии (файл VERSION; tools\check.ps1 вписывает его в build\Version.cs при сборке) — показан в заголовке
+        /// окна. Владелец 15.10: версия — номер, а не время сборки (DECISIONS #33).
+        public static readonly string Build = Version.Number;
         public static string DataDir = Path.Combine(Root, "data");  // проверка --selftest подставляет временную папку
 
         /// --after N: номер процесса прежнего окна, запустившего движок кнопкой «новое окно» (Tray.WatchOldWindow); 0 — нет.

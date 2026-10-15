@@ -12,6 +12,7 @@ pub mod files;
 pub mod limits;
 pub mod mailbox;
 pub mod marker;
+pub mod memory;
 pub mod named;
 pub mod pawnio;
 pub mod profile;

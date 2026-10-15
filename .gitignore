@@ -33,3 +33,7 @@ node_modules/
 
 # Сборка Rust-части (cargo)
 rust/target/
+
+# Сборки для проверки (tools/check.ps1) и прежние версии программ владельца (tools/deliver.ps1)
+build/
+archive/

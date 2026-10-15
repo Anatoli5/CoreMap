@@ -13,6 +13,7 @@
 
 mod app;
 mod check;
+mod fans;
 mod journal;
 mod shell;
 
@@ -24,6 +25,8 @@ use machine::named::{self, Names};
 use crate::app::{App, Config};
 use crate::shell::{Handler, Loop, Shell};
 
+/// Номер версии (файл VERSION, tools\rust.ps1) — его владелец видит в подсказке значка и называет.
+pub const VERSION: &str = env!("COREMAP_VERSION");
 /// Время сборки (tools\rust.ps1); после «|» — метка, которая только делает файл другим при пересборке.
 pub const BUILT: &str = env!("COREMAP_BUILT");
 
@@ -107,7 +110,7 @@ fn main() {
         }
     };
     journal.note(&format!(
-        "запуск, сборка {}",
+        "запуск, версия {VERSION} (собрана {})",
         BUILT.split('|').next().unwrap_or_default()
     ));
     app.start(&mut shell);

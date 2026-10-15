@@ -1,16 +1,20 @@
-// Регулятор автомодуля (DECISIONS #31, «Auto module»): по показаниям блоков решает, какой блок опустить на ступень и
-// какой вернуть. Окна, таймеров и вызовов Windows здесь нет: время и показания приходят снаружи, ответ — действие.
+// Регулятор автомодуля (DECISIONS #31 «Auto module», #32): по показаниям блоков решает, какой блок опустить на ступень
+// и какой поднять. Окна, таймеров и вызовов Windows здесь нет: время и показания приходят снаружи, ответ — решение.
 // Поэтому правило проверяется тестами на многих минутах «времени» за миллисекунды.
 //
-// Правило — как у регуляторов в Linux (thermald) и ACPI: снижать быстро, возвращать медленно и по одной ступени, с
+// Правило — как у регуляторов в Linux (thermald) и ACPI: снижать быстро, поднимать медленно и по одной ступени, с
 // зазором между порогами (без зазора, как у ThrottleStop, — скачки туда-сюда; outputs/auto-control-research-2026-10-14.md).
 // - Опустить: блок нагружен (доля работы ≥ 50 %), его средняя температура за окно (20 с) выше предела, после его
 //   прошлого изменения прошла пауза (15 с). Новый потолок — на ступень ниже фактического множителя, а не потолка:
 //   горячие ядра и так идут на 2–4 ступени ниже потолка (измерено), снижение потолка над ними ничего бы не дало. Не
-//   глубже «принятый минус глубина». За один шаг — один блок, самый горячий.
-// - Вернуть: блок ниже принятого, и его температура держится ниже «предел − 5 °C» уже 2 минуты. На одну ступень; до
-//   следующей — снова 2 минуты прохлады. Выше принятого — никогда.
-// - Между порогами — ничего. После любого изменения потолка память всех блоков начинается заново: прежние показания
+//   глубже «где работал при первом снижении минус глубина». За один шаг — один блок, самый горячий. Вместе с решением
+//   уходит ступень, на которой блок перегрелся (`Decision::ban`): выше неё память перегрева (memory.rs) не пустит.
+// - Поднять: блок пробыл прохладным (ниже «предел − 5 °C») под нагрузкой 2 минуты — простой не считается и не
+//   сбрасывает счёт (DECISIONS #32: опущенный блок «остывал» в меню игры, поднимался и снова перегревался в игре).
+//   Поднимается на одну ступень, до следующей — снова 2 минуты; ступень, на которую запрещает память, — нет.
+//   До принятого потолка — всегда; выше принятого, до заводского — только если включено подтягивание и блок на деле
+//   работает на своём потолке (иначе более высокий потолок ничего не меняет).
+// - Между порогами — ничего. После любого изменения потолка окна всех блоков начинаются заново: прежние показания
 //   были до него, а сосед греет соседа (связь 21–48 %, KNOWLEDGE.md) — следующее решение только по свежему окну.
 // - Глубина считается от того, где блок работал при первом снижении (фактический множитель), а не от принятого
 //   потолка: горячие ядра и так идут на 3–4 ступени ниже потолка, и «принятый − 4» оставлял регулятору одну
@@ -21,19 +25,24 @@ use std::time::Duration;
 
 use crate::thermal::Reading;
 
-/// Зазор между порогом снижения и порогом возврата, °C: два шага датчика ядра (2 °C) и одна ступень потолка.
+/// Зазор между порогом снижения и порогом подъёма, °C: два шага датчика ядра (2 °C) и одна ступень потолка.
 pub const MARGIN: f64 = 5.0;
 /// С какой доли работы блок считается нагруженным: простаивающий блок греет сосед, а не он сам.
 pub const BUSY: f64 = 0.5;
+/// Блок «на своём потолке», если его средний фактический множитель не ниже потолка больше чем на столько.
+pub const AT_CEILING: f64 = 0.5;
+/// Больше этого между двумя показаниями «прохладен под нагрузкой» к счёту прохлады не прибавляется: был перерыв.
+const COOL_GAP: Duration = Duration::from_secs(10);
 
-/// Выбор владельца: предел температуры и насколько глубоко можно опускать ниже принятых потолков.
+/// Выбор владельца: предел температуры, насколько глубоко можно опускать и можно ли подтягивать выше принятого.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub limit: f64,
     pub depth: i32,
+    pub step_up: bool,
 }
 
-/// Сроки: окно усреднения, пауза после изменения, сколько держаться прохладным перед возвратом ступени.
+/// Сроки: окно усреднения, пауза после изменения, сколько держаться прохладным под нагрузкой перед подъёмом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub window: Duration,
@@ -58,6 +67,41 @@ pub enum Action {
     Raise { block: usize, to: i32 },
 }
 
+/// Окно блока на момент решения — для журнала действий.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Window {
+    pub mean: f64,
+    pub max: f64,
+    pub busy: f64,
+    /// Средний фактический множитель; None — не известен.
+    pub ratio: Option<f64>,
+}
+
+/// Решение регулятора.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decision {
+    pub action: Action,
+    /// Окно блока, по которому решено; None — окна нет (подъём сразу после чужого действия).
+    pub window: Option<Window>,
+    /// Снижение: ступень, на которой блок перегрелся, — поднимать на неё и выше запрещает память перегрева.
+    pub ban: Option<i32>,
+    /// Подъём: сколько блок пробыл прохладным под нагрузкой.
+    pub cool: Duration,
+}
+
+/// Один опрос: показания и потолки по блокам.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame<'a> {
+    /// None — блок в этом опросе не читался.
+    pub readings: &'a [Option<Reading>],
+    /// Действующий потолок блока.
+    pub ceilings: &'a [i32],
+    /// Принятый потолок блока: до него регулятор поднимает всегда, выше — только при подтягивании.
+    pub accepted: &'a [i32],
+    /// Заводской предел блока: выше никогда.
+    pub fused: &'a [i32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Point {
     at: Duration,
@@ -70,10 +114,34 @@ struct Point {
 struct Track {
     points: VecDeque<Point>,
     acted: Option<Duration>,
-    cool_since: Option<Duration>,
+    /// Сколько блок пробыл прохладным под нагрузкой с последнего своего изменения или перегрева.
+    cool: Duration,
+    /// Когда было последнее показание «нагружен и прохладен»: следующее такое же прибавляет промежуток.
+    cool_at: Option<Duration>,
     /// Где блок работал при первом снижении (целый фактический множитель, не выше принятого): от него считается
     /// глубина, пока блок не вернётся к принятому.
     anchor: Option<i32>,
+}
+
+impl Track {
+    /// Окно заполнено: показания тянутся хотя бы на три четверти окна и их не меньше трёх.
+    fn covered(&self, now: Duration, window: Duration) -> bool {
+        self.points
+            .front()
+            .is_some_and(|first| self.points.len() >= 3 && now.saturating_sub(first.at) * 4 >= window * 3)
+    }
+
+    fn window(&self) -> Option<Window> {
+        let count = f64::from(u32::try_from(self.points.len()).ok().filter(|&n| n > 0)?);
+        let ratios: Vec<f64> = self.points.iter().filter_map(|p| p.ratio).collect();
+        Some(Window {
+            mean: self.points.iter().map(|p| p.temp).sum::<f64>() / count,
+            max: self.points.iter().map(|p| p.temp).fold(f64::MIN, f64::max),
+            busy: self.points.iter().map(|p| p.busy).sum::<f64>() / count,
+            ratio: (!ratios.is_empty())
+                .then(|| ratios.iter().sum::<f64>() / f64::from(u32::try_from(ratios.len()).unwrap_or(u32::MAX))),
+        })
+    }
 }
 
 /// Регулятор: память блоков и выбор владельца.
@@ -99,18 +167,19 @@ impl Controller {
         self.settings
     }
 
-    /// Нужно ли читать блоки в этом опросе: корпус близко к пределу (или не прочитан), или какой-то блок опущен —
-    /// за ним надо следить, чтобы вернуть.
+    /// Нужно ли читать блоки в этом опросе по самой температуре: корпус близко к пределу (или не прочитан), или
+    /// какой-то блок не на принятом — за ним надо следить, чтобы вернуть.
     #[must_use]
-    pub fn watch_blocks(&self, package: Option<f64>, lowered: bool) -> bool {
-        lowered || package.is_none_or(|p| p >= self.settings.limit - MARGIN)
+    pub fn watch_blocks(&self, package: Option<f64>, overlay: bool) -> bool {
+        overlay || package.is_none_or(|p| p >= self.settings.limit - MARGIN)
     }
 
-    /// Блоки не читались (корпус далеко от предела): прежние показания больше не окно подряд.
+    /// Блоки не читались: прежние показания больше не окно подряд. Набранная прохлада под нагрузкой остаётся —
+    /// перерыв её не сбрасывает, следующая прохлада прибавляется к ней.
     pub fn forget(&mut self) {
         for track in &mut self.tracks {
             track.points.clear();
-            track.cool_since = None;
+            track.cool_at = None;
         }
     }
 
@@ -121,16 +190,18 @@ impl Controller {
         }
     }
 
-    /// Один опрос. `readings` — по блокам (None — блок в этом опросе не читался), `ceilings` — действующий потолок
-    /// блока, `accepted` — принятый (выше него регулятор не поднимает). Возвращает не больше одного действия.
-    pub fn step(
-        &mut self,
-        now: Duration,
-        readings: &[Option<Reading>],
-        ceilings: &[i32],
-        accepted: &[i32],
-    ) -> Option<Action> {
-        let Settings { limit, depth } = self.settings;
+    /// Один опрос. `banned(блок, потолок)` — запрещает ли память перегрева поднять блок на этот потолок. Возвращает
+    /// не больше одного решения.
+    pub fn step(&mut self, now: Duration, frame: &Frame<'_>, banned: &dyn Fn(usize, i32) -> bool) -> Option<Decision> {
+        self.observe(now, frame.readings);
+        if let Some(decision) = self.lower(now, frame) {
+            return Some(decision);
+        }
+        self.raise(now, frame, banned)
+    }
+
+    fn observe(&mut self, now: Duration, readings: &[Option<Reading>]) {
+        let Settings { limit, .. } = self.settings;
         let window = self.timing.window;
         for (track, reading) in self.tracks.iter_mut().zip(readings) {
             let Some(Reading {
@@ -139,12 +210,22 @@ impl Controller {
                 ratio,
             }) = *reading
             else {
+                track.cool_at = None;
                 continue;
             };
-            if temp < limit - MARGIN {
-                track.cool_since.get_or_insert(now);
+            let loaded = busy.is_some_and(|b| b >= BUSY);
+            if loaded && temp < limit - MARGIN {
+                if let Some(at) = track.cool_at {
+                    track.cool += now.saturating_sub(at).min(COOL_GAP);
+                }
+                track.cool_at = Some(now);
+            } else if loaded {
+                // Нагружен и не прохладен: прохлада не доказана — счёт заново.
+                track.cool = Duration::ZERO;
+                track.cool_at = None;
             } else {
-                track.cool_since = None;
+                // Простой: часы прохлады стоят — не идут и не сбрасываются.
+                track.cool_at = None;
             }
             // Без доли работы (первый опрос после перерыва) точка в окно не идёт: ноль занизил бы среднюю (ревизия L3).
             let Some(busy) = busy else { continue };
@@ -158,79 +239,105 @@ impl Controller {
                 track.points.pop_front();
             }
         }
-        let settled = |track: &Track| track.acted.is_none_or(|t| now.saturating_sub(t) >= self.timing.settle);
+    }
 
-        // Опустить: самый горячий из нагруженных и перегретых за всё окно.
-        let mut hottest: Option<(usize, f64, i32, i32)> = None; // блок, средняя, куда, якорь
+    fn settled(&self, track: &Track, now: Duration) -> bool {
+        track.acted.is_none_or(|t| now.saturating_sub(t) >= self.timing.settle)
+    }
+
+    /// Опустить: самый горячий из нагруженных и перегретых за всё окно.
+    fn lower(&mut self, now: Duration, frame: &Frame<'_>) -> Option<Decision> {
+        let Settings { limit, depth, .. } = self.settings;
+        let mut hottest: Option<(usize, Window, i32, i32, i32)> = None; // блок, окно, куда, якорь, ступень перегрева
         for (block, track) in self.tracks.iter().enumerate() {
-            let (Some(&ceiling), Some(&base)) = (ceilings.get(block), accepted.get(block)) else {
+            let (Some(&ceiling), Some(&base)) = (frame.ceilings.get(block), frame.accepted.get(block)) else {
                 continue;
             };
-            let Some(first) = track.points.front() else { continue };
-            // Окно заполнено: показания тянутся хотя бы на три четверти окна и их не меньше трёх.
-            let covered = track.points.len() >= 3 && now.saturating_sub(first.at) * 4 >= window * 3;
-            if !covered || !settled(track) {
+            if !track.covered(now, self.timing.window) || !self.settled(track, now) {
                 continue;
             }
-            let count = f64::from(u32::try_from(track.points.len()).unwrap_or(u32::MAX));
-            let mean_temp = track.points.iter().map(|p| p.temp).sum::<f64>() / count;
-            let mean_busy = track.points.iter().map(|p| p.busy).sum::<f64>() / count;
-            if mean_temp <= limit || mean_busy < BUSY {
+            let Some(window) = track.window() else { continue };
+            if window.mean <= limit || window.busy < BUSY {
                 continue;
             }
-            let ratios: Vec<f64> = track.points.iter().filter_map(|p| p.ratio).collect();
-            let actual = if ratios.is_empty() {
-                ceiling
-            } else {
-                let mean = ratios.iter().sum::<f64>() / f64::from(u32::try_from(ratios.len()).unwrap_or(u32::MAX));
-                // Множитель — целые ступени; дробный средний округляется вниз.
-                #[expect(clippy::cast_possible_truncation, reason = "a multiplier is a small positive number")]
-                let whole = mean.floor() as i32;
-                whole.min(ceiling)
-            };
+            // Множитель — целые ступени; дробный средний округляется вниз, а ступень перегрева — вверх: блок, шедший
+            // в среднем на ×49,9, работал и на ×50.
+            #[expect(clippy::cast_possible_truncation, reason = "a multiplier is a small positive number")]
+            let (actual, ran) = window.ratio.map_or((ceiling, ceiling), |r| {
+                ((r.floor() as i32).min(ceiling), (r.ceil() as i32).min(ceiling))
+            });
             let anchor = track.anchor.unwrap_or_else(|| actual.min(base));
             let floor = anchor - depth;
             if ceiling <= floor {
                 continue;
             }
             let to = (actual - 1).min(ceiling - 1).max(floor);
-            if hottest.is_none_or(|(_, t, _, _)| mean_temp > t) {
-                hottest = Some((block, mean_temp, to, anchor));
+            if hottest.is_none_or(|(_, w, ..)| window.mean > w.mean) {
+                hottest = Some((block, window, to, anchor, ran.max(to + 1)));
             }
         }
-        if let Some((block, _, to, anchor)) = hottest {
-            self.after_action();
-            let track = &mut self.tracks[block];
-            track.acted = Some(now);
-            track.cool_since = None;
-            track.anchor = Some(anchor);
-            return Some(Action::Lower { block, to });
-        }
-
-        // Вернуть: дольше всех прохладный из опущенных.
-        let mut coolest: Option<(usize, Duration)> = None;
-        for (block, track) in self.tracks.iter().enumerate() {
-            let (Some(&ceiling), Some(&base)) = (ceilings.get(block), accepted.get(block)) else {
-                continue;
-            };
-            let Some(since) = track.cool_since else { continue };
-            if ceiling >= base || !settled(track) || now.saturating_sub(since) < self.timing.release {
-                continue;
-            }
-            if coolest.is_none_or(|(_, s)| since < s) {
-                coolest = Some((block, since));
-            }
-        }
-        let (block, _) = coolest?;
-        let to = ceilings[block] + 1;
+        let (block, window, to, anchor, ran) = hottest?;
         self.after_action();
         let track = &mut self.tracks[block];
         track.acted = Some(now);
-        track.cool_since = Some(now); // до следующей ступени — снова полный срок прохлады
-        if accepted.get(block).is_some_and(|&base| to >= base) {
+        track.cool = Duration::ZERO;
+        track.cool_at = None;
+        track.anchor = Some(anchor);
+        Some(Decision {
+            action: Action::Lower { block, to },
+            window: Some(window),
+            ban: Some(ran),
+            cool: Duration::ZERO,
+        })
+    }
+
+    /// Поднять: из прохладных под нагрузкой дольше всех прохладный, если память не запрещает.
+    fn raise(&mut self, now: Duration, frame: &Frame<'_>, banned: &dyn Fn(usize, i32) -> bool) -> Option<Decision> {
+        let mut coolest: Option<(usize, Duration)> = None;
+        for (block, track) in self.tracks.iter().enumerate() {
+            let (Some(&ceiling), Some(&base), Some(&fused)) = (
+                frame.ceilings.get(block),
+                frame.accepted.get(block),
+                frame.fused.get(block),
+            ) else {
+                continue;
+            };
+            if track.cool < self.timing.release || !self.settled(track, now) || ceiling >= fused {
+                continue;
+            }
+            let wanted = ceiling < base || (self.settings.step_up && self.at_ceiling(track, now, ceiling));
+            if !wanted || banned(block, ceiling + 1) {
+                continue;
+            }
+            if coolest.is_none_or(|(_, c)| track.cool > c) {
+                coolest = Some((block, track.cool));
+            }
+        }
+        let (block, cool) = coolest?;
+        let to = frame.ceilings[block] + 1;
+        let window = self.tracks[block].window();
+        self.after_action();
+        let track = &mut self.tracks[block];
+        track.acted = Some(now);
+        track.cool = Duration::ZERO; // до следующей ступени — снова полный срок прохлады
+        track.cool_at = None;
+        if frame.accepted.get(block).is_some_and(|&base| to >= base) {
             track.anchor = None; // вернулся к принятому: следующее снижение считает глубину заново
         }
-        Some(Action::Raise { block, to })
+        Some(Decision {
+            action: Action::Raise { block, to },
+            window,
+            ban: None,
+            cool,
+        })
+    }
+
+    /// Блок нагружен и на деле работает на своём потолке — только тогда выше потолка есть смысл.
+    fn at_ceiling(&self, track: &Track, now: Duration, ceiling: i32) -> bool {
+        track.covered(now, self.timing.window)
+            && track
+                .window()
+                .is_some_and(|w| w.busy >= BUSY && w.ratio.is_some_and(|r| r >= f64::from(ceiling) - AT_CEILING))
     }
 
     /// После любого изменения потолка — свежие окна у всех блоков (их показания были до него).
@@ -246,9 +353,22 @@ mod tests {
     use super::*;
 
     const LIMIT: f64 = 85.0;
+    const FUSED: i32 = 54;
 
     fn controller(blocks: usize) -> Controller {
-        Controller::new(Settings { limit: LIMIT, depth: 4 }, Timing::REAL, blocks)
+        with(blocks, false)
+    }
+
+    fn with(blocks: usize, step_up: bool) -> Controller {
+        Controller::new(
+            Settings {
+                limit: LIMIT,
+                depth: 4,
+                step_up,
+            },
+            Timing::REAL,
+            blocks,
+        )
     }
 
     #[expect(
@@ -263,7 +383,36 @@ mod tests {
         })
     }
 
-    /// Прокручивает `seconds` секунд опросами раз в 2 с с одними показаниями; возвращает действия по порядку.
+    /// Прокручивает `seconds` секунд опросами раз в 2 с с одними показаниями; возвращает решения по порядку.
+    fn run_with(
+        c: &mut Controller,
+        from: u64,
+        seconds: u64,
+        readings: &[Option<Reading>],
+        ceilings: &mut [i32],
+        accepted: &[i32],
+        banned: &dyn Fn(usize, i32) -> bool,
+    ) -> Vec<(u64, Decision)> {
+        let fused = vec![FUSED; ceilings.len()];
+        let mut decisions = Vec::new();
+        for t in (from..from + seconds).step_by(2) {
+            let frame = Frame {
+                readings,
+                ceilings,
+                accepted,
+                fused: &fused,
+            };
+            if let Some(decision) = c.step(Duration::from_secs(t), &frame, banned) {
+                match decision.action {
+                    Action::Lower { block, to } | Action::Raise { block, to } => ceilings[block] = to,
+                }
+                decisions.push((t, decision));
+            }
+        }
+        decisions
+    }
+
+    /// То же без запретов памяти; возвращает действия.
     fn run(
         c: &mut Controller,
         from: u64,
@@ -272,16 +421,10 @@ mod tests {
         ceilings: &mut [i32],
         accepted: &[i32],
     ) -> Vec<(u64, Action)> {
-        let mut actions = Vec::new();
-        for t in (from..from + seconds).step_by(2) {
-            if let Some(action) = c.step(Duration::from_secs(t), readings, ceilings, accepted) {
-                match action {
-                    Action::Lower { block, to } | Action::Raise { block, to } => ceilings[block] = to,
-                }
-                actions.push((t, action));
-            }
-        }
-        actions
+        run_with(c, from, seconds, readings, ceilings, accepted, &|_, _| false)
+            .into_iter()
+            .map(|(t, d)| (t, d.action))
+            .collect()
     }
 
     #[test]
@@ -397,8 +540,7 @@ mod tests {
     fn a_cool_block_returns_one_step_per_two_minutes_up_to_the_accepted_ceiling() {
         let mut c = controller(1);
         let mut ceilings = [47];
-        let actions = run(&mut c, 0, 900, &[hot(70.0, 1.0, 47.0)], &mut ceilings, &[50]);
-        let raises: Vec<(u64, Action)> = actions.into_iter().collect();
+        let raises = run(&mut c, 0, 900, &[hot(70.0, 1.0, 47.0)], &mut ceilings, &[50]);
         assert_eq!(
             ceilings[0], 50,
             "back to the accepted ceiling and not above: {raises:?}"
@@ -412,6 +554,119 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_block_is_not_raised_however_long_it_idles() {
+        // DECISIONS #32: a lowered block cooled in the game's menu, went up and overheated again in play.
+        let mut c = controller(1);
+        let mut ceilings = [47];
+        assert_eq!(run(&mut c, 0, 1800, &[hot(55.0, 0.05, 47.0)], &mut ceilings, &[50]), []);
+    }
+
+    #[test]
+    fn idle_pauses_the_cool_clock_and_does_not_reset_it() {
+        // 60 s cool under load, 10 min menu, 60 s cool under load: two minutes of cool in all - the step comes then.
+        let mut c = controller(1);
+        let mut ceilings = [47];
+        let cool = [hot(70.0, 1.0, 47.0)];
+        assert_eq!(run(&mut c, 0, 62, &cool, &mut ceilings, &[50]), []);
+        assert_eq!(run(&mut c, 62, 600, &[hot(55.0, 0.05, 47.0)], &mut ceilings, &[50]), []);
+        let back = run(&mut c, 662, 70, &cool, &mut ceilings, &[50]);
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(
+            back[0].0 >= 662 + 58,
+            "not before the second minute is made up: {back:?}"
+        );
+    }
+
+    #[test]
+    fn heat_under_load_starts_the_cool_count_afresh() {
+        let mut c = controller(1);
+        let mut ceilings = [47];
+        assert_eq!(run(&mut c, 0, 100, &[hot(70.0, 1.0, 47.0)], &mut ceilings, &[50]), []);
+        assert_eq!(run(&mut c, 100, 4, &[hot(82.0, 1.0, 47.0)], &mut ceilings, &[50]), []);
+        assert_eq!(
+            run(&mut c, 104, 100, &[hot(70.0, 1.0, 47.0)], &mut ceilings, &[50]),
+            [],
+            "100 s + 100 s of cool split by heat are not two minutes"
+        );
+    }
+
+    #[test]
+    fn a_banned_step_is_not_raised_to_but_the_one_below_is() {
+        let mut c = controller(1);
+        let mut ceilings = [47];
+        let decisions = run_with(
+            &mut c,
+            0,
+            1200,
+            &[hot(70.0, 1.0, 47.0)],
+            &mut ceilings,
+            &[50],
+            &|_, to| to >= 49,
+        );
+        assert_eq!(ceilings[0], 48, "{decisions:?}");
+    }
+
+    #[test]
+    fn a_lowering_names_the_step_it_overheated_at_and_its_window() {
+        // Ceiling x53, ran x49.87 - it ran at x50 too: the ban starts at x50, the new ceiling is x48.
+        let mut c = controller(1);
+        let mut ceilings = [53];
+        let decisions = run_with(
+            &mut c,
+            0,
+            20,
+            &[hot(91.0, 0.9, 49.87)],
+            &mut ceilings,
+            &[53],
+            &|_, _| false,
+        );
+        let d = decisions[0].1;
+        assert_eq!(d.action, Action::Lower { block: 0, to: 48 });
+        assert_eq!(d.ban, Some(50));
+        let w = d.window.expect("a lowering is decided on a window");
+        assert!((w.mean - 91.0).abs() < 1e-9 && (w.max - 91.0).abs() < 1e-9 && (w.busy - 0.9).abs() < 1e-9);
+        assert!(w.ratio.is_some_and(|r| (r - 49.87).abs() < 1e-9));
+    }
+
+    #[test]
+    fn without_step_up_a_cool_block_stays_at_the_accepted_ceiling() {
+        let mut c = controller(1);
+        let mut ceilings = [50];
+        assert_eq!(run(&mut c, 0, 900, &[hot(65.0, 1.0, 50.0)], &mut ceilings, &[50]), []);
+    }
+
+    #[test]
+    fn step_up_raises_a_cool_block_running_at_its_ceiling_up_to_fused() {
+        let mut c = with(1, true);
+        let mut ceilings = [50];
+        // The simulated block always runs at its ceiling.
+        let mut t = 0;
+        while t < 3000 && ceilings[0] < FUSED {
+            let r = [hot(65.0, 1.0, f64::from(ceilings[0]))];
+            run(&mut c, t, 2, &r, &mut ceilings, &[50]);
+            t += 2;
+        }
+        assert_eq!(ceilings[0], FUSED, "up to fused");
+        let more = run(
+            &mut c,
+            t,
+            900,
+            &[hot(65.0, 1.0, f64::from(FUSED))],
+            &mut ceilings,
+            &[50],
+        );
+        assert_eq!(more, [], "never above fused");
+    }
+
+    #[test]
+    fn step_up_leaves_a_block_that_does_not_reach_its_ceiling() {
+        // Cool, but runs x48.6 under a x50 ceiling: a higher ceiling would change nothing.
+        let mut c = with(1, true);
+        let mut ceilings = [50];
+        assert_eq!(run(&mut c, 0, 900, &[hot(65.0, 1.0, 48.6)], &mut ceilings, &[50]), []);
+    }
+
+    #[test]
     fn a_block_not_read_is_not_judged() {
         let mut c = controller(1);
         let mut ceilings = [50];
@@ -419,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_are_watched_near_the_limit_or_while_one_is_lowered() {
+    fn blocks_are_watched_near_the_limit_or_while_one_is_off_its_accepted_ceiling() {
         let c = controller(1);
         assert!(!c.watch_blocks(Some(70.0), false));
         assert!(c.watch_blocks(Some(81.0), false));

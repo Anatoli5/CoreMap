@@ -368,8 +368,8 @@ namespace CoreMap
             calibrationStatus.ForeColor = cal.Running ? Theme.Text : cal.Error != null ? Theme.Bad : cal.Fitted ? Theme.Dim : Theme.Accent;
         }
 
-        /// Заголовок окна: какое измерение идёт и какая это сборка — по заголовку видно, с какой версией имеешь дело.
-        string Title() { return Doing() + " · сборка " + Program.Build; }
+        /// Заголовок окна: номер версии и какое измерение идёт («CoreMap 0.2 — кривая 3 из 12»).
+        string Title() { return "CoreMap " + Program.Build + Doing().Substring("CoreMap".Length); }
 
         string Doing()
         {

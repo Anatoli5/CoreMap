@@ -125,8 +125,8 @@ component TileView inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    in property <string> built;  // время сборки; пусто — собрано не скриптом tools\rust.ps1
-    title: root.built == "" ? "CoreMap" : "CoreMap · сборка " + root.built;
+    in property <string> version;  // номер версии (файл VERSION); «без номера» — собрано не скриптом tools\rust.ps1
+    title: "CoreMap " + root.version;
     background: Palette.bg;
     default-font-family: "Segoe UI";
     default-font-size: 14px;

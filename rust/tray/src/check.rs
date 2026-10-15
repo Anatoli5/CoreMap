@@ -197,13 +197,19 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
         wake_delay: Duration::from_millis(300),
         lease_wait: 500,
         wake_gap: Duration::from_millis(500),
-        // Сроки автомодуля в проверке укорочены: опрос 50 мс, окно 0,4 с, пауза 0,3 с, прохлада 1 с.
+        // Сроки автомодуля в проверке укорочены: опрос 50 мс, окно 0,4 с, пауза 0,3 с, прохлада 1 с; запрет памяти
+        // перегрева 2 с (вдвое за повтор, не дольше 8 с, прощение через минуту).
         auto: crate::app::AutoTiming {
             tick: Duration::from_millis(50),
             control: machine::auto::Timing {
                 window: Duration::from_millis(400),
                 settle: Duration::from_millis(300),
                 release: Duration::from_secs(1),
+            },
+            bans: machine::memory::Spans {
+                first: Duration::from_secs(2),
+                longest: Duration::from_secs(8),
+                forgive: Duration::from_mins(1),
             },
         },
     };
@@ -420,7 +426,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         app.said.iter().any(|s| s.contains("Прежнее окно сейчас не открыть")),
         "и говорит почему",
     );
-    r.check(app.tip() == "CoreMap — идёт настройка", "подсказка: идёт настройка");
+    r.check(
+        app.tip() == format!("CoreMap {} — идёт настройка", crate::VERSION),
+        "подсказка: идёт настройка",
+    );
     let taken_back = logged(app, "потолки снова мои");
     let _ = core.send(());
     let _ = engine.send(());
@@ -595,9 +604,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         None => r.note("сон во время работы окна: профиля запуска нет — проверять нечего"),
     }
 
-    // 11. Автомодуль (DECISIONS #31): нагруженный горячий блок опускается, пока не остынет до предела, но не глубже
-    //     выбранного, держа аренду и метку; стартующему прежнему окну возвращает принятые и отпускает аренду; остыв —
-    //     возвращается по одной ступени.
+    // 11. Автомодуль (DECISIONS #31, #32): нагруженный горячий блок опускается, пока не остынет до предела, но не
+    //     глубже выбранного, держа аренду и метку, и каждое снижение ставит запрет на ступень перегрева; стартующему
+    //     прежнему окну возвращает принятые и отпускает аренду; простой прохладой не считается; прохладный под
+    //     нагрузкой блок возвращается по одной ступени, когда выходят запреты. Журнал действий и срезы пишутся.
     let accepted = app.intended().map(<[i32]>::to_vec).unwrap_or_default();
     // Горячий блок — с самым высоким принятым потолком (кроме кластера 2–5: ему ниже чужая правка): нагрев имитации
     // 40 + (потолок − 20) · 1,5 выше 75 °C с ×44. Профиль — копия файлов владельца, номер блока заранее не известен
@@ -681,6 +691,14 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         again < base,
         &format!("автомодуль: окно закрылось — горячий блок снова опущен (×{again})"),
     );
+    // Память перегрева: снижения поставили запреты; из журнала действий восстанавливаются те же (как после перезапуска).
+    let bans = app.bans_now();
+    app.replay_memory();
+    r.check(
+        bans > 0 && app.bans_now() == bans && logged(app, "и выше — не раньше") > 0,
+        &format!("автомодуль: снижения ставят запреты ({bans}), из журнала действий восстанавливаются те же"),
+    );
+    check_logs(r, app, data, block.first);
     // Чужая правка у блока, который автомодуль не трогал: принять, сказать один раз, больше этот блок не трогать.
     let other = app.topology().blocks[2].first; // кластер E-ядер 2–5
     let foreign = u8::try_from(accepted.get(other).copied().unwrap_or(40) - 2).unwrap_or(30);
@@ -705,18 +723,33 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         app.intended().and_then(|i| i.get(other)) == Some(&i32::from(foreign)) && told == 1,
         &format!("автомодуль: чужая правка принята, сказано один раз ({told})"),
     );
+    // Без нагрузки блок остывает, но не поднимается: простой — не прохлада (DECISIONS #32, качели «меню — игра»).
     if let Some(sim) = app.sim() {
         for &m in &block.members {
             sim.load[m] = 0.0;
         }
     }
     let raised = logged(app, &lowered);
-    pump_until(shell, app, Duration::from_secs(12), |a| {
+    pump(shell, app, Duration::from_secs(3));
+    r.check(
+        ceilings_now(app).get(first) == Some(&again),
+        &format!(
+            "автомодуль: без нагрузки остывший блок не поднят за 3 с при сроке прохлады 1 с (стоит {:?})",
+            ceilings_now(app).get(first)
+        ),
+    );
+    // Под лёгкой нагрузкой (доля 0,6) блок прохладен: поднимается по ступени, когда выходят запреты.
+    if let Some(sim) = app.sim() {
+        for &m in &block.members {
+            sim.load[m] = 0.6;
+        }
+    }
+    pump_until(shell, app, Duration::from_secs(30), |a| {
         ceilings_now(a).get(first) == Some(&base)
     });
     r.check(
         ceilings_now(app).get(first) == Some(&base),
-        "автомодуль: остывший блок вернулся к принятому",
+        "автомодуль: прохладный под нагрузкой блок вернулся к принятому, когда вышли запреты",
     );
     let steps = logged(app, &lowered) - raised;
     r.check(
@@ -727,6 +760,11 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         !marker.exists() && lease_free(&names.lease),
         "автомодуль: всё вернулось — метки нет, аренда свободна",
     );
+    if let Some(sim) = app.sim() {
+        for &m in &block.members {
+            sim.load[m] = 0.0;
+        }
+    }
     app.command(shell, AUTO_ON); // выключить: дальше меряется покой без опроса
 
     // 10. Цена: память и процессор в покое.
@@ -749,5 +787,41 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     r.check(
         idle_to.cpu.saturating_sub(idle_from.cpu) < 200_000,
         "в покое процессор не тратится (меньше 20 мс за 3 с)",
+    );
+}
+
+/// Журналы автомодуля после снижений: строки действий с условиями и запретом, срезы с заголовком по всем блокам.
+fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
+    let blocks = app.topology().blocks.len();
+    let log = fs::read_to_string(data.join("auto-log.jsonl")).unwrap_or_default();
+    let lowerings: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["act"] == "lower" && v["first"] == first)
+        .collect();
+    let complete = lowerings.iter().all(|v| {
+        v["ban"].is_i64()
+            && v["mean"].is_f64()
+            && v["max"].is_f64()
+            && v["until"].is_string()
+            && v["temps"].as_array().is_some_and(|a| a.len() == blocks)
+            && v["fans"] == serde_json::json!([3200, 3000])
+    });
+    r.check(
+        !lowerings.is_empty() && complete,
+        &format!(
+            "журнал действий: {} снижений блока с условиями (температуры {blocks} блоков, вентиляторы, запрет)",
+            lowerings.len()
+        ),
+    );
+    let day = machine::clock::Stamp::now().local(machine::clock::Pattern::Date);
+    let samples = fs::read_to_string(data.join("samples").join(format!("{day}.csv"))).unwrap_or_default();
+    let mut lines = samples.lines();
+    let width = 4 + 4 * blocks;
+    let header = lines.next().map_or(0, |h| h.split(',').count());
+    let rows: Vec<usize> = lines.map(|l| l.split(',').count()).collect();
+    r.check(
+        header == width && !rows.is_empty() && rows.iter().all(|&n| n == width),
+        &format!("срезы: заголовок {header} столбцов из {width}, строк {}", rows.len()),
     );
 }

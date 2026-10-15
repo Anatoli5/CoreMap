@@ -558,10 +558,12 @@ impl App {
         profile::standing(limits, self.profile.as_ref(), &self.listed_sets())
     }
 
-    /// Подсказка значка (Resident.Tip в C#).
+    /// Подсказка значка (Resident.Tip в C#); после названия программы — номер версии.
     #[must_use]
     pub fn tip(&mut self) -> String {
-        let text = self.tip_body();
+        let text = self
+            .tip_body()
+            .replacen("CoreMap", &format!("CoreMap {}", crate::VERSION), 1);
         match self.auto_tip() {
             Some(auto) => format!("{text}\n{auto}"),
             None => text,

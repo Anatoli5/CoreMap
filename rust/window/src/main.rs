@@ -55,6 +55,11 @@ thread_local! {
     static VIEW: RefCell<Option<Rc<RefCell<view::View>>>> = const { RefCell::new(None) };
 }
 
+/// Метка сборки (tools\rust.ps1): в окне не показывается, но остаётся в файле — пересобранный с новой меткой файл
+/// другой, и Smart App Control судит его заново (без неё повторная сборка дала бы тот же файл и тот же отказ).
+#[used]
+static STAMP: &str = env!("COREMAP_BUILT");
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Пробный запуск после сборки (tools\rust.ps1): пустил ли Windows файл. Ничего не делает и выходит.
@@ -77,8 +82,8 @@ fn main() {
     // по умолчанию, который AppWindow::new возьмёт сам; окно от этого не теряется.
     let _ = slint::BackendSelector::new().renderer_name("software".into()).select();
     let ui = AppWindow::new().expect("окно");
-    // После «|» — метка, которая только делает файл другим при пересборке (tools\rust.ps1); в заголовок не идёт.
-    ui.set_built(env!("COREMAP_BUILT").split('|').next().unwrap_or_default().into());
+    // Номер версии (файл VERSION, tools\rust.ps1); метка сборки в заголовок не идёт — она только делает файл другим.
+    ui.set_version(env!("COREMAP_VERSION").into());
     // События канала приходят в его потоке и передаются в поток окна по порядку.
     let link = pipe::Link::start(pipe, |event| {
         // Ошибка здесь значит, что цикл окна уже кончился (окно закрыто): событие больше некому показать.

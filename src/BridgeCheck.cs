@@ -338,7 +338,7 @@ namespace CoreMap
                 verdict = "Мост: проверка оборвалась — " + Program.Why(e) + ". Подробности — data\\bridge-check.txt";
                 log.Add(e.ToString());
             }
-            log.Insert(0, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  сборка " + Program.Build);
+            log.Insert(0, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  версия " + Program.Build);
             log.Insert(0, verdict);
             try
             {

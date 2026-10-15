@@ -32,8 +32,8 @@ use windows_sys::Win32::System::Power::{POWERBROADCAST_SETTING, RegisterPowerSet
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetProcessTimes, OpenProcessToken, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetProcessTimes, GetSystemTimes, OpenProcessToken,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -801,4 +801,22 @@ pub fn usage() -> Usage {
         working: counters.WorkingSetSize,
         cpu: ticks(kernel) + ticks(user),
     }
+}
+
+/// Время процессоров с запуска Windows, сотни наносекунд: (простой, всего). Доля работы между двумя чтениями —
+/// 1 − Δпростой/Δвсего; Windows считает её сама, так что ни одно спящее ядро ради неё не будится.
+#[must_use]
+pub fn system_times() -> Option<(u64, u64)> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+    // SAFETY: all three FILETIMEs are writable for the call.
+    if unsafe { GetSystemTimes(&raw mut idle, &raw mut kernel, &raw mut user) } == 0 {
+        return None;
+    }
+    let ticks = |ft: FILETIME| u64::from(ft.dwHighDateTime) << 32 | u64::from(ft.dwLowDateTime);
+    // Время ядра Windows включает простой: всего = ядро + пользователь.
+    Some((ticks(idle), ticks(kernel) + ticks(user)))
 }
