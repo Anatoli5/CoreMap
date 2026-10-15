@@ -27,8 +27,9 @@ export struct TileData {
 export struct MenuEntry {
     ratio: int,
     text: string,
-    hint: string,
+    hint: string,   // значки: ◆ заводской предел, ○ «было»
     checked: bool,
+    above: bool,    // выше заводского — красным
 }
 
 export global Palette {
@@ -175,9 +176,9 @@ export component AppWindow inherits Window {
     out property <length> menu-x;
     out property <length> menu-y;
     out property <bool> menu-shown;
-    out property <length> menu-head-h: 33px;
+    out property <length> menu-head-h: 52px;  // заголовок и строка расшифровки значков
     out property <length> entry-h: 26px;
-    property <length> menu-w: 250px;
+    property <length> menu-w: 290px;  // строка расшифровки значков помещается целиком
     out property <length> menu-left: min(root.menu-x, root.width - root.menu-w);
     // Меню выше окна (потолок опускается до ×8 — до 50 строк) прокручивается внутри окна.
     out property <length> menu-h: min(root.menu-head-h + root.menu-entries.length * root.entry-h + 4px, root.height - 16px);
@@ -302,10 +303,17 @@ export component AppWindow inherits Window {
         VerticalLayout {
             padding-top: 4px;
             padding-bottom: 4px;
-            HorizontalLayout {
+            VerticalLayout {
                 padding-left: 12px;
                 height: root.menu-head-h - 5px;
-                Text { text: root.menu-title; color: Palette.dim; vertical-alignment: center; }
+                alignment: center;
+                Text { text: root.menu-title; color: Palette.dim; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "◆ заводской"; color: Palette.dim; }
+                    Text { text: "○ было"; color: Palette.dim; }
+                    Text { text: "выше заводского"; color: Palette.bad; }
+                }
             }
             Rectangle { height: 1px; background: Palette.cell; }
             Flickable {
@@ -319,7 +327,7 @@ export component AppWindow inherits Window {
                     padding-right: 12px;
                     spacing: 8px;
                     Text { text: entry.checked ? "✓" : ""; width: 14px; color: Palette.text; vertical-alignment: center; }
-                    Text { text: entry.text; color: root.busy ? Palette.dim : Palette.text; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: entry.text; color: root.busy ? Palette.dim : entry.above ? Palette.bad : Palette.text; vertical-alignment: center; horizontal-stretch: 1; }
                     Text { text: entry.hint; color: Palette.dim; vertical-alignment: center; }
                 }
                 touch := TouchArea {

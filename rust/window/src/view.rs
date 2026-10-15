@@ -405,20 +405,18 @@ impl View {
         let entries: Vec<MenuEntry> = choices
             .iter()
             .map(|&v| {
-                let mut hint = match v.cmp(&fused) {
-                    Ordering::Equal => "заводской предел",
-                    Ordering::Greater => "выше заводского",
-                    Ordering::Less => "",
-                }
-                .to_string();
-                if Some(v) == was && v != fused {
-                    hint.push_str(if hint.is_empty() { "было" } else { " · было" });
-                }
+                // Значки вместо слов (владелец 15.10): ◆ — заводской предел, ○ — «было», красным — выше заводского;
+                // расшифровка — строкой под заголовком меню. ↺ шрифт окна не рисует (снимок проверки 15.10).
+                let marks: Vec<&str> = [(v == fused, "◆"), (Some(v) == was, "○")]
+                    .into_iter()
+                    .filter_map(|(on, mark)| on.then_some(mark))
+                    .collect();
                 MenuEntry {
                     ratio: slint_int(v),
                     text: format!("×{v}").into(),
-                    hint: hint.into(),
+                    hint: marks.join(" ").into(),
                     checked: Some(v) == current,
+                    above: v.cmp(&fused) == Ordering::Greater,
                 }
             })
             .collect();

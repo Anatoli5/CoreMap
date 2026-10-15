@@ -1,5 +1,6 @@
 // Главное окно: схема кристалла. Плитка на блок: щелчок — нагрузка и выбор блока, правая кнопка — меню потолка.
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
@@ -69,22 +70,31 @@ namespace CoreMap
             drawnKey = null;
         }
 
-        /// Меню потолка множителя для блока: от нескольких ступеней выше заводского предела (CoreLimits.Over) вниз.
+        /// Меню потолка множителя для блока: от заводского предела плюс CoreLimits.Over вниз до базового множителя.
+        /// Пометки значками, а не словами (владелец 15.10: «графические обозначения обычно лучше читаются»): ◆ — заводской
+        /// предел, всегда; ○ — «было»; красным — выше заводского; ✓ — стоит сейчас. Расшифровка — строкой вверху меню и
+        /// подсказкой у пункта. Значки те же, что в новом окне.
         void LimitMenu(Block block, Point at)
         {
             CoreLimits limits = core.Limits;
             int i = block.First;  // потолок блока читается и ставится через первое ядро
             if (limits == null || !limits.Known(i)) return;
-            var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, Font = Theme.Font(13) };
+            var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true, ShowItemToolTips = true, Font = Theme.Font(13) };
             menu.Items.Add(new ToolStripLabel("Потолок множителя: " + (block.Kind == 'E' ? "кластер ядра " : "ядро ") + block.Lp));
+            menu.Items.Add(new ToolStripLabel("◆ заводской   ○ было   красным — выше заводского") { ForeColor = SystemColors.GrayText });
             menu.Items.Add(new ToolStripSeparator());
             int[] baseline = core.Was;
             foreach (int ratio in limits.Choices(i))
             {
                 int value = ratio;
-                string text = "×" + value + (value == limits.Fused[i] ? "  заводской предел" : value > limits.Fused[i] ? "  выше заводского" : "") +
-                    (value == baseline[i] && value != limits.Fused[i] ? "  было" : "");
-                var item = new ToolStripMenuItem(text) { Checked = value == limits.Current[i], Enabled = !core.Busy };
+                bool factory = value == limits.Fused[i], was = value == baseline[i], above = value > limits.Fused[i];
+                string text = "×" + value + (factory ? "   ◆" : "") + (was ? "   ○" : "");
+                var tips = new List<string>();
+                if (factory) tips.Add("заводской предел");
+                if (above) tips.Add("выше заводского — ставится после подтверждения");
+                if (was) tips.Add("было — последний принятый потолок");
+                var item = new ToolStripMenuItem(text) { Checked = value == limits.Current[i], Enabled = !core.Busy, ToolTipText = string.Join("; ", tips) };
+                if (above) item.ForeColor = Theme.Bad;
                 item.Click += (s, e) =>
                 {
                     string refusal = core.SetLimit(i, value);
