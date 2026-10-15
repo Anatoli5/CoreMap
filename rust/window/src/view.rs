@@ -6,8 +6,9 @@
 // того, что они показывают (профили, потолки, надстройка автомодуля, выбор; сводка статистики, выбранный блок), и
 // свойства окна ставятся, только если значение другое.
 //
-// Жесты (владелец 15.10: «по две функции на одно действие… так не делается»): щелчок по плитке — выбрать блок и
-// показать его статистику, и только; правая кнопка — меню потолка. Нагрузки у окна нет.
+// Жесты (владелец 15.10: «по две функции на одно действие… так не делается»): щелчок по плитке — добавить блок в
+// статистику или убрать его оттуда (сравнение до четырёх блоков, владелец 15.10), и только; правая кнопка — меню
+// потолка. Нагрузки у окна нет.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -27,8 +28,8 @@ const TEXT: [u8; 3] = [0xe6, 0xe8, 0xec];
 const ACCENT: [u8; 3] = [0xff, 0xd1, 0x66];
 const BAD: [u8; 3] = [0xff, 0x5d, 0x5d];
 const CELL: [u8; 3] = [0x2a, 0x2e, 0x36];
-const P_CORE: [u8; 3] = [0xf0, 0xb8, 0x60];
-const E_CORE: [u8; 3] = [0x6f, 0xd0, 0xc8];
+/// Полоска плитки, пока ▲ наибольшей ещё нет.
+const NO_PEAK: [u8; 3] = [0x35, 0x3a, 0x44];
 
 fn rgb([r, g, b]: [u8; 3]) -> Color {
     Color::from_rgb_u8(r, g, b)
@@ -122,7 +123,13 @@ pub struct View {
     geometry: Geometry,
     tiles: Rc<VecModel<TileData>>,
     sets: Rc<VecModel<SetRow>>,
-    pub selected: i32,
+    /// Блоки в статистике по порядку добавления: (номер блока, номер цвета в `panels::SERIES`).
+    pub compared: Vec<(usize, usize)>,
+    /// Подсветка линий (владелец 15.10 не решил, какая удобнее, — переключатель в окне): false — под курсором (плитка
+    /// или линия графика), true — закреплённая: последний добавленный блок или линия, по которой щёлкнули.
+    pub pin_mode: bool,
+    pub pinned: Option<usize>,
+    pub hovered: Option<usize>,
     /// Выбранная строка списка наборов: "" — заводские; None — ничего.
     chosen: Option<String>,
     shown_profiles: Option<ProfileShown>,
@@ -158,7 +165,10 @@ impl View {
             geometry: Geometry::default(),
             tiles,
             sets,
-            selected: -1,
+            compared: Vec::new(),
+            pin_mode: false,
+            pinned: None,
+            hovered: None,
             chosen: None,
             shown_profiles: None,
             shown_stats: None,
@@ -196,6 +206,8 @@ impl View {
                 self.limits = Some(limits);
                 self.refresh(false);
                 self.refresh_profiles();
+                // Заводские потолки — края оси множителя.
+                self.refresh_stats();
             }
             Event::Message(Message::Profiles(profiles)) => {
                 let keep = self
@@ -299,15 +311,19 @@ impl View {
         self.geometry = die::geometry(&hello);
         ui.set_die_nat_w(self.geometry.width);
         ui.set_die_nat_h(self.geometry.height);
-        let valid = usize::try_from(self.selected).is_ok_and(|i| i < hello.blocks.len());
-        if !valid
+        // Выбор переживает новое знакомство, пока такие блоки есть; пусто — первое P-ядро.
+        self.compared.retain(|&(b, _)| b < hello.blocks.len());
+        self.pinned = self.pinned.filter(|&b| b < hello.blocks.len());
+        self.hovered = None;
+        if self.compared.is_empty()
             && let Some(first) = hello
                 .blocks
                 .iter()
                 .find(|b| b.kind == "P")
                 .or_else(|| hello.blocks.first())
         {
-            self.selected = slint_int(first.index);
+            self.compared.push((first.index, 0));
+            self.pinned = Some(first.index);
         }
         self.hello = Some(hello);
         self.refresh(true);
@@ -350,11 +366,16 @@ impl View {
             .state
             .as_ref()
             .is_none_or(|old| old.limit != state.limit || old.auto != state.auto || old.busy != state.busy);
+        // Статистика зависит от состояния только отсечкой автомодуля (линия на графике).
+        let cutoff_moved = self.state.as_ref().is_none_or(|old| old.auto_limit != state.auto_limit);
         self.state = Some(state);
         self.show_problem();
         self.refresh(false);
         if profiles_moved {
             self.refresh_profiles();
+        }
+        if cutoff_moved {
+            self.refresh_stats();
         }
     }
 
@@ -406,9 +427,13 @@ impl View {
             peak: "▲ –".into(),
             mean: "ø –".into(),
             pair_color: rgb(TEXT),
-            selected: self.selected == slint_int(block.index),
+            strip: rgb(NO_PEAK),
             ..Default::default()
         };
+        if let Some(&(_, slot)) = self.compared.iter().find(|(b, _)| *b == block.index) {
+            data.selected = true;
+            data.outline = panels::rgb(panels::SERIES[slot % panels::COMPARE]);
+        }
         if cluster {
             let cells: Vec<CellData> = t
                 .places
@@ -421,7 +446,7 @@ impl View {
                         text: core.lp.to_string().into(),
                         temp: temp.map_or_else(|| "–".into(), |v| format!("{v:.0}°").into()),
                         fill: temp.map_or(rgb(CELL), heat_of),
-                        num_color: rgb(if thr(i) { BAD } else { E_CORE }),
+                        num_color: rgb(if thr(i) { BAD } else { TEXT }),
                         col: slint_int(k % 2),
                         row: slint_int(k / 2),
                     })
@@ -435,13 +460,8 @@ impl View {
                 .map(|c| c.lp.to_string())
                 .unwrap_or_default()
                 .into();
-            data.number_color = rgb(if thr(first) {
-                BAD
-            } else if hello.cores.get(first).is_some_and(|c| c.kind == "E") {
-                E_CORE
-            } else {
-                P_CORE
-            });
+            // Номер белый; красный — ядро сбрасывает частоту (владелец 15.10: жёлтый номер читался как меняющееся число).
+            data.number_color = rgb(if thr(first) { BAD } else { TEXT });
         }
         let Some(s) = s else {
             return Some(data);
@@ -454,6 +474,9 @@ impl View {
         let peak = highest(&s.max, members);
         if let Some(p) = peak {
             data.peak = format!("▲ {p:.0}°").into();
+            // Полоска слева — ▲ наибольшая цветом, по той же шкале, что плитка: видно, какое ядро грелось сильнее
+            // (владелец 15.10).
+            data.strip = heat_of(p);
         }
         let mean = highest(&s.avg, members);
         let mean_ratio = highest(&s.avg_ratio, members);
@@ -549,34 +572,55 @@ impl View {
 
     // ----- статистика -----
 
+    /// Подсвеченный блок: под курсором или закреплённый — по переключателю.
+    fn highlight(&self) -> Option<usize> {
+        if self.pin_mode { self.pinned } else { self.hovered }
+    }
+
     fn refresh_stats(&mut self) {
         let Some(hello) = self.hello.as_ref() else { return };
-        let Some(block) = usize::try_from(self.selected).ok().and_then(|i| hello.blocks.get(i)) else {
-            return;
-        };
-        let shown = panels::stats_panel(block, self.digest.as_deref());
+        let shown = panels::stats_panel(&panels::StatsInput {
+            blocks: &hello.blocks,
+            compared: &self.compared,
+            highlight: self.highlight(),
+            fused: self.limits.as_ref().map(|l| l.fused.as_slice()),
+            cutoff: self.state.as_ref().and_then(|s| s.auto_limit),
+            digest: self.digest.as_deref(),
+        });
         if self.shown_stats.as_ref() == Some(&shown) {
             return;
         }
         let ui = self.ui();
-        set_text(&ui.get_stats_title(), &shown.title, |t| ui.set_stats_title(t));
         set_text(&ui.get_stats_note(), &shown.note, |t| ui.set_stats_note(t));
-        set_text(&ui.get_chart_mean(), &shown.mean_path, |t| ui.set_chart_mean(t));
-        set_text(&ui.get_chart_peak(), &shown.peak_path, |t| ui.set_chart_peak(t));
         set_text(&ui.get_chart_empty(), &shown.empty, |t| ui.set_chart_empty(t));
-        set_text(&ui.get_chart_fan_top(), &shown.fan_top, |t| ui.set_chart_fan_top(t));
+        set_text(&ui.get_chart_cutoff_text(), &shown.cutoff_text, |t| {
+            ui.set_chart_cutoff_text(t);
+        });
         set_text(&ui.get_actions_empty(), &shown.actions_empty, |t| {
             ui.set_actions_empty(t);
         });
-        ui.set_chart_columns(shown.columns);
+        // Та же величина из того же расчёта — те же биты.
+        if ui.get_chart_cutoff().to_bits() != shown.cutoff.to_bits() {
+            ui.set_chart_cutoff(shown.cutoff);
+        }
+        #[expect(clippy::cast_precision_loss, reason = "a few dozen columns: exact in f32")]
+        let width = shown.columns.len().max(1) as f32;
+        ui.set_chart_columns(width);
+        if ui.get_pin_mode() != self.pin_mode {
+            ui.set_pin_mode(self.pin_mode);
+        }
         let old = self.shown_stats.as_ref();
-        if old.is_none_or(|o| o.points != shown.points) {
-            ui.set_chart_points(ModelRc::new(VecModel::from(
-                shown.points.iter().map(panels::PointShown::point).collect::<Vec<_>>(),
-            )));
+        if old.is_none_or(|o| o.series != shown.series) {
+            ui.set_chart_series(ModelRc::new(VecModel::from(shown.series_rows())));
+        }
+        if old.is_none_or(|o| o.columns != shown.columns) {
+            ui.set_chart_cols(ModelRc::new(VecModel::from(shown.column_rows())));
         }
         if old.is_none_or(|o| o.yticks != shown.yticks) {
             ui.set_chart_yticks(ModelRc::new(VecModel::from(shown.ticks())));
+        }
+        if old.is_none_or(|o| o.legend != shown.legend) {
+            ui.set_stats_legend(ModelRc::new(VecModel::from(shown.legend_rows())));
         }
         if old.is_none_or(|o| o.actions != shown.actions) {
             ui.set_actions(ModelRc::new(VecModel::from(shown.action_rows())));
@@ -695,14 +739,91 @@ impl View {
         }
     }
 
-    /// Щелчок по плитке: выбрать блок — его статистика справа. Больше щелчок ничего не делает.
+    /// Щелчок по плитке: блока нет в статистике — добавить (до `COMPARE` блоков, у каждого свой цвет), есть — убрать.
+    /// Больше щелчок ничего не делает.
     pub fn clicked(&mut self, block: i32) {
-        if self.selected == block {
+        let Ok(block) = usize::try_from(block) else { return };
+        if let Some(at) = self.compared.iter().position(|(b, _)| *b == block) {
+            self.compared.remove(at);
+            if self.pinned == Some(block) {
+                self.pinned = self.compared.last().map(|(b, _)| *b);
+            }
+            if self.hovered == Some(block) {
+                self.hovered = None;
+            }
+        } else if self.compared.len() >= panels::COMPARE {
+            self.problem = Some(format!(
+                "Сравнить можно до {} блоков — сначала убери один щелчком по его плитке",
+                panels::COMPARE
+            ));
+            self.show_problem();
             return;
+        } else {
+            // Цвет — первый свободный: у оставшихся блоков цвета не меняются.
+            let slot = (0..panels::COMPARE)
+                .find(|s| self.compared.iter().all(|(_, used)| used != s))
+                .unwrap_or(0);
+            self.compared.push((block, slot));
+            self.pinned = Some(block);
         }
-        self.selected = block;
         self.refresh(false);
         self.refresh_stats();
+    }
+
+    /// Курсор над плиткой или ушёл с неё: в подсветке «под курсором» её линия — поверх остальных.
+    pub fn tile_hover(&mut self, block: i32, on: bool) {
+        let Ok(block) = usize::try_from(block) else { return };
+        let hovered = if on {
+            self.compared.iter().any(|(b, _)| *b == block).then_some(block)
+        } else if self.hovered == Some(block) {
+            None
+        } else {
+            self.hovered
+        };
+        self.hover(hovered);
+    }
+
+    /// Курсор над полем графика (пиксели от его левого верхнего угла, поле w × h): ближайшая линия — подсвеченная.
+    pub fn chart_pointer(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let near = self.near(x, y, w, h);
+        self.hover(near);
+    }
+
+    pub fn chart_left(&mut self) {
+        self.hover(None);
+    }
+
+    /// Щелчок по полю графика: в подсветке «закреплённая» ближайшая линия становится закреплённой.
+    pub fn chart_click(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if let Some(block) = self.near(x, y, w, h)
+            && self.pinned != Some(block)
+        {
+            self.pinned = Some(block);
+            if self.pin_mode {
+                self.refresh_stats();
+            }
+        }
+    }
+
+    pub fn mode_changed(&mut self, pin: bool) {
+        if self.pin_mode != pin {
+            self.pin_mode = pin;
+            self.refresh_stats();
+        }
+    }
+
+    fn near(&self, x: f32, y: f32, w: f32, h: f32) -> Option<usize> {
+        let series = self.shown_stats.as_ref().map(|s| s.series.as_slice())?;
+        panels::nearest(series, (f64::from(x), f64::from(y)), (f64::from(w), f64::from(h)))
+    }
+
+    fn hover(&mut self, block: Option<usize>) {
+        if self.hovered != block {
+            self.hovered = block;
+            if !self.pin_mode {
+                self.refresh_stats();
+            }
+        }
     }
 
     pub fn reset_max(&mut self) {
@@ -894,6 +1015,8 @@ fn same(a: &TileData, b: &TileData) -> bool {
         && a.auto == b.auto
         && a.ban == b.ban
         && a.selected == b.selected
+        && a.outline == b.outline
+        && a.strip == b.strip
         && a.tip == b.tip
         && cells(a) == cells(b)
 }

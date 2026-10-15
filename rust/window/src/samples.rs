@@ -502,59 +502,70 @@ pub struct Action {
     pub lower: bool,
 }
 
-/// Действия над блоком `name`, новые первыми.
-pub fn actions_for(entries: &[AutoEntry], name: &str) -> Vec<Action> {
-    let prefix = format!("{name} ×");
-    let mut out: Vec<Action> = entries
-        .iter()
-        .filter_map(|e| {
-            let time = e.time.as_deref().map(short_time).unwrap_or_default();
-            match e.act.as_str() {
-                "lower" | "raise" if e.block.as_deref() == Some(name) => {
-                    let lower = e.act == "lower";
-                    let change = match (e.from, e.to) {
-                        (Some(f), Some(t)) => format!("×{f} → ×{t}"),
-                        (_, Some(t)) => format!("→ ×{t}"),
-                        _ => String::new(),
+/// Действия над блоками `names` (сравнение нескольких блоков), новые первыми: номер названия в `names` и действие.
+pub fn actions_for(entries: &[AutoEntry], names: &[&str]) -> Vec<(usize, Action)> {
+    let mut out = Vec::new();
+    for e in entries {
+        let time = || e.time.as_deref().map(short_time).unwrap_or_default();
+        match e.act.as_str() {
+            "lower" | "raise" => {
+                let Some(which) = e.block.as_deref().and_then(|b| names.iter().position(|n| *n == b)) else {
+                    continue;
+                };
+                let lower = e.act == "lower";
+                let change = match (e.from, e.to) {
+                    (Some(f), Some(t)) => format!("×{f} → ×{t}"),
+                    (_, Some(t)) => format!("→ ×{t}"),
+                    _ => String::new(),
+                };
+                let why = if lower {
+                    let mut why = match (e.mean, e.max) {
+                        (Some(m), Some(x)) => format!("перегрев: ø {m:.0} °C, ▲ {x:.0} °C"),
+                        (Some(m), None) => format!("перегрев: ø {m:.0} °C"),
+                        _ => "перегрев".to_string(),
                     };
-                    let why = if lower {
-                        let mut why = match (e.mean, e.max) {
-                            (Some(m), Some(x)) => format!("перегрев: ø {m:.0} °C, ▲ {x:.0} °C"),
-                            (Some(m), None) => format!("перегрев: ø {m:.0} °C"),
-                            _ => "перегрев".to_string(),
-                        };
-                        if let Some(ban) = e.ban {
-                            let until = e.until.as_deref().map(short_time).unwrap_or_default();
-                            let strikes = e.strikes.map(|s| format!(", {s}-й раз")).unwrap_or_default();
-                            let _ = write!(why, "; ×{ban} не раньше {until}{strikes}"); // into a String
-                        }
-                        why
-                    } else {
-                        e.cool.map_or_else(
-                            || "прохладен под нагрузкой".to_string(),
-                            |c| format!("прохладен под нагрузкой {c} с"),
-                        )
-                    };
-                    Some(Action {
-                        time,
+                    if let Some(ban) = e.ban {
+                        let until = e.until.as_deref().map(short_time).unwrap_or_default();
+                        let strikes = e.strikes.map(|s| format!(", {s}-й раз")).unwrap_or_default();
+                        let _ = write!(why, "; ×{ban} не раньше {until}{strikes}"); // into a String
+                    }
+                    why
+                } else {
+                    e.cool.map_or_else(
+                        || "прохладен под нагрузкой".to_string(),
+                        |c| format!("прохладен под нагрузкой {c} с"),
+                    )
+                };
+                out.push((
+                    which,
+                    Action {
+                        time: time(),
                         change,
                         why,
                         lower,
-                    })
-                }
-                "back" => {
-                    let item = e.blocks.iter().find(|b| b.starts_with(&prefix))?;
-                    Some(Action {
-                        time,
-                        change: format!("→ {}", &item[name.len() + 1..]),
-                        why: format!("принятый возвращён: {}", e.why.as_deref().unwrap_or("")),
-                        lower: false,
-                    })
-                }
-                _ => None,
+                    },
+                ));
             }
-        })
-        .collect();
+            // Возврат принятых — одна строка журнала на все блоки: по действию на каждый выбранный из них.
+            "back" => {
+                for (which, name) in names.iter().enumerate() {
+                    let prefix = format!("{name} ×");
+                    if let Some(item) = e.blocks.iter().find(|b| b.starts_with(&prefix)) {
+                        out.push((
+                            which,
+                            Action {
+                                time: time(),
+                                change: format!("→ {}", &item[name.len() + 1..]),
+                                why: format!("принятый возвращён: {}", e.why.as_deref().unwrap_or("")),
+                                lower: false,
+                            },
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     out.reverse();
     out
 }
@@ -838,7 +849,7 @@ mod tests {
         let mut entries = Vec::new();
         auto_entries(&log.join("\n"), &mut entries);
         assert_eq!(entries.len(), 4);
-        let actions = actions_for(&entries, "2–5");
+        let actions: Vec<Action> = actions_for(&entries, &["2–5"]).into_iter().map(|(_, a)| a).collect();
         assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].time, "15.10 01:40");
         assert_eq!(actions[0].change, "→ ×46");
@@ -847,7 +858,20 @@ mod tests {
         assert!(
             actions[2].lower && actions[2].why.contains("88") && actions[2].why.contains("×46 не раньше 15.10 01:55")
         );
-        assert!(actions_for(&entries, "2").is_empty(), "«2» — не «2–5»");
+        assert!(actions_for(&entries, &["2"]).is_empty(), "«2» — не «2–5»");
+        // Два блока сразу: одно время по журналу, новые первыми; возврат принятых — по строке на каждый блок.
+        let both = actions_for(&entries, &["0", "2–5"]);
+        let order: Vec<(usize, &str)> = both.iter().map(|(w, a)| (*w, a.change.as_str())).collect();
+        assert_eq!(
+            order,
+            [
+                (1, "→ ×46"),
+                (0, "→ ×53"),
+                (1, "×45 → ×46"),
+                (0, "×53 → ×52"),
+                (1, "×46 → ×45")
+            ]
+        );
     }
 
     #[test]

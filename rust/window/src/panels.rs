@@ -10,7 +10,7 @@ use crate::die::Geometry;
 use crate::samples::{self, Bin};
 use crate::store::Digest;
 use crate::wire::{AutoMark, BlockInfo, Hello, Limits, Profiles, State};
-use crate::{ChartPoint, LineRow, LinkData, SetRow, Tick};
+use crate::{Column, LegendItem, LineRow, LinkData, Mark, Series, SetRow, Tick};
 
 pub fn rgb(hex: u32) -> Color {
     let [_, r, g, b] = hex.to_be_bytes();
@@ -19,9 +19,6 @@ pub fn rgb(hex: u32) -> Color {
 
 const TEXT: u32 = 0x00e6_e8ec;
 const DIM: u32 = 0x008b_93a1;
-const SAME: u32 = 0x003a_404b;
-const LOWER: u32 = 0x006f_9be0;
-const HIGHER: u32 = 0x00f0_b860;
 const PEAK: u32 = 0x00ff_8a7a;
 const E_TEXT: u32 = 0x006f_d0c8;
 
@@ -160,7 +157,9 @@ pub struct SetShown {
     pub startup: bool,
     pub disabled: bool,
     pub selected: bool,
-    pub cells: Vec<Color>,
+    /// Средний потолок набора по P-ядрам и по E-ядрам («52.4»); "" — таких ядер нет или потолков нет.
+    pub p_mean: String,
+    pub e_mean: String,
     pub tip: String,
 }
 
@@ -173,10 +172,31 @@ impl SetShown {
             startup: self.startup,
             disabled: self.disabled,
             selected: self.selected,
-            cells: ModelRc::new(VecModel::from(self.cells.clone())), // a dozen colours per changed row
+            p_mean: self.p_mean.as_str().into(),
+            e_mean: self.e_mean.as_str().into(),
             tip: self.tip.as_str().into(),
         }
     }
+}
+
+/// Средний потолок набора по P-ядрам и по E-ядрам — оценка уровня набора (владелец 15.10: «средний множитель по
+/// эффективным ядрам и… по производительным… две такие вот цифры оценочные»). У кластера E-ядер потолок общий, поэтому
+/// среднее по кластерам равно среднему по ядрам.
+pub fn kind_means(blocks: &[BlockInfo], ratios: Option<&[i64]>) -> (Option<f64>, Option<f64>) {
+    let mean = |kind: &str| {
+        let values: Vec<i64> = blocks
+            .iter()
+            .filter(|b| b.kind == kind)
+            .filter_map(|b| ratios?.get(b.first).copied().filter(|&v| v > 0))
+            .collect();
+        average(&values)
+    };
+    (mean("P"), mean("E"))
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a dozen ceilings of tens: exact in f64")]
+fn average(values: &[i64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<i64>() as f64 / values.len() as f64)
 }
 
 /// Название длиннее не принимает движок (Commands.NameLength).
@@ -206,28 +226,29 @@ pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
     let entries =
         std::iter::once(("", fused)).chain(p.sets.iter().map(|s| (s.name.as_str(), Some(s.ratios.as_slice()))));
     for (key, ratios) in entries {
-        let mut cells = Vec::with_capacity(blocks.len());
         let mut differ = Vec::new();
         for (b, c) in blocks.iter().zip(&ceilings) {
             let set = ratios.and_then(|r| r.get(b.first).copied()).filter(|&v| v > 0);
-            cells.push(match (set, c.now) {
-                (Some(s), Some(n)) if s == n => rgb(SAME),
-                (Some(s), Some(n)) => {
-                    differ.push(format!("{} ×{s} (сейчас ×{n})", b.name));
-                    let steps = (s - n).unsigned_abs().min(4);
-                    let k = 0.45 + 0.55 * f32::from(u8::try_from(steps).unwrap_or(4)) / 4.0;
-                    let base = rgb(if s < n { LOWER } else { HIGHER });
-                    rgb(SAME).mix(&base, 1.0 - k)
-                }
-                _ => Color::from_argb_u8(0, 0, 0, 0),
-            });
+            if let (Some(s), Some(n)) = (set, c.now)
+                && s != n
+            {
+                differ.push(format!("{} ×{s} (сейчас ×{n})", b.name));
+            }
         }
+        let (p_mean, e_mean) = kind_means(blocks, ratios);
+        let one = |m: Option<f64>| m.map_or_else(String::new, |m| format!("{m:.1}"));
         let title = titled(Some(key));
+        let level = match (p_mean, e_mean) {
+            (Some(p), Some(e)) => format!("\nсредний потолок: P-ядра ×{p:.1}, E-ядра ×{e:.1}"),
+            (Some(p), None) => format!("\nсредний потолок P-ядер ×{p:.1}"),
+            (None, Some(e)) => format!("\nсредний потолок E-ядер ×{e:.1}"),
+            (None, None) => String::new(),
+        };
         let tip = if differ.is_empty() {
-            format!("{title}: то же, что стоит сейчас")
+            format!("{title}: то же, что стоит сейчас{level}")
         } else {
             format!(
-                "{title}: отличается от того, что стоит сейчас, у {} из {} блоков\n• {}\nКлетки справа — блоки по порядку: синяя — в наборе ниже, жёлтая — выше; ярче — больше ступеней.",
+                "{title}: отличается от того, что стоит сейчас, у {} из {} блоков{level}\n• {}",
                 differ.len(),
                 blocks.len(),
                 differ.join("\n• ")
@@ -245,7 +266,8 @@ pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
             startup: startup_name.is_some_and(|s| same_name(s, key)),
             disabled: p.startup.disabled,
             selected: input.chosen == Some(key),
-            cells,
+            p_mean: one(p_mean),
+            e_mean: one(e_mean),
             tip,
         });
     }
@@ -339,53 +361,105 @@ pub fn history_rows(entries: &[Map<String, Value>], hello: Option<&Hello>) -> Ve
                 head: SharedString::new(),
                 text: text.into(),
                 color: rgb(TEXT),
+                mark: Color::default(),
             }
         })
         .collect()
 }
 
-// ----- статистика блока -----
+// ----- статистика блоков -----
+
+/// Цвета линий сравнения (владелец 15.10: «кликнуть несколько ядер… одновременно несколько графиков… для
+/// сравнения»). Блок держит свой цвет, пока он в сравнении; обводка его плитки — того же цвета, поэтому легенда не
+/// нужна.
+pub const SERIES: [u32; 4] = [0x00ff_b86b, 0x0062_c6ff, 0x00c8_9bff, 0x0080_e08c];
+/// Сколько блоков сравнивается сразу: больше четырёх линий на одном поле не читаются (суждение, не замер).
+pub const COMPARE: usize = SERIES.len();
+/// Ось множителя одна на все блоки (владелец 15.10: «общую числовую ось вообще для всех ядер»): от заводского +1
+/// (выше программа не ставит) до самого низкого заводского −14 — ниже ядра под нагрузкой не ходят. Срезы за краями
+/// расширяют ось для всех блоков сразу, поэтому от выбора она не зависит.
+const AXIS_OVER: i64 = 1;
+const AXIS_BELOW: i64 = 14;
+/// Ось температуры одна на все блоки: 40–100 °C, как шкала цвета плиток; срезы за краями расширяют её.
+const Y_LOW: f64 = 40.0;
+const Y_HIGH: f64 = 100.0;
+/// Курсор ближе этого к линии блока — она подсвечивается (пиксели поля графика).
+const NEAR_PX: f64 = 10.0;
+
+/// Что нужно панели статистики.
+#[derive(Debug)]
+pub struct StatsInput<'a> {
+    pub blocks: &'a [BlockInfo],
+    /// Блоки в сравнении по порядку добавления: (номер блока, номер цвета в SERIES).
+    pub compared: &'a [(usize, usize)],
+    /// Подсвеченный блок: его линия поверх остальных, остальные бледнее; None — все одинаковы.
+    pub highlight: Option<usize>,
+    /// Заводские потолки по ядрам — края оси множителя.
+    pub fused: Option<&'a [i64]>,
+    /// Отсечка автомодуля, °C — линией на графике.
+    pub cutoff: Option<f64>,
+    pub digest: Option<&'a Digest>,
+}
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StatsShown {
-    pub title: String,
     pub note: String,
-    pub points: Vec<PointShown>,
+    pub legend: Vec<LegendShown>,
+    /// Линии в порядке рисования: подсвеченная — последней, поверх.
+    pub series: Vec<SeriesShown>,
+    /// Каждый множитель оси по порядку: место и подсказка столбца.
+    pub columns: Vec<ColumnShown>,
     pub yticks: Vec<(f32, String)>,
-    pub mean_path: String,
-    pub peak_path: String,
+    /// Отсечка автомодуля — доля высоты поля; < 0 — линии нет.
+    pub cutoff: f32,
+    pub cutoff_text: String,
     pub empty: String,
-    pub fan_top: String,
-    pub columns: f32,
-    pub actions: Vec<(String, String, String, bool)>,
+    pub actions: Vec<ActionShown>,
     pub actions_empty: String,
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LegendShown {
+    pub block: usize,
+    pub name: String,
+    pub color: u32,
+    pub tip: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SeriesShown {
+    pub block: usize,
+    pub color: u32,
+    pub faded: bool,
+    pub mean_path: String,
+    pub peak_path: String,
+    pub points: Vec<PointShown>,
+}
+
+/// Точка линии: множитель, место (доли поля), срезов в корзине.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PointShown {
     pub ratio: i32,
     pub x: f32,
     pub mean: f32,
     pub peak: f32,
-    pub fan: f32,
-    pub label: String,
-    pub count: String,
-    pub tip: String,
     pub samples: u32,
 }
 
-impl PointShown {
-    pub fn point(&self) -> ChartPoint {
-        ChartPoint {
-            x: self.x,
-            mean: self.mean,
-            peak: self.peak,
-            fan: self.fan,
-            label: self.label.as_str().into(),
-            count: self.count.as_str().into(),
-            tip: self.tip.as_str().into(),
-        }
-    }
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ColumnShown {
+    pub ratio: i32,
+    pub x: f32,
+    pub tip: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ActionShown {
+    pub time: String,
+    pub change: String,
+    pub why: String,
+    pub lower: bool,
+    pub color: u32,
 }
 
 impl StatsShown {
@@ -399,21 +473,63 @@ impl StatsShown {
             .collect()
     }
 
+    pub fn series_rows(&self) -> Vec<Series> {
+        self.series
+            .iter()
+            .map(|s| Series {
+                mean: s.mean_path.as_str().into(),
+                peak: s.peak_path.as_str().into(),
+                color: rgb(s.color),
+                faded: s.faded,
+                marks: ModelRc::new(VecModel::from(
+                    s.points
+                        .iter()
+                        .map(|p| Mark {
+                            x: p.x,
+                            mean: p.mean,
+                            peak: p.peak,
+                        })
+                        .collect::<Vec<_>>(),
+                )), // a few dozen points per changed series
+            })
+            .collect()
+    }
+
+    pub fn column_rows(&self) -> Vec<Column> {
+        self.columns
+            .iter()
+            .map(|c| Column {
+                x: c.x,
+                v: c.ratio,
+                tip: c.tip.as_str().into(),
+            })
+            .collect()
+    }
+
+    pub fn legend_rows(&self) -> Vec<LegendItem> {
+        self.legend
+            .iter()
+            .map(|l| LegendItem {
+                name: l.name.as_str().into(),
+                color: rgb(l.color),
+                tip: l.tip.as_str().into(),
+            })
+            .collect()
+    }
+
     pub fn action_rows(&self) -> Vec<LineRow> {
         self.actions
             .iter()
-            .map(|(time, change, why, lower)| LineRow {
-                time: time.as_str().into(),
-                head: change.as_str().into(),
-                text: why.as_str().into(),
-                color: rgb(if *lower { PEAK } else { E_TEXT }),
+            .map(|a| LineRow {
+                time: a.time.as_str().into(),
+                head: a.change.as_str().into(),
+                text: a.why.as_str().into(),
+                color: rgb(if a.lower { PEAK } else { E_TEXT }),
+                mark: rgb(a.color),
             })
             .collect()
     }
 }
-
-/// Сколько корзин помещается подписанными; больше — подписывается каждая вторая (числа — в подсказке столбца).
-const LABELED: usize = 18;
 
 #[expect(
     clippy::cast_possible_truncation,
@@ -446,34 +562,126 @@ pub fn grouped(v: u64) -> String {
     out
 }
 
-#[expect(clippy::too_many_lines, reason = "the chart's scales and points read top to bottom")]
-pub fn stats_panel(block: &BlockInfo, digest: Option<&Digest>) -> StatsShown {
-    let mut shown = StatsShown {
-        title: format!("Статистика · {}", whom(block)),
-        columns: 1.0,
-        ..StatsShown::default()
-    };
-    let Some(digest) = digest else {
-        shown.empty = "Статистика читается…".into();
-        return shown;
-    };
-    let actions = samples::actions_for(&digest.auto, &block.name);
-    shown.actions = actions
-        .into_iter()
-        .map(|a| (a.time, a.change, a.why, a.lower))
-        .collect();
-    shown.actions_empty = if digest.auto.is_empty() {
-        "журнала автомодуля нет — он ещё ничего не делал".into()
-    } else {
-        "этот блок автомодуль не трогал".into()
-    };
-    let bins: Vec<(i32, Bin)> = digest
+/// Корзины блока, где были срезы под нагрузкой, по возрастанию множителя.
+fn bins_of(digest: &Digest, block: &BlockInfo) -> Vec<(i32, Bin)> {
+    digest
         .tally
         .blocks
         .get(&block.name)
         .map(|t| t.bins.iter().filter(|(_, b)| b.n > 0).map(|(r, b)| (*r, *b)).collect())
-        .unwrap_or_default();
-    let busy: u64 = bins.iter().map(|(_, b)| u64::from(b.n)).sum();
+        .unwrap_or_default()
+}
+
+/// Ось множителя: (наименьший, наибольший) — одна на все блоки, от выбора не зависит; None — ни заводских, ни срезов.
+pub fn axis(blocks: &[BlockInfo], fused: Option<&[i64]>, digest: Option<&Digest>) -> Option<(i32, i32)> {
+    let mut lo: Option<i64> = None;
+    let mut hi: Option<i64> = None;
+    let mut take = |v: i64| {
+        lo = Some(lo.map_or(v, |l| l.min(v)));
+        hi = Some(hi.map_or(v, |h| h.max(v)));
+    };
+    for b in blocks {
+        if let Some(f) = fused.and_then(|f| f.get(b.first).copied()).filter(|&f| f > 0) {
+            take(f + AXIS_OVER);
+            take(f - AXIS_BELOW);
+        }
+        if let Some(d) = digest {
+            for (r, _) in bins_of(d, b) {
+                take(i64::from(r));
+            }
+        }
+    }
+    Some((i32::try_from(lo?).ok()?, i32::try_from(hi?).ok()?))
+}
+
+/// Ось температуры: 40–100 °C, шире — если срезы какого-нибудь блока за краями (от выбора не зависит).
+fn temp_range(blocks: &[BlockInfo], digest: &Digest) -> (f64, f64) {
+    let (mut y0, mut y1) = (Y_LOW, Y_HIGH);
+    for b in blocks {
+        for (_, bin) in bins_of(digest, b) {
+            if let Some(m) = bin.mean() {
+                y0 = y0.min((m / 10.0).floor() * 10.0);
+            }
+            y1 = y1.max((bin.temp_max / 10.0).ceil() * 10.0);
+        }
+    }
+    (y0, y1)
+}
+
+/// Подпись блока в легенде и подсказке.
+fn legend(compared: &[(&BlockInfo, usize)], digest: Option<&Digest>) -> Vec<LegendShown> {
+    compared
+        .iter()
+        .map(|&(b, slot)| {
+            let busy: u32 = digest.map_or(0, |d| bins_of(d, b).iter().map(|(_, bin)| bin.n).sum());
+            let counted = if digest.is_some() {
+                format!(
+                    ": {} срезов под нагрузкой ({})",
+                    grouped(u64::from(busy)),
+                    span_of(busy)
+                )
+            } else {
+                String::new()
+            };
+            LegendShown {
+                block: b.index,
+                name: whom(b),
+                color: SERIES[slot % COMPARE],
+                tip: format!(
+                    "{}{counted}\nЩелчок по плитке убирает блок из сравнения, щелчок по другой — добавляет.",
+                    capital(&whom(b))
+                ),
+            }
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the chart's scales, lines and columns read top to bottom"
+)]
+pub fn stats_panel(input: &StatsInput) -> StatsShown {
+    let mut shown = StatsShown {
+        cutoff: -1.0,
+        ..StatsShown::default()
+    };
+    let compared: Vec<(&BlockInfo, usize)> = input
+        .compared
+        .iter()
+        .filter_map(|&(b, slot)| Some((input.blocks.get(b)?, slot)))
+        .collect();
+    shown.legend = legend(&compared, input.digest);
+    let Some(digest) = input.digest else {
+        shown.empty = "Статистика читается…".into();
+        return shown;
+    };
+
+    let names: Vec<&str> = compared.iter().map(|(b, _)| b.name.as_str()).collect();
+    let several = compared.len() > 1;
+    shown.actions = samples::actions_for(&digest.auto, &names)
+        .into_iter()
+        .map(|(which, a)| ActionShown {
+            time: a.time,
+            change: if several {
+                format!("{} {}", names[which], a.change)
+            } else {
+                a.change
+            },
+            why: a.why,
+            lower: a.lower,
+            color: SERIES[compared[which].1 % COMPARE],
+        })
+        .collect();
+    shown.actions_empty = if compared.is_empty() {
+        String::new()
+    } else if digest.auto.is_empty() {
+        "журнала автомодуля нет — он ещё ничего не делал".into()
+    } else if several {
+        "эти блоки автомодуль не трогал".into()
+    } else {
+        "этот блок автомодуль не трогал".into()
+    };
+
     // Срок срезов: «15.10 01:25–23:10» за один день, «14.10 – 15.10» за несколько.
     let period = match (&digest.tally.first, &digest.tally.last) {
         (Some(a), Some(b)) => {
@@ -486,63 +694,59 @@ pub fn stats_panel(block: &BlockInfo, digest: Option<&Digest>) -> StatsShown {
         }
         _ => String::new(),
     };
-    shown.note = format!(
-        "{} из {} срезов под нагрузкой{period}",
-        grouped(busy),
-        grouped(digest.tally.rows)
-    );
+    shown.note = format!("{} срезов{period}", grouped(digest.tally.rows));
     if let Some(trouble) = &digest.trouble {
         shown.note.clone_from(trouble);
     }
-    let (Some(&(lo, _)), Some(&(hi, _))) = (bins.first(), bins.last()) else {
+
+    if compared.is_empty() {
+        shown.empty = format!(
+            "Щёлкни по плитке — её статистика появится здесь. Сравнить можно до {COMPARE} блоков: щелчок добавляет блок, повторный — убирает."
+        );
+        return shown;
+    }
+    let all: Vec<Vec<(i32, Bin)>> = compared.iter().map(|(b, _)| bins_of(digest, b)).collect();
+    if all.iter().all(Vec::is_empty) {
         shown.empty = if digest.tally.rows == 0 {
-            "Срезов пока нет. Их пишет программа входа каждые 2 с, пока включён автомодуль и процессор нагружен.".into()
+            "Срезов пока нет. Их пишет программа у часов каждые 2 с, пока включён автомодуль и процессор нагружен."
+                .into()
+        } else if several {
+            format!(
+                "Выбранные блоки ни разу не были заняты (доля работы ≥ 50 %) в {} срезах.",
+                grouped(digest.tally.rows)
+            )
         } else {
             format!(
                 "{} ни разу не был занят (доля работы ≥ 50 %) в {} срезах.",
-                whom(block),
+                capital(&whom(compared[0].0)),
                 grouped(digest.tally.rows)
             )
         };
         return shown;
-    };
-    // По оси множителя — все корзины от наименьшей до наибольшей, не меньше трёх (одна точка — посередине).
-    let width = (hi - lo + 1).max(3);
-    let first = lo - (width - (hi - lo + 1)) / 2;
-    let columns = f64::from(width);
-    shown.columns = f(columns);
-    let x_of = |ratio: i32| (f64::from(ratio - first) + 0.5) / columns;
-
-    let low = bins.iter().filter_map(|(_, b)| b.mean()).fold(f64::INFINITY, f64::min);
-    let high = bins.iter().map(|(_, b)| b.temp_max).fold(f64::NEG_INFINITY, f64::max);
-    let mut y0: f64 = ((low - 3.0) / 5.0).floor() * 5.0;
-    let mut y1: f64 = ((high + 3.0) / 5.0).ceil() * 5.0;
-    if y1 - y0 < 15.0 {
-        let pad = ((15.0 - (y1 - y0)) / 10.0).ceil() * 5.0;
-        y0 -= pad;
-        y1 += pad;
     }
+    let Some((lo, hi)) = axis(input.blocks, input.fused, Some(digest)) else {
+        return shown;
+    };
+    let width = f64::from(hi - lo + 1);
+    let x_of = |ratio: i32| (f64::from(ratio - lo) + 0.5) / width;
+    let (y0, y1) = temp_range(input.blocks, digest);
     let y_of = |t: f64| (t - y0) / (y1 - y0);
-    let step = if y1 - y0 <= 30.0 { 5.0 } else { 10.0 };
-    let mut t = (y0 / step).ceil() * step;
+    let mut t = y0;
     while t <= y1 + 1e-9 {
         shown.yticks.push((f(y_of(t)), format!("{t:.0}°")));
-        t += step;
+        t += 10.0;
+    }
+    if let Some(c) = input.cutoff
+        && (y0..=y1).contains(&c)
+    {
+        shown.cutoff = f(y_of(c));
+        shown.cutoff_text = format!("{c:.0}°");
     }
 
-    let fan_high = bins.iter().filter_map(|(_, b)| b.fan()).fold(0.0, f64::max);
-    let fan_top = (fan_high / 500.0).ceil() * 500.0;
-    shown.fan_top = if fan_top > 0.0 {
-        format!("{fan_top:.0}")
-    } else {
-        String::new()
-    };
-
-    let every = if bins.len() > LABELED { 2 } else { 1 };
-    let path = |value: &dyn Fn(&Bin) -> f64| {
+    let path = |bins: &[(i32, Bin)], value: &dyn Fn(&Bin) -> f64| {
         let mut d = String::with_capacity(bins.len() * 16);
         let mut previous: Option<i32> = None;
-        for (ratio, b) in &bins {
+        for (ratio, b) in bins {
             let verb = if previous.is_some_and(|p| ratio - p == 1) {
                 'L'
             } else {
@@ -558,49 +762,104 @@ pub fn stats_panel(block: &BlockInfo, digest: Option<&Digest>) -> StatsShown {
         }
         d
     };
-    shown.mean_path = path(&|b| b.mean().unwrap_or(0.0));
-    shown.peak_path = path(&|b| b.temp_max);
-    for (i, (ratio, b)) in bins.iter().enumerate() {
-        let mean = b.mean().unwrap_or(0.0);
-        let fan = b.fan();
-        let labeled = i.is_multiple_of(every);
-        let mut tip = format!(
-            "×{ratio}: {} срезов ({})\nø средняя {mean:.1} °C, ▲ наибольшая {:.0} °C",
-            grouped(u64::from(b.n)),
-            span_of(b.n),
-            b.temp_max
-        );
-        match fan {
-            Some(rpm) => {
-                let _ = write!(
-                    tip,
-                    "\nвентилятор процессора ≈ {} об/мин (в {} срезах)",
-                    grouped(rpm_u64(rpm)),
-                    b.fan_n
-                ); // into a String
-            }
-            None => tip.push_str("\nобороты вентилятора в эти срезы неизвестны"),
-        }
-        shown.points.push(PointShown {
-            ratio: *ratio,
-            x: f(x_of(*ratio)),
-            mean: f(y_of(mean)),
-            peak: f(y_of(b.temp_max)),
-            fan: match fan {
-                Some(rpm) if fan_top > 0.0 => f(rpm / fan_top),
-                _ => -1.0,
-            },
-            label: if labeled { format!("×{ratio}") } else { String::new() },
-            count: if labeled {
-                grouped(u64::from(b.n))
-            } else {
+    // Подсвеченная линия рисуется последней — поверх остальных (порядок остальных — порядок добавления).
+    let mut order: Vec<usize> = (0..compared.len()).collect();
+    order.sort_by_key(|&i| input.highlight == Some(compared[i].0.index));
+    for i in order {
+        let (b, slot) = compared[i];
+        let bins = &all[i];
+        shown.series.push(SeriesShown {
+            block: b.index,
+            color: SERIES[slot % COMPARE],
+            faded: input.highlight.is_some_and(|h| h != b.index),
+            mean_path: path(bins, &|bin| bin.mean().unwrap_or(0.0)),
+            peak_path: path(bins, &|bin| bin.temp_max),
+            points: bins
+                .iter()
+                .map(|(ratio, bin)| PointShown {
+                    ratio: *ratio,
+                    x: f(x_of(*ratio)),
+                    mean: f(y_of(bin.mean().unwrap_or(0.0))),
+                    peak: f(y_of(bin.temp_max)),
+                    samples: bin.n,
+                })
+                .collect(),
+        });
+    }
+
+    // Столбец каждого множителя оси: подсказка — что у каждого блока сравнения на этом множителе.
+    for ratio in lo..=hi {
+        let lines: Vec<String> = compared
+            .iter()
+            .zip(&all)
+            .filter_map(|((b, _), bins)| {
+                let bin = bins.iter().find(|(r, _)| *r == ratio)?.1;
+                let fan = bin
+                    .fan()
+                    .map(|rpm| format!(", вент. ≈ {}", grouped(rpm_u64(rpm))))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{}: ø {:.1} °C, ▲ {:.0} °C · {} срезов ({}){fan}",
+                    capital(&whom(b)),
+                    bin.mean().unwrap_or(0.0),
+                    bin.temp_max,
+                    grouped(u64::from(bin.n)),
+                    span_of(bin.n)
+                ))
+            })
+            .collect();
+        shown.columns.push(ColumnShown {
+            ratio,
+            x: f(x_of(ratio)),
+            tip: if lines.is_empty() {
                 String::new()
+            } else {
+                format!("×{ratio}\n{}", lines.join("\n"))
             },
-            tip,
-            samples: b.n,
         });
     }
     shown
+}
+
+/// Линия какого блока ближе всего к курсору: поле графика w × h пикселей, курсор (x, y) от его левого верхнего угла;
+/// None — ни одна не ближе `NEAR_PX`. Считаются обе линии блока — ø средняя и ▲ наибольшая.
+pub fn nearest(series: &[SeriesShown], cursor: (f64, f64), field: (f64, f64)) -> Option<usize> {
+    let (width, height) = field;
+    let values: [fn(&PointShown) -> f32; 2] = [|p| p.mean, |p| p.peak];
+    let mut best: Option<(f64, usize)> = None;
+    for s in series {
+        for value in values {
+            let at = |p: &PointShown| (f64::from(p.x) * width, (1.0 - f64::from(value(p))) * height);
+            let mut previous: Option<&PointShown> = None;
+            for p in &s.points {
+                // Соседние множители соединены линией; через пустую корзину линии нет — там только точки.
+                let gap = match previous.filter(|q| p.ratio - q.ratio == 1) {
+                    Some(q) => segment_distance(at(q), at(p), cursor),
+                    None => distance(at(p), cursor),
+                };
+                if gap <= NEAR_PX && best.is_none_or(|(closest, _)| gap < closest) {
+                    best = Some((gap, s.block));
+                }
+                previous = Some(p);
+            }
+        }
+    }
+    best.map(|(_, b)| b)
+}
+
+fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// Расстояние от точки p до отрезка a–b.
+fn segment_distance(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length = dx * dx + dy * dy;
+    if length <= f64::EPSILON {
+        return distance(a, p);
+    }
+    let k = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / length).clamp(0.0, 1.0);
+    distance((a.0 + k * dx, a.1 + k * dy), p)
 }
 
 #[expect(
@@ -718,7 +977,7 @@ pub struct TileFacts<'a> {
 pub fn tile_tip(t: &TileFacts) -> String {
     let b = t.block;
     let mut tip = format!(
-        "{} ({}) — щелчок: статистика, правая кнопка: потолок{}",
+        "{} ({}) — щелчок: добавить в статистику или убрать, правая кнопка: потолок{}",
         capital(&whom(b)),
         if b.kind == "E" {
             "E-ядра, потолок общий"
@@ -750,7 +1009,10 @@ pub fn tile_tip(t: &TileFacts) -> String {
         let _ = write!(tip, ", множитель {r:.1}"); // into a String
     }
     if let Some(p) = t.peak {
-        let _ = write!(tip, "\n• ▲ наибольшая с последнего сброса: {p:.0} °C"); // into a String
+        let _ = write!(
+            tip,
+            "\n• ▲ наибольшая с последнего сброса: {p:.0} °C — её цвет у полоски слева"
+        ); // into a String
     }
     match (t.mean, t.mean_ratio) {
         (None, None) => tip.push_str("\n• ø под нагрузкой: ещё нет — считается, пока блок нагружен"),
@@ -912,8 +1174,28 @@ mod tests {
         let quiet = &shown.rows[1];
         assert!(quiet.was && quiet.startup && quiet.selected && !quiet.standing);
         assert!(quiet.tip.contains("у 2 из 2 блоков"), "{}", quiet.tip);
-        // Клетка кластера: в наборе ×44, сейчас ×43 — набор выше, жёлтая сторона.
-        assert_ne!(quiet.cells[1], rgb(SAME));
+        // Средние потолки набора: P — одно ядро ×50, E — кластер ×44; у заводских — заводские.
+        assert_eq!((quiet.p_mean.as_str(), quiet.e_mean.as_str()), ("50.0", "44.0"));
+        assert_eq!(
+            (shown.rows[0].p_mean.as_str(), shown.rows[0].e_mean.as_str()),
+            ("53.0", "46.0")
+        );
+    }
+
+    #[test]
+    fn kind_means_average_each_kind_over_its_blocks() {
+        let blocks = vec![
+            block(0, "0", vec![0]),
+            block(1, "1", vec![1]),
+            block(2, "2–5", vec![2, 3, 4, 5]),
+            block(3, "6–9", vec![6, 7, 8, 9]),
+        ];
+        // P: ×52 и ×53 → 52.5; E: кластеры ×44 и ×45 (по ядрам те же) → 44.5; неизвестный (0) не считается.
+        let ratios = [52, 53, 44, 44, 44, 44, 45, 45, 45, 45];
+        assert_eq!(kind_means(&blocks, Some(&ratios)), (Some(52.5), Some(44.5)));
+        let partial = [0, 53, 44, 44, 44, 44, 0, 0, 0, 0];
+        assert_eq!(kind_means(&blocks, Some(&partial)), (Some(53.0), Some(44.0)));
+        assert_eq!(kind_means(&blocks, None), (None, None));
     }
 
     #[test]
@@ -1009,38 +1291,163 @@ mod tests {
         }
     }
 
-    #[test]
-    fn chart_points_follow_bins_and_counts() {
+    /// 30 срезов: ядро 0 занято (20 на ×50 при 80 °C, 10 на ×48 при 70 °C); кластер занят, только если `cluster`
+    /// (×44 при 60 °C).
+    fn thirty(cluster: bool) -> Digest {
         let mut rows = Vec::new();
         for i in 0..30 {
             let (ratio, temp) = if i < 20 { (50, 80) } else { (48, 70) };
             rows.push(format!(
-                "2026-10-15 10:00:{i:02},60,{},,53,{ratio},1,{temp},46,45,0,60",
-                4000 + i
+                "2026-10-15 10:00:{i:02},60,{},,53,{ratio},1,{temp},46,44,{},60",
+                4000 + i,
+                u8::from(cluster)
             ));
         }
-        let d = digest(&rows);
-        let s = stats_panel(&hello().blocks[0], Some(&d));
+        digest(&rows)
+    }
+
+    fn stats(
+        digest: &Digest,
+        compared: &[(usize, usize)],
+        highlight: Option<usize>,
+        fused: Option<&[i64]>,
+    ) -> StatsShown {
+        stats_panel(&StatsInput {
+            blocks: &hello().blocks,
+            compared,
+            highlight,
+            fused,
+            cutoff: None,
+            digest: Some(digest),
+        })
+    }
+
+    #[test]
+    fn chart_points_follow_bins_and_counts() {
+        let d = thirty(false);
+        let s = stats(&d, &[(0, 0)], None, None);
         assert_eq!(s.empty, "");
-        let ratios: Vec<i32> = s.points.iter().map(|p| p.ratio).collect();
+        assert_eq!(s.series.len(), 1);
+        let line = &s.series[0];
+        let ratios: Vec<i32> = line.points.iter().map(|p| p.ratio).collect();
         assert_eq!(ratios, [48, 50], "только корзины с данными, по возрастанию множителя");
-        assert_eq!(s.points.iter().map(|p| p.samples).collect::<Vec<_>>(), [10, 20]);
-        assert_eq!(s.points[1].count, "20");
+        assert_eq!(line.points.iter().map(|p| p.samples).collect::<Vec<_>>(), [10, 20]);
         assert!(
-            s.points[0].x < s.points[1].x && s.points[0].mean < s.points[1].mean,
+            line.points[0].x < line.points[1].x && line.points[0].mean < line.points[1].mean,
             "правее и выше — горячее"
         );
         assert!(
-            s.points
+            line.points
                 .iter()
-                .all(|p| (0.0..=1.0).contains(&p.mean) && (0.0..=1.0).contains(&p.peak) && p.fan > 0.0 && p.fan <= 1.0)
+                .all(|p| (0.0..=1.0).contains(&p.mean) && (0.0..=1.0).contains(&p.peak))
         );
         // ×49 пуст: линия средней рвётся (два «M»), а не проводится через пустую корзину.
-        assert_eq!(s.mean_path.matches('M').count(), 2);
-        assert_eq!(s.note, "30 из 30 срезов под нагрузкой · 15.10 10:00–10:00");
+        assert_eq!(line.mean_path.matches('M').count(), 2);
+        assert_eq!(s.note, "30 срезов · 15.10 10:00–10:00");
+        // Без заводских ось — по срезам: ×48…×50, столбец на каждый множитель; у пустого ×49 подсказки нет.
+        let axis: Vec<i32> = s.columns.iter().map(|c| c.ratio).collect();
+        assert_eq!(axis, [48, 49, 50]);
+        assert_eq!(s.columns[1].tip, "");
+        assert!(s.columns[2].tip.contains("20 срезов"), "{}", s.columns[2].tip);
+        // Ось температуры общая: 40–100 °C через 10.
+        assert_eq!(s.yticks.first().map(|t| t.1.as_str()), Some("40°"));
+        assert_eq!(s.yticks.last().map(|t| t.1.as_str()), Some("100°"));
         // Кластер ни разу не занят — строка вместо графика.
-        let e = stats_panel(&hello().blocks[1], Some(&d));
-        assert!(e.points.is_empty() && e.empty.contains("ни разу не был занят"));
+        let e = stats(&d, &[(1, 0)], None, None);
+        assert!(
+            e.series.is_empty() && e.empty.contains("ни разу не был занят"),
+            "{}",
+            e.empty
+        );
+        // Ничего не выбрано — подсказка, как выбрать.
+        let none = stats(&d, &[], None, None);
+        assert!(none.series.is_empty() && none.empty.contains("Щёлкни по плитке"));
+    }
+
+    #[test]
+    fn the_multiplier_axis_is_one_for_all_blocks_whatever_is_compared() {
+        let d = thirty(true);
+        let fused = [53, 46, 46, 46, 46];
+        // От самого низкого заводского −14 (кластер ×46 → ×32) до самого высокого +1 (ядро ×53 → ×54).
+        assert_eq!(axis(&hello().blocks, Some(&fused), Some(&d)), Some((32, 54)));
+        let p = stats(&d, &[(0, 0)], None, Some(&fused));
+        let e = stats(&d, &[(1, 0)], None, Some(&fused));
+        let both = stats(&d, &[(0, 0), (1, 1)], None, Some(&fused));
+        let columns = |s: &StatsShown| s.columns.iter().map(|c| (c.ratio, c.x)).collect::<Vec<_>>();
+        assert_eq!(columns(&p), columns(&e), "P и E — на одной оси");
+        assert_eq!(columns(&p), columns(&both));
+        assert_eq!(p.yticks, e.yticks, "и температура — на одной");
+        // Срез ниже оси расширяет её — для всех блоков.
+        let low = digest(&["2026-10-15 10:00:00,60,,,53,30,1,70,46,44,0,60".to_string()]);
+        assert_eq!(axis(&hello().blocks, Some(&fused), Some(&low)), Some((30, 54)));
+    }
+
+    #[test]
+    fn compared_blocks_keep_their_colours_and_the_highlighted_one_is_drawn_last() {
+        let d = thirty(true);
+        let s = stats(&d, &[(0, 2), (1, 0)], None, None);
+        assert_eq!(
+            s.series.iter().map(|l| (l.block, l.color, l.faded)).collect::<Vec<_>>(),
+            [(0, SERIES[2], false), (1, SERIES[0], false)],
+            "без подсветки — порядок добавления, никто не бледнее"
+        );
+        assert_eq!(
+            s.legend.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["ядро 0", "кластер 2–5"]
+        );
+        let lit = stats(&d, &[(0, 2), (1, 0)], Some(0), None);
+        assert_eq!(
+            lit.series.iter().map(|l| (l.block, l.faded)).collect::<Vec<_>>(),
+            [(1, true), (0, false)],
+            "подсвеченный — последним (поверх), остальные бледнее"
+        );
+        // Подсказка столбца называет каждый блок, у которого есть срезы на этом множителе.
+        let at44 = lit.columns.iter().find(|c| c.ratio == 44).map(|c| c.tip.clone());
+        assert!(at44.is_some_and(|t| t.contains("Кластер 2–5") && !t.contains("Ядро 0")));
+    }
+
+    #[test]
+    fn nearest_line_is_found_within_ten_pixels() {
+        let sampled = thirty(true);
+        let shown = stats(&sampled, &[(0, 0), (1, 1)], None, None);
+        let field = (400.0, 300.0);
+        let point = |block: usize, ratio: i32| {
+            let found = shown
+                .series
+                .iter()
+                .find(|l| l.block == block)
+                .and_then(|l| l.points.iter().find(|p| p.ratio == ratio))
+                .expect("точка");
+            (f64::from(found.x) * field.0, (1.0 - f64::from(found.mean)) * field.1)
+        };
+        let cluster = point(1, 44);
+        assert_eq!(nearest(&shown.series, (cluster.0, cluster.1 + 6.0), field), Some(1));
+        let core = point(0, 50);
+        assert_eq!(nearest(&shown.series, (core.0 - 3.0, core.1 - 4.0), field), Some(0));
+        assert_eq!(
+            nearest(&shown.series, (core.0, core.1 - 60.0), field),
+            None,
+            "далеко от линий — никого"
+        );
+    }
+
+    #[test]
+    fn the_cutoff_line_sits_at_its_temperature() {
+        let d = thirty(false);
+        let s = stats_panel(&StatsInput {
+            blocks: &hello().blocks,
+            compared: &[(0, 0)],
+            highlight: None,
+            fused: None,
+            cutoff: Some(85.0),
+            digest: Some(&d),
+        });
+        assert!(
+            (s.cutoff - 0.75).abs() < 1e-6,
+            "85 °C на шкале 40–100 — три четверти: {}",
+            s.cutoff
+        );
+        assert_eq!(s.cutoff_text, "85°");
     }
 
     #[test]

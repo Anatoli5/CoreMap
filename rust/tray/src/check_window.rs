@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use machine::named::Names;
 use serde_json::{Value, json};
 
-use crate::app::{App, Confirm, WINDOW_ID};
+use crate::app::{AUTO_ON, App, Confirm, LIMIT_ID, WINDOW_ID};
 use crate::check::{Report, ceilings_now, hold, logged, pump, pump_until};
 use crate::shell::{self, Shell};
 
@@ -349,6 +349,24 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data
     r.check(
         state["fans"]["rpm"] == json!([3200, 3000]),
         &format!("обороты вентиляторов в состоянии ({})", state["fans"]["rpm"]),
+    );
+    // Отсечка автомодуля для линии на графике окна: выключен — null; включён — его предел (первый пресет, 75 °C).
+    // Включается на одно состояние и сразу выключается: регулятору нужны минуты, ничего не успеет сдвинуться.
+    let off = state["autoLimit"].is_null();
+    app.command(shell, AUTO_ON);
+    app.command(shell, LIMIT_ID);
+    let from = client.of("state").len();
+    let on = wait(shell, app, &mut client, Duration::from_secs(2), |c| {
+        c.of("state").len() > from && c.last("state").is_some_and(|s| s["autoLimit"] == json!(75))
+    });
+    app.command(shell, AUTO_ON);
+    let from = client.of("state").len();
+    let off_again = wait(shell, app, &mut client, Duration::from_secs(2), |c| {
+        c.of("state").len() > from && c.last("state").is_some_and(|s| s["autoLimit"].is_null())
+    });
+    r.check(
+        off && on && off_again,
+        "отсечка автомодуля в состоянии: выключен — null, включён на 75 °C — 75, выключен снова — null",
     );
 
     // 12c. Средняя под нагрузкой: нагруженный блок получает среднюю после 2 с прогрева, ненагруженный — нет;

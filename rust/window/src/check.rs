@@ -1,7 +1,7 @@
 // Скрытая проверка окна (--snapshot F): ни окна на экране, ни кнопки на панели задач. Окно рисуется программно
 // (программный отрисовщик Slint в буфер), щелчки и нажатия клавиш — настоящие события по координатам плиток, кнопок и
 // строк. Против движка на имитации; запускает её проверка движка (Tray.cs C#-части). Итог — F.txt рядом с картинкой
-// F, первая строка ok / FAILED; картинки F, F-select.png, F-profiles.png, F-menu.png, F-1280.png, F-natural.png
+// F, первая строка ok / FAILED; картинки F, F-select.png, F-pin.png, F-tip.png, F-profiles.png, F-menu.png, F-1280.png, F-natural.png
 // смотрит агент — как выглядит окно, проверка не судит.
 //
 // Статистика — из своей временной папки: придуманные срезы за сегодня (полный день, 43 200 строк — цена разбора дня),
@@ -246,7 +246,7 @@ impl Check {
             "картинка окна (выбран первый P-блок, статистика из придуманных срезов)",
         );
         self.idle();
-        self.select(&e_block, expected.as_ref());
+        self.select(&p_block, &e_block, expected.as_ref());
         self.means_and_reset(&p_block);
         self.limit_menu(&limits, &e_block);
         self.profiles(&limits, &e_block);
@@ -287,7 +287,7 @@ impl Check {
             self.check(
                 e.cells.row_count() == 4 && p.cells.row_count() == 0 && e.h > p.h,
                 format!(
-                    "кластер — четыре клетки ядер в рамке, P-плитка — одна; высота кластера {:.0} px, P {:.0} px",
+                    "кластер — четыре клетки ядер на подложке, P-плитка — одна; высота кластера {:.0} px, P {:.0} px",
                     e.h * self.ui.get_die_h(),
                     p.h * self.ui.get_die_h()
                 ),
@@ -403,15 +403,41 @@ impl Check {
         ));
     }
 
-    /// 2. Щелчок по плитке кластера — выбор и его статистика, и ничего больше (нагрузки нет).
-    fn select(&mut self, e_block: &BlockInfo, expected: Option<&Synthetic>) {
-        let (x, y) = self.tile_center(e_block.index);
-        let index = i32::try_from(e_block.index).unwrap_or(-1);
-        self.click(x, y, PointerEventButton::Left);
-        let selected = self.pump(|v| v.selected == index, 2.0);
+    /// Шаг 2: щелчки по плиткам — сравнение блоков в статистике (владелец 15.10): щелчок добавляет блок, повторный убирает,
+    /// у каждого свой цвет линии и обводки; ось множителя одна на всех; подсветка линии — под курсором или
+    /// закреплённая. И ничего больше: нагрузки щелчок не даёт.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario of clicks and hovers, read top to bottom"
+    )]
+    fn select(&mut self, p_block: &BlockInfo, e_block: &BlockInfo, expected: Option<&Synthetic>) {
+        let (p, e) = (p_block.index, e_block.index);
+        let compared = |v: &View| v.compared.iter().map(|(b, _)| *b).collect::<Vec<_>>();
+        let first = compared(&self.view.borrow()) == [p];
+        self.check(
+            first,
+            format!("при открытии в статистике первый P-блок {}", p_block.name),
+        );
+        // Повторный щелчок убирает блок: статистика пуста и говорит, как выбрать.
+        let (px, py) = self.tile_center(p);
+        self.click(px, py, PointerEventButton::Left);
+        let emptied = self.pump(|v| v.compared.is_empty(), 2.0);
+        let hint = self.ui.get_chart_empty().to_string();
+        let unframed = !self.view.borrow().shown(p).is_some_and(|t| t.selected);
+        self.check(
+            emptied && hint.contains("Щёлкни по плитке") && unframed,
+            format!("повторный щелчок убрал блок {}; вместо графика: «{hint}»", p_block.name),
+        );
+        // Кластер — один в статистике.
+        let (ex, ey) = self.tile_center(e);
+        self.click(ex, ey, PointerEventButton::Left);
+        let selected = self.pump(|v| compared(v) == [e], 2.0);
         self.check(selected, format!("щелчок выбрал блок {}", e_block.name));
-        let framed = self.view.borrow().shown(e_block.index).is_some_and(|t| t.selected);
-        self.check(framed, "выбранная плитка обведена");
+        let outline = self.view.borrow().shown(e).map(|t| (t.selected, t.outline));
+        self.check(
+            outline == Some((true, crate::panels::rgb(crate::panels::SERIES[0]))),
+            "выбранная плитка обведена цветом своей линии",
+        );
         self.pump(|_| false, 1.0);
         let loaded = self
             .view
@@ -420,11 +446,18 @@ impl Check {
             .as_ref()
             .is_some_and(|s| e_block.members.iter().any(|&i| s.load.get(i).copied().unwrap_or(false)));
         self.check(!loaded, "щелчок не дал нагрузки");
-        let title = self.ui.get_stats_title().to_string();
+        let legend: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.name.to_string()).collect();
         self.check(
-            title.contains(&e_block.name),
-            format!("заголовок статистики: «{title}»"),
+            legend.len() == 1 && legend[0].contains(&e_block.name),
+            format!("в заголовке статистики: {legend:?}"),
         );
+        let axis = |v: &View| {
+            v.shown_stats
+                .as_ref()
+                .map(|s| s.columns.iter().map(|c| c.ratio).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let axis_e = axis(&self.view.borrow());
         if let Some(s) = expected {
             let want: Vec<(i32, u32)> = s
                 .bins
@@ -436,18 +469,24 @@ impl Check {
                 .borrow()
                 .shown_stats
                 .as_ref()
-                .map(|st| st.points.iter().map(|p| (p.ratio, p.samples)).collect())
+                .and_then(|st| st.series.first())
+                .map(|l| l.points.iter().map(|p| (p.ratio, p.samples)).collect())
                 .unwrap_or_default();
             self.check(
                 got == want && !got.is_empty(),
                 format!("точки графика (множитель, срезов) {got:?}, у генератора {want:?}"),
             );
-            let counts: Vec<String> = self.ui.get_chart_points().iter().map(|p| p.count.to_string()).collect();
-            let labeled = want
-                .iter()
-                .map(|(_, n)| crate::panels::grouped(u64::from(*n)))
-                .collect::<Vec<_>>();
-            self.check(counts == labeled, format!("под осью числа срезов: {counts:?}"));
+            let covered = want.iter().all(|(r, _)| axis_e.contains(r))
+                && axis_e.windows(2).all(|w| w[1] == w[0] + 1)
+                && axis_e.len() == self.ui.get_chart_cols().row_count();
+            self.check(
+                covered,
+                format!(
+                    "ось множителя ×{}…×{} — подряд, каждый множитель столбцом, точки на ней",
+                    axis_e.first().copied().unwrap_or_default(),
+                    axis_e.last().copied().unwrap_or_default()
+                ),
+            );
             let actions = self.ui.get_actions().row_count();
             self.check(
                 actions == s.actions,
@@ -459,22 +498,158 @@ impl Check {
                 format!("строк истории профилей {history}, в журнале {}", s.history),
             );
         }
+        // Второй блок — к первому: две линии, ось та же.
+        self.click(px, py, PointerEventButton::Left);
+        let two = self.pump(|v| compared(v) == [e, p], 2.0);
+        let series = self.ui.get_chart_series().row_count();
+        let same_axis = axis(&self.view.borrow()) == axis_e;
+        let now = compared(&self.view.borrow());
+        self.check(
+            two && series == 2 && same_axis,
+            format!(
+                "щелчок по {} добавил его: блоков {now:?}, линий {series}; ось та же, что у одного кластера: {same_axis}",
+                p_block.name
+            ),
+        );
+        let p_outline = self.view.borrow().shown(p).map(|t| t.outline);
+        self.check(
+            p_outline == Some(crate::panels::rgb(crate::panels::SERIES[1])),
+            "у второго блока — второй цвет",
+        );
         let shot = self.shot("select");
-        self.check(shot, "картинка со статистикой кластера");
-        // Подсказка плитки: курсор стоит на ней — через полсекунды подсказка в окне, курсор ушёл — её нет.
+        self.check(shot, "картинка сравнения двух блоков");
+
+        // Подсветка под курсором: курсор на плитке P — её линия последней (поверх), линия кластера бледнее.
+        let order = |v: &View| {
+            v.shown_stats
+                .as_ref()
+                .map(|s| s.series.iter().map(|l| (l.block, l.faded)).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
         self.ui.window().dispatch_event(WindowEvent::PointerMoved {
-            position: LogicalPosition::new(x, y),
+            position: LogicalPosition::new(px, py),
         });
+        let lit = self.pump(|v| order(v) == [(e, true), (p, false)], 1.0);
+        let drawn = order(&self.view.borrow());
+        self.check(
+            lit,
+            format!("курсор на плитке {} — её линия поверх: {drawn:?}", p_block.name),
+        );
+        // Подсказка плитки: курсор стоит на ней — через полсекунды подсказка в окне.
         let shown = self.pump(|_| false, 0.7) || self.ui.get_tip_shown();
         self.check(shown, "курсор на плитке — подсказка показана");
         let shot = self.shot("tip");
         self.check(shot, "картинка с подсказкой плитки");
         self.ui.window().dispatch_event(WindowEvent::PointerExited);
         self.pump(|_| true, 0.0);
-        let gone = !self.ui.get_tip_shown();
-        self.check(gone, "курсор ушёл — подсказки нет");
+        let gone = !self.ui.get_tip_shown() && order(&self.view.borrow()) == [(e, false), (p, false)];
+        self.check(gone, "курсор ушёл — подсказки нет, линии снова одинаковы");
+        // Курсор у точки линии кластера на графике — подсвечена она.
+        if let Some((x, y)) = self.chart_point(e) {
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, y + 3.0),
+            });
+            let near = self.pump(|v| v.hovered == Some(e), 1.0);
+            self.check(
+                near,
+                format!("курсор у линии {} на графике — подсвечена она", e_block.name),
+            );
+            self.ui.window().dispatch_event(WindowEvent::PointerExited);
+            self.pump(|_| true, 0.0);
+        } else {
+            self.check(false, "у линии кластера нет точки на графике");
+        }
+        // Закреплённая подсветка: последний добавленный (P) поверх, без курсора.
+        // Переключатель — щелчком по его кнопке, как владелец: кнопка должна быть в окне и попадать под щелчок.
+        let (pin_x, pin_y) = (self.ui.get_pin_chip_x(), self.ui.get_pin_chip_y());
+        let inside =
+            pin_x > 0.0 && pin_y > 0.0 && pin_x < units(self.size.0 as usize) && pin_y < units(self.size.1 as usize);
+        self.check(inside, format!("кнопка «закреплённая» в окне: {pin_x:.0}, {pin_y:.0}"));
+        self.click(pin_x, pin_y, PointerEventButton::Left);
+        let pinned = self.pump(|v| order(v) == [(e, true), (p, false)], 1.0);
+        self.check(
+            pinned && self.ui.get_pin_mode(),
+            format!("закреплённая подсветка — последний добавленный {} поверх", p_block.name),
+        );
+        let shot = self.shot("pin");
+        self.check(shot, "картинка закреплённой подсветки");
+        // Щелчок по линии кластера закрепляет её.
+        if let Some((x, y)) = self.chart_point(e) {
+            self.click(x, y + 3.0, PointerEventButton::Left);
+            let moved = self.pump(|v| order(v) == [(p, true), (e, false)], 1.0);
+            self.check(
+                moved,
+                format!("щелчок по линии {} на графике закрепил её", e_block.name),
+            );
+        }
+        let (hover_x, hover_y) = (self.ui.get_hover_chip_x(), self.ui.get_hover_chip_y());
+        self.click(hover_x, hover_y, PointerEventButton::Left);
+        let back = self.pump(|v| !v.pin_mode, 1.0);
+        self.check(back, "щелчок по «под курсором» вернул подсветку под курсором");
+
+        // Больше четырёх блоков не сравнивается: пятый щелчок не добавляет и говорит почему.
+        let others: Vec<usize> = self
+            .view
+            .borrow()
+            .hello
+            .as_ref()
+            .map(|h| {
+                h.blocks
+                    .iter()
+                    .map(|b| b.index)
+                    .filter(|&b| b != p && b != e)
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if others.len() == 3 {
+            for &b in &others {
+                let (x, y) = self.tile_center(b);
+                self.click(x, y, PointerEventButton::Left);
+            }
+            let refused = self.pump(|v| v.compared.len() == crate::panels::COMPARE, 1.0);
+            let said = self.ui.get_problem().to_string();
+            let count = self.view.borrow().compared.len();
+            self.check(
+                refused && said.contains("до 4"),
+                format!("пятый блок не добавлен: блоков {count}, строка «{said}»"),
+            );
+            self.view.borrow_mut().problem_dismissed();
+            // Убрать лишние: сравниваются снова кластер и P-ядро, их цвета прежние.
+            for &b in others.iter().take(2) {
+                let (x, y) = self.tile_center(b);
+                self.click(x, y, PointerEventButton::Left);
+            }
+            let back = self.pump(|v| compared(v) == [e, p], 1.0);
+            let colours = self.view.borrow().compared.clone();
+            self.check(
+                back && colours == [(e, 0), (p, 1)],
+                format!("лишние убраны, цвета оставшихся прежние: {colours:?}"),
+            );
+        }
     }
 
+    /// Точка ø средней линии блока на графике — координаты окна; None — у блока нет точек.
+    fn chart_point(&self, block: usize) -> Option<(f32, f32)> {
+        let view = self.view.borrow();
+        let point = view
+            .shown_stats
+            .as_ref()?
+            .series
+            .iter()
+            .find(|l| l.block == block)?
+            .points
+            .first()?
+            .clone();
+        // Поле графика: Chart стоит в stats-x + pad - 4, поле — 40 px от его левого края и 8 px от верха, справа 10 px,
+        // снизу ось 34 px (ui/app.slint, Chart).
+        let ui = &self.ui;
+        let chart_x = ui.get_stats_x() + ui.get_pad() - 4.0;
+        let chart_w = ui.get_stats_w() - 2.0 * ui.get_pad() + 4.0;
+        let (plot_x, plot_y) = (chart_x + 40.0, ui.get_chart_y() + 8.0);
+        let (plot_w, plot_h) = (chart_w - 40.0 - 10.0, ui.get_chart_h() - 8.0 - 34.0);
+        Some((plot_x + point.x * plot_w, plot_y + (1.0 - point.mean) * plot_h))
+    }
     /// Шаг 3: ø под нагрузкой на плитке; кнопка «▲ ø» сбрасывает наибольшую и средние. Нагрузку даёт команда
     /// движку напрямую (не жест окна: у окна нагрузки нет) — только чтобы движок на имитации посчитал средние.
     fn means_and_reset(&mut self, p_block: &BlockInfo) {

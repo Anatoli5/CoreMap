@@ -23,7 +23,7 @@ export struct TileData {
     y: float,
     w: float,
     h: float,
-    cluster: bool,     // кластер E-ядер: рамка и четыре клетки ядер
+    cluster: bool,     // кластер E-ядер: подложка с четырьмя клетками ядер, без обводки (обводка — только у выбранного)
     number: string,    // номер P-ядра
     number-color: color,
     cells: [CellData], // ядра кластера
@@ -37,7 +37,9 @@ export struct TileData {
     delta: string,     // разница с «было»: «−2»
     auto: string,      // поправка автомодуля: «авто −2»
     ban: bool,         // автомодулю нельзя поднимать обратно (память перегрева)
-    selected: bool,
+    strip: color,      // полоска слева — ▲ наибольшая цветом шкалы температуры
+    selected: bool,    // в статистике
+    outline: color,    // обводка выбранного — цвет его линии на графике
     tip: string,
 }
 
@@ -65,7 +67,8 @@ export struct SetRow {
     startup: bool,      // ставится при входе в Windows
     disabled: bool,     // профиль запуска отключён после сбоя
     selected: bool,
-    cells: [color],     // по блокам: отличие набора от того, что стоит сейчас
+    p-mean: string,     // средний потолок набора по P-ядрам: «52.4»
+    e-mean: string,     // и по E-ядрам
     tip: string,
 }
 
@@ -74,15 +77,35 @@ export struct LineRow {
     head: string,
     text: string,
     color: color,
+    mark: color,    // цвет блока (действия автомодуля при сравнении)
 }
 
-export struct ChartPoint {
-    x: float,       // доли области графика
+// Точка линии блока: место по оси множителя и высоты ø средней и ▲ наибольшей — доли поля графика.
+export struct Mark {
+    x: float,
     mean: float,
     peak: float,
-    fan: float,     // доля полосы вентилятора; < 0 — оборотов нет
-    label: string,  // «×52»
-    count: string,  // число срезов
+}
+
+// Линия блока на графике статистики: пути в рамке 1000 × 1000, цвет блока, бледная — подсвечен другой.
+export struct Series {
+    mean: string,
+    peak: string,
+    color: color,
+    faded: bool,
+    marks: [Mark],
+}
+
+// Столбец множителя на оси: место, множитель, подсказка (что у каждого выбранного блока на нём; "" — ничего).
+export struct Column {
+    x: float,
+    v: int,
+    tip: string,
+}
+
+export struct LegendItem {
+    name: string,
+    color: color,
     tip: string,
 }
 
@@ -104,10 +127,7 @@ export global Palette {
     out property <color> warn-text: #ffd9a0;
     out property <color> p-text: #f0b860;   // P-ядро (Theme.KindText в C#-части)
     out property <color> e-text: #6fd0c8;   // E-ядро
-    out property <color> e-back: #163f3c;   // рамка кластера (темнее Theme.KindBack E, чтобы клетки ядер читались)
-    out property <color> mean: #ffb86b;     // средняя температура на графике
-    out property <color> peak: #ff8a7a;     // наибольшая
-    out property <color> fan: #6f8fb0;      // обороты вентилятора
+    out property <color> plate: #23272e;    // подложка кластера E-ядер: светлее панели, без обводки
     out property <color> auto: #8fb8ff;     // поправка автомодуля
 }
 
@@ -171,23 +191,24 @@ component TileView inherits Rectangle {
     property <length> small: max(10px, 12 * root.u);
     property <length> line: root.small * 1.3;
     property <length> pad: 6 * root.u;
+    property <length> strip-w: 4 * root.u;
     // Колонка чисел справа: у P-ядра от края, у кластера — справа от клеток ядер.
     property <length> cell-w: 38 * root.u;
     property <length> cell-gap: 4 * root.u;
+    property <length> cells-x: root.strip-w + 4 * root.u;
     property <length> cells-w: 2 * root.cell-w + root.cell-gap;
 
-    background: data.cluster ? Palette.e-back : data.fill;
+    // Кластер — подложка с клетками ядер; обводки нет: обводка значит «выбран» (владелец 15.10).
+    background: data.cluster ? Palette.plate : data.fill;
     border-radius: 6 * root.u;
-    border-width: data.cluster ? max(1.5px, 2 * root.u) : 0;
-    border-color: Palette.e-text;
 
-    // P-ядро: полоса цвета рода слева, номер, температура сейчас крупно.
-    if !data.cluster: Rectangle {
+    // Полоска слева — ▲ наибольшая цветом той же шкалы, что плитка: какое ядро грелось сильнее остальных.
+    Rectangle {
         x: 0;
         y: 0;
-        width: 4 * root.u;
+        width: root.strip-w;
         height: root.height;
-        background: Palette.p-text;
+        background: data.strip;
         border-top-left-radius: 6 * root.u;
         border-bottom-left-radius: 6 * root.u;
     }
@@ -210,7 +231,7 @@ component TileView inherits Rectangle {
 
     // Кластер E-ядер: четыре клетки ядер 2 × 2 — у каждой своя температура и свой цвет; потолок у кластера один.
     for cell in data.cells: Rectangle {
-        x: root.pad + cell.col * (root.cell-w + root.cell-gap);
+        x: root.cells-x + cell.col * (root.cell-w + root.cell-gap);
         y: root.pad + cell.row * ((root.height - 2 * root.pad - root.cell-gap) / 2 + root.cell-gap);
         width: root.cell-w;
         height: (root.height - 2 * root.pad - root.cell-gap) / 2;
@@ -239,7 +260,7 @@ component TileView inherits Rectangle {
     // Числа справа. P-ядро: ▲ наибольшая, ø средняя и ø множитель под нагрузкой, внизу — множитель / потолок.
     // Кластер: то же столбцом — по строке на число.
     VerticalLayout {
-        x: data.cluster ? root.pad + root.cells-w + 6 * root.u : 0;
+        x: data.cluster ? root.cells-x + root.cells-w + 6 * root.u : 0;
         y: root.pad - 2 * root.u;
         width: root.width - self.x - 8 * root.u;
         height: root.height - 2 * root.pad + 4 * root.u;
@@ -266,13 +287,14 @@ component TileView inherits Rectangle {
         }
     }
 
+    // Выбран (в статистике): обводка цветом его линии на графике.
     if data.selected: Rectangle {
         x: -3px;
         y: -3px;
         width: root.width + 6px;
         height: root.height + 6px;
-        border-width: 2px;
-        border-color: Palette.text;
+        border-width: 2.5px;
+        border-color: data.outline;
         border-radius: 6 * root.u + 3px;
     }
 
@@ -288,27 +310,34 @@ component TileView inherits Rectangle {
     }
 }
 
-// График «температура от фактического множителя» выбранного блока: линия — средняя, ▲ — наибольшая, под ним полоса
-// оборотов вентилятора на той же оси множителя (своя шкала — не вторая ось на одном поле), под осью — число срезов.
+// График «температура от фактического множителя» выбранных блоков: у каждого блока своя линия своего цвета —
+// толстая ø средняя, тонкая ▲ наибольшая. Оси общие для всех блоков (владелец 15.10): множитель — числовая ось с
+// подписью через 1, 2 или 5 ступеней, сколько помещается; температура — 40–100 °C. Отсечка автомодуля — красной
+// линией. Подсвеченная линия рисуется последней (Rust ставит её в конец), остальные тогда бледнее.
 component Chart inherits Rectangle {
-    in property <[ChartPoint]> points;
+    in property <[Series]> series;
+    in property <[Column]> cols;
     in property <[Tick]> yticks;
-    in property <string> mean-path;
-    in property <string> peak-path;
     in property <string> empty;     // вместо графика, когда точек нет
-    in property <string> fan-top;   // верх шкалы вентилятора: «5000»
-    in property <float> columns: 1; // сколько корзин множителя в ширину (с пустыми)
+    in property <float> columns: 1; // сколько множителей на оси
+    in property <float> cutoff: -1; // отсечка автомодуля — доля высоты поля; < 0 — нет
+    in property <string> cutoff-text;
     callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
+    // Курсор над полем (от его левого верхнего угла) и размер поля: Rust ищет ближайшую линию.
+    callback pointer(length, length, length, length);
+    callback exited();
+    callback clicked-at(length, length, length, length);
 
     property <length> left: 40px;
-    property <length> fan-h: max(28px, min(56px, root.height * 0.14));
-    property <length> label-h: 30px;
+    property <length> axis-h: 34px;
     out property <length> plot-x: root.left;
     out property <length> plot-y: 8px;
     out property <length> plot-w: root.width - root.left - 10px;
-    out property <length> plot-h: root.height - root.plot-y - 22px - root.fan-h - root.label-h;
+    out property <length> plot-h: root.height - root.plot-y - root.axis-h;
     property <length> col-w: root.plot-w / max(1, root.columns);
-    property <length> fan-y: root.plot-y + root.plot-h + 18px;
+    // Подпись каждого множителя, каждого второго или каждого пятого — по ширине столбца.
+    property <int> step: root.col-w >= 20px ? 1 : root.col-w >= 10px ? 2 : 5;
+    property <bool> drawn: root.empty == "" && root.cols.length > 0;
 
     if root.empty != "": Text {
         x: 0;
@@ -341,122 +370,158 @@ component Chart inherits Rectangle {
         vertical-alignment: center;
     }
 
-    // Столбец корзины: подсветка под курсором и подсказка с числами — больше, чем сама точка.
-    for p in root.points: Rectangle {
-        x: root.plot-x + p.x * root.plot-w - root.col-w / 2;
+    // Столбец под курсором — подсветка (подсказка с числами — у окна).
+    if plot-touch.has-hover && root.cols[plot-touch.at-col].tip != "": Rectangle {
+        x: root.plot-x + plot-touch.at-col * root.col-w;
         y: root.plot-y;
         width: root.col-w;
-        height: root.plot-h + 18px + root.fan-h + root.label-h;
-        background: hover.has-hover ? #ffffff0c : transparent;
-        hover := TouchArea {
-            changed has-hover => {
-                root.tip(self.has-hover, "bin" + p.x, p.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-            }
+        height: root.plot-h;
+        background: #ffffff0c;
+    }
+
+    // Отсечка автомодуля.
+    if root.drawn && root.cutoff >= 0: Rectangle {
+        x: root.plot-x;
+        y: root.plot-y + (1 - root.cutoff) * root.plot-h;
+        width: root.plot-w;
+        height: 1px;
+        background: Palette.bad.transparentize(0.25);
+    }
+    if root.drawn && root.cutoff >= 0: Text {
+        x: root.plot-x;
+        width: root.plot-w - 4px;
+        y: root.plot-y + (1 - root.cutoff) * root.plot-h - 15px;
+        text: "отсечка " + root.cutoff-text;
+        color: Palette.bad;
+        font-size: 10px;
+        horizontal-alignment: right;
+    }
+
+    // Линии блоков: пути в рамке 1000 × 1000 растягиваются на поле (толщина линии — снаружи поля).
+    for s in root.series: Rectangle {
+        x: root.plot-x;
+        y: root.plot-y;
+        width: root.plot-w;
+        height: root.plot-h;
+        opacity: s.faded ? 0.3 : 1;
+        Path {
+            x: -1px;
+            y: -1px;
+            width: parent.width + 2px;
+            height: parent.height + 2px;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: s.peak;
+            stroke: s.color.transparentize(0.45);
+            stroke-width: 1.5px;
+        }
+        Path {
+            x: -1.5px;
+            y: -1.5px;
+            width: parent.width + 3px;
+            height: parent.height + 3px;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: s.mean;
+            stroke: s.color;
+            stroke-width: 3px;
+            stroke-line-join: round;
+        }
+        for m in s.marks: Text {
+            x: m.x * parent.width - 6px;
+            y: (1 - m.peak) * parent.height - 8px;
+            width: 12px;
+            height: 14px;
+            text: "▲";
+            color: s.color.transparentize(0.2);
+            font-size: 9px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        for m in s.marks: Rectangle {
+            x: m.x * parent.width - 4px;
+            y: (1 - m.mean) * parent.height - 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: s.color;
+            border-width: 1.5px;
+            border-color: Palette.panel;
         }
     }
 
-    // Обороты вентилятора: столбики от низа полосы.
-    if root.points.length > 0 && root.empty == "": Rectangle {
+    // Ось множителя: черта на каждый, подпись — через шаг; название оси справа.
+    if root.drawn: Rectangle {
         x: root.plot-x;
-        y: root.fan-y + root.fan-h;
+        y: root.plot-y + root.plot-h;
         width: root.plot-w;
         height: 1px;
-        background: Palette.line;
+        background: Palette.dim;
     }
-    if root.fan-top != "" && root.empty == "": Text {
-        x: 0;
-        width: root.left - 6px;
-        y: root.fan-y - 2px;
-        text: root.fan-top;
-        color: Palette.dim;
-        font-size: 10px;
-        horizontal-alignment: right;
+    for c in root.cols: Rectangle {
+        x: root.plot-x + c.x * root.plot-w;
+        y: root.plot-y + root.plot-h;
+        width: 1px;
+        height: Math.mod(c.v, root.step) == 0 ? 5px : 3px;
+        background: Palette.dim;
     }
-    if root.empty == "": Text {
-        x: 0;
-        width: root.left - 6px;
-        y: root.fan-y + root.fan-h - 12px;
-        text: "вент.";
-        color: Palette.dim;
-        font-size: 10px;
-        horizontal-alignment: right;
-    }
-    for p in root.points: Rectangle {
-        x: root.plot-x + p.x * root.plot-w - min(root.col-w * 0.6, 22px) / 2;
-        y: root.fan-y + root.fan-h * (1 - max(0, p.fan));
-        width: min(root.col-w * 0.6, 22px);
-        height: p.fan < 0 ? 0 : root.fan-h * p.fan;
-        background: Palette.fan;
-        border-top-left-radius: 3px;
-        border-top-right-radius: 3px;
-    }
-
-    // Линии: путь в рамке 1000 × 1000 растягивается на поле графика (толщина линии — снаружи поля).
-    Path {
-        x: root.plot-x - 1px;
-        y: root.plot-y - 1px;
-        width: root.plot-w + 2px;
-        height: root.plot-h + 2px;
-        viewbox-width: 1000;
-        viewbox-height: 1000;
-        fit: fill;
-        commands: root.peak-path;
-        stroke: Palette.peak.transparentize(0.35);
-        stroke-width: 2px;
-    }
-    Path {
-        x: root.plot-x - 1.5px;
-        y: root.plot-y - 1.5px;
-        width: root.plot-w + 3px;
-        height: root.plot-h + 3px;
-        viewbox-width: 1000;
-        viewbox-height: 1000;
-        fit: fill;
-        commands: root.mean-path;
-        stroke: Palette.mean;
-        stroke-width: 3px;
-        stroke-line-join: round;
-    }
-    for p in root.points: Text {
-        x: root.plot-x + p.x * root.plot-w - 6px;
-        y: root.plot-y + (1 - p.peak) * root.plot-h - 8px;
-        width: 12px;
-        height: 14px;
-        text: "▲";
-        color: Palette.peak;
-        font-size: 11px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    for p in root.points: Rectangle {
-        x: root.plot-x + p.x * root.plot-w - 5px;
-        y: root.plot-y + (1 - p.mean) * root.plot-h - 5px;
-        width: 10px;
-        height: 10px;
-        border-radius: 5px;
-        background: Palette.mean;
-        border-width: 2px;
-        border-color: Palette.panel;
-    }
-
-    // Ось множителя и число срезов под каждой корзиной.
-    for p in root.points: Text {
-        x: root.plot-x + p.x * root.plot-w - root.col-w / 2 - 6px;
-        width: root.col-w + 12px;
-        y: root.fan-y + root.fan-h + 3px;
-        text: p.label;
+    for c in root.cols: Text {
+        visible: Math.mod(c.v, root.step) == 0;
+        x: root.plot-x + c.x * root.plot-w - 15px;
+        width: 30px;
+        y: root.plot-y + root.plot-h + 6px;
+        text: "\{c.v}";
         color: Palette.text;
         font-size: 11px;
         horizontal-alignment: center;
     }
-    for p in root.points: Text {
-        x: root.plot-x + p.x * root.plot-w - root.col-w / 2 - 6px;
-        width: root.col-w + 12px;
-        y: root.fan-y + root.fan-h + 16px;
-        text: p.count;
+    if root.drawn: Text {
+        x: root.plot-x;
+        width: root.plot-w;
+        y: root.plot-y + root.plot-h + 20px;
+        text: "множитель, ×";
         color: Palette.dim;
         font-size: 10px;
-        horizontal-alignment: center;
+        horizontal-alignment: right;
+    }
+
+    // Одна область касания на всё поле: столбец под курсором (подсказка), ближайшая линия (Rust), щелчок.
+    plot-touch := TouchArea {
+        x: root.plot-x;
+        y: root.plot-y;
+        width: root.plot-w;
+        height: root.plot-h;
+        enabled: root.drawn;
+        out property <int> at-col: max(0, min(root.cols.length - 1, floor(self.mouse-x / root.col-w)));
+        function show() {
+            root.tip(true, "col" + self.at-col, root.cols[self.at-col].tip, self.absolute-position.x + self.at-col * root.col-w, self.absolute-position.y, root.col-w, root.plot-h);
+        }
+        changed at-col => {
+            if (self.has-hover) {
+                self.show();
+            }
+        }
+        changed has-hover => {
+            if (self.has-hover) {
+                self.show();
+            } else {
+                root.tip(false, "col" + self.at-col, "", 0, 0, 0, 0);
+                root.exited();
+            }
+        }
+        changed mouse-x => {
+            if (self.has-hover) {
+                root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
+            }
+        }
+        changed mouse-y => {
+            if (self.has-hover) {
+                root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
+            }
+        }
+        clicked => { root.clicked-at(self.mouse-x, self.mouse-y, self.width, self.height); }
     }
 }
 
@@ -465,6 +530,7 @@ component Lines inherits Flickable {
     in property <[LineRow]> rows;
     in property <length> row-h: 18px;
     in property <string> empty;
+    in property <bool> marks;   // у строк есть цвет блока — квадратик перед заголовком
     callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
     content-height: max(self.height, root.rows.length * root.row-h);
     if root.rows.length == 0: Text {
@@ -480,6 +546,10 @@ component Lines inherits Flickable {
         width: root.width;
         spacing: 8px;
         Text { text: r.time; color: Palette.dim; font-size: 12px; width: 70px; vertical-alignment: center; }
+        if root.marks: Rectangle {
+            width: 8px;
+            Rectangle { y: (parent.height - 8px) / 2; width: 8px; height: 8px; border-radius: 2px; background: r.mark; }
+        }
         if r.head != "": Text { text: r.head; color: r.color; font-size: 12px; vertical-alignment: center; }
         Text { text: r.text; color: Palette.text; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
     }
@@ -538,19 +608,31 @@ export component AppWindow inherits Window {
     in property <bool> has-history;
 
     // Статистика
-    in property <string> stats-title;
     in property <string> stats-note;
-    in property <[ChartPoint]> chart-points;
+    in property <[LegendItem]> stats-legend;   // выбранные блоки: цвет линии и название
+    in property <[Series]> chart-series;
+    in property <[Column]> chart-cols;
     in property <[Tick]> chart-yticks;
-    in property <string> chart-mean;
-    in property <string> chart-peak;
     in property <string> chart-empty;
-    in property <string> chart-fan-top;
     in property <float> chart-columns: 1;
+    in property <float> chart-cutoff: -1;
+    in property <string> chart-cutoff-text;
     in property <[LineRow]> actions;
     in property <string> actions-empty;
+    // Подсветка линий: false — под курсором, true — закреплённая (владелец 15.10: попробовать обе).
+    in property <bool> pin-mode;
+    // Середины кнопок переключателя — по ним щёлкает скрытая проверка (src/check.rs).
+    out property <length> hover-chip-x: hover-chip.absolute-position.x + hover-chip.width / 2;
+    out property <length> hover-chip-y: hover-chip.absolute-position.y + hover-chip.height / 2;
+    out property <length> pin-chip-x: pin-chip.absolute-position.x + pin-chip.width / 2;
+    out property <length> pin-chip-y: pin-chip.absolute-position.y + pin-chip.height / 2;
 
     callback tile-clicked(int);
+    callback tile-hover(int, bool);
+    callback chart-pointer(length, length, length, length);
+    callback chart-left();
+    callback chart-click(length, length, length, length);
+    callback mode-changed(bool);
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
     callback limit-chosen(int);
     callback problem-dismissed();
@@ -638,6 +720,7 @@ export component AppWindow inherits Window {
     out property <length> btn-w: 88px;
     out property <length> btn-gap: 6px;
     out property <length> set-h: 26px;
+    property <length> mean-w: 40px;  // столбец среднего потолка набора («52.4»)
     out property <length> row-a-y: root.body-y + root.head-h + 40px;
     out property <length> sets-y: root.row-a-y + root.btn-h + 26px;
     property <length> below-sets: 6px + root.btn-h + 6px + root.btn-h + 4px + 18px + (root.has-history ? 30px + 3 * 18px : 0px) + root.pad;
@@ -781,7 +864,10 @@ export component AppWindow inherits Window {
         scale: root.scale;
         data: tile;
         clicked => { root.tile-clicked(tile.block); }
-        hover(on) => { root.tip(on, "tile" + tile.block, tile.tip, self.x, self.y, self.width, self.height); }
+        hover(on) => {
+            root.tip(on, "tile" + tile.block, tile.tip, self.x, self.y, self.width, self.height);
+            root.tile-hover(tile.block, on);
+        }
         menu(x, y) => {
             root.menu-x = x;
             root.menu-y = y;
@@ -876,17 +962,30 @@ export component AppWindow inherits Window {
         clicked => { root.profile-revert(); }
         hover(on) => { root.tip(on, "revert", self.tip, self.x, self.y, self.width, self.height); }
     }
-    // Значки списка — строкой над ним; клетки справа в строке — чем набор отличается от того, что стоит сейчас.
+    // Значки списка — строкой над ним; справа — заголовки столбцов среднего потолка набора по P- и по E-ядрам.
     if root.has-profiles: Text {
         x: root.prof-x + root.pad;
         y: root.row-a-y + root.btn-h + 6px;
-        width: root.prof-w - 2 * root.pad;
+        width: root.prof-w - 2 * root.pad - 2 * root.mean-w - 8px;
         height: 16px;
-        text: "● стоит   ○ было   ► при входе   клетки: отличие";
+        text: "● стоит   ○ было   ► при входе";
         color: Palette.dim;
         font-size: 11px;
         vertical-alignment: center;
         overflow: elide;
+    }
+    if root.has-profiles: Rectangle {
+        x: root.prof-x + root.prof-w - root.pad - 2 * root.mean-w - 8px;
+        y: root.row-a-y + root.btn-h + 6px;
+        width: 2 * root.mean-w;
+        height: 16px;
+        Text { x: 0; width: root.mean-w; height: parent.height; text: "ø P"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+        Text { x: root.mean-w; width: root.mean-w; height: parent.height; text: "ø E"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+        TouchArea {
+            changed has-hover => {
+                root.tip(self.has-hover, "means", "Средний потолок набора\nПо P-ядрам и по E-ядрам отдельно — оценка уровня набора: выше — быстрее.\n• это потолки, а не фактические множители: под нагрузкой ядро может идти ниже", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
     }
 
     if root.has-profiles: Flickable {
@@ -906,7 +1005,7 @@ export component AppWindow inherits Window {
             Text { x: 30px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
             Text {
                 x: 46px;
-                width: parent.width - 46px - 12 * 9px - 8px;
+                width: parent.width - 46px - 2 * root.mean-w - 12px;
                 text: s.name;
                 color: Palette.text;
                 font-size: 13px;
@@ -914,15 +1013,9 @@ export component AppWindow inherits Window {
                 height: parent.height;
                 overflow: elide;
             }
-            // Чем набор отличается от того, что стоит сейчас: клетка на блок (в порядке блоков).
-            for c[k] in s.cells: Rectangle {
-                x: parent.width - 8px - (s.cells.length - k) * 9px;
-                y: (parent.height - 12px) / 2;
-                width: 7px;
-                height: 12px;
-                border-radius: 1.5px;
-                background: c;
-            }
+            // Средний потолок набора по P- и по E-ядрам — для сравнения наборов между собой.
+            Text { x: parent.width - 8px - 2 * root.mean-w; width: root.mean-w; height: parent.height; text: s.p-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+            Text { x: parent.width - 8px - root.mean-w; width: root.mean-w; height: parent.height; text: s.e-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
             set-touch := TouchArea {
                 clicked => { root.set-clicked(i); }
                 changed has-hover => {
@@ -1043,36 +1136,113 @@ export component AppWindow inherits Window {
         height: root.body-h;
         background: Palette.panel;
         border-radius: 8px;
-        stats-title := Text { x: root.pad; y: 9px; width: self.preferred-width; text: root.stats-title; color: Palette.dim; font-weight: 600; }
+        // Заголовок и выбранные блоки — квадратик цвета их линии и название; справа — сколько срезов и за какое время.
+        stats-head := HorizontalLayout {
+            x: root.pad;
+            y: 4px;
+            height: 24px;
+            spacing: 10px;
+            alignment: start;
+            Text { text: "Статистика"; color: Palette.dim; font-weight: 600; vertical-alignment: center; }
+            for l[i] in root.stats-legend: Rectangle {
+                width: item.preferred-width;
+                item := HorizontalLayout {
+                    spacing: 4px;
+                    Rectangle {
+                        width: 10px;
+                        Rectangle { y: (parent.height - 10px) / 2; width: 10px; height: 10px; border-radius: 2px; background: l.color; }
+                    }
+                    Text { text: l.name; color: Palette.text; font-size: 12px; vertical-alignment: center; }
+                }
+                TouchArea {
+                    changed has-hover => {
+                        root.tip(self.has-hover, "legend" + i, l.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
+            }
+        }
         Text {
-            x: stats-title.x + stats-title.width + 12px;
-            y: 10px;
+            x: root.pad + stats-head.preferred-width + 12px;
+            y: 4px;
+            height: 24px;
             width: parent.width - root.pad - self.x;
             text: root.stats-note;
             color: Palette.dim;
             font-size: 12px;
             horizontal-alignment: right;
+            vertical-alignment: center;
             overflow: elide;
         }
+        // Что значат линии; справа — какая линия подсвечивается.
         HorizontalLayout {
             x: root.pad;
             y: root.head-h;
             height: 18px;
-            spacing: 6px;
+            spacing: 5px;
             alignment: start;
-            Rectangle { width: 16px; height: 3px; y: 8px; background: Palette.mean; }
+            Rectangle {
+                width: 16px;
+                Rectangle { y: (parent.height - 3px) / 2; width: 16px; height: 3px; background: Palette.dim; }
+            }
             Text { text: "ø средняя"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 6px; }
-            Text { text: "▲"; color: Palette.peak; font-size: 11px; vertical-alignment: center; }
-            Text { text: "наибольшая, °C — блок занят ≥ 50 %"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 6px; }
-            Rectangle { width: 8px; height: 10px; y: 4px; background: Palette.fan; }
-            Text { text: "вентилятор, об/мин"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 4px; }
+            Text { text: "▲ наибольшая, °C"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+        }
+        TouchArea {
+            x: root.pad;
+            y: root.head-h;
+            width: 190px;
+            height: 18px;
+            changed has-hover => {
+                root.tip(self.has-hover, "lines", "Линии выбранных блоков\nПо срезам, когда блок занят (доля работы ≥ 50 %): на каждом фактическом множителе — ø средняя температура (толстая линия) и ▲ наибольшая (тонкая).\n• оси общие для всех блоков — графики можно сравнивать\n• красная линия — отсечка автомодуля\n• числа — в подсказке столбца множителя", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        // Переключатель подсветки: «курсор» — линия под курсором (или плитки под курсором) поверх остальных;
+        // «закреплённая» — последний добавленный блок или линия, по которой щёлкнули.
+        HorizontalLayout {
+            // Ширина — по содержимому: без неё раскладка шириной в панель растягивает надпись и уводит кнопки за край.
+            x: parent.width - root.pad - self.width;
+            y: root.head-h - 2px;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            alignment: end;
+            Text { text: "подсветка:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            hover-chip := Rectangle {
+                width: hover-text.preferred-width + 14px;
+                border-radius: 4px;
+                background: !root.pin-mode ? Palette.line : hover-touch.has-hover ? Palette.cell : transparent;
+                border-width: 1px;
+                border-color: Palette.cell;
+                hover-text := Text { text: "под курсором"; color: !root.pin-mode ? Palette.text : Palette.dim; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                hover-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.mode-changed(false); }
+                    changed has-hover => {
+                        root.tip(self.has-hover, "mode-hover", "Подсветка под курсором\nНаведи на линию или на плитку выбранного блока — его линия поверх остальных, остальные бледнее; курсор ушёл — все одинаковы.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
+            }
+            pin-chip := Rectangle {
+                width: pin-text.preferred-width + 14px;
+                border-radius: 4px;
+                background: root.pin-mode ? Palette.line : pin-touch.has-hover ? Palette.cell : transparent;
+                border-width: 1px;
+                border-color: Palette.cell;
+                pin-text := Text { text: "закреплённая"; color: root.pin-mode ? Palette.text : Palette.dim; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                pin-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.mode-changed(true); }
+                    changed has-hover => {
+                        root.tip(self.has-hover, "mode-pin", "Закреплённая подсветка\nПоверх остальных всегда одна линия: последнего добавленного блока или та, по которой щёлкнули на графике; остальные бледнее.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
+            }
         }
         Text {
             x: root.pad;
             y: parent.height - root.pad - root.actions-h - 24px;
-            text: "Автомодуль · действия с этим блоком";
+            text: root.stats-legend.length > 1 ? "Автомодуль · действия с выбранными блоками" : "Автомодуль · действия с этим блоком";
             color: Palette.dim;
             font-weight: 600;
             font-size: 12px;
@@ -1083,14 +1253,17 @@ export component AppWindow inherits Window {
         y: root.chart-y;
         width: root.stats-w - 2 * root.pad + 4px;
         height: root.chart-h;
-        points: root.chart-points;
+        series: root.chart-series;
+        cols: root.chart-cols;
         yticks: root.chart-yticks;
-        mean-path: root.chart-mean;
-        peak-path: root.chart-peak;
         empty: root.chart-empty;
-        fan-top: root.chart-fan-top;
         columns: root.chart-columns;
+        cutoff: root.chart-cutoff;
+        cutoff-text: root.chart-cutoff-text;
         tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
+        pointer(x, y, w, h) => { root.chart-pointer(x, y, w, h); }
+        exited() => { root.chart-left(); }
+        clicked-at(x, y, w, h) => { root.chart-click(x, y, w, h); }
     }
     Lines {
         x: root.stats-x + root.pad;
@@ -1099,6 +1272,7 @@ export component AppWindow inherits Window {
         height: root.actions-h;
         rows: root.actions;
         empty: root.actions-empty;
+        marks: root.stats-legend.length > 1;
         tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
     }
 

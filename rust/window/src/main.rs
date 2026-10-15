@@ -24,7 +24,7 @@ mod ui {
     )]
     slint::include_modules!();
 }
-use ui::{AppWindow, CellData, ChartPoint, LineRow, LinkData, MenuEntry, SetRow, Tick, TileData};
+use ui::{AppWindow, CellData, Column, LegendItem, LineRow, LinkData, Mark, MenuEntry, Series, SetRow, Tick, TileData};
 
 mod check;
 mod die;
@@ -54,6 +54,16 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_tile_clicked(move |block| v.borrow_mut().clicked(block));
+    let v = Rc::clone(view);
+    ui.on_tile_hover(move |block, on| v.borrow_mut().tile_hover(block, on));
+    let v = Rc::clone(view);
+    ui.on_chart_pointer(move |x, y, w, h| v.borrow_mut().chart_pointer(x, y, w, h));
+    let v = Rc::clone(view);
+    ui.on_chart_left(move || v.borrow_mut().chart_left());
+    let v = Rc::clone(view);
+    ui.on_chart_click(move |x, y, w, h| v.borrow_mut().chart_click(x, y, w, h));
+    let v = Rc::clone(view);
+    ui.on_mode_changed(move |pin| v.borrow_mut().mode_changed(pin));
     let v = Rc::clone(view);
     ui.on_tile_menu(move |block| v.borrow_mut().menu(block));
     let v = Rc::clone(view);

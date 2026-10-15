@@ -8,7 +8,8 @@
 // • state — показания, дважды в секунду, пока окно подключено, и сразу после исполненной команды; окна нет — нет ни
 //   таймера, ни чтения датчиков.
 // Новое, чего у движка не было: history — последние смены потолков (app/history.rs); в state — доля работы ядер
-// (busyShare), потолок автомодуля по блокам (auto) и потолки владельца под ним (intended).
+// (busyShare), потолок автомодуля по блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля
+// (autoLimit).
 //
 // Команды — тоже как у движка (src/Commands.cs): limit.set, profile.save/open/accept/revert/delete, max.reset,
 // notices.seen. Нагрузки и замеров в программе входа нет: их команды отклоняются одной фразой. Поднять потолок выше
@@ -742,6 +743,13 @@ impl App {
         match &self.intended {
             Some(intended) => ints(&mut s, intended.iter().map(|&c| Some(c))),
             None => s.push_str("null"),
+        }
+        // Отсечка автомодуля, °C — окно рисует её линией на графике статистики; null — автомодуль выключен.
+        key(&mut s, "autoLimit");
+        if self.auto.choice.on {
+            s.push_str(&self.auto.choice.limit.to_string());
+        } else {
+            s.push_str("null");
         }
         s.push('}');
         self.send(shell, &s);

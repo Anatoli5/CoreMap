@@ -96,6 +96,9 @@ pub struct State {
     /// auto[b] − intended[первое ядро b].
     #[serde(default, deserialize_with = "lenient")]
     pub intended: Option<Vec<Option<i64>>>,
+    /// Отсечка автомодуля, °C (программа входа; null — автомодуль выключен, у движка C# поля нет).
+    #[serde(default, deserialize_with = "lenient")]
+    pub auto_limit: Option<f64>,
 }
 
 /// Что автомодуль держит у блока: потолок, который он поставил, или подробнее — потолок, от какого принятого и
