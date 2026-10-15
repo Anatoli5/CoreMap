@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use machine::named::Names;
 use serde_json::{Value, json};
 
-use crate::app::{AUTO_ON, App, Confirm, LIMIT_ID, WINDOW_ID};
+use crate::app::{AUTO_ON, App, AutoTiming, Confirm, LIMIT_ID, WINDOW_ID};
 use crate::check::{Report, ceilings_now, hold, logged, pump, pump_until};
 use crate::shell::{self, Shell};
 
@@ -259,6 +259,96 @@ fn window_reads_hello(hello: &Value) -> Result<(), String> {
     )
 }
 
+/// 12m (см. run). Горячий блок — с самым высоким потолком: корпус имитации близко к пределу 75 °C, условие журнала
+/// выполнено без доли работы по Windows. Регулятор на настоящих сроках за несколько секунд ничего не решает.
+fn logging_with_window(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client) {
+    let cores = u64::try_from(app.topology().cores.len()).unwrap_or(0);
+    let now = ceilings_now(app);
+    let Some(hot) = app
+        .topology()
+        .blocks
+        .iter()
+        .max_by_key(|b| now.get(b.first).copied().unwrap_or(0))
+        .cloned()
+    else {
+        r.check(false, "журнал срезов с окном: блоков нет");
+        return;
+    };
+    let was = app.retime(shell, AutoTiming::REAL);
+    if let Some(sim) = app.sim() {
+        for &m in &hot.members {
+            sim.load[m] = 1.0;
+        }
+    }
+    app.command(shell, AUTO_ON);
+    wait(shell, app, client, Duration::from_secs(5), |_| false);
+    let started = app.logging().on;
+    client.collect();
+    let (before, reads, fed, from) = (
+        app.logging(),
+        app.reads(),
+        app.window_fed().unwrap_or(0),
+        client.got.len(),
+    );
+    wait(shell, app, client, Duration::from_secs(4), |_| false);
+    let (after, reads_after, fed_after) = (app.logging(), app.reads(), app.window_fed().unwrap_or(0));
+    let fresh: Vec<Value> = client.got[from..]
+        .iter()
+        .filter(|v| v["t"] == "state")
+        .cloned()
+        .collect();
+    let cost = crate::check::cost_line(app);
+    app.command(shell, AUTO_ON); // выключить
+    if let Some(sim) = app.sim() {
+        for &m in &hot.members {
+            sim.load[m] = 0.0;
+        }
+    }
+    app.retime(shell, was);
+    r.note(&format!(
+        "цена опроса срезов при открытом окне (имитация): {}",
+        cost.unwrap_or_default()
+    ));
+    let blocks = u64::try_from(app.topology().blocks.len()).unwrap_or(0);
+    let (polled, windowed, read) = (
+        after.polls - before.polls,
+        after.window_polls - before.window_polls,
+        reads_after - reads,
+    );
+    // Ревизия 15.10, п. 5: все ядра — только в опросе окна, каждом втором; между ними — первые ядра блоков (журналу и
+    // автомодулю другие не нужны). Чтений ровно столько, ни одного сверх: окно и автомодуль сами не читают.
+    r.check(
+        started
+            && after.on
+            && after.starts == before.starts
+            && polled > 0
+            && (2 * windowed).abs_diff(polled) <= 1
+            && read == windowed * cores + (polled - windowed) * blocks,
+        &format!(
+            "журнал срезов при открытом окне: {polled} опросов, из них {windowed} опросов окна; {read} чтений ядер — все {cores} в опросе окна, {blocks} первых в остальных, ни одного сверх"
+        ),
+    );
+    // Ревизия 15.10, п. 1: средние под нагрузкой — по опросам окна, каждый опрос окна — один раз, и только он.
+    let fed = fed_after - fed;
+    r.check(
+        fed == windowed,
+        &format!("средние под нагрузкой: {fed} опросов окна дошло до средних из {windowed} — каждое чтение один раз"),
+    );
+    let hot_first = hot.first;
+    r.check(
+        (7..=10).contains(&fresh.len())
+            && fresh.iter().all(|s| {
+                s["sensorError"].is_null() && s["cur"].as_array().is_some_and(|a| a.iter().all(Value::is_number))
+            })
+            && fresh.iter().any(|s| s["load"][hot_first] == 1),
+        &format!(
+            "состояний окну за 4 с: {} (дважды в секунду), все с температурами ядер, горячий блок {} — нагружен",
+            fresh.len(),
+            hot.name
+        ),
+    );
+}
+
 fn cores_of(value: &Value) -> Vec<i64> {
     value
         .as_array()
@@ -415,6 +505,11 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data
             sim.load[m] = 0.0;
         }
     }
+
+    // 12m. Журнал срезов на настоящих сроках, пока окно открыто: опрос срезов читает все ядра (окну они нужны) — и это
+    //      единственное чтение: чтений ядер ровно «опросов × ядер», окно раз в полсекунды и автомодуль раз в 2 с сами
+    //      ничего не читают; состояния окну идут дважды в секунду с показаниями этого опроса.
+    logging_with_window(r, app, shell, &mut client);
 
     // 12d. Нагрузка и замеры — отказ одной фразой; неизвестная команда и негодные аргументы — с причиной.
     let (_, ok, why) = order(shell, app, &mut client, "load.toggle", &json!({ "block": 0 }));

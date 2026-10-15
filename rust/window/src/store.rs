@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 
 use crate::samples::{self, AutoEntry, Columns, Fresh, Scratch, Tail, Tally};
 
-/// Как часто смотреть, не дописаны ли журналы. Программа входа пишет срез раз в 2 с; график в окне раз в 5 с
-/// отстаёт от неё не больше чем на два среза, а проверка — несколько вызовов Windows.
+/// Как часто смотреть, не дописаны ли журналы. Программа входа пишет срез раз в 0,25 с (до 0.5.2 — раз в 2 с); график
+/// в окне отстаёт от неё не больше чем на 5 с, а проверка — несколько вызовов Windows и разбор только дописанного.
 pub const SCAN: Duration = Duration::from_secs(5);
 /// Срезы за сколько дней (программа входа хранит 30 и удаляет старые сама).
 pub const DAYS: i64 = 30;
@@ -44,6 +44,8 @@ struct SampleFile {
     headed: bool,
     columns: Option<Columns>,
     tally: Tally,
+    /// Время последней посчитанной строки (мс, `samples::row_time`): следующая порция считает промежуток от неё.
+    previous: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -189,6 +191,7 @@ fn read_samples(path: &Path, file: &mut SampleFile, scratch: &mut Scratch) -> st
             file.headed = false;
             file.columns = None;
             file.tally = Tally::default();
+            file.previous = None;
             text
         }
     };
@@ -204,7 +207,7 @@ fn read_samples(path: &Path, file: &mut SampleFile, scratch: &mut Scratch) -> st
     }
     let rows_before = file.tally.rows;
     if let Some(columns) = &file.columns {
-        scratch.count(columns, body, &mut file.tally);
+        scratch.count(columns, body, &mut file.previous, &mut file.tally);
     }
     Ok(Some((text.len() as u64, file.tally.rows - rows_before)))
 }

@@ -6,6 +6,8 @@
 // часового пояса этой машины для той даты, о которой речь (летнее время учтено).
 #![expect(unsafe_code, reason = "time zone conversion: Win32 calls the standard library lacks")]
 
+use std::fmt::Write as _;
+
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows_sys::Win32::System::Time::{
@@ -157,22 +159,36 @@ impl Stamp {
         }
     }
 
-    /// Местное время по образцу: «dd.MM HH:mm», «HH:mm», «yyyy-MM-dd HH:mm:ss», «yyyy-MM-dd».
+    /// Местное время по образцу: «dd.MM HH:mm», «HH:mm», «yyyy-MM-dd HH:mm:ss», «yyyy-MM-dd», «yyyy-MM-dd HH:mm:ss.fff».
     #[must_use]
     pub fn local(self, pattern: Pattern) -> String {
+        let mut text = String::new();
+        self.write_local(pattern, &mut text);
+        text
+    }
+
+    /// То же, что `local`, — дописывает в `out`: строка среза пишется раз в 0,25 с в один и тот же буфер.
+    pub fn write_local(self, pattern: Pattern, out: &mut String) {
         let local = self.0 + self.offset().unwrap_or(0);
         let Some(st) = civil_of(local) else {
-            return String::new();
+            return;
         };
-        match pattern {
-            Pattern::DayTime => format!("{:02}.{:02} {:02}:{:02}", st.wDay, st.wMonth, st.wHour, st.wMinute),
-            Pattern::Time => format!("{:02}:{:02}", st.wHour, st.wMinute),
-            Pattern::Log => format!(
+        // В String запись не отказывает.
+        let _ = match pattern {
+            Pattern::DayTime => write!(out, "{:02}.{:02} {:02}:{:02}", st.wDay, st.wMonth, st.wHour, st.wMinute),
+            Pattern::Time => write!(out, "{:02}:{:02}", st.wHour, st.wMinute),
+            Pattern::Log => write!(
+                out,
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
             ),
-            Pattern::Date => format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
-        }
+            Pattern::Date => write!(out, "{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+            Pattern::Millis => write!(
+                out,
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+            ),
+        };
     }
 
     /// Мировое время для запроса к журналу Windows: «yyyy-MM-ddTHH:mm:ss.fffZ» (как в Profile.FirstEvent).
@@ -196,6 +212,8 @@ pub enum Pattern {
     Log,
     /// Имя дневного файла.
     Date,
+    /// «yyyy-MM-dd HH:mm:ss.fff» — строка среза: опрос идёт раз в 0,25 с, секунд мало.
+    Millis,
 }
 
 /// Отметка из FILETIME (журнал Windows отдаёт время событий так).
@@ -271,6 +289,21 @@ mod tests {
         let a = Stamp::parse_roundtrip("2026-01-02T03:04:05.0000001Z").expect("utc");
         let b = Stamp::parse_roundtrip("2026-01-02T06:04:05.0000001+03:00").expect("offset");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn millis_pattern_keeps_the_milliseconds_of_the_instant() {
+        // 22:33:26.1031323 UTC: whatever the zone, seconds and milliseconds of local time are those of the instant
+        // (zones differ by whole minutes), and the form is the seconds form plus «.mmm».
+        let stamp = Stamp::parse_roundtrip("2026-10-14T22:33:26.1031323Z").expect("utc");
+        let millis = stamp.local(Pattern::Millis);
+        assert_eq!(millis.len(), 23, "{millis}");
+        assert!(millis.starts_with(&stamp.local(Pattern::Log)), "{millis}");
+        assert!(millis.ends_with(":26.103"), "{millis}");
+        // The buffer form appends, it does not replace: a samples row is built field after field.
+        let mut row = String::from("x,");
+        stamp.write_local(Pattern::Millis, &mut row);
+        assert_eq!(row, format!("x,{millis}"));
     }
 
     #[test]

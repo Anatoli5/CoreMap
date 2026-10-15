@@ -12,12 +12,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use machine::clock::Stamp;
+use machine::clock::{Pattern, Stamp};
 use machine::events::{Event, EventLog};
 use machine::named::{self, Names};
 use machine::thermal::Thermal;
 
-use crate::app::{AUTO_ON, App, Config, Confirm, DEPTH_ID, EXIT_ID, FACTORY_ID, LIMIT_ID, WINDOW_ID};
+use crate::app::{AUTO_ON, App, AutoTiming, Config, Confirm, DEPTH_ID, EXIT_ID, FACTORY_ID, LIMIT_ID, WINDOW_ID};
 use crate::shell::{self, Item, Menu, Shell};
 
 /// Журнал без сбоев: проверка не зависит от истории машины.
@@ -201,9 +201,12 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
         lease_wait: 500,
         wake_gap: Duration::from_millis(500),
         // Сроки автомодуля в проверке укорочены: опрос 50 мс, окно 0,4 с, пауза 0,3 с, прохлада 1 с; запрет памяти
-        // перегрева 2 с (вдвое за повтор, не дольше 8 с, прощение через минуту).
+        // перегрева 2 с (вдвое за повтор, не дольше 8 с, прощение через минуту). Опрос срезов — тоже 50 мс, обороты
+        // при нём — каждый восьмой (как 2 с при 0,25 с); настоящий шаг журнала — отдельным шагом проверки (12m).
         auto: crate::app::AutoTiming {
             tick: Duration::from_millis(50),
+            sample: Duration::from_millis(50),
+            fans: Duration::from_millis(400),
             control: machine::auto::Timing {
                 window: Duration::from_millis(400),
                 settle: Duration::from_millis(300),
@@ -786,6 +789,9 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     }
     app.command(shell, AUTO_ON); // выключить: дальше меряется покой без опроса
 
+    // 11b. Журнал срезов на настоящих сроках (опрос 0,25 с, обороты раз в 2 с, решение раз в 2 с), окна нет.
+    logging_real(r, app, shell, data, &block);
+
     // 10. Цена: память и процессор в покое, окна нет.
     let idle_from = shell::usage();
     pump(shell, app, Duration::from_secs(3));
@@ -811,6 +817,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     // 12. Окно по каналу (DECISIONS #32, шаг 2) — после замера цены: его клиент держит в этом же процессе все
     //     полученные сообщения, и память после него — уже не память программы входа.
     crate::check_window::run(r, app, shell, names, data);
+
+    // 13. Журнал срезов, когда что-то не так: файл дня удалён, перемещён, не открывается; обороты отказывают; потолки
+    //     не читаются. Последним шагом: файл дня после него может не открываться ещё 10 с.
+    logging_failures(r, app, shell, data);
 }
 
 /// Журналы автомодуля после снижений: строки действий с условиями и запретом, срезы с заголовком по всем блокам.
@@ -837,14 +847,284 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             lowerings.len()
         ),
     );
-    let day = machine::clock::Stamp::now().local(machine::clock::Pattern::Date);
-    let samples = fs::read_to_string(data.join("samples").join(format!("{day}.csv"))).unwrap_or_default();
+    let samples = fs::read_to_string(today(data)).unwrap_or_default();
     let mut lines = samples.lines();
     let width = 4 + 4 * blocks;
     let header = lines.next().map_or(0, |h| h.split(',').count());
-    let rows: Vec<usize> = lines.map(|l| l.split(',').count()).collect();
+    let rows: Vec<&str> = lines.collect();
     r.check(
-        header == width && !rows.is_empty() && rows.iter().all(|&n| n == width),
+        header == width && !rows.is_empty() && rows.iter().all(|l| l.split(',').count() == width),
         &format!("срезы: заголовок {header} столбцов из {width}, строк {}", rows.len()),
     );
+    let timed = rows.iter().filter(|l| ms_of_day(field(l, 0)).is_some()).count();
+    let fans = rows.iter().filter(|l| !field(l, 2).is_empty()).count();
+    r.check(
+        timed == rows.len() && fans > 0 && fans < rows.len(),
+        &format!(
+            "срезы: время с миллисекундами у {timed} строк из {}; обороты — в {fans} строках (где прочитаны), в остальных пусто",
+            rows.len()
+        ),
+    );
+}
+
+/// Поле строки среза по номеру ("" — нет такого).
+fn field(line: &str, k: usize) -> &str {
+    line.split(',').nth(k).unwrap_or("")
+}
+
+/// Миллисекунды от полуночи по времени строки среза «гггг-мм-дд чч:мм:сс.ммм»; None — время не такого вида.
+fn ms_of_day(time: &str) -> Option<i64> {
+    if time.len() != 23 || time.as_bytes().get(19) != Some(&b'.') {
+        return None;
+    }
+    let n = |at: std::ops::Range<usize>| time.get(at)?.parse::<i64>().ok();
+    Some(((n(11..13)? * 60 + n(14..16)?) * 60 + n(17..19)?) * 1000 + n(20..23)?)
+}
+
+/// Строки сегодняшних срезов со временем позже `from` (оно — в том же виде, что у строк).
+pub fn rows_since(data: &Path, from: &str) -> Vec<String> {
+    fs::read_to_string(today(data))
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter(|l| field(l, 0) > from)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Последняя строка цены опроса срезов в tray.log.
+pub fn cost_line(app: &App) -> Option<String> {
+    fs::read_to_string(app.journal().tray_path())
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .find(|l| l.contains("срезы: опросов"))
+        .map(str::to_string)
+}
+
+/// 11b. Журнал срезов на настоящих сроках (опрос 0,25 с, обороты раз в 2 с, решение раз в 2 с), окна нет: строки раз
+/// в 0,25 с со временем до миллисекунд, обороты — в каждой восьмой строке, в остальных пусто; ядра читает только опрос
+/// срезов — первое ядро каждого блока на опрос, автомодуль раз в 2 с сам не читает. Регулятор на этих сроках за
+/// несколько секунд ничего не решает (окно 20 с). Только имитация: настоящие таймеры, но не настоящий процессор.
+fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &machine::topology::Block) {
+    let blocks = u64::try_from(app.topology().blocks.len()).unwrap_or(0);
+    let was = app.retime(shell, AutoTiming::REAL);
+    if let Some(sim) = app.sim() {
+        for &m in &hot.members {
+            sim.load[m] = 1.0;
+        }
+    }
+    let from = Stamp::now().local(Pattern::Millis);
+    app.command(shell, AUTO_ON);
+    pump_until(shell, app, Duration::from_secs(5), |a| a.logging().on);
+    let (before, reads) = (app.logging(), app.reads());
+    pump(shell, app, Duration::from_secs(6));
+    let (after, reads_after) = (app.logging(), app.reads());
+    app.command(shell, AUTO_ON); // выключить
+    let stopped = !app.logging().on;
+    if let Some(sim) = app.sim() {
+        for &m in &hot.members {
+            sim.load[m] = 0.0;
+        }
+    }
+    let cost = cost_line(app);
+    app.retime(shell, was);
+    r.check(
+        before.on && after.on && after.starts == before.starts && stopped,
+        "журнал срезов: начался по условию автомодуля, шёл без перерыва 6 с, с выключением автомодуля остановлен",
+    );
+    let (polled, read) = (after.polls - before.polls, reads_after - reads);
+    r.check(
+        polled > 0 && read == polled * blocks,
+        &format!(
+            "журнал срезов без окна: {read} чтений ядер за {polled} опросов — по первому ядру каждого из {blocks} блоков; автомодуль за это время сам не читал"
+        ),
+    );
+    let rows = rows_since(data, &from);
+    let times: Vec<i64> = rows.iter().filter_map(|l| ms_of_day(field(l, 0))).collect();
+    let mut steps: Vec<i64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+    steps.sort_unstable();
+    let median = steps.get(steps.len() / 2).copied().unwrap_or(0);
+    let (low, high) = (steps.first().copied().unwrap_or(0), steps.last().copied().unwrap_or(0));
+    r.check(
+        times.len() == rows.len() && rows.len() >= 20 && (240..=265).contains(&median) && high < 400,
+        &format!(
+            "строки срезов на настоящих сроках: {} строк, время с миллисекундами у {}; шаг — медиана {median} мс, от {low} до {high} мс",
+            rows.len(),
+            times.len()
+        ),
+    );
+    let fan_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| !field(l, 2).is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    let gaps: Vec<usize> = fan_rows.windows(2).map(|w| w[1] - w[0]).collect();
+    // Первая строка с оборотами — одна из первых восьми: какая именно, зависит от того, когда обороты читались до
+    // начала журнала (опрос автомодуля без журнала читает их раз в 10 с), а не от журнала (ревизия 15.10, п. 9).
+    r.check(
+        fan_rows.first().is_some_and(|&first| first < 8) && fan_rows.len() >= 2 && gaps.iter().all(|&g| g == 8),
+        &format!(
+            "обороты — в одной из первых восьми строк и дальше в каждой восьмой (строки {fan_rows:?} из {}), в остальных пусто",
+            rows.len()
+        ),
+    );
+    r.check(
+        cost.is_some(),
+        &format!("цена опроса срезов в tray.log (имитация): {}", cost.unwrap_or_default()),
+    );
+}
+
+/// Файл сегодняшних срезов.
+fn today(data: &Path) -> std::path::PathBuf {
+    data.join("samples")
+        .join(format!("{}.csv", Stamp::now().local(Pattern::Date)))
+}
+
+/// Строк в файле (0 — файла нет или он не читается).
+fn lines_in(path: &Path) -> usize {
+    fs::read_to_string(path).map_or(0, |t| t.lines().count())
+}
+
+/// Шаг 13 — журнал срезов, когда что-то не так (ревизия outputs/review-sampling-2026-10-15.md, пункты 3, 4, 7, 8):
+/// файл дня удалён и перемещён посреди записи, обороты отказывают, потолки не читаются, файл дня не открывается.
+/// Сроки: опрос срезов 50 мс, обороты и сверка файла дня — раз в 0,4 с, опрос автомодуля 0,2 с; регулятор — на
+/// настоящих сроках и за эти секунды ничего не решает. Окна нет.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario, step after step, reads best as one piece"
+)]
+fn logging_failures(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path) {
+    let was = app.retime(
+        shell,
+        AutoTiming {
+            tick: Duration::from_millis(200),
+            sample: Duration::from_millis(50),
+            fans: Duration::from_millis(400),
+            control: machine::auto::Timing::REAL,
+            bans: machine::memory::Spans::REAL,
+        },
+    );
+    let now = ceilings_now(app);
+    let Some(hot) = app
+        .topology()
+        .blocks
+        .iter()
+        .max_by_key(|b| now.get(b.first).copied().unwrap_or(0))
+        .cloned()
+    else {
+        r.check(false, "журнал срезов, отказы: блоков нет");
+        return;
+    };
+    let load = |app: &mut App, value: f64| {
+        if let Some(sim) = app.sim() {
+            for &m in &hot.members {
+                sim.load[m] = value;
+            }
+        }
+    };
+    let file = today(data);
+    load(app, 1.0);
+    app.command(shell, AUTO_ON);
+    pump_until(shell, app, Duration::from_secs(2), |a| a.logging().on);
+    // Файл открыт журналом, только когда в него легла строка этого журнала: удалить его раньше — значит проверить
+    // открытие нового, а не удаление открытого (так первая версия шага прошла на коде до исправления).
+    let size = fs::metadata(&file).map_or(0, |m| m.len());
+    pump_until(shell, app, Duration::from_secs(1), |_| {
+        fs::metadata(&file).is_ok_and(|m| m.len() > size)
+    });
+
+    // п. 8: файл дня удалён — строки не уходят в удалённый файл, начинается новый с заголовком.
+    let removed = fs::remove_file(&file).is_ok();
+    pump_until(shell, app, Duration::from_secs(2), |_| lines_in(&file) >= 3);
+    let text = fs::read_to_string(&file).unwrap_or_default();
+    r.check(
+        removed && text.starts_with("time,") && text.lines().count() >= 3,
+        &format!(
+            "файл срезов удалён посреди записи — начат новый, с заголовком ({} строк)",
+            text.lines().count()
+        ),
+    );
+    // п. 8: файл дня перемещён — в перемещённый больше не пишется, строки идут в новый файл дня.
+    let moved = file.with_file_name("moved.csv");
+    let renamed = fs::rename(&file, &moved).is_ok();
+    pump_until(shell, app, Duration::from_secs(2), |_| lines_in(&file) >= 2);
+    let left = fs::metadata(&moved).map_or(0, |m| m.len());
+    pump(shell, app, Duration::from_millis(500));
+    let still = fs::metadata(&moved).map_or(0, |m| m.len());
+    r.check(
+        renamed && lines_in(&file) >= 2 && still == left,
+        &format!(
+            "файл срезов перемещён — строки идут в новый файл дня, в перемещённый больше нет ({left} → {still} байт)"
+        ),
+    );
+    let _ = fs::remove_file(&moved); // временная папка проверки: не удалился — удалится с ней
+
+    // п. 4: обороты отказали — следующая попытка через 10 с (как до 0.5.2), а не в шаге журнала: каждая попытка у
+    // настоящей прошивки может держать цикл программы до 4 с.
+    app.sim_fans(true);
+    let calls = app.fan_calls();
+    pump_until(shell, app, Duration::from_secs(2), |a| a.fan_calls() > calls);
+    let failed = app.fan_calls();
+    pump(shell, app, Duration::from_secs(2));
+    let again = app.fan_calls() - failed;
+    let going = app.logging().on;
+    app.sim_fans(false);
+    r.check(
+        failed == calls + 1 && again == 0 && going,
+        &format!(
+            "обороты отказали посреди журнала — за 2 с после отказа попыток {again} (шаг оборотов 0,4 с; повтор — через 10 с), журнал идёт"
+        ),
+    );
+
+    // п. 3: потолки не читаются — строк нет (столбец потолков был бы не прочитан), опроса срезов нет (он открывал бы
+    // драйвер, который опрос автомодуля после ошибки отпускает); прочитались снова — журнал пишется.
+    let deaf = app
+        .topology()
+        .blocks
+        .iter()
+        .find(|b| b.first != hot.first)
+        .map_or(0, |b| b.first);
+    if let Some(sim) = app.sim() {
+        sim.set_deaf(deaf, true);
+    }
+    pump_until(shell, app, Duration::from_secs(2), |a| !a.logging().on);
+    let (stopped, polls, rows) = (!app.logging().on, app.logging().polls, lines_in(&file));
+    pump(shell, app, Duration::from_secs(1));
+    let quiet = !app.logging().on && app.logging().polls == polls && lines_in(&file) == rows;
+    if let Some(sim) = app.sim() {
+        sim.set_deaf(deaf, false);
+    }
+    pump_until(shell, app, Duration::from_secs(2), |a| a.logging().on);
+    r.check(
+        stopped && quiet && app.logging().on,
+        "потолки не читаются — журнал срезов стоит (ни опроса, ни строк), прочитались снова — пишется",
+    );
+
+    // п. 7: файл дня не открывается — одна попытка и одна строка в error.log, следующая попытка через 10 с, а не в
+    // каждом опросе.
+    app.command(shell, AUTO_ON); // выключить: журнал стоит, файл закрыт
+    let _ = fs::remove_file(&file); // файла может и не быть: на его месте нужна папка
+    let blocked = fs::create_dir(&file).is_ok();
+    let opens = app.logging().opens;
+    app.command(shell, AUTO_ON);
+    pump_until(shell, app, Duration::from_secs(2), |a| a.logging().on);
+    let polls = app.logging().polls;
+    pump(shell, app, Duration::from_millis(1500));
+    let (tries, polled) = (app.logging().opens - opens, app.logging().polls - polls);
+    app.command(shell, AUTO_ON); // выключить
+    let told = fs::read_to_string(data.join("error.log"))
+        .unwrap_or_default()
+        .matches("срез не записан")
+        .count();
+    let _ = fs::remove_dir(&file); // временная папка проверки, как выше
+    r.check(
+        blocked && polled >= 10 && tries == 1 && told == 1,
+        &format!(
+            "файл дня не открывается — попыток {tries} за {polled} опросов, строк в error.log {told}; следующая — через 10 с"
+        ),
+    );
+    load(app, 0.0);
+    app.retime(shell, was);
 }

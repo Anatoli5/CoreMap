@@ -1,21 +1,28 @@
-// Показания ядер, когда их читают двое: окно (все ядра раз в полсекунды) и автомодуль (первые ядра блоков раз в 2 с).
+// Показания ядер, когда их читает один опрос, а берут трое: журнал срезов (раз в 0,25 с, app/sense.rs), окно (раз в
+// полсекунды) и автомодуль (раз в 2 с).
 //
 // Доля работы и фактический множитель — по приращениям счётчиков ядра между двумя чтениями (machine::thermal), и
-// счётчики у ядра одни. Если бы автомодуль читал ядро сам, пока его читает окно, его показание покрывало бы не 2 с, а
-// то, что осталось с последнего чтения окна (доли секунды). Поэтому каждое чтение ядра идёт сюда (`Meter::record`), а
-// автомодуль забирает сумму за всё время со своего прошлого раза (`Meter::drain`): доля работы — среднее по времени,
-// множитель — среднее по времени работы. Это ровно то, что дало бы одно чтение через 2 с: приращения счётчиков
-// складываются. Окна нет — автомодуль читает сам, и сумма состоит из одного его чтения, как раньше.
+// счётчики у ядра одни. Если бы автомодуль читал ядро сам, пока его читает опрос срезов или окно, его показание
+// покрывало бы не 2 с, а то, что осталось с последнего чужого чтения (доли секунды). Поэтому каждое чтение ядра идёт
+// сюда (`Meter::record`), а автомодуль забирает сумму за всё время со своего прошлого раза (`Meter::drain`): доля
+// работы — среднее по времени, множитель — среднее по времени работы. Это ровно то, что дало бы одно чтение через 2 с:
+// приращения счётчиков складываются. Никто больше не читает — автомодуль читает сам, и сумма состоит из одного его
+// чтения, как раньше. Последнее показание каждого ядра (`Meter::latest`) — строка среза; последняя температура корпуса
+// (`Meter::package_within`) — автомодулю, чтобы не читать её второй раз.
 //
-// `Watch` — что видит окно: последнее показание каждого ядра, наибольшая температура с последнего сброса и средняя
-// под нагрузкой (Core.Average в C#-части, правило ниже).
+// `Watch` — что видит окно. Так же, как автомодуль, окно складывает каждое чтение ядра в свою сумму и забирает её в
+// своём опросе раз в полсекунды (`Watch::polled`): доля работы и множитель в состоянии окна и в средней под нагрузкой —
+// за полсекунды с прошлого опроса окна, кто бы ни читал ядро в это время. Прежде, пока шёл журнал срезов, окно брало
+// последнее показание за 0,25 с — каждое второе, а после начала журнала порой одно и то же дважды (ревизия 15.10,
+// п. 1). Наибольшая температура — по каждому чтению сразу: пик между опросами окна не теряется. Средняя под
+// нагрузкой — правило Core.Average в C#-части (ниже).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use machine::auto::BUSY;
 use machine::thermal::Reading;
 
-/// Сумма показаний одного ядра со времени прошлого `drain`.
+/// Сумма показаний одного ядра со времени, когда её забрали в прошлый раз.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Sum {
     /// Секунд с известной долей работы.
@@ -28,13 +35,43 @@ struct Sum {
     ratio: f64,
 }
 
+impl Sum {
+    /// Показание за `seconds` с прошлого чтения ядра; без доли работы за этот отрезок известна только температура.
+    fn add(&mut self, seconds: f64, reading: Reading) {
+        let Some(busy) = reading.busy else { return };
+        self.time += seconds;
+        self.busy += busy * seconds;
+        if let Some(ratio) = reading.ratio {
+            self.run += busy * seconds;
+            self.ratio += ratio * busy * seconds;
+        }
+    }
+
+    /// Доля работы (среднее по времени) и множитель (среднее по времени работы) за всё сложенное.
+    fn mean(&self) -> (Option<f64>, Option<f64>) {
+        (
+            (self.time > 0.0).then(|| self.busy / self.time),
+            (self.run > 0.0).then(|| self.ratio / self.run),
+        )
+    }
+}
+
+/// Температура корпуса из опроса: когда прочитана и что дала (None — датчик не дал действительного показания).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PackageRead {
+    pub value: Option<f64>,
+    pub at: Instant,
+}
+
 /// Чтения ядер и их суммы для автомодуля.
 #[derive(Debug, Clone)]
 pub struct Meter {
     last: Vec<Option<Instant>>,
-    temp: Vec<Option<f64>>,
+    latest: Vec<Reading>,
     sums: Vec<Sum>,
-    /// Сколько ядер прочитано всего — скрытая проверка видит, не читает ли программа без окна.
+    /// Последняя температура корпуса и когда она прочитана.
+    package: Option<PackageRead>,
+    /// Сколько ядер прочитано всего — скрытая проверка видит, не читает ли программа без окна и не читает ли дважды.
     pub reads: u64,
 }
 
@@ -43,29 +80,26 @@ impl Meter {
     pub fn new(cores: usize) -> Self {
         Self {
             last: vec![None; cores],
-            temp: vec![None; cores],
+            latest: vec![Reading::default(); cores],
             sums: vec![Sum::default(); cores],
+            package: None,
             reads: 0,
         }
     }
 
-    /// Ядро прочитано в `at`: показание покрывает время с его прошлого чтения.
-    pub fn record(&mut self, core: usize, reading: Reading, at: Instant) {
+    /// Ядро прочитано в `at`: показание покрывает время с его прошлого чтения. Возвращает это время, секунды (None —
+    /// первое чтение: сравнивать не с чем); его же складывает окно (`Watch::core`).
+    pub fn record(&mut self, core: usize, reading: Reading, at: Instant) -> Option<f64> {
         self.reads += 1;
-        let Some(slot) = self.sums.get_mut(core) else { return };
+        let slot = self.sums.get_mut(core)?;
         let since = self.last[core]
             .replace(at)
             .map(|t| at.saturating_duration_since(t).as_secs_f64());
-        self.temp[core] = reading.temp;
-        let (Some(seconds), Some(busy)) = (since, reading.busy) else {
-            return; // первое чтение или перерыв: за этот отрезок известно только температура
-        };
-        slot.time += seconds;
-        slot.busy += busy * seconds;
-        if let Some(ratio) = reading.ratio {
-            slot.run += busy * seconds;
-            slot.ratio += ratio * busy * seconds;
+        self.latest[core] = reading;
+        if let Some(seconds) = since {
+            slot.add(seconds, reading);
         }
+        since
     }
 
     /// Было ли чтение ядра после прошлого `drain`.
@@ -74,15 +108,33 @@ impl Meter {
         self.sums.get(core).is_some_and(|s| s.time > 0.0)
     }
 
+    /// Последнее показание ядра как оно прочитано: доля работы и множитель — за промежуток до прошлого чтения.
+    #[must_use]
+    pub fn latest(&self, core: usize) -> Reading {
+        self.latest.get(core).copied().unwrap_or_default()
+    }
+
+    /// Корпус прочитан в `at`.
+    pub fn record_package(&mut self, value: Option<f64>, at: Instant) {
+        self.package = Some(PackageRead { value, at });
+    }
+
+    /// Температура корпуса, прочитанная не раньше чем `age` назад; None — такой нет (читать самому).
+    #[must_use]
+    pub fn package_within(&self, age: Duration) -> Option<PackageRead> {
+        self.package.filter(|read| read.at.elapsed() <= age)
+    }
+
     /// Показание ядра за всё время с прошлого раза (температура — последняя) и начать сумму заново.
     pub fn drain(&mut self, core: usize) -> Reading {
         let Some(sum) = self.sums.get_mut(core).map(std::mem::take) else {
             return Reading::default();
         };
+        let (busy, ratio) = sum.mean();
         Reading {
-            temp: self.temp[core],
-            busy: (sum.time > 0.0).then(|| sum.busy / sum.time),
-            ratio: (sum.run > 0.0).then(|| sum.ratio / sum.run),
+            temp: self.latest[core].temp,
+            busy,
+            ratio,
         }
     }
 
@@ -141,12 +193,24 @@ impl Means {
         }
     }
 
-    fn add(&mut self, ceilings: &[i32], cur: &[Option<f64>], ratio: &[Option<f64>], busy: &[Option<f64>]) {
+    /// Опрос окна при этих потолках. В счёт — только ядра, прочитанные с прошлого опроса (`fresh`): прежнее показание
+    /// второй раз не считается.
+    fn add(
+        &mut self,
+        ceilings: &[i32],
+        cur: &[Option<f64>],
+        ratio: &[Option<f64>],
+        busy: &[Option<f64>],
+        fresh: &[bool],
+    ) {
         if self.key != ceilings {
             ceilings.clone_into(&mut self.key);
             self.restart(busy);
         }
         for i in 0..self.streak.len() {
+            if !fresh.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             if !busy.get(i).copied().flatten().is_some_and(|b| b >= BUSY) {
                 self.streak[i] = 0;
                 continue;
@@ -181,7 +245,8 @@ impl Means {
     }
 }
 
-/// Что видит окно: последние показания ядер и корпуса, наибольшие с последнего сброса, средние под нагрузкой.
+/// Что видит окно: показания ядер на прошлый опрос окна (температура — последняя, доля работы и множитель — за время
+/// от позапрошлого опроса), корпус, наибольшие с последнего сброса, средние под нагрузкой.
 #[derive(Debug, Clone)]
 pub struct Watch {
     pub cur: Vec<Option<f64>>,
@@ -192,8 +257,14 @@ pub struct Watch {
     pub pkg_max: Option<f64>,
     /// С какого времени считаются наибольшие и средние.
     pub since: Instant,
-    /// Сколько опросов прошло (номер состояния для окна).
+    /// Сколько опросов окна дошло до средних под нагрузкой (скрытая проверка: каждое чтение — в одном опросе).
     pub polls: u64,
+    /// Когда был прошлый опрос окна; None — ещё не было.
+    polled_at: Option<Instant>,
+    /// По ядрам, с прошлого опроса окна: последняя температура, сумма промежутков, было ли чтение.
+    temp: Vec<Option<f64>>,
+    sums: Vec<Sum>,
+    fresh: Vec<bool>,
     means: Means,
 }
 
@@ -209,21 +280,28 @@ impl Watch {
             pkg_max: None,
             since: Instant::now(),
             polls: 0,
+            polled_at: None,
+            temp: vec![None; cores],
+            sums: vec![Sum::default(); cores],
+            fresh: vec![false; cores],
             means: Means::new(cores),
         }
     }
 
-    /// Показание ядра из опроса.
-    pub fn core(&mut self, core: usize, reading: Reading) {
+    /// Ядро прочитано (`seconds` — время с его прошлого чтения, `Meter::record`): наибольшая — сразу, остальное — в
+    /// опрос окна.
+    pub fn core(&mut self, core: usize, reading: Reading, seconds: Option<f64>) {
         if core >= self.cur.len() {
             return;
         }
-        self.cur[core] = reading.temp;
-        self.ratio[core] = reading.ratio;
-        self.busy[core] = reading.busy;
         if let Some(t) = reading.temp {
             self.max[core] = Some(self.max[core].map_or(t, |m| m.max(t)));
         }
+        self.temp[core] = reading.temp;
+        if let Some(seconds) = seconds {
+            self.sums[core].add(seconds, reading);
+        }
+        self.fresh[core] = true;
     }
 
     pub fn package(&mut self, pkg: Option<f64>) {
@@ -233,10 +311,33 @@ impl Watch {
         }
     }
 
-    /// Опрос окончен: средние под нагрузкой при этих потолках.
-    pub fn polled(&mut self, ceilings: &[i32]) {
+    /// Пора ли опросу окна: прошлый был не ближе `min` (или его не было).
+    #[must_use]
+    pub fn due(&self, now: Instant, min: Duration) -> bool {
+        self.polled_at.is_none_or(|t| now.saturating_duration_since(t) >= min)
+    }
+
+    /// Опрос окна в `now` при этих потолках: у ядер, прочитанных с прошлого, — последняя температура, доля работы и
+    /// множитель за всё время с него; затем средние под нагрузкой. С прошлого опроса ничего не прочитано — ничего не
+    /// меняется.
+    pub fn polled(&mut self, ceilings: &[i32], now: Instant) {
+        if !self.fresh.contains(&true) {
+            return;
+        }
+        for i in 0..self.cur.len() {
+            if !self.fresh[i] {
+                continue;
+            }
+            let (busy, ratio) = std::mem::take(&mut self.sums[i]).mean();
+            self.cur[i] = self.temp[i];
+            self.busy[i] = busy;
+            self.ratio[i] = ratio;
+        }
+        self.means
+            .add(ceilings, &self.cur, &self.ratio, &self.busy, &self.fresh);
+        self.fresh.fill(false);
         self.polls += 1;
-        self.means.add(ceilings, &self.cur, &self.ratio, &self.busy);
+        self.polled_at = Some(now);
     }
 
     /// Датчики не читались (держит другая часть `CoreMap` или ошибка): показаний нет, наибольшие и средние остаются.
@@ -245,7 +346,6 @@ impl Watch {
         self.ratio.fill(None);
         self.busy.fill(None);
         self.pkg = None;
-        self.polls += 1;
     }
 
     /// «Сбросить максимумы»: наибольшие — с нынешних, средние — заново (Monitor.ResetMax и Core.ResetAverage).
@@ -269,8 +369,6 @@ impl Watch {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn reading(temp: f64, busy: f64, ratio: Option<f64>) -> Reading {
@@ -301,6 +399,57 @@ mod tests {
     }
 
     #[test]
+    fn the_row_takes_the_last_interval_and_the_auto_module_the_sum() {
+        // Two reads 0.25 s apart: the samples row shows the second read as it is (its own interval), the auto module's
+        // drain sums both intervals — one does not disturb the other.
+        let mut meter = Meter::new(1);
+        let t0 = Instant::now();
+        meter.record(0, Reading::default(), t0);
+        meter.record(0, reading(70.0, 1.0, Some(50.0)), t0 + Duration::from_millis(250));
+        meter.record(0, reading(72.0, 0.2, Some(44.0)), t0 + Duration::from_millis(500));
+        assert_eq!(meter.latest(0), reading(72.0, 0.2, Some(44.0)));
+        let sum = meter.drain(0);
+        assert!((sum.busy.unwrap_or(f64::NAN) - 0.6).abs() < 1e-9, "{sum:?}");
+        assert_eq!(
+            meter.latest(0),
+            reading(72.0, 0.2, Some(44.0)),
+            "a drain leaves the latest read"
+        );
+        assert_eq!(
+            meter.latest(5),
+            Reading::default(),
+            "no such core — nothing, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_package_read_is_reused_only_while_fresh() {
+        let mut meter = Meter::new(1);
+        assert!(
+            meter.package_within(Duration::from_secs(1)).is_none(),
+            "nothing read yet"
+        );
+        meter.record_package(Some(80.0), Instant::now());
+        assert_eq!(
+            meter.package_within(Duration::from_secs(1)).map(|p| p.value),
+            Some(Some(80.0))
+        );
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("the machine has been up for 2 s");
+        meter.record_package(None, old);
+        assert!(
+            meter.package_within(Duration::from_secs(1)).is_none(),
+            "2 s old is not fresh for a 1 s age"
+        );
+        assert_eq!(
+            meter.package_within(Duration::from_secs(3)).map(|p| p.value),
+            Some(None),
+            "an invalid reading is still a reading"
+        );
+    }
+
+    #[test]
     fn ratio_is_weighted_by_running_time_not_by_reads() {
         // 1.5 s at busy 1 and ratio 50, then 0.5 s at busy 0.2 and ratio 30: running time 1.5 vs 0.1 s.
         let mut meter = Meter::new(1);
@@ -313,11 +462,12 @@ mod tests {
         assert!((r.ratio.unwrap_or(f64::NAN) - expected).abs() < 1e-9);
     }
 
+    /// One window poll: every core read once over the last half second.
     fn poll(watch: &mut Watch, ceilings: &[i32], temps: &[f64], busy: &[f64]) {
         for (i, (&t, &b)) in temps.iter().zip(busy).enumerate() {
-            watch.core(i, reading(t, b, (b > 0.05).then_some(45.0)));
+            watch.core(i, reading(t, b, (b > 0.05).then_some(45.0)), Some(0.5));
         }
-        watch.polled(ceilings);
+        watch.polled(ceilings, Instant::now());
     }
 
     #[test]
@@ -342,6 +492,80 @@ mod tests {
         assert_eq!(watch.avg()[0], Some(80.0));
         poll(&mut watch, &ceilings, &[83.0, 50.0], &[1.0, 0.0]);
         assert_eq!(watch.avg()[0], Some(81.0));
+    }
+
+    #[test]
+    fn a_poll_without_a_new_reading_adds_nothing() {
+        // Review 15.10, finding 1: a window poll that comes before the next reading must not count the last reading
+        // a second time (it did when the samples log started between two window polls).
+        let mut watch = Watch::new(1);
+        for _ in 0..=WARM {
+            poll(&mut watch, &[50], &[80.0], &[1.0]);
+        }
+        assert_eq!(watch.avg()[0], Some(80.0));
+        watch.core(0, reading(90.0, 1.0, Some(45.0)), Some(0.5));
+        watch.polled(&[50], Instant::now());
+        assert_eq!(watch.avg()[0], Some(85.0));
+        let polls = watch.polls;
+        watch.polled(&[50], Instant::now());
+        assert_eq!(watch.avg()[0], Some(85.0), "the same reading counted twice");
+        assert_eq!(watch.polls, polls, "a poll with nothing new is no poll");
+    }
+
+    #[test]
+    fn a_window_poll_takes_every_reading_since_the_last_one() {
+        // Review 15.10, finding 1: while the samples log runs, the first core of a block is read every 0.25 s and the
+        // window polls every 0.5 s. The window's load and multiplier must be those of its whole half second (as when it
+        // read the core itself), not of the last quarter: 0.8 then 0.3 is 0.55 — loaded; the last read alone (0.3)
+        // is not. Core 1 stands for a non-first E core, read once per window poll.
+        let mut watch = Watch::new(2);
+        for _ in 0..=WARM {
+            watch.core(0, reading(90.0, 0.8, Some(50.0)), Some(0.25));
+            watch.core(0, reading(82.0, 0.3, Some(40.0)), Some(0.25));
+            watch.core(1, reading(60.0, 0.6, Some(30.0)), Some(0.5));
+            watch.polled(&[50, 46], Instant::now());
+        }
+        assert!(
+            (watch.busy[0].unwrap_or(f64::NAN) - 0.55).abs() < 1e-9,
+            "{:?}",
+            watch.busy
+        );
+        let ratio = (50.0 * 0.8 + 40.0 * 0.3) / (0.8 + 0.3);
+        assert!(
+            (watch.ratio[0].unwrap_or(f64::NAN) - ratio).abs() < 1e-9,
+            "{:?}",
+            watch.ratio
+        );
+        assert_eq!(
+            watch.cur,
+            [Some(82.0), Some(60.0)],
+            "the temperature is the latest read"
+        );
+        assert_eq!(watch.max[0], Some(90.0), "a peak between window polls is kept");
+        assert_eq!(
+            watch.avg(),
+            [Some(82.0), Some(60.0)],
+            "both loaded over their half second"
+        );
+        assert!((watch.avg_ratio()[0].unwrap_or(f64::NAN) - ratio).abs() < 1e-9);
+        assert_eq!(watch.polls, u64::from(WARM) + 1);
+    }
+
+    #[test]
+    fn the_window_poll_is_due_twice_a_second() {
+        let mut watch = Watch::new(1);
+        let t0 = Instant::now();
+        let min = Duration::from_millis(375);
+        assert!(watch.due(t0, min), "no poll yet");
+        watch.polled(&[50], t0);
+        assert!(watch.due(t0, min), "nothing was read: that was no poll");
+        watch.core(0, reading(60.0, 0.2, None), Some(0.5));
+        watch.polled(&[50], t0);
+        assert!(
+            !watch.due(t0 + Duration::from_millis(250), min),
+            "the next quarter-second poll is not the window's"
+        );
+        assert!(watch.due(t0 + Duration::from_millis(500), min), "the one after it is");
     }
 
     #[test]

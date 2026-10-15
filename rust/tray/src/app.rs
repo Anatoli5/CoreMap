@@ -37,9 +37,11 @@ use crate::journal::Journal;
 mod auto;
 mod history;
 mod meter;
+mod sense;
 mod serve;
 use crate::shell::{Event, Item, Loop, Menu, Shell};
 pub use auto::{AUTO_ON, AutoTiming, DEPTH_ID, LIMIT_ID};
+pub use sense::LogCount;
 pub use serve::Confirm;
 
 /// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — щелчок по значку).
@@ -175,6 +177,8 @@ pub struct App {
     version: u64,
     history: history::History,
     meter: meter::Meter,
+    /// Журнал срезов и его опрос раз в 0,25 с (app/sense.rs).
+    logging: sense::Logging,
     serving: serve::Serving,
     auto: auto::Autopilot,
     lease: Rc<named::Mutex>,
@@ -226,6 +230,7 @@ impl App {
             version: 0,
             history,
             meter: meter::Meter::new(cores),
+            logging: sense::Logging::default(),
             serving,
             auto: auto::Autopilot::new(blocks),
             lease: Rc::new(lease),
@@ -290,6 +295,45 @@ impl App {
         self.meter.reads
     }
 
+    /// Скрытая проверка: пишется ли журнал срезов, сколько было его опросов (из них опросов окна), сколько раз он
+    /// начинался и сколько раз открывался файл дня.
+    #[must_use]
+    pub fn logging(&self) -> LogCount {
+        let l = &self.logging;
+        LogCount {
+            on: l.on,
+            polls: l.polls,
+            window_polls: l.window_polls,
+            starts: l.starts,
+            opens: l.opens,
+        }
+    }
+
+    /// Скрытая проверка: сколько раз спрошены обороты (вызовы прошивки, у имитации — её ответы).
+    #[must_use]
+    pub fn fan_calls(&self) -> u64 {
+        self.auto.fan_calls
+    }
+
+    /// Скрытая проверка: сколько опросов окна дошло до средних под нагрузкой; None — окна нет.
+    #[must_use]
+    pub fn window_fed(&self) -> Option<u64> {
+        self.serving.watch().map(|w| w.polls)
+    }
+
+    /// Скрытая проверка: другие сроки автомодуля и опроса срезов — шаг журнала проверяется на настоящих 0,25 с, а
+    /// регулятор — на коротких. Опрос автомодуля, регулятор и счёт цены опроса начинаются заново. Возвращает прежние.
+    pub fn retime(&mut self, shell: &Shell, timing: AutoTiming) -> AutoTiming {
+        let was = std::mem::replace(&mut self.config.auto, timing);
+        self.stop_logging(shell);
+        self.restart_costs();
+        if self.auto.choice.on {
+            self.auto.controller = Some(self.controller_for());
+            shell.set_timer(auto::AUTO, timing.tick);
+        }
+        was
+    }
+
     // ----- кто держит потолки -----
 
     /// Кто сейчас держит потолки вместо этой программы; заодно начинает ждать его конца.
@@ -348,8 +392,8 @@ impl App {
             return Err(format!("потолки множителей недоступны: {}", e.0));
         }
         let result = act(self);
-        // Автомодуль опрашивает раз в 2 с, окно — раз в полсекунды: пока работает кто-то из них, драйвер остаётся
-        // открытым, иначе каждый опрос заново грузил бы модуль.
+        // Автомодуль опрашивает раз в 2 с (а его журнал срезов — 4 раза в секунду), окно — раз в полсекунды: пока
+        // работает кто-то из них, драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
         if !self.auto.choice.on
             && !self.serving.attached()
             && let Some(device) = &mut self.device
@@ -931,11 +975,14 @@ impl App {
                 self.wake_repair(shell);
             }
             Event::Timer(auto::AUTO) => self.auto_tick(shell),
+            Event::Timer(sense::SENSE) => self.sense_tick(shell),
             Event::Timer(serve::STATE) => self.serve_tick(shell),
             Event::Timer(serve::GREET) => self.greet_tick(shell),
             Event::Timer(_) => {}
             Event::Suspend => {
                 self.journal.note("уход в сон");
+                // Журнал срезов — до пробуждения и сверки после него: начнёт его снова опрос автомодуля.
+                self.stop_logging(shell);
                 self.put_back("уход в сон");
                 self.note_power_near_csharp();
             }

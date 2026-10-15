@@ -80,11 +80,13 @@ export struct LineRow {
     mark: color,    // цвет блока (действия автомодуля при сравнении)
 }
 
-// Точка линии блока: место по оси множителя и высоты ø средней и ▲ наибольшей — доли поля графика.
+// Точка линии блока: место по оси множителя и высоты ø средней и ▲ наибольшей — доли поля графика; ø доля работы
+// (0…1; < 0 — не известна) — заливка точки.
 export struct Mark {
     x: float,
     mean: float,
     peak: float,
+    load: float,
 }
 
 // Линия блока на графике статистики: пути в рамке 1000 × 1000, цвет блока, бледная — подсвечен другой.
@@ -440,15 +442,26 @@ component Chart inherits Rectangle {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
+        // Точка ø средней — кольцо цвета блока, залитое по ø нагрузке: площадь заливки — её доля (пустое — 0 %,
+        // полное — 100 %; владелец 15.10 о нагрузке: «от 0 до 100»).
         for m in s.marks: Rectangle {
-            x: m.x * parent.width - 4px;
-            y: (1 - m.mean) * parent.height - 4px;
-            width: 8px;
-            height: 8px;
-            border-radius: 4px;
-            background: s.color;
+            x: m.x * parent.width - 5px;
+            y: (1 - m.mean) * parent.height - 5px;
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: Palette.panel;
             border-width: 1.5px;
-            border-color: Palette.panel;
+            border-color: s.color;
+            Rectangle {
+                property <length> d: 10px * Math.sqrt(max(0, m.load));
+                x: (parent.width - self.d) / 2;
+                y: (parent.height - self.d) / 2;
+                width: self.d;
+                height: self.d;
+                border-radius: self.d / 2;
+                background: s.color;
+            }
         }
     }
 
@@ -1190,14 +1203,29 @@ export component AppWindow inherits Window {
             Text { text: "ø средняя"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
             Rectangle { width: 4px; }
             Text { text: "▲ наибольшая, °C"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 4px; }
+            Rectangle {
+                width: 10px;
+                Rectangle {
+                    y: (parent.height - 10px) / 2;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 5px;
+                    background: Palette.panel;
+                    border-width: 1.5px;
+                    border-color: Palette.dim;
+                    Rectangle { x: 2.5px; y: 2.5px; width: 5px; height: 5px; border-radius: 2.5px; background: Palette.dim; }
+                }
+            }
+            Text { text: "заливка — ø нагрузка"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
         }
         TouchArea {
             x: root.pad;
             y: root.head-h;
-            width: 190px;
+            width: 330px;
             height: 18px;
             changed has-hover => {
-                root.tip(self.has-hover, "lines", "Линии выбранных блоков\nПо срезам, когда блок занят (доля работы ≥ 50 %): на каждом фактическом множителе — ø средняя температура (толстая линия) и ▲ наибольшая (тонкая).\n• оси общие для всех блоков — графики можно сравнивать\n• красная линия — отсечка автомодуля\n• числа — в подсказке столбца множителя", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(self.has-hover, "lines", "Линии выбранных блоков\nПо всем срезам, при любой нагрузке: на каждом фактическом множителе — ø средняя температура (толстая линия) и ▲ наибольшая (тонкая).\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• оси общие для всех блоков — графики можно сравнивать\n• красная линия — отсечка автомодуля\n• числа — в подсказке столбца множителя: сколько времени, ø нагрузка, при каком множителе, нагрузке и когда была ▲", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         // Переключатель подсветки: «курсор» — линия под курсором (или плитки под курсором) поверх остальных;

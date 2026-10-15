@@ -337,7 +337,7 @@ impl Check {
         ));
         if let Some(s) = &expected {
             self.note(format!(
-                "        из них сегодняшний полный день: {} строк, {:.1} МБ",
+                "        из них сегодняшний день (8 ч по 2 с, перерыв, 6 ч по 0,25 с): {} строк, {:.1} МБ",
                 s.today_rows,
                 to_mb(s.today_bytes)
             ));
@@ -346,6 +346,16 @@ impl Check {
                 format!(
                     "строк в сводке {}, должно {} (сегодня без обрезанной строки и вчера; файл 40-дневной давности не входит), файлов {}",
                     digest.tally.rows, s.rows, digest.files
+                ),
+            );
+            // Время — по времени строк: прежняя строка — 2 с, новая — 0,25 с, перерыв между ними в счёт не идёт.
+            #[expect(clippy::cast_precision_loss, reason = "milliseconds of a synthetic day and a half")]
+            let want = s.ms as f64 / 1000.0;
+            self.check(
+                (digest.tally.secs - want).abs() < 1e-6,
+                format!(
+                    "время в сводке {:.2} с, должно {want:.2} с (строки по 2 с и по 0,25 с, перерыв не в счёт)",
+                    digest.tally.secs
                 ),
             );
             // Повторный проход по неизменившимся файлам ничего не присылает (статистика не пересчитывается зря).
@@ -462,7 +472,7 @@ impl Check {
             let want: Vec<(i32, u32)> = s
                 .bins
                 .get(&e_block.name)
-                .map(|b| b.iter().map(|(r, n)| (*r, *n)).collect())
+                .map(|b| b.iter().map(|(r, (n, _))| (*r, *n)).collect())
                 .unwrap_or_default();
             let got: Vec<(i32, u32)> = self
                 .view
@@ -474,7 +484,53 @@ impl Check {
                 .unwrap_or_default();
             self.check(
                 got == want && !got.is_empty(),
-                format!("точки графика (множитель, срезов) {got:?}, у генератора {want:?}"),
+                format!("точки графика (множитель, строк) {got:?}, у генератора {want:?} — при любой нагрузке"),
+            );
+            let want_ms: Vec<(i32, u64)> = s
+                .bins
+                .get(&e_block.name)
+                .map(|b| b.iter().map(|(r, (_, ms))| (*r, *ms)).collect())
+                .unwrap_or_default();
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "seconds of a synthetic day, multiples of 0.25 s, rounded"
+            )]
+            let got_ms: Vec<(i32, u64)> = self
+                .view
+                .borrow()
+                .digest
+                .as_ref()
+                .and_then(|d| d.tally.blocks.get(&e_block.name))
+                .map(|t| {
+                    t.bins
+                        .iter()
+                        .map(|(r, b)| (*r, (b.secs * 1000.0).round() as u64))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.check(
+                got_ms == want_ms,
+                format!("время корзин (множитель, мс) {got_ms:?}, у генератора {want_ms:?}"),
+            );
+            let loads: Vec<f32> = self
+                .view
+                .borrow()
+                .shown_stats
+                .as_ref()
+                .and_then(|st| st.series.first())
+                .map(|l| l.points.iter().map(|p| p.load).collect())
+                .unwrap_or_default();
+            self.check(
+                !loads.is_empty() && loads.iter().all(|l| (0.1..=0.9).contains(l)),
+                format!(
+                    "у каждой точки ø нагрузка (в срезах 0,1…0,9): {}",
+                    loads
+                        .iter()
+                        .map(|l| format!("{:.0}%", l * 100.0))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
             );
             let covered = want.iter().all(|(r, _)| axis_e.contains(r))
                 && axis_e.windows(2).all(|w| w[1] == w[0] + 1)
@@ -518,6 +574,49 @@ impl Check {
         );
         let shot = self.shot("select");
         self.check(shot, "картинка сравнения двух блоков");
+        // Подсказки столбцов: подсказка есть ровно у столбцов с точками (у множителей обоих блоков — в придуманных
+        // срезах они не пересекаются: P ×50…54, кластер ×43…46); в каждой по каждому блоку — время, ø температура и ø
+        // нагрузка, ▲ — с фактическим множителем, нагрузкой и временем своей строки; числа строк в ней нет.
+        let (tips, point_ratios) = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .map(|st| {
+                let tips: Vec<(i32, String)> = st
+                    .columns
+                    .iter()
+                    .filter(|c| !c.tip.is_empty())
+                    .map(|c| (c.ratio, c.tip.clone()))
+                    .collect();
+                let mut ratios: Vec<i32> = st
+                    .series
+                    .iter()
+                    .flat_map(|s| s.points.iter().map(|p| p.ratio))
+                    .collect();
+                ratios.sort_unstable();
+                ratios.dedup();
+                (tips, ratios)
+            })
+            .unwrap_or_default();
+        for tip in [tips.first(), tips.last()].into_iter().flatten() {
+            self.note(format!("подсказка столбца: {}", tip.1.replace('\n', " / ")));
+        }
+        let well_formed = |tip: &str| {
+            let peaks = tip.matches('▲').count();
+            peaks >= 1
+                && tip.matches("при нагрузке ø").count() == peaks
+                && tip.matches(", нагрузка ").count() == peaks
+                && !tip.contains("срезов")
+        };
+        let tip_ratios: Vec<i32> = tips.iter().map(|(r, _)| *r).collect();
+        self.check(
+            !tips.is_empty() && tip_ratios == point_ratios && tips.iter().all(|(_, t)| well_formed(t)),
+            format!(
+                "подсказки столбцов: есть у множителей {tip_ratios:?}, точки у {point_ratios:?}; у каждого блока время, \
+                 ø нагрузка и ▲ со множителем, нагрузкой и временем"
+            ),
+        );
 
         // Подсветка под курсором: курсор на плитке P — её линия последней (поверх), линия кластера бледнее.
         let order = |v: &View| {
@@ -996,27 +1095,35 @@ const LINK_EFFECT: f64 = 4.0;
 
 #[derive(Debug, Default)]
 struct Synthetic {
-    /// По блоку: множитель → число занятых срезов, посчитанное генератором.
-    bins: HashMap<String, BTreeMap<i32, u32>>,
+    /// По блоку: множитель → (строк, мс), посчитанное генератором: каждая строка с температурой и множителем, при любой
+    /// нагрузке; мс — её шаг (строки идут без пропусков, кроме перерыва перед первой новой — та тоже покрывает шаг).
+    bins: HashMap<String, BTreeMap<i32, (u32, u64)>>,
     rows: u64,
+    /// Сколько мс покрывают все строки.
+    ms: u64,
     today_rows: u64,
     today_bytes: u64,
     actions: usize,
     history: usize,
 }
 
-/// Строки одного файла: `count` срезов с шагом 2 с от полуночи дня `date`; `from` — номер первого среза (узор
-/// занятости непрерывен между файлами). s — куда считать ожидаемое; None — эти строки не должны войти.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::too_many_arguments,
-    reason = "small synthetic numbers; a test generator"
-)]
-fn rows(
-    text: &mut String,
-    date: &str,
+/// Отрезок строк одного файла: `count` срезов дня `date` с шагом `step_ms` от `start_ms` после полуночи; `from` — номер
+/// первого среза (узор занятости непрерывен между отрезками). Шаг 2 с — время до секунды и обороты почти в каждой
+/// строке (прежний журнал); шаг 0,25 с — время до миллисекунды и обороты в каждой восьмой (с 0.5.2).
+#[derive(Debug, Clone, Copy)]
+struct Stretch<'a> {
+    date: &'a str,
     from: u64,
     count: u64,
+    start_ms: u64,
+    step_ms: u64,
+}
+
+/// Строки отрезка. s — куда считать ожидаемое; None — эти строки не должны войти.
+#[expect(clippy::cast_precision_loss, reason = "small synthetic numbers; a test generator")]
+fn rows(
+    text: &mut String,
+    stretch: Stretch,
     hello: &Hello,
     limits: &Limits,
     neighbours: &[Vec<usize>],
@@ -1025,19 +1132,36 @@ fn rows(
     let n = hello.blocks.len();
     let mut busy = vec![false; n];
     let mut counted = s;
-    for k in 0..count {
-        let i = from + k;
-        let t = k * 2;
-        let _ = write!(text, "{date} {:02}:{:02}:{:02}", t / 3600 % 24, t / 60 % 60, t % 60); // into a String
+    let old = stretch.step_ms == samples::OLD_STEP_MS.unsigned_abs();
+    for k in 0..stretch.count {
+        let i = stretch.from + k;
+        let ms = stretch.start_ms + k * stretch.step_ms;
+        let t = ms / 1000;
+        let _ = write!(
+            text,
+            "{} {:02}:{:02}:{:02}",
+            stretch.date,
+            t / 3600 % 24,
+            t / 60 % 60,
+            t % 60
+        ); // into a String
+        if !old {
+            let _ = write!(text, ".{:03}", ms % 1000); // into a String
+        }
         for (j, b) in busy.iter_mut().enumerate() {
             let period = 15 + 7 * j as u64;
             *b = !(i / period).is_multiple_of(3);
         }
         let package = 50 + i % 20;
-        let fan = if i.is_multiple_of(10) {
-            String::new()
+        let read = if old {
+            !i.is_multiple_of(10)
         } else {
+            k.is_multiple_of(8)
+        };
+        let fan = if read {
             (2500 + 40 * package).to_string()
+        } else {
+            String::new()
         };
         let _ = write!(text, ",{package},{fan},"); // into a String
         for (j, b) in hello.blocks.iter().enumerate() {
@@ -1069,24 +1193,32 @@ fn rows(
                 format!("{temp:.0}")
             };
             let _ = write!(text, ",{fused},{ratio_text},{share},{temp_text}"); // into a String
-            if is_busy
-                && !temp_text.is_empty()
+            // В график идёт каждая строка с температурой и множителем — при любой нагрузке (владелец 15.10).
+            if !temp_text.is_empty()
                 && let Some(s) = counted.as_deref_mut()
             {
-                *s.bins
+                let bin = s
+                    .bins
                     .entry(b.name.clone())
                     .or_default()
                     .entry(i32::try_from(ratio).unwrap_or(0))
-                    .or_default() += 1;
+                    .or_default();
+                bin.0 += 1;
+                bin.1 += stretch.step_ms;
             }
         }
         text.push('\n');
         if let Some(s) = counted.as_deref_mut() {
             s.rows += 1;
+            s.ms += stretch.step_ms;
         }
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one synthetic data folder — three sample files and two logs — reads best top to bottom"
+)]
 fn synthesize(dir: &Path, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -> std::io::Result<Synthetic> {
     let samples_dir = dir.join("samples");
     std::fs::create_dir_all(&samples_dir)?;
@@ -1112,31 +1244,56 @@ fn synthesize(dir: &Path, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -
     let mut s = Synthetic::default();
     let now = SystemTime::now();
     let day = |back| samples::date_before(now, back);
+    let (old, new) = (samples::OLD_STEP_MS.unsigned_abs(), samples::STEP_MS.unsigned_abs());
 
-    // Сегодня: полный день по 2 с и обрезанная строка в конце (программа входа дописывает её как раз сейчас).
+    // Сегодня — день, когда поставлена новая сборка: 00:00–08:00 прежний журнал по 2 с, перерыв, 08:30–14:30 новый по
+    // 0,25 с (6 часов игры), и обрезанная строка в конце (программа входа дописывает её как раз сейчас).
+    let today = day(0);
     let mut text = header.clone();
-    rows(&mut text, &day(0), 0, 43_200, hello, limits, &neighbours, Some(&mut s));
+    let morning = Stretch {
+        date: &today,
+        from: 0,
+        count: 14_400,
+        start_ms: 0,
+        step_ms: old,
+    };
+    rows(&mut text, morning, hello, limits, &neighbours, Some(&mut s));
+    let game = Stretch {
+        date: &today,
+        from: 14_400,
+        count: 86_400,
+        start_ms: 8 * 3_600_000 + 30 * 60_000,
+        step_ms: new,
+    };
+    rows(&mut text, game, hello, limits, &neighbours, Some(&mut s));
     s.today_rows = s.rows;
-    let _ = write!(text, "{} 23:59:59,61,3000,,", day(0)); // into a String
+    let _ = write!(text, "{today} 23:59:59.750,61,3000,,"); // into a String
     s.today_bytes = text.len() as u64;
-    std::fs::write(samples_dir.join(format!("{}.csv", day(0))), &text)?;
-    // Вчера — входит.
+    std::fs::write(samples_dir.join(format!("{today}.csv")), &text)?;
+    // Вчера — прежний журнал, входит.
+    let yesterday = day(1);
     let mut text = header.clone();
-    rows(
-        &mut text,
-        &day(1),
-        50_000,
-        600,
-        hello,
-        limits,
-        &neighbours,
-        Some(&mut s),
-    );
-    std::fs::write(samples_dir.join(format!("{}.csv", day(1))), &text)?;
+    let evening = Stretch {
+        date: &yesterday,
+        from: 200_000,
+        count: 600,
+        start_ms: 20 * 3_600_000,
+        step_ms: old,
+    };
+    rows(&mut text, evening, hello, limits, &neighbours, Some(&mut s));
+    std::fs::write(samples_dir.join(format!("{yesterday}.csv")), &text)?;
     // 40 дней назад — за окном в 30 дней, не входит.
+    let long_ago = day(40);
     let mut text = header;
-    rows(&mut text, &day(40), 90_000, 300, hello, limits, &neighbours, None);
-    std::fs::write(samples_dir.join(format!("{}.csv", day(40))), &text)?;
+    let stale = Stretch {
+        date: &long_ago,
+        from: 300_000,
+        count: 300,
+        start_ms: 0,
+        step_ms: old,
+    };
+    rows(&mut text, stale, hello, limits, &neighbours, None);
+    std::fs::write(samples_dir.join(format!("{long_ago}.csv")), &text)?;
 
     // Журнал автомодуля: три действия с кластером, одно с другим блоком.
     let name = &e_block.name;

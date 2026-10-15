@@ -1,13 +1,21 @@
-// Статистика из журналов программы входа (DECISIONS #32): срезы data\samples\<дата>.csv (каждые 2 с, пока
-// процессор занят) и журнал действий автомодуля data\auto-log.jsonl. Здесь только разбор и счёт — без окна и без
-// потоков: что и когда читать, решает store.rs, как показать — panels.rs.
+// Статистика из журналов программы входа (DECISIONS #32): срезы data\samples\<дата>.csv и журнал действий автомодуля
+// data\auto-log.jsonl. Здесь только разбор и счёт — без окна и без потоков: что и когда читать, решает store.rs, как
+// показать — panels.rs.
+//
+// Срезы пишутся, пока работает автомодуль и процессор занят: до 0.5.2 — строка раз в 2 с, время до секунды; с 0.5.2 —
+// раз в 0,25 с, время до миллисекунды (выбор владельца 15.10, вариант А), обороты — только в строке, где прочитаны
+// (раз в 2 с). В одном файле бывают оба вида (день, когда поставлена новая сборка), поэтому вес строки — время, которое
+// она покрывает, по её времени и времени прошлой строки (`span_ms`), а не «строки × 2 с».
 //
 // Что считается (слова владельца 15.10: «какую температуру на каких множителях, на какой нагрузке… с каким-нибудь
-// показанием вентилятора»; «если два ядра работают вместе они греются например сильнее»):
-// • по блоку — корзины по фактическому множителю (округлённому до целого): число срезов, средняя и наибольшая
-//   температура, средние обороты вентилятора процессора; только срезы, где блок занят (доля работы ≥ BUSY);
-// • по паре блоков A, B — температура A, когда он занят, отдельно «B тоже занят» и «B свободен», в той же корзине
-//   множителя A: так разница не смешивается с тем, что при работе соседа A чаще стоит на другом множителе.
+// показанием вентилятора»; «если два ядра работают вместе они греются например сильнее»; о нагрузке: «зачем вот эта
+// градация… давай использовать от 0 до 100»):
+// • по блоку — корзины по фактическому множителю (округлённому до целого) из каждой строки, где множитель и
+//   температура известны, при любой нагрузке: время, средняя температура и средняя доля работы (по времени),
+//   наибольшая температура со строкой, где она была (множитель, доля работы, время), средние обороты вентилятора;
+// • по паре блоков A, B — температура A, когда он занят (доля работы ≥ BUSY), отдельно «B тоже занят» и «B свободен»,
+//   в той же корзине множителя A: так разница не смешивается с тем, что при работе соседа A чаще стоит на другом
+//   множителе. Это сравнение — как было (граница «занят» здесь остаётся).
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -18,29 +26,144 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/// Блок занят — доля работы не меньше этой (та же граница, что у автомодуля: `machine::auto::BUSY`).
+/// Блок занят — доля работы не меньше этой (та же граница, что у автомодуля: `machine::auto::BUSY`). Только для
+/// сравнения с соседом: корзины графика берут строки при любой нагрузке.
 pub const BUSY: f64 = 0.5;
 /// Множители ×0…×80: больше у этих процессоров не бывает (machine: заводской вне 8..80 — не ответ процессора).
 pub const BINS: usize = 81;
 const TOP: f64 = 80.0;
-/// Сколько срезов нужно в корзине с каждой стороны, чтобы сравнивать «вместе» и «порознь»: 5 срезов — 10 с работы.
-pub const MIN_PAIR: u32 = 5;
+/// Сколько секунд работы нужно в корзине с каждой стороны, чтобы сравнивать «вместе» и «порознь» (было «5 срезов» —
+/// те же 10 с при прежнем шаге 2 с).
+pub const MIN_PAIR: f64 = 10.0;
+/// Шаг записи срезов, мс: прежний (время строки до секунды) и с 0.5.2 (время с долями секунды).
+pub const OLD_STEP_MS: i64 = 2000;
+pub const STEP_MS: i64 = 250;
+
+/// Время строки среза: миллисекунды от 1970-01-01 по местным часам (как их пишет программа входа) и шаг, которым она
+/// записана (по виду времени).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTime {
+    pub ms: i64,
+    pub step: i64,
+}
+
+/// «ГГГГ-ММ-ДД чч:мм:сс» (прежние срезы, шаг 2 с) или «ГГГГ-ММ-ДД чч:мм:сс.ммм» (с 0.5.2, шаг 0,25 с; долей секунды
+/// может быть от 1 до 9 знаков, берутся миллисекунды). Другое — None: строка не в счёт.
+pub fn row_time(text: &str) -> Option<RowTime> {
+    let number = |at: std::ops::Range<usize>| -> Option<i64> {
+        let part = text.get(at)?;
+        if part.bytes().all(|b| b.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    let b = text.as_bytes();
+    let marks = [(4, b'-'), (7, b'-'), (10, b' '), (13, b':'), (16, b':')];
+    if b.len() < 19 || marks.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let (millis, step) = match &text[19..] {
+        "" => (0, OLD_STEP_MS),
+        rest => {
+            let digits = rest.strip_prefix('.')?;
+            if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Первые три знака — миллисекунды («.5» — 500, «.25» — 250, «.1234» — 123).
+            let mut ms = 0;
+            for k in 0..3 {
+                ms = ms * 10 + digits.as_bytes().get(k).map_or(0, |d| i64::from(d - b'0'));
+            }
+            (ms, STEP_MS)
+        }
+    };
+    let days = days_from_civil(year, month, day);
+    Some(RowTime {
+        ms: ((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis,
+        step,
+    })
+}
+
+/// Сколько времени покрывает строка, мс: промежуток до прошлой строки того же файла, если он не длиннее полутора шагов
+/// записи (таймеры Windows дрожат, время старых строк — до секунды); иначе — первая строка, перерыв записи (процессор
+/// был свободен, программа не работала) или часы назад — один шаг: перерыв в счёт не идёт.
+pub fn span_ms(previous: Option<i64>, at: RowTime) -> i64 {
+    match previous.map(|p| at.ms - p) {
+        Some(gap) if gap > 0 && gap * 2 <= at.step * 3 => gap,
+        _ => at.step,
+    }
+}
+
+/// Строка в корзине: что о ней помнить.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Seen {
+    temp: f64,
+    ratio: f64,
+    busy: Option<f64>,
+    secs: f64,
+    at: i64,
+}
+
+/// Строка наибольшей температуры корзины: температура, фактический множитель, доля работы и время (мс по местным
+/// часам от 1970-01-01, `row_time`).
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Peak {
+    pub temp: f64,
+    pub ratio: f64,
+    pub busy: Option<f64>,
+    pub at: i64,
+}
+
+impl Peak {
+    /// Выше ли эта, чем `other`: горячее; при равной температуре — позже (итог не зависит от порядка файлов).
+    fn above(&self, other: &Peak) -> bool {
+        (self.temp, self.at) > (other.temp, other.at)
+    }
+}
 
 /// Корзина одного множителя.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Bin {
+    /// Строк в корзине.
     pub n: u32,
+    /// Секунд, которые эти строки покрывают (`span_ms`).
+    pub secs: f64,
+    /// Температура × секунды: средняя — по времени, а не по числу строк (строка прежнего журнала — 2 с, нового — 0,25 с).
     pub temp_sum: f64,
-    pub temp_max: f64,
+    /// Доля работы × секунды и секунды, где она известна.
+    pub busy_sum: f64,
+    pub busy_secs: f64,
+    /// Строка с наибольшей температурой.
+    pub peak: Peak,
     pub fan_sum: f64,
     pub fan_n: u32,
 }
 
 impl Bin {
-    fn add(&mut self, temp: f64, fan: Option<f64>) {
-        self.temp_max = if self.n == 0 { temp } else { self.temp_max.max(temp) };
+    fn add(&mut self, seen: Seen, fan: Option<f64>) {
+        let peak = Peak {
+            temp: seen.temp,
+            ratio: seen.ratio,
+            busy: seen.busy,
+            at: seen.at,
+        };
+        if self.n == 0 || peak.above(&self.peak) {
+            self.peak = peak;
+        }
         self.n += 1;
-        self.temp_sum += temp;
+        self.secs += seen.secs;
+        self.temp_sum += seen.temp * seen.secs;
+        if let Some(busy) = seen.busy {
+            self.busy_sum += busy * seen.secs;
+            self.busy_secs += seen.secs;
+        }
+        // Обороты — средняя по строкам, где они прочитаны: и в прежнем журнале, и в новом такая строка — раз в 2 с.
         if let Some(f) = fan {
             self.fan_sum += f;
             self.fan_n += 1;
@@ -51,19 +174,26 @@ impl Bin {
         if other.n == 0 {
             return;
         }
-        self.temp_max = if self.n == 0 {
-            other.temp_max
-        } else {
-            self.temp_max.max(other.temp_max)
-        };
+        if self.n == 0 || other.peak.above(&self.peak) {
+            self.peak = other.peak;
+        }
         self.n += other.n;
+        self.secs += other.secs;
         self.temp_sum += other.temp_sum;
+        self.busy_sum += other.busy_sum;
+        self.busy_secs += other.busy_secs;
         self.fan_sum += other.fan_sum;
         self.fan_n += other.fan_n;
     }
 
+    /// Средняя температура по времени.
     pub fn mean(&self) -> Option<f64> {
-        (self.n > 0).then(|| self.temp_sum / f64::from(self.n))
+        (self.n > 0 && self.secs > 0.0).then(|| self.temp_sum / self.secs)
+    }
+
+    /// Средняя доля работы по времени (0…1); None — ни в одной строке не известна.
+    pub fn load(&self) -> Option<f64> {
+        (self.busy_secs > 0.0).then(|| self.busy_sum / self.busy_secs)
     }
 
     pub fn fan(&self) -> Option<f64> {
@@ -71,26 +201,26 @@ impl Bin {
     }
 }
 
-/// Сумма температур и число срезов.
+/// Время и сумма температур × секунды.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Side {
-    pub n: u32,
+    pub secs: f64,
     pub sum: f64,
 }
 
 impl Side {
-    fn add(&mut self, temp: f64) {
-        self.n += 1;
-        self.sum += temp;
+    fn add(&mut self, temp: f64, secs: f64) {
+        self.secs += secs;
+        self.sum += temp * secs;
     }
 
     fn merge(&mut self, other: Side) {
-        self.n += other.n;
+        self.secs += other.secs;
         self.sum += other.sum;
     }
 
     fn mean(self) -> f64 {
-        self.sum / f64::from(self.n.max(1))
+        if self.secs > 0.0 { self.sum / self.secs } else { 0.0 }
     }
 }
 
@@ -112,6 +242,8 @@ pub struct BlockTally {
 #[derive(Clone, Default, Debug)]
 pub struct Tally {
     pub rows: u64,
+    /// Секунд, которые строки покрывают (`span_ms`).
+    pub secs: f64,
     pub first: Option<String>,
     pub last: Option<String>,
     pub blocks: BTreeMap<String, BlockTally>,
@@ -120,6 +252,7 @@ pub struct Tally {
 impl Tally {
     pub fn merge(&mut self, other: &Tally) {
         self.rows += other.rows;
+        self.secs += other.secs;
         if let Some(f) = &other.first
             && self.first.as_ref().is_none_or(|mine| f < mine)
         {
@@ -148,27 +281,28 @@ impl Tally {
 }
 
 /// Насколько блок горячее, когда другой блок тоже занят, чем когда тот свободен: средняя по корзинам множителя,
-/// где обеих сторон не меньше `MIN_PAIR`, с весом min(вместе, порознь). None — таких корзин нет.
+/// где обеих сторон не меньше `MIN_PAIR` секунд, с весом min(вместе, порознь). None — таких корзин нет. Вместе и
+/// порознь — секунды.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Effect {
     pub delta: f64,
-    pub together: u32,
-    pub alone: u32,
+    pub together: f64,
+    pub alone: f64,
 }
 
 pub fn effect(splits: &BTreeMap<i32, Split>) -> Option<Effect> {
     let mut weight = 0.0;
     let mut sum = 0.0;
-    let (mut together, mut alone) = (0, 0);
+    let (mut together, mut alone) = (0.0, 0.0);
     for s in splits.values() {
-        if s.together.n < MIN_PAIR || s.alone.n < MIN_PAIR {
+        if s.together.secs < MIN_PAIR || s.alone.secs < MIN_PAIR {
             continue;
         }
-        let w = f64::from(s.together.n.min(s.alone.n));
+        let w = s.together.secs.min(s.alone.secs);
         weight += w;
         sum += w * (s.together.mean() - s.alone.mean());
-        together += s.together.n;
-        alone += s.alone.n;
+        together += s.together.secs;
+        alone += s.alone.secs;
     }
     (weight > 0.0).then(|| Effect {
         delta: sum / weight,
@@ -245,6 +379,7 @@ impl Columns {
 pub struct Scratch {
     n: usize,
     rows: u64,
+    secs: f64,
     first: Option<String>,
     last: Option<String>,
     bins: Vec<Bin>,              // [блок × BINS]
@@ -290,29 +425,37 @@ impl Scratch {
             self.cells = vec![Cell::default(); n];
         }
         self.rows = 0;
+        self.secs = 0.0;
         self.first = None;
         self.last = None;
     }
 
-    /// Строки срезов (полные, без заголовка) — в сводку файла.
-    pub fn count(&mut self, columns: &Columns, text: &str, into: &mut Tally) {
+    /// Строки срезов (полные, без заголовка) — в сводку файла. `previous` — время последней посчитанной строки этого
+    /// файла (мс, `row_time`): файл дочитывается порциями, и первая строка порции считает промежуток от неё.
+    pub fn count(&mut self, columns: &Columns, text: &str, previous: &mut Option<i64>, into: &mut Tally) {
         let n = columns.blocks.len();
         self.reset(n);
-        let mut last_time = None;
+        // Самая ранняя и самая поздняя строка по времени, не по месту в файле: часы могут отойти назад (сверка
+        // времени, ручная правка), и тогда последняя строка файла — не самая поздняя.
+        let mut earliest: Option<(i64, &str)> = None;
+        let mut latest: Option<(i64, &str)> = None;
         for line in text.lines() {
-            if let Some(time) = self.row(columns, line.trim_end_matches('\r')) {
-                if self.first.is_none() {
-                    self.first = Some(time.to_string()); // once per chunk
+            if let Some((time, ms)) = self.row(columns, line.trim_end_matches('\r'), previous) {
+                if earliest.is_none_or(|(e, _)| ms < e) {
+                    earliest = Some((ms, time));
                 }
-                last_time = Some(time);
+                if latest.is_none_or(|(l, _)| ms >= l) {
+                    latest = Some((ms, time));
+                }
             }
         }
-        self.last = last_time.map(str::to_string);
+        self.first = earliest.map(|(_, t)| t.to_string()); // once per chunk
+        self.last = latest.map(|(_, t)| t.to_string());
         self.flush(columns, into);
     }
 
-    /// Одна строка; Some(время) — строка принята.
-    fn row<'a>(&mut self, columns: &Columns, line: &'a str) -> Option<&'a str> {
+    /// Одна строка; Some((время, мс)) — строка принята.
+    fn row<'a>(&mut self, columns: &Columns, line: &'a str, previous: &mut Option<i64>) -> Option<(&'a str, i64)> {
         self.fields.clear();
         let mut start = 0;
         for (i, b) in line.bytes().enumerate() {
@@ -326,7 +469,16 @@ impl Scratch {
         if self.fields.len() < columns.width {
             return None;
         }
-        let field = |at: Option<usize>| at.and_then(|i| self.fields.get(i)).map(|&(s, e)| &line[s..e]);
+        let time = &line[self.fields[0].0..self.fields[0].1];
+        // Без времени у строки нет длительности: не в счёт.
+        let at = row_time(time)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a span of milliseconds between two rows, far below 2^52"
+        )]
+        let secs = span_ms(*previous, at) as f64 / 1000.0;
+        *previous = Some(at.ms);
+        let field = |column: Option<usize>| column.and_then(|i| self.fields.get(i)).map(|&(s, e)| &line[s..e]);
         let fan = field(columns.fan_cpu).and_then(number);
         for (cell, b) in self.cells.iter_mut().zip(&columns.blocks) {
             *cell = Cell {
@@ -338,14 +490,25 @@ impl Scratch {
         let n = self.n;
         for a in 0..n {
             let me = self.cells[a];
-            let (Some(busy), Some(temp), Some(ratio)) = (me.busy, me.temp, me.ratio) else {
+            let (Some(temp), Some(ratio)) = (me.temp, me.ratio) else {
                 continue;
             };
-            if busy < BUSY {
+            let Some(bin) = bin_of(ratio) else { continue };
+            // График: каждая строка, при любой нагрузке (владелец 15.10: «от 0 до 100»).
+            self.bins[a * BINS + bin].add(
+                Seen {
+                    temp,
+                    ratio,
+                    busy: me.busy,
+                    secs,
+                    at: at.ms,
+                },
+                fan,
+            );
+            // Связь соседей: только пока блок сам занят, сосед — занят или свободен (это правило не менялось).
+            if me.busy.is_none_or(|busy| busy < BUSY) {
                 continue;
             }
-            let Some(bin) = bin_of(ratio) else { continue };
-            self.bins[a * BINS + bin].add(temp, fan);
             for b in 0..n {
                 let Some(other) = self.cells[b].busy else { continue };
                 if b == a {
@@ -353,19 +516,21 @@ impl Scratch {
                 }
                 let split = &mut self.pairs[(a * n + b) * BINS + bin];
                 if other >= BUSY {
-                    split.together.add(temp);
+                    split.together.add(temp, secs);
                 } else {
-                    split.alone.add(temp);
+                    split.alone.add(temp, secs);
                 }
             }
         }
         self.rows += 1;
-        Some(&line[self.fields[0].0..self.fields[0].1])
+        self.secs += secs;
+        Some((time, at.ms))
     }
 
     fn flush(&self, columns: &Columns, into: &mut Tally) {
         let chunk = Tally {
             rows: self.rows,
+            secs: self.secs,
             first: self.first.clone(),
             last: self.last.clone(),
             blocks: BTreeMap::new(),
@@ -384,7 +549,7 @@ impl Scratch {
                 tally.bins.entry(ratio_of(bin)).or_default().merge(b);
                 for (o, other) in columns.blocks.iter().enumerate() {
                     let s = self.pairs[(a * n + o) * BINS + bin];
-                    if s.together.n == 0 && s.alone.n == 0 {
+                    if s.together.secs <= 0.0 && s.alone.secs <= 0.0 {
                         continue;
                     }
                     let into = tally
@@ -676,6 +841,29 @@ pub fn civil(days: i64) -> (i64, u32, u32) {
     (year, u32::try_from(month).unwrap_or(1), u32::try_from(day).unwrap_or(1))
 }
 
+/// Число дней от 1970-01-01 по дате (обратное к `civil`; H. Hinnant `days_from_civil`).
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Время строки (`row_time`, мс) для владельца: «15.10 14:03:07».
+pub fn day_time(ms: i64) -> String {
+    let (_, month, day) = civil(ms.div_euclid(86_400_000));
+    let second = ms.rem_euclid(86_400_000) / 1000;
+    format!(
+        "{day:02}.{month:02} {:02}:{:02}:{:02}",
+        second / 3600,
+        second / 60 % 60,
+        second % 60
+    )
+}
+
 /// «ГГГГ-ММ-ДД» за `back` дней до сегодняшней даты (по UTC: граница окна в 30 дней — с точностью до часов пояса).
 pub fn date_before(now: SystemTime, back: i64) -> String {
     let secs = now
@@ -696,8 +884,17 @@ mod tests {
         let columns = Columns::parse(HEADER).expect("заголовок");
         let mut scratch = Scratch::default();
         let mut tally = Tally::default();
-        scratch.count(&columns, &rows.join("\n"), &mut tally);
+        scratch.count(&columns, &rows.join("\n"), &mut None, &mut tally);
         tally
+    }
+
+    /// Время прежней строки: шаг 2 с от 10:00:00.
+    fn old(i: u32) -> String {
+        format!("2026-10-15 10:{:02}:{:02}", i * 2 / 60, i * 2 % 60)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
     }
 
     #[test]
@@ -708,51 +905,182 @@ mod tests {
     }
 
     #[test]
+    fn old_and_millisecond_times_parse_and_name_their_step() {
+        let day = days_from_civil(2026, 10, 15) * 86_400_000;
+        let second = day + (3600 + 25 * 60 + 8) * 1000;
+        assert_eq!(
+            row_time("2026-10-15 01:25:08"),
+            Some(RowTime {
+                ms: second,
+                step: OLD_STEP_MS
+            })
+        );
+        assert_eq!(
+            row_time("2026-10-15 01:25:08.250"),
+            Some(RowTime {
+                ms: second + 250,
+                step: STEP_MS
+            })
+        );
+        assert_eq!(row_time("2026-10-15 01:25:08.5").map(|t| t.ms), Some(second + 500));
+        assert_eq!(
+            row_time("2026-10-15 01:25:08.1234567").map(|t| t.ms),
+            Some(second + 123)
+        );
+        for bad in [
+            "",
+            "t1",
+            "2026-10-15 01:25",
+            "2026-10-15T01:25:08",
+            "2026-10-15 24:00:00",
+            "2026-13-15 01:25:08",
+            "2026-10-15 01:25:08.",
+            "2026-10-15 01:25:08,5",
+            "2026-10-15 01:25:08.25x",
+        ] {
+            assert_eq!(row_time(bad), None, "{bad}");
+        }
+        // Сутки и месяцы — по календарю: 1 марта 2028 — через день после 28 февраля (високосный год).
+        let feb = row_time("2028-02-28 12:00:00").map_or(0, |t| t.ms);
+        let mar = row_time("2028-03-01 12:00:00").map_or(0, |t| t.ms);
+        assert_eq!(mar - feb, 2 * 86_400_000);
+    }
+
+    #[test]
+    fn days_from_civil_undoes_civil() {
+        for days in [-1, 0, 59, 60, 10_957, 11_016, 20_376, 40_000] {
+            let (y, m, d) = civil(days);
+            assert_eq!(days_from_civil(y, i64::from(m), i64::from(d)), days, "{y}-{m}-{d}");
+        }
+        assert_eq!(
+            day_time(row_time("2026-10-15 14:03:07.900").map_or(0, |t| t.ms)),
+            "15.10 14:03:07"
+        );
+    }
+
+    #[test]
+    fn a_row_covers_the_gap_to_the_previous_one_but_not_a_pause() {
+        let at = |text: &str| row_time(text).expect("время");
+        let new = at("2026-10-15 10:00:00.266");
+        assert_eq!(span_ms(None, new), STEP_MS, "первая строка — шаг");
+        assert_eq!(span_ms(Some(new.ms - 266), new), 266, "дрожание таймера — как есть");
+        assert_eq!(span_ms(Some(new.ms - 375), new), 375, "полтора шага — ещё как есть");
+        assert_eq!(span_ms(Some(new.ms - 376), new), STEP_MS, "больше — перерыв: один шаг");
+        assert_eq!(span_ms(Some(new.ms + 10), new), STEP_MS, "часы назад — один шаг");
+        assert_eq!(span_ms(Some(new.ms), new), STEP_MS, "то же время — один шаг");
+        let old = at("2026-10-15 10:00:03");
+        assert_eq!(
+            span_ms(Some(old.ms - 3000), old),
+            3000,
+            "прежние строки до секунды: 3 с между ними бывает"
+        );
+        assert_eq!(span_ms(Some(old.ms - 4000), old), OLD_STEP_MS);
+    }
+
+    #[test]
+    fn mixed_old_and_new_rows_weigh_by_their_time() {
+        // Прежние строки по 2 с при 60 °C, перерыв, новые по 0,25 с при 80 °C — одна корзина ×52. Средняя по
+        // времени: (60·4 + 80·2) / 6 = 66,7; по числу строк вышло бы (60·2 + 80·8) / 10 = 76.
+        let mut rows = vec![
+            "2026-10-15 10:00:00,60,,,53,52.0,0.9,60,46,,,".to_string(),
+            "2026-10-15 10:00:02,60,,,53,52.0,0.9,60,46,,,".to_string(),
+        ];
+        for k in 0..8 {
+            let ms = k * 250;
+            rows.push(format!(
+                "2026-10-15 10:05:{:02}.{:03},60,,,53,52.0,0.9,80,46,,,",
+                ms / 1000,
+                ms % 1000
+            ));
+        }
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let t = tally(&rows);
+        let bin = t.blocks["0"].bins[&52];
+        assert_eq!(bin.n, 10);
+        assert!(close(bin.secs, 6.0) && close(t.secs, 6.0), "{} {}", bin.secs, t.secs);
+        assert!(
+            close(bin.mean().unwrap_or(0.0), (60.0 * 4.0 + 80.0 * 2.0) / 6.0),
+            "{:?}",
+            bin.mean()
+        );
+    }
+
+    #[test]
     fn empty_fields_are_unknown_not_zero() {
-        // Блок 0 занят, но температура пуста — строка не даёт ему точки; 2–5 без множителя — тоже.
+        // Блок 0, температура пуста — строка не даёт ему точки; 2–5 без множителя — тоже; без доли работы точка есть,
+        // но в среднюю нагрузку не идёт.
         let t = tally(&[
             "2026-10-15 01:00:00,60,,,53,52.0,0.9,,46,,0.9,70",
-            "2026-10-15 01:00:02,60,,,53,52.0,0.9,80,46,45.0,0.9,70",
+            "2026-10-15 01:00:02,60,,,53,52.0,,80,46,45.0,0.9,70",
         ]);
         assert_eq!(t.rows, 2);
         let b0 = &t.blocks["0"].bins;
         assert_eq!(b0.len(), 1);
         assert_eq!(b0[&52].n, 1);
         assert_eq!(b0[&52].fan(), None, "пустые обороты — неизвестны, а не 0");
+        assert_eq!(b0[&52].load(), None, "пустая доля работы — неизвестна, а не 0");
         assert_eq!(t.blocks["2–5"].bins[&45].n, 1);
         assert_eq!(t.first.as_deref(), Some("2026-10-15 01:00:00"));
         assert_eq!(t.last.as_deref(), Some("2026-10-15 01:00:02"));
     }
 
     #[test]
-    fn busy_filter_takes_half_and_above_only() {
+    fn every_load_goes_into_the_bins_with_its_mean_load() {
+        // Нагрузка 0,05 … 1,00: в корзину идут все строки (владелец 15.10: «от 0 до 100»), средняя нагрузка — по
+        // времени.
         let t = tally(&[
-            "t1,60,3000,,53,52.0,0.49,90,46,45.0,,70",
-            "t2,60,3000,,53,52.0,0.50,80,46,45.0,,70",
-            "t3,60,3000,,53,52.0,1.00,70,46,45.0,,70",
+            &format!("{},60,3000,,53,52.0,0.05,50,46,45.0,,70", old(0)),
+            &format!("{},60,3000,,53,52.0,0.49,60,46,45.0,,70", old(1)),
+            &format!("{},60,3000,,53,52.0,0.50,70,46,45.0,,70", old(2)),
+            &format!("{},60,3000,,53,52.0,1.00,80,46,45.0,,70", old(3)),
         ]);
         let b = t.blocks["0"].bins[&52];
-        assert_eq!(b.n, 2, "0.49 — не занят; 0.50 и 1.00 — заняты");
-        assert_eq!(b.mean(), Some(75.0));
-        assert_eq!(b.temp_max, 80.0);
+        assert_eq!(b.n, 4, "ни одна нагрузка не отсекается");
+        assert_eq!(b.mean(), Some(65.0));
+        assert!(close(b.load().unwrap_or(0.0), (0.05 + 0.49 + 0.5 + 1.0) / 4.0));
         assert_eq!(b.fan(), Some(3000.0));
-        assert!(t.blocks["2–5"].bins.is_empty(), "без доли работы — не в счёт");
+        assert_eq!(t.blocks["2–5"].bins[&45].n, 4, "без доли работы точки тоже есть");
+    }
+
+    #[test]
+    fn the_peak_carries_its_row_multiplier_load_and_time() {
+        let t = tally(&[
+            "2026-10-15 10:00:00.000,60,,,53,51.8,0.40,88,46,,,",
+            "2026-10-15 10:00:00.250,60,,,53,52.3,0.70,91,46,,,",
+            "2026-10-15 10:00:00.500,60,,,53,52.1,0.95,90,46,,,",
+        ]);
+        let peak = t.blocks["0"].bins[&52].peak;
+        assert_eq!(peak.temp, 91.0);
+        assert_eq!(peak.ratio, 52.3, "фактический множитель строки, а не корзина");
+        assert_eq!(peak.busy, Some(0.7));
+        assert_eq!(day_time(peak.at), "15.10 10:00:00");
+        assert_eq!(peak.at, row_time("2026-10-15 10:00:00.250").map_or(0, |t| t.ms));
     }
 
     #[test]
     fn bins_by_rounded_actual_multiplier() {
         let t = tally(&[
-            "a,60,2000,,53,44.6,1,70,46,,0,40",
-            "b,60,4000,,53,45.4,1,74,46,,0,40",
-            "c,60,5000,,53,45.6,1,90,46,,0,40",
+            &format!("{},60,2000,,53,44.6,1,70,46,,0,40", old(0)),
+            &format!("{},60,4000,,53,45.4,1,74,46,,0,40", old(1)),
+            &format!("{},60,5000,,53,45.6,1,90,46,,0,40", old(2)),
         ]);
         let bins = &t.blocks["0"].bins;
         assert_eq!(bins.keys().copied().collect::<Vec<_>>(), [45, 46]);
         assert_eq!(bins[&45].n, 2);
         assert_eq!(bins[&45].mean(), Some(72.0));
-        assert_eq!(bins[&45].temp_max, 74.0);
+        assert_eq!(bins[&45].peak.temp, 74.0);
         assert_eq!(bins[&45].fan(), Some(3000.0));
-        assert_eq!(bins[&46].temp_max, 90.0);
+        assert_eq!(bins[&46].peak.temp, 90.0);
+    }
+
+    #[test]
+    fn rows_without_a_time_are_not_counted() {
+        let t = tally(&[
+            "t1,60,3000,,53,52.0,0.9,90,46,45.0,,70",
+            &format!("{},60,,,53,52.0,0.9,80,46,,,", old(0)),
+        ]);
+        assert_eq!(t.rows, 1);
+        assert_eq!(t.blocks["0"].bins[&52].peak.temp, 80.0);
     }
 
     #[test]
@@ -767,7 +1095,8 @@ mod tests {
             let neighbour = k < busy_share;
             let temp = base + if neighbour { 6.0 } else { 0.0 };
             rows.push(format!(
-                "t{i:03},60,,,53,{ratio},1,{temp},46,45,{},60",
+                "{},60,,,53,{ratio},1,{temp},46,45,{},60",
+                old(i),
                 if neighbour { "0.9" } else { "0.1" }
             ));
         }
@@ -775,24 +1104,50 @@ mod tests {
         let t = tally(&rows);
         let e = effect(&t.blocks["0"].with["2–5"]).expect("есть корзины с обеими сторонами");
         assert!((e.delta - 6.0).abs() < 1e-9, "разница {}", e.delta);
-        assert_eq!(e.together + e.alone, 100);
+        assert!(close(e.together + e.alone, 200.0), "100 строк по 2 с");
         // Обратная пара: 2–5 занят только с занятым 0 — «порознь» нет, сравнивать не с чем.
         assert_eq!(effect(&t.blocks["2–5"].with["0"]), None);
     }
 
     #[test]
-    fn effect_needs_enough_samples_on_both_sides() {
-        let mut rows = Vec::new();
-        for i in 0..20 {
-            let neighbour = i < 4; // 4 «вместе» — меньше MIN_PAIR
-            rows.push(format!(
-                "t{i:02},60,,,53,45,1,{},46,45,{},60",
-                if neighbour { 70 } else { 60 },
-                u8::from(neighbour)
-            ));
+    fn effect_needs_ten_seconds_on_both_sides_whatever_the_step() {
+        assert!(close(MIN_PAIR, 10.0));
+        // Прежние строки: 4 «вместе» по 2 с — 8 с, мало; 5 — 10 с, хватает.
+        // Новые строки: 39 «вместе» по 0,25 с — 9,75 с, мало; 40 — 10 с, хватает.
+        for (together, stamp, enough) in [
+            (4, None, false),
+            (5, None, true),
+            (39, Some(250), false),
+            (40, Some(250), true),
+        ] {
+            let mut rows = Vec::new();
+            for i in 0..(together + 60) {
+                let time = match stamp {
+                    None => old(i),
+                    Some(step) => {
+                        let ms = i * step;
+                        format!(
+                            "2026-10-15 10:{:02}:{:02}.{:03}",
+                            ms / 60_000,
+                            ms / 1000 % 60,
+                            ms % 1000
+                        )
+                    }
+                };
+                let neighbour = i < together;
+                rows.push(format!(
+                    "{time},60,,,53,45,1,{},46,45,{},60",
+                    if neighbour { 70 } else { 60 },
+                    u8::from(neighbour)
+                ));
+            }
+            let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+            let found = effect(&tally(&rows).blocks["0"].with["2–5"]);
+            assert_eq!(found.is_some(), enough, "{together} строк «вместе», шаг {stamp:?}");
+            if let Some(e) = found {
+                assert!(close(e.delta, 10.0), "{}", e.delta);
+            }
         }
-        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
-        assert_eq!(effect(&tally(&rows).blocks["0"].with["2–5"]), None);
     }
 
     #[test]
@@ -804,11 +1159,20 @@ mod tests {
         ]);
         a.merge(&b);
         let bin = a.blocks["0"].bins[&45];
-        assert_eq!((bin.n, bin.temp_max), (3, 90.0));
+        assert_eq!((bin.n, bin.peak.temp), (3, 90.0));
         assert_eq!(bin.mean(), Some(80.0));
         assert_eq!(a.rows, 3);
+        assert!(close(a.secs, 6.0));
         assert_eq!(a.first.as_deref(), Some("2026-10-14 10:00:00"));
         assert_eq!(a.last.as_deref(), Some("2026-10-15 10:00:02"));
+        // Равные наибольшие: остаётся поздняя строка, в каком порядке ни сливай.
+        let early = tally(&["2026-10-14 10:00:00,60,,,53,45,1,90,46,,,"]);
+        let mut x = early.clone();
+        x.merge(&b);
+        let mut y = b.clone();
+        y.merge(&early);
+        assert_eq!(x.blocks["0"].bins[&45].peak, y.blocks["0"].bins[&45].peak);
+        assert_eq!(day_time(x.blocks["0"].bins[&45].peak.at), "15.10 10:00:00");
     }
 
     #[test]

@@ -5,8 +5,8 @@
 // • hello — процессор, ядра, блоки, схема кристалла; limits — заводские потолки, «было», что можно поставить блоку;
 //   profiles — профиль запуска, сохранённые наборы, что из них стоит и было; notice — сообщение владельцу. Шлются при
 //   знакомстве и потом только когда изменились.
-// • state — показания, дважды в секунду, пока окно подключено, и сразу после исполненной команды; окна нет — нет ни
-//   таймера, ни чтения датчиков.
+// • state — показания, дважды в секунду, пока окно подключено (пока пишется журнал срезов — из каждого второго его
+//   опроса, app/sense.rs), и сразу после исполненной команды; окна нет — нет ни таймера, ни чтения датчиков.
 // Новое, чего у движка не было: history — последние смены потолков (app/history.rs); в state — доля работы ядер
 // (busyShare), потолок автомодуля по блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля
 // (autoLimit).
@@ -42,7 +42,7 @@ use crate::shell::{self, Shell};
 pub const STATE: usize = 5;
 /// Таймер знакомства: окно подключилось и молчит.
 pub const GREET: usize = 6;
-const STATE_EVERY: Duration = Duration::from_millis(500);
+pub(super) const STATE_EVERY: Duration = Duration::from_millis(500);
 const GREET_EVERY: Duration = Duration::from_millis(500);
 /// Подключилось и столько молчит — отключается (Bridge.GreetWithin).
 const GREET_WITHIN: Duration = Duration::from_secs(2);
@@ -164,6 +164,20 @@ impl Serving {
     #[must_use]
     pub fn handles(&self) -> Vec<windows_sys::Win32::Foundation::HANDLE> {
         self.server.as_ref().map(Server::handles).unwrap_or_default()
+    }
+
+    /// Что видит подключённое окно; None — окна нет или оно ещё не назвало себя.
+    pub(super) fn watch_mut(&mut self) -> Option<&mut Watch> {
+        self.session.as_mut().filter(|s| s.greeted).map(|s| &mut s.watch)
+    }
+
+    pub(super) fn watch(&self) -> Option<&Watch> {
+        self.session.as_ref().filter(|s| s.greeted).map(|s| &s.watch)
+    }
+
+    /// Пора ли опросу окна: окно подключено и прошлый его опрос был не ближе `min` (`Watch::due`).
+    pub(super) fn window_due(&self, now: Instant, min: Duration) -> bool {
+        self.watch().is_some_and(|w| w.due(now, min))
     }
 }
 
@@ -444,6 +458,12 @@ impl App {
             self.drop_client(shell, "окно не читает канал 2 с");
             return;
         }
+        // Пока пишется журнал срезов, опрос окна — каждый второй его опрос (app/sense.rs): он и шлёт состояние, и цену
+        // чтения пишет он. Журнал только что кончился, а его опрос окна был меньше четверти секунды назад — это
+        // состояние пропускается, следующее — через полсекунды: средние идут по промежуткам около полсекунды.
+        if self.logging.on || !self.serving.window_due(Instant::now(), STATE_EVERY / 2) {
+            return;
+        }
         let started = Instant::now();
         self.sense();
         let cost = started.elapsed();
@@ -472,7 +492,8 @@ impl App {
 
     // ----- датчики -----
 
-    /// Опрос для окна: все ядра, корпус, раз в 10 с — потолки. Держит другая часть `CoreMap` — датчики не читаются.
+    /// Опрос окна по его таймеру, пока журнал срезов не пишется: все ядра, корпус, раз в 10 с — потолки. Держит другая
+    /// часть `CoreMap` — датчики не читаются.
     fn sense(&mut self) {
         let reason = if let Some(other) = self.other() {
             Some(other.menu_text().to_string())
@@ -509,6 +530,12 @@ impl App {
                 }
             }
         };
+        self.serving_trouble(reason);
+    }
+
+    /// Итог чтения датчиков для окна: None — показания есть; Some — почему их нет (окно покажет это строкой, а
+    /// показания ядер — пустыми).
+    pub(super) fn serving_trouble(&mut self, reason: Option<String>) {
         let Some(session) = self.serving.session.as_mut() else {
             return;
         };
@@ -518,38 +545,45 @@ impl App {
         session.trouble = reason;
     }
 
-    /// Под арендой: корпус и каждое ядро (как Monitor в C#), каждое чтение ядра — и в сумму автомодуля.
+    /// Под арендой: корпус и каждое ядро (как Monitor в C#) — одним путём чтения (app/sense.rs), затем средние под
+    /// нагрузкой.
     fn sense_all(&mut self) -> Result<(), String> {
-        let cores = self.topology.cores.len();
-        let Some(device) = self.device.as_mut() else {
-            return Err("нет доступа к процессору".into());
-        };
-        let Some(session) = self.serving.session.as_mut() else {
-            return Ok(());
-        };
-        let pkg = device
-            .thermal()
-            .package()
-            .map_err(|e| format!("температура не прочитана: {e}"))?;
-        for core in 0..cores {
-            let reading = device
-                .thermal()
-                .block(core)
-                .map_err(|e| format!("датчик ядра не прочитан: {e}"))?;
-            self.meter.record(core, reading, Instant::now());
-            session.watch.core(core, reading);
-        }
-        session.watch.package(pkg);
-        if Instant::now() >= session.next_refresh {
-            session.next_refresh = Instant::now() + REFRESH_EVERY;
-            if let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
-                session.unread = limits.refresh(cpu, &self.topology);
-            }
-        }
-        if let Some(limits) = &self.limits {
-            session.watch.polled(limits.current());
-        }
+        self.read_sensors(true)?;
+        self.feed_means();
         Ok(())
+    }
+
+    /// Опрос окна окончен: показания за полсекунды и средние под нагрузкой при нынешних потолках (`Watch::polled`).
+    fn feed_means(&mut self) {
+        if let (Some(session), Some(limits)) = (self.serving.session.as_mut(), &self.limits) {
+            session.watch.polled(limits.current(), Instant::now());
+        }
+    }
+
+    /// Опрос окна в опросе срезов (app/sense.rs) окончен: средние под нагрузкой, затем — что изменилось и состояние,
+    /// как по таймеру состояния.
+    pub(super) fn window_polled(&mut self, shell: &Shell) {
+        self.feed_means();
+        if self.serving.server.as_ref().is_some_and(Server::writing) {
+            return;
+        }
+        self.push_topics(shell);
+        self.push_state(shell);
+    }
+
+    /// Раз в 10 с, пока открыто окно, — потолки заново из процессора: их мог сбросить сон или изменить другая
+    /// программа. Под арендой, в опросе датчиков.
+    pub(super) fn refresh_for_window(&mut self) {
+        let Some(session) = self.serving.session.as_mut().filter(|s| s.greeted) else {
+            return;
+        };
+        if Instant::now() < session.next_refresh {
+            return;
+        }
+        session.next_refresh = Instant::now() + REFRESH_EVERY;
+        if let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
+            session.unread = limits.refresh(cpu, &self.topology);
+        }
     }
 
     // ----- сообщения -----

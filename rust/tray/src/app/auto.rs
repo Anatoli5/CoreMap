@@ -6,8 +6,9 @@
 // Память перегрева (machine::memory) не пускает блок обратно на ступень, где он перегрелся, пока не выйдет запрет; она
 // восстанавливается при запуске из журнала действий data\auto-log.jsonl — там каждое решение с условиями: средняя и
 // наибольшая температура блока, фактический множитель, загрузка, температуры всех блоков (соседи), корпус,
-// вентиляторы. Пока блоки читаются, каждые 2 с пишется срез в data\samples\<дата>.csv — «матрица» владельца для
-// будущих кривых; срезы старше 30 дней удаляются.
+// вентиляторы. Пока блоки судятся (то же условие), идёт опрос раз в 0,25 с и пишется журнал срезов
+// data\samples\<дата>.csv — «матрица» владельца для будущих кривых (app/sense.rs); решает регулятор по-прежнему раз
+// в 2 с — по сумме показаний этого опроса за 2 с (app/meter.rs), сам ядра тогда не читает.
 //
 // Блоки не на принятом — «надстройка» над принятыми потолками (`intended`): принятые не меняются, надстройка помнит,
 // какой блок куда сдвинут (вниз — снижение, вверх — подтягивание до заводского). Пока надстройка есть, программа держит аренду «CoreMap.Ceilings»: прежнее окно или движок,
@@ -46,24 +47,29 @@ pub const DEPTH_ID: u32 = 30;
 pub const LIMITS: [i32; 5] = [75, 80, 85, 90, 95];
 pub const DEPTHS: [i32; 3] = [2, 4, 6];
 /// Как часто писать в журнал цену опроса — так она измеряется на машине владельца.
-const COST_EVERY: Duration = Duration::from_secs(60);
+pub(super) const COST_EVERY: Duration = Duration::from_secs(60);
 /// Столько чтений подряд потолок блока должен расходиться с ожидаемым, чтобы считаться чужой правкой: одно чтение
 /// бывает и запоздалым ответом на собственную запись, и чужим запросом в ящике (`ThrottleStop` не берёт наш замок).
 const FOREIGN_READS: u8 = 2;
 /// С такой доли работы всего процессора (по Windows) блоки читаются, даже если корпус далеко от предела: для журнала
 /// срезов и для подтягивания нужны блоки под нагрузкой. Простой Windows — 1–5 %; число — выбор агента, не мерено.
 const LOADED: f64 = 0.10;
-/// Обороты читаются не чаще: каждый раз — вызов прошивки.
+/// Обороты для окна, пока журнал срезов не пишется, и после отказа прошивки — не чаще: каждый раз — вызов прошивки
+/// (около 30 мс, замер на машине владельца 15.10), а отказавший может держать цикл программы до 4 с (fans.rs,
+/// `PATIENCE_MS`): опрос журнала и состояния окна в это время стоят (ревизия 15.10, п. 4).
 const FANS_EVERY: Duration = Duration::from_secs(10);
 /// Прошивка не открылась — следующая попытка через столько.
 const FANS_RETRY: Duration = Duration::from_secs(60);
-/// Срезы хранятся столько дней.
-const KEEP_DAYS: i64 = 30;
 
-/// Сроки автомодуля: опрос и сроки регулятора. Скрытая проверка их укорачивает.
+/// Сроки автомодуля: опрос и сроки регулятора, опрос срезов и обороты при нём. Скрытая проверка их укорачивает.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoTiming {
+    /// Опрос автомодуля: решение регулятора, а без журнала срезов — и само чтение корпуса (и блоков).
     pub tick: Duration,
+    /// Опрос срезов, пока пишется журнал: строка на каждый (выбор владельца 15.10, вариант А, — 0,25 с).
+    pub sample: Duration,
+    /// Обороты, пока пишется журнал: в строку того опроса, где прочитаны.
+    pub fans: Duration,
     pub control: Timing,
     pub bans: Spans,
 }
@@ -71,6 +77,8 @@ pub struct AutoTiming {
 impl AutoTiming {
     pub const REAL: Self = Self {
         tick: Duration::from_secs(2),
+        sample: Duration::from_millis(250),
+        fans: Duration::from_secs(2),
         control: Timing::REAL,
         bans: Spans::REAL,
     };
@@ -110,16 +118,17 @@ pub struct Autopilot {
     /// Время процессоров по Windows на прошлом опросе: (простой, всего).
     system: Option<(u64, u64)>,
     fans: Option<Box<dyn Fans>>,
-    /// Когда читать обороты (или открывать прошивку) в следующий раз.
-    fans_next: Option<Instant>,
+    /// Когда обороты читались (или открывалась прошивка) последний раз; следующий раз — через срок, который зависит
+    /// от того, пишется ли журнал срезов и чем кончился прошлый раз.
+    fans_last: Option<Instant>,
+    /// Чем кончился прошлый раз; None — обороты прочитаны (или ещё не спрашивались).
+    fans_fault: Option<FanFault>,
     /// Последние прочитанные обороты; None — не известны. Их же видит окно.
     pub(super) rpm: Option<Vec<u32>>,
     fans_said: Option<String>,
-    /// Последняя ошибка записи журналов: одна строка журнала программы на одну и ту же.
-    files_said: Option<String>,
     fans_cost: Option<Duration>,
-    /// День, в чей файл пишутся срезы.
-    samples_day: String,
+    /// Скрытая проверка: сколько раз обороты спрошены.
+    pub(super) fan_calls: u64,
     /// По блокам: чужая правка принята — автомодуль этот блок не трогает до смены набора.
     aside: Vec<bool>,
     /// По блокам: сколько чтений подряд потолок расходится с ожидаемым.
@@ -145,12 +154,12 @@ impl Autopilot {
             memory: Memory::new(Spans::REAL),
             system: None,
             fans: None,
-            fans_next: None,
+            fans_last: None,
+            fans_fault: None,
             rpm: None,
             fans_said: None,
-            files_said: None,
             fans_cost: None,
-            samples_day: String::new(),
+            fan_calls: 0,
             aside: vec![false; blocks],
             mismatch: vec![0; blocks],
             holding: false,
@@ -196,6 +205,27 @@ enum Polled {
     Said(String),
     /// Потолки сброшены (сон): поставить их на место — дело сверки после пробуждения.
     Reset,
+}
+
+/// Докуда дошёл опрос: от этого — пишется ли журнал срезов и что сказать в строке цены.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Только корпус: блоки не нужны, не прочитаны или опроса не было.
+    Package,
+    /// Блоки прочитаны, потолки — нет.
+    Blocks,
+    /// Блоки и потолки прочитаны: журнал срезов пишется — в строке потолки прочитанные, а не последние известные
+    /// (ревизия 15.10, п. 3; так было и до журнала раз в 0,25 с).
+    Ceilings,
+}
+
+/// Отказ оборотов: от него — когда спрашивать снова.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanFault {
+    /// Прошивка открыта, но ответила ошибкой или не ответила: снова через `FANS_EVERY`.
+    Read,
+    /// Прошивка не открылась: снова через `FANS_RETRY`.
+    Open,
 }
 
 impl App {
@@ -247,7 +277,7 @@ impl App {
         }
     }
 
-    fn controller_for(&self) -> Controller {
+    pub(super) fn controller_for(&self) -> Controller {
         let c = self.auto.choice;
         Controller::new(
             Settings {
@@ -290,15 +320,20 @@ impl App {
     /// Память перегрева из журнала действий: записанные снижения повторяются по порядку. Испорченные строки
     /// пропускаются — говорится об этом одной строкой журнала программы.
     pub(crate) fn replay_memory(&mut self) {
+        // Журнала нет или он не читается — память пустая, но со сроками из настроек: прежде здесь оставалась память из
+        // `Autopilot::new` с настоящими сроками, и скрытая проверка с короткими сроками сравнивала запреты на 30 мин с
+        // запретами на 2 с (её шаг «из журнала действий восстанавливаются те же» то проходил, то нет).
+        let mut memory = Memory::new(self.config.auto.bans);
         let text = match std::fs::read_to_string(self.log_path()) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                self.journal.error(&format!("журнал автомодуля не прочитан: {e}"));
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    self.journal.error(&format!("журнал автомодуля не прочитан: {e}"));
+                }
+                self.auto.memory = memory;
                 return;
             }
         };
-        let mut memory = Memory::new(self.config.auto.bans);
         let mut bad = 0_usize;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) else {
@@ -485,6 +520,7 @@ impl App {
                     shell.set_timer(AUTO, self.config.auto.tick);
                 } else {
                     shell.kill_timer(AUTO);
+                    self.stop_logging(shell);
                     self.put_back("автомодуль выключен");
                     self.auto.controller = None;
                     // Драйвер нужен ещё окну, если оно открыто (его опрос раз в полсекунду).
@@ -585,15 +621,26 @@ impl App {
         self.auto.last_tick = Some(Instant::now());
         if let Some(other) = self.other() {
             // C#-часть стартует (или уже работает): вернуть принятые, пока она ждёт аренду, и отпустить её.
+            self.stop_logging(shell);
             self.yield_to(other);
             return;
         }
         if self.take_back_pending || self.auto.wake_pending {
+            self.stop_logging(shell);
             return; // потолки ставит на место возврат права или сверка после пробуждения
         }
         let started = Instant::now();
-        let mut watched_blocks = false;
-        let outcome = self.with_ceilings(|app| app.poll(&mut watched_blocks));
+        let mut reach = Reach::Package;
+        let polled = self.logging.on;
+        let outcome = self.with_ceilings(|app| app.poll(&mut reach));
+        // Журнал срезов пишется, пока блоки судятся и потолки прочитаны (то же условие, что и раньше для строки раз в
+        // 2 с): опрос раз в 0,25 с — с этого решения до того, которое скажет «не нужно». Потолки не прочитаны — журнал
+        // стоит: его опрос открывал бы драйвер, который здесь после ошибки отпускается.
+        if reach == Reach::Ceilings {
+            self.start_logging(shell);
+        } else {
+            self.stop_logging(shell);
+        }
         let said = match outcome {
             Ok(Polled::Quiet) => None,
             Ok(Polled::Said(said)) => Some(said),
@@ -628,10 +675,10 @@ impl App {
             self.journal.note(&format!(
                 "автомодуль: опрос {} мкс{}{fans}",
                 started.elapsed().as_micros(),
-                if watched_blocks {
-                    ", с блоками"
-                } else {
-                    ", только корпус"
+                match (reach, polled) {
+                    (Reach::Package, _) => ", только корпус",
+                    (_, true) => ", с блоками (показания опроса срезов)",
+                    (_, false) => ", с блоками",
                 }
             ));
         }
@@ -642,8 +689,8 @@ impl App {
         }
     }
 
-    /// Один опрос под арендой: показания, сверка потолков, срез в журнал, решение регулятора, запись.
-    fn poll(&mut self, watched_blocks: &mut bool) -> Polled {
+    /// Один опрос под арендой: показания, сверка потолков, решение регулятора, запись.
+    fn poll(&mut self, reach: &mut Reach) -> Polled {
         let (package, readings) = match self.sample() {
             Ok(Some(sampled)) => sampled,
             Ok(None) => {
@@ -655,14 +702,17 @@ impl App {
             }
             Err(said) => return Polled::Said(said),
         };
-        *watched_blocks = true;
+        *reach = Reach::Blocks;
         let foreign = match self.reconcile() {
             Ok(Some(foreign)) => foreign,
             Ok(None) => return Polled::Reset,
             Err(said) => return Polled::Said(said),
         };
-        self.read_fans();
-        self.write_sample(package, &readings);
+        *reach = Reach::Ceilings;
+        // Обороты для условий решения в журнале действий: пока пишется журнал срезов, их читает его опрос.
+        if !self.logging.on {
+            self.read_fans();
+        }
         let mut said = (!foreign.is_empty()).then(|| {
             format!(
                 "Потолки блоков {} изменила другая программа — автомодуль их больше не трогает",
@@ -700,17 +750,21 @@ impl App {
     /// Показания: корпус и, если нужны, блоки — корпус близко к пределу, надстройка есть или процессор нагружен.
     /// Ok(None) — блоки не нужны.
     ///
-    /// Пока открыто окно, оно читает все ядра раз в полсекунду, и у ядра счётчики одни: показание блока — сумма чтений
-    /// окна с прошлого опроса (app/meter.rs), своего чтения нет. Окна нет — блок читается здесь, как раньше.
+    /// Пока ядра читает кто-то другой — опрос срезов раз в 0,25 с или окно раз в полсекунды, — у ядра счётчики одни:
+    /// показание блока — сумма их чтений с прошлого решения (app/meter.rs), своего чтения нет; корпус — их последнее
+    /// чтение, если оно свежее половины опроса. Никто не читает — корпус и блоки читаются здесь, как раньше.
     fn sample(&mut self) -> Result<Option<Sampled>, String> {
         let share = self.system_share();
         let Some(device) = self.device.as_mut() else {
             return Ok(None);
         };
-        let package = device
-            .thermal()
-            .package()
-            .map_err(|e| format!("Автомодуль: температура не прочитана — {e}"))?;
+        let package = match self.meter.package_within(self.config.auto.tick / 2) {
+            Some(read) => read.value,
+            None => device
+                .thermal()
+                .package()
+                .map_err(|e| format!("Автомодуль: температура не прочитана — {e}"))?,
+        };
         let overlay = self.auto.active();
         let Some(controller) = self.auto.controller.as_ref() else {
             return Ok(None);
@@ -720,17 +774,20 @@ impl App {
             self.meter.forget();
             return Ok(None);
         }
-        let sensing = self.serving.attached();
+        let sensing = self.serving.attached() || self.logging.on;
         let mut readings = Vec::with_capacity(self.topology.blocks.len());
         for (b, block) in self.topology.blocks.iter().enumerate() {
-            // Отставленный после чужой правки блок не судится: показаний для регулятора нет.
+            // Отставленный после чужой правки блок не судится: показаний для регулятора нет. Набранное опросом срезов
+            // или окном — прочь, чтобы, когда блок снова под присмотром, первое решение было по свежему времени.
             if self.auto.aside[b] {
+                self.meter.drain(block.first);
                 readings.push(None);
                 continue;
             }
             if !(sensing && self.meter.has(block.first)) {
                 if let Ok(reading) = device.thermal().block(block.first) {
-                    self.meter.record(block.first, reading, Instant::now());
+                    // Тем же путём, что опрос срезов и окна: открытое окно складывает и это чтение.
+                    super::sense::record(&mut self.meter, self.serving.watch_mut(), block.first, reading);
                 } else {
                     // Блок не прочитался: в этом опросе его нет (как и раньше); сумма — заново.
                     self.meter.drain(block.first);
@@ -743,50 +800,73 @@ impl App {
         Ok(Some((package, readings)))
     }
 
-    /// Обороты вентиляторов — не чаще раза в 10 с (каждый раз — вызов прошивки). На имитации прошивка не трогается.
-    /// Зовут опрос автомодуля и опрос окна.
-    pub(super) fn read_fans(&mut self) {
+    /// Обороты вентиляторов: пока пишется журнал срезов — раз в 2 с (`AutoTiming::fans`), иначе и после отказа — не
+    /// чаще раза в 10 с (каждый раз — вызов прошивки), прошивка не открылась — раз в минуту. На имитации прошивка не
+    /// трогается. Зовут опрос срезов, опрос автомодуля (пока журнал не пишется) и опрос окна. true — обороты прочитаны
+    /// сейчас (они идут в строку среза только тогда).
+    pub(super) fn read_fans(&mut self) -> bool {
         let now = Instant::now();
-        if self.auto.fans_next.is_some_and(|next| now < next) {
-            return;
+        let every = match self.auto.fans_fault {
+            Some(FanFault::Open) => FANS_RETRY,
+            None if self.logging.on => self.config.auto.fans,
+            Some(FanFault::Read) | None => FANS_EVERY,
+        };
+        // Пол-опроса срезов — допуск на дрожание таймера: обороты в каждой восьмой строке, а не то в восьмой, то в
+        // девятой.
+        let slack = self.config.auto.sample / 2;
+        if self
+            .auto
+            .fans_last
+            .is_some_and(|last| now.saturating_duration_since(last) + slack < every)
+        {
+            return false;
         }
-        self.auto.fans_next = Some(now + FANS_EVERY);
+        self.auto.fans_last = Some(now);
         if self.auto.fans.is_none() {
             let opened: Result<Box<dyn Fans>, String> = match &self.device {
-                Some(Device::Sim(_)) => Ok(Box::new(SimFans {
-                    rpm: vec![3200, 3000],
-                    fail: false,
-                })),
+                Some(Device::Sim(_)) => Ok(Box::new(sim_fans(false))),
                 Some(Device::Real(_)) => HpFans::open()
                     .map(|fans| Box::new(fans) as Box<dyn Fans>)
                     .map_err(|e| e.0),
-                None => return,
+                None => return false,
             };
             match opened {
                 Ok(fans) => self.auto.fans = Some(fans),
                 Err(text) => {
                     self.auto.rpm = None;
-                    self.auto.fans_next = Some(now + FANS_RETRY);
+                    self.auto.fans_fault = Some(FanFault::Open);
                     self.fans_trouble(&text);
-                    return;
+                    return false;
                 }
             }
         }
         let Some(fans) = self.auto.fans.as_mut() else {
-            return;
+            return false;
         };
         let started = Instant::now();
         let read = fans.rpm();
         self.auto.fans_cost = Some(started.elapsed());
+        self.auto.fan_calls += 1;
         match read {
             Ok(rpm) => {
                 self.auto.rpm = Some(rpm);
                 self.auto.fans_said = None;
+                self.auto.fans_fault = None;
+                true
             }
             Err(e) => {
                 self.auto.rpm = None;
+                self.auto.fans_fault = Some(FanFault::Read);
                 self.fans_trouble(&e.0);
+                false
             }
+        }
+    }
+
+    /// Скрытая проверка: обороты имитации отказывают (`fail`) или снова отвечают. Только на имитации.
+    pub fn sim_fans(&mut self, fail: bool) {
+        if matches!(self.device, Some(Device::Sim(_))) {
+            self.auto.fans = Some(Box::new(sim_fans(fail)));
         }
     }
 
@@ -796,85 +876,6 @@ impl App {
             self.journal
                 .error(&format!("автомодуль: обороты вентиляторов не прочитаны — {text}"));
             self.auto.fans_said = Some(text.to_owned());
-        }
-    }
-
-    /// Срез в data\samples\<дата>.csv: время, корпус, вентиляторы, по блокам потолок, фактический множитель, доля
-    /// работы, температура. Заголовок — при создании файла; новый день — новый файл и чистка старых.
-    fn write_sample(&mut self, package: Option<f64>, readings: &[Option<Reading>]) {
-        let Some(limits) = self.limits.as_ref() else {
-            return;
-        };
-        let now = Stamp::now();
-        let day = now.local(Pattern::Date);
-        let dir = self.config.data.join("samples");
-        let path = dir.join(format!("{day}.csv"));
-        let mut text = String::with_capacity(600);
-        if !path.exists() {
-            text.push_str("time,package,fan_cpu,fan_gpu");
-            for block in &self.topology.blocks {
-                let n = &block.name;
-                let _ = write!(text, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String: cannot fail
-            }
-            text.push('\n');
-        }
-        let rpm = self.auto.rpm.as_deref().unwrap_or_default();
-        let fan = |k: usize| rpm.get(k).map(u32::to_string).unwrap_or_default();
-        let _ = write!(
-            text,
-            "{},{},{},{}",
-            now.local(Pattern::Log),
-            opt(package, 0),
-            fan(0),
-            fan(1)
-        ); // into a String
-        for (block, reading) in self.topology.blocks.iter().zip(readings) {
-            let r = reading.unwrap_or_default();
-            let _ = write!(
-                text,
-                ",{},{},{},{}",
-                limits.current()[block.first],
-                opt(r.ratio, 2),
-                opt(r.busy, 2),
-                opt(r.temp, 0)
-            ); // into a String: cannot fail
-        }
-        let line = text.strip_suffix('\n').unwrap_or(&text);
-        if let Err(e) = files::append_line(&path, line) {
-            self.files_trouble(&format!("срез не записан: {e}"));
-        }
-        if day != self.auto.samples_day {
-            self.auto.samples_day = day;
-            self.prune_samples(&dir, now);
-        }
-    }
-
-    /// Ошибка записи журнала — одна строка журнала программы на одну и ту же ошибку.
-    fn files_trouble(&mut self, text: &str) {
-        if self.auto.files_said.as_deref() != Some(text) {
-            self.journal.error(&format!("автомодуль: {text}"));
-            self.auto.files_said = Some(text.to_owned());
-        }
-    }
-
-    /// Срезы старше 30 дней удаляются (это журнал программы, не файлы владельца; срок — его выбор 15.10).
-    fn prune_samples(&self, dir: &std::path::Path, now: Stamp) {
-        let cutoff = Stamp(now.0 - KEEP_DAYS * 24 * 3600 * 10_000_000).local(Pattern::Date);
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(date) = name.strip_suffix(".csv") else {
-                continue;
-            };
-            if date.len() == 10
-                && date < cutoff.as_str()
-                && let Err(e) = std::fs::remove_file(entry.path())
-            {
-                self.journal
-                    .error(&format!("автомодуль: старый срез {name} не удалён: {e}"));
-            }
         }
     }
 
@@ -1184,13 +1185,16 @@ impl App {
     }
 }
 
+/// Обороты имитации: те же числа во всей программе (скрытая проверка ждёт их в состоянии окна).
+pub(super) fn sim_fans(fail: bool) -> SimFans {
+    SimFans {
+        rpm: vec![3200, 3000],
+        fail,
+    }
+}
+
 /// Число для журнала: `digits` знаков после запятой.
 fn round(value: f64, digits: i32) -> f64 {
     let scale = 10_f64.powi(digits);
     (value * scale).round() / scale
-}
-
-/// Число для среза: пусто, если не известно.
-fn opt(value: Option<f64>, digits: usize) -> String {
-    value.map(|v| format!("{v:.digits$}")).unwrap_or_default()
 }
