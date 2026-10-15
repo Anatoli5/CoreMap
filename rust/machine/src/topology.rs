@@ -219,11 +219,23 @@ fn bits(mask: u64) -> impl Iterator<Item = u32> {
 /// Должно совпадать с тем, что пишет C#-часть, иначе файл профиля молча считается чужим.
 #[must_use]
 pub fn cpu_name() -> String {
+    processor_value("ProcessorNameString").unwrap_or_else(|| "процессор".into())
+}
+
+/// Строка «Intel64 Family 6 Model 198 Stepping 2» из реестра (`Identifier`; Topology.Identity в C#): по ней и по
+/// раскладке ядер выбирается схема кристалла (`layouts\*.json`). Нет значения — пустая строка: схема не подойдёт.
+#[must_use]
+pub fn cpu_identifier() -> String {
+    processor_value("Identifier").unwrap_or_default()
+}
+
+/// Строковое значение ключа первого процессора в реестре, без пробелов по краям; None — его нет.
+fn processor_value(name: &str) -> Option<String> {
     let key: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"
         .encode_utf16()
         .chain([0])
         .collect();
-    let value: Vec<u16> = "ProcessorNameString".encode_utf16().chain([0]).collect();
+    let value: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let mut buffer = [0u16; 256];
     let mut bytes = u32::try_from(size_of_val(&buffer)).unwrap_or(u32::MAX);
     // SAFETY: names are NUL-terminated and outlive the call; `buffer` is writable for `bytes` bytes; RRF_RT_REG_SZ
@@ -240,8 +252,8 @@ pub fn cpu_name() -> String {
         )
     };
     if status != ERROR_SUCCESS {
-        return "процессор".into();
+        return None;
     }
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    OsString::from_wide(&buffer[..len]).to_string_lossy().trim().to_string()
+    Some(OsString::from_wide(&buffer[..len]).to_string_lossy().trim().to_string())
 }

@@ -101,9 +101,10 @@ impl Default for Choice {
 #[derive(Debug)]
 pub struct Autopilot {
     pub choice: Choice,
-    controller: Option<Controller>,
-    /// По блокам: потолок, поставленный автомодулем (ниже или выше принятого); None — блок на принятом.
-    overlay: Vec<Option<i32>>,
+    pub(super) controller: Option<Controller>,
+    /// По блокам: потолок, поставленный автомодулем (ниже или выше принятого); None — блок на принятом. Окно видит его
+    /// в состоянии (app/serve.rs, поле auto).
+    pub(super) overlay: Vec<Option<i32>>,
     /// Память перегрева.
     memory: Memory,
     /// Время процессоров по Windows на прошлом опросе: (простой, всего).
@@ -111,8 +112,8 @@ pub struct Autopilot {
     fans: Option<Box<dyn Fans>>,
     /// Когда читать обороты (или открывать прошивку) в следующий раз.
     fans_next: Option<Instant>,
-    /// Последние прочитанные обороты; None — не известны.
-    rpm: Option<Vec<u32>>,
+    /// Последние прочитанные обороты; None — не известны. Их же видит окно.
+    pub(super) rpm: Option<Vec<u32>>,
     fans_said: Option<String>,
     /// Последняя ошибка записи журналов: одна строка журнала программы на одну и ту же.
     files_said: Option<String>,
@@ -169,7 +170,7 @@ impl Autopilot {
 }
 
 impl Device {
-    fn thermal(&mut self) -> &mut dyn Thermal {
+    pub(super) fn thermal(&mut self) -> &mut dyn Thermal {
         match self {
             Self::Real(cpu) => cpu,
             Self::Sim(cpu) => cpu,
@@ -271,6 +272,7 @@ impl App {
         }
         if self.auto.choice.on {
             self.auto.controller = Some(self.controller_for());
+            self.meter.forget();
             shell.set_timer(AUTO, self.config.auto.tick);
             self.journal.note(&format!(
                 "автомодуль включён: до {} °C, глубина {}{}",
@@ -359,7 +361,7 @@ impl App {
     }
 
     /// Переписать метку по надстройке; надстройки нет — убрать метку и отпустить аренду.
-    fn mark(&mut self) -> Result<(), String> {
+    pub(super) fn mark(&mut self) -> Result<(), String> {
         if !self.auto.active() {
             if let Err(e) = files::delete_with_backup(&self.marker_path()) {
                 self.journal.error(&format!("метка автомодуля не удалена: {e}"));
@@ -478,12 +480,17 @@ impl App {
             (AUTO_ON, ..) => {
                 self.auto.choice.on = !self.auto.choice.on;
                 if self.auto.choice.on {
+                    // Суммы показаний, набранные окном до включения, — не для первого решения регулятора.
+                    self.meter.forget();
                     shell.set_timer(AUTO, self.config.auto.tick);
                 } else {
                     shell.kill_timer(AUTO);
                     self.put_back("автомодуль выключен");
                     self.auto.controller = None;
-                    if let Some(device) = &mut self.device {
+                    // Драйвер нужен ещё окну, если оно открыто (его опрос раз в полсекунду).
+                    if !self.serving.attached()
+                        && let Some(device) = &mut self.device
+                    {
                         device.cpu().release();
                     }
                 }
@@ -508,6 +515,20 @@ impl App {
             if c.step_up { "вкл" } else { "выкл" }
         ));
         true
+    }
+
+    /// Владелец поставил блоку потолок сам (окно): регулятор судит этот блок заново, отставленный из-за чужой правки —
+    /// снова под присмотром.
+    pub(super) fn auto_block_fresh(&mut self, b: usize) {
+        if let Some(aside) = self.auto.aside.get_mut(b) {
+            *aside = false;
+        }
+        if let Some(mismatch) = self.auto.mismatch.get_mut(b) {
+            *mismatch = 0;
+        }
+        if let Some(controller) = &mut self.auto.controller {
+            controller.forget_block(b);
+        }
     }
 
     /// Смена набора: принятые потолки — новые, блоки, отставленные из-за чужой правки, снова под присмотром.
@@ -678,6 +699,9 @@ impl App {
 
     /// Показания: корпус и, если нужны, блоки — корпус близко к пределу, надстройка есть или процессор нагружен.
     /// Ok(None) — блоки не нужны.
+    ///
+    /// Пока открыто окно, оно читает все ядра раз в полсекунду, и у ядра счётчики одни: показание блока — сумма чтений
+    /// окна с прошлого опроса (app/meter.rs), своего чтения нет. Окна нет — блок читается здесь, как раньше.
     fn sample(&mut self) -> Result<Option<Sampled>, String> {
         let share = self.system_share();
         let Some(device) = self.device.as_mut() else {
@@ -692,21 +716,36 @@ impl App {
             return Ok(None);
         };
         if !controller.watch_blocks(package, overlay) && share < LOADED {
+            // Блоки не судятся: набранное окном — не для следующего решения (оно должно быть по свежему времени).
+            self.meter.forget();
             return Ok(None);
         }
+        let sensing = self.serving.attached();
         let mut readings = Vec::with_capacity(self.topology.blocks.len());
         for (b, block) in self.topology.blocks.iter().enumerate() {
             // Отставленный после чужой правки блок не судится: показаний для регулятора нет.
-            let reading = (!self.auto.aside[b])
-                .then(|| device.thermal().block(block.first).ok())
-                .flatten();
-            readings.push(reading);
+            if self.auto.aside[b] {
+                readings.push(None);
+                continue;
+            }
+            if !(sensing && self.meter.has(block.first)) {
+                if let Ok(reading) = device.thermal().block(block.first) {
+                    self.meter.record(block.first, reading, Instant::now());
+                } else {
+                    // Блок не прочитался: в этом опросе его нет (как и раньше); сумма — заново.
+                    self.meter.drain(block.first);
+                    readings.push(None);
+                    continue;
+                }
+            }
+            readings.push(Some(self.meter.drain(block.first)));
         }
         Ok(Some((package, readings)))
     }
 
     /// Обороты вентиляторов — не чаще раза в 10 с (каждый раз — вызов прошивки). На имитации прошивка не трогается.
-    fn read_fans(&mut self) {
+    /// Зовут опрос автомодуля и опрос окна.
+    pub(super) fn read_fans(&mut self) {
         let now = Instant::now();
         if self.auto.fans_next.is_some_and(|next| now < next) {
             return;
@@ -851,6 +890,9 @@ impl App {
         }
         let intended = self.intended.get_or_insert_with(|| limits.current().to_vec());
         let mut foreign = Vec::new();
+        // Принятые до чужой правки — для истории профилей; копия только в опрос, где правка принята (редко).
+        let mut before: Option<Vec<i32>> = None;
+        let mut adopted = Vec::new();
         for (b, block) in topology.blocks.iter().enumerate() {
             let i = block.first;
             let expected = self.auto.overlay[b].unwrap_or(intended[i]);
@@ -865,8 +907,11 @@ impl App {
             if self.auto.mismatch[b] < FOREIGN_READS {
                 continue;
             }
+            before.get_or_insert_with(|| intended.clone());
+            adopted.push(block.name.clone());
+            // Потолок у блока общий, а перечитано только первое ядро (refresh_blocks): его значение — всем ядрам блока.
             for &m in &block.members {
-                intended[m] = limits.current()[m];
+                intended[m] = limits.current()[i];
             }
             self.auto.overlay[b] = None;
             self.auto.mismatch[b] = 0;
@@ -877,6 +922,10 @@ impl App {
             if let Some(controller) = &mut self.auto.controller {
                 controller.forget_block(b);
             }
+        }
+        if let Some(before) = before {
+            self.log_change("foreign", None, &before, Some(&adopted.join(", ")), None);
+            self.version += 1;
         }
         Ok(Some(foreign))
     }
@@ -1069,7 +1118,7 @@ impl App {
         map
     }
 
-    fn log_line(&mut self, line: &Value) {
+    pub(super) fn log_line(&mut self, line: &Value) {
         if let Err(e) = files::append_line(&self.log_path(), &line.to_string()) {
             self.journal.error(&format!("журнал автомодуля не дописан: {e}"));
         }

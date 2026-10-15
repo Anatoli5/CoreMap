@@ -18,7 +18,7 @@ slint = { version = "=1.18.1", features = ["renderer-software"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 png = "0.17"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 slint-build = "=1.18.1"

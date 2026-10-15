@@ -4,7 +4,8 @@
 // заново, но не раньше, чем по журналу Windows проверено, что прошлое применение не кончилось сбоем. Профиль с
 // потолком выше заводского проходит испытательный срок («пробный»): столько-то перезапусков и часов без сбоя.
 // Сбой после применения рискованного профиля отключает его; безопасный ставится и после сбоя, с пометкой.
-// Сохранённые наборы по названиям (data\profiles.json) пишет только C#-часть; здесь они только читаются.
+// Сохранённые наборы по названиям (data\profiles.json) пишут прежнее окно на C# и программа входа (команды окна на
+// Rust, DECISIONS #32 шаг 2) — в одном и том же виде (`Store::sets_text`).
 //
 // Отличие от C# (DECISIONS #31, выбор владельца 2): часы пробного профиля считаются до штатного завершения работы
 // ИЛИ до записи Windows о быстром выключении (Kernel-Power 42) — при быстром запуске событие 6006 не пишется, и
@@ -412,13 +413,26 @@ pub fn save(store: &Store, limits: &Limits, name: &str, now: Stamp) -> io::Resul
     Ok(p)
 }
 
-/// Каким сохранённым набором являются потолки: Some(название), Some("") — заводские, None — ни одним (ставились
-/// вручную, ползунком или измерением). Ядра, о которых процессор не ответил, не в счёт. Первым идёт профиль
-/// запуска, затем наборы по порядку (LimitsStartup.Named в C#). `sets` уже включает профиль запуска.
+/// Каким сохранённым набором являются потолки, стоящие в процессоре: Some(название), Some("") — заводские, None — ни
+/// одним (ставились вручную, ползунком или измерением). См. `named`.
 #[must_use]
 pub fn standing(limits: &Limits, startup: Option<&Profile>, sets: &[Set]) -> Option<String> {
-    let current = limits.current();
-    let same = |other: &[i32]| (0..current.len()).all(|i| !limits.known(i) || other.get(i) == Some(&current[i]));
+    named(limits, limits.current(), startup, sets, None)
+}
+
+/// Каким сохранённым набором являются потолки `ratios`: Some(название), Some("") — заводские, None — ни одним.
+/// Ядра, о которых процессор не ответил, не в счёт. Первым идёт профиль запуска, затем `preferred` — набор, который
+/// владелец открыл или сохранил последним (одни и те же потолки бывают записаны под несколькими названиями), затем
+/// наборы по порядку (LimitsStartup.Named в C#). `sets` уже включает профиль запуска.
+#[must_use]
+pub fn named(
+    limits: &Limits,
+    ratios: &[i32],
+    startup: Option<&Profile>,
+    sets: &[Set],
+    preferred: Option<&str>,
+) -> Option<String> {
+    let same = |other: &[i32]| (0..ratios.len()).all(|i| !limits.known(i) || other.get(i) == ratios.get(i));
     match startup {
         None if same(limits.fused()) => return Some(String::new()),
         Some(p) if sets.iter().any(|s| same_name(&s.name, &p.name)) && same(&p.ratios) => {
@@ -426,8 +440,115 @@ pub fn standing(limits: &Limits, startup: Option<&Profile>, sets: &[Set]) -> Opt
         }
         _ => {}
     }
+    if let Some(set) = preferred.and_then(|name| sets.iter().find(|s| same_name(&s.name, name)))
+        && same(&set.ratios)
+    {
+        return Some(set.name.trim().to_string());
+    }
     if let Some(set) = sets.iter().find(|s| same(&s.ratios)) {
         return Some(set.name.clone());
     }
     same(limits.fused()).then(String::new)
+}
+
+/// Кладёт набор в список (ProfileSets.Put в C#): набор с тем же названием (без учёта регистра и пробелов по краям)
+/// получает новые потолки и сохраняет своё прежнее написание, как ключ в словаре C# без учёта регистра.
+pub fn put_set(sets: &mut Vec<Set>, name: &str, ratios: &[i32]) {
+    if let Some(set) = sets.iter_mut().find(|s| same_name(&s.name, name)) {
+        set.ratios = ratios.to_vec();
+    } else {
+        sets.push(Set {
+            name: name.trim().to_string(),
+            ratios: ratios.to_vec(),
+        });
+    }
+    sort_sets(sets);
+}
+
+/// Убирает набор с таким названием. false — такого нет.
+pub fn remove_set(sets: &mut Vec<Set>, name: &str) -> bool {
+    let before = sets.len();
+    sets.retain(|s| !same_name(&s.name, name));
+    sets.len() != before
+}
+
+/// Порядок наборов в файле — по алфавиту без учёта регистра, как их держит C# (`SortedDictionary` с
+/// `CurrentCultureIgnoreCase`). Здесь сравниваются строчные буквы по номерам знаков: у латиницы, кириллицы и цифр
+/// порядок тот же, расходится только у знаков препинания и буквы «ё» — это меняет лишь порядок строк в меню, C# при
+/// чтении сортирует сам.
+fn sort_sets(sets: &mut [Set]) {
+    sets.sort_by_cached_key(|s| s.name.to_lowercase());
+}
+
+impl Store {
+    /// Текст profiles.json — тот же, что пишет C# (ProfileSets.Write через Json.WriteFile): процессор, раскладка,
+    /// наборы в порядке списка.
+    #[must_use]
+    pub fn sets_text(&self, sets: &[Set]) -> String {
+        let lps: Vec<u32> = self.lps.iter().map(|lp| lp.0).collect();
+        let listed: Vec<String> = sets
+            .iter()
+            .map(|s| {
+                format!(
+                    "{{\"name\": {}, \"ratios\": {}}}",
+                    quote(&s.name),
+                    files::ints(&s.ratios)
+                )
+            })
+            .collect();
+        format!(
+            "{{\"cpu\": {}, \"lps\": {}, \"sets\": [{}]}}",
+            quote(&self.cpu),
+            files::ints(&lps),
+            listed.join(", ")
+        )
+    }
+
+    /// Записывает profiles.json (через .tmp и .bak, как C#). Пишет его программа входа по командам окна и прежнее
+    /// окно на C#; одновременно они не пишут: пока работает C#-часть, программа входа команды профилей отклоняет.
+    pub fn write_sets(&self, sets: &[Set]) -> io::Result<()> {
+        files::write_replacing(&self.sets_path(), &self.sets_text(sets))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(name: &str, ratios: &[i32]) -> Set {
+        Set {
+            name: name.into(),
+            ratios: ratios.to_vec(),
+        }
+    }
+
+    #[test]
+    fn sets_text_is_the_csharp_writer_shape() {
+        // Shape copied from a profiles.json written by the C# window on the owner's machine (15.10).
+        let store = Store::new(Path::new("."), "Intel(R) Core(TM) Ultra 9 275HX", &[Lp(0), Lp(1)]);
+        let text = store.sets_text(&[set("74optima", &[48, 48]), set("csmart", &[47, 45])]);
+        assert_eq!(
+            text,
+            "{\"cpu\": \"Intel(R) Core(TM) Ultra 9 275HX\", \"lps\": [0, 1], \"sets\": [{\"name\": \"74optima\", \
+             \"ratios\": [48, 48]}, {\"name\": \"csmart\", \"ratios\": [47, 45]}]}"
+        );
+        assert_eq!(
+            store.sets_text(&[]),
+            "{\"cpu\": \"Intel(R) Core(TM) Ultra 9 275HX\", \"lps\": [0, 1], \"sets\": []}"
+        );
+    }
+
+    #[test]
+    fn put_keeps_the_stored_spelling_and_the_alphabetical_order() {
+        let mut sets = vec![set("csmart", &[1]), set("Жара", &[2])];
+        put_set(&mut sets, "  CSMART ", &[9]);
+        put_set(&mut sets, "74optima", &[3]);
+        put_set(&mut sets, "bench", &[4]);
+        let names: Vec<&str> = sets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["74optima", "bench", "csmart", "Жара"]);
+        assert_eq!(sets[2].ratios, [9], "the same name, any case, replaces the ratios");
+        assert!(remove_set(&mut sets, "жара"));
+        assert!(!remove_set(&mut sets, "жара"), "nothing left to remove");
+        assert_eq!(sets.len(), 3);
+    }
 }

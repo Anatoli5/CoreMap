@@ -1,5 +1,5 @@
-// Вызовы Windows программы входа: скрытое окно, значок у часов, меню, всплывающие сообщения, таймеры, сон и
-// пробуждение, запуск других частей CoreMap, права администратора, замер памяти. Логики здесь нет: окно только
+// Вызовы Windows программы входа: скрытое окно, значок у часов, меню, всплывающие сообщения, вопрос владельцу,
+// таймеры, сон и пробуждение, права администратора, замер памяти. (Канал окна — pipe.rs, запуск окна — launch.rs.) Логики здесь нет: окно только
 // складывает события в очередь, а решает `app.rs`.
 //
 // Окно — обычное верхнего уровня, но никогда не показывается (не «только для сообщений»): сообщения, которые Windows
@@ -31,10 +31,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::{POWERBROADCAST_SETTING, RegisterPowerSettingNotification};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
-use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetProcessTimes, GetSystemTimes, OpenProcessToken,
-    PROCESS_INFORMATION, STARTUPINFOW,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NIM_SETVERSION, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
@@ -42,24 +39,23 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE,
-    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMenuItemCount,
-    GetMenuItemInfoW, GetSystemMetrics, HMENU, IDI_APPLICATION, IMAGE_ICON, KillTimer, LR_DEFAULTCOLOR, LR_SHARED,
-    LoadIconW, LoadImageW, MENUITEMINFOW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MFS_CHECKED,
-    MFS_DEFAULT, MFS_DISABLED, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, MSGFLT_ALLOW,
-    MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassW,
-    RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
-    SetMenuDefaultItem, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMenuItemCount, GetMenuItemInfoW,
+    GetSystemMetrics, HMENU, IDI_APPLICATION, IDYES, IMAGE_ICON, KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadIconW,
+    LoadImageW, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MENUITEMINFOW, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MFS_CHECKED, MFS_DEFAULT, MFS_DISABLED, MIIM_FTYPE, MIIM_ID,
+    MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, MSGFLT_ALLOW, MWMO_INPUTAVAILABLE, MessageBoxW,
+    MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
+    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW,
+    SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
 };
 
 /// Сообщение значка (как `IconMessage` в Tray.cs).
 const ICON_MESSAGE: u32 = 0x8001;
 /// Прежнее окно сообщает о себе номером процесса (Tray.WindowOpened; шлёт Tray.Announce в C#).
 pub const WINDOW_OPENED: u32 = 0x8002;
-/// Просьба к движку открыть новое окно (Tray.OpenNew в C#).
-pub const OPEN_NEW: u32 = 0x8004;
 
 /// Что произошло — для логики программы (app.rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -633,77 +629,22 @@ fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
-/// Запущенный процесс; дескриптор закрывается при выходе из области видимости.
-#[derive(Debug)]
-pub struct Child(HANDLE);
-
-// SAFETY: a process handle is not tied to the thread that opened it.
-unsafe impl Send for Child {}
-
-impl Child {
-    #[must_use]
-    pub fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from CreateProcessW and is closed exactly once, here.
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
-/// Запускает программу с правами этого процесса (запроса Windows нет): `exe` с аргументами `args`, папка — `dir`.
-pub fn launch(exe: &Path, args: &str, dir: &Path) -> Result<Child, String> {
-    let application = wide_os(exe.as_os_str());
-    // Командная строка: путь в кавычках и аргументы; CreateProcessW может её менять, поэтому — свой буфер.
-    let mut command: Vec<u16> = wide(&format!(
-        "\"{}\"{}{}",
-        exe.display(),
-        if args.is_empty() { "" } else { " " },
-        args
-    ));
-    let directory = wide_os(dir.as_os_str());
-    let startup = STARTUPINFOW {
-        cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap_or(0),
-        ..STARTUPINFOW::default()
-    };
-    let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: every string is NUL-terminated and outlives the call; the command line buffer is writable; the
-    // structures are initialised; handles are not inherited.
-    let ok = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            CREATE_NO_WINDOW,
-            null(),
-            directory.as_ptr(),
-            &raw const startup,
-            &raw mut info,
+/// Вопрос владельцу в окошке Windows «Да / Нет» поверх всех окон; true — «Да». Окошко — этой программы (у неё права
+/// администратора): ответить в нём за владельца другая программа не может (Commands.Confirm в C#). По умолчанию — «Нет».
+#[must_use]
+pub fn confirm(question: &str) -> bool {
+    let text = wide(question);
+    let title = wide("CoreMap");
+    // SAFETY: both strings are NUL-terminated and outlive the call; no owner window (the program has no visible one).
+    let answer = unsafe {
+        MessageBoxW(
+            null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND,
         )
     };
-    if ok == 0 {
-        return Err(format!("{} не запустился, код {}", exe.display(), last_error()));
-    }
-    // SAFETY: the thread handle is not needed; it is closed once here.
-    unsafe { CloseHandle(info.hThread) };
-    Ok(Child(info.hProcess))
-}
-
-/// Шлёт сообщение окну C#-части по имени его класса. false — такого окна нет.
-pub fn post_to_class(class: &str, message: u32, wparam: usize) -> bool {
-    let name = wide(class);
-    // SAFETY: the class name is NUL-terminated; no title filter.
-    let window = unsafe { FindWindowW(name.as_ptr(), null()) };
-    if window.is_null() {
-        return false;
-    }
-    // SAFETY: posting to another process's window; Windows checks the window is still valid.
-    unsafe { PostMessageW(window, message, wparam, 0) != 0 }
+    answer == IDYES
 }
 
 /// Процесс запущен с правами администратора.

@@ -1,8 +1,13 @@
-// Что окно показывает: из сообщений движка — строки и цвета для ui/app.slint; из щелчков — команды движку.
-// Правила показа — те же, что у прежнего окна (DieView в src/Ui.cs C#-части).
+// Что окно показывает: из сообщений движка (или программы входа) и сводки статистики — строки и цвета для
+// ui/app.slint; из щелчков — команды. Правила показа плиток — те же, что у прежнего окна (DieView в src/Ui.cs).
 //
-// Плитка — строка модели. Пришло состояние — для каждой плитки считается новая строка, и заменяется только та,
-// что отличается от показанной: Slint перерисовывает только её. Строки верхней полосы — так же.
+// Плитка — строка модели. Пришло состояние — для каждой плитки считается новая строка, и заменяется только та, что
+// отличается от показанной: Slint перерисовывает только её. Панели профилей и статистики пересчитываются только от
+// того, что они показывают (профили, потолки, надстройка автомодуля, выбор; сводка статистики, выбранный блок), и
+// свойства окна ставятся, только если значение другое.
+//
+// Жесты (владелец 15.10: «по две функции на одно действие… так не делается»): щелчок по плитке — выбрать блок и
+// показать его статистику, и только; правая кнопка — меню потолка. Нагрузки у окна нет.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -11,9 +16,12 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
+use crate::die::{self, Geometry};
+use crate::panels::{self, ProfileInput, ProfileShown, StatsShown};
 use crate::pipe::{Event, Link};
-use crate::wire::{Hello, Limits, Message, State};
-use crate::{AppWindow, MenuEntry, NumData, TileData};
+use crate::store::Digest;
+use crate::wire::{Hello, Limits, Message, Profiles, State};
+use crate::{AppWindow, CellData, LineRow, LinkData, MenuEntry, SetRow, TileData};
 
 const TEXT: [u8; 3] = [0xe6, 0xe8, 0xec];
 const ACCENT: [u8; 3] = [0xff, 0xd1, 0x66];
@@ -63,6 +71,11 @@ fn heat(k: f64) -> Color {
     Color::from_rgb_u8(channel(hue + 1.0 / 3.0), channel(hue), channel(hue - 1.0 / 3.0))
 }
 
+/// Цвет плитки по температуре: 40 °C — синий, 100 °C — красный (`DieView`).
+fn heat_of(temp: f64) -> Color {
+    heat((temp - 40.0) / 60.0)
+}
+
 /// Номер для Slint (его целые — i32). Движок шлёт номера блоков и ступени множителя — десятки; что не помещается,
 /// становится -1 и не совпадёт ни с одной плиткой или пунктом.
 fn slint_int(v: impl TryInto<i32>) -> i32 {
@@ -84,6 +97,14 @@ pub struct Changes {
     pub last: u32,
 }
 
+/// Команда, на которую ждём ответ: что сказать при отказе и что сделать при успехе.
+#[derive(Debug)]
+struct Pending {
+    failure: &'static str,
+    /// «Сохранить как»: название, которое станет выбранным, когда движок ответит «сделано».
+    saved_as: Option<String>,
+}
+
 #[expect(
     missing_debug_implementations,
     reason = "holds Slint handles that have no Debug; nothing prints a View"
@@ -94,13 +115,27 @@ pub struct View {
     pub hello: Option<Hello>,
     pub limits: Option<Limits>,
     pub state: Option<State>,
+    pub profiles: Option<Profiles>,
+    /// Тема «history» программы входа; None — её не было, тогда история — из data\profile-log.jsonl.
+    history: Option<Vec<Map<String, Value>>>,
+    pub digest: Option<Arc<Digest>>,
+    geometry: Geometry,
     tiles: Rc<VecModel<TileData>>,
-    selected: i32,
+    sets: Rc<VecModel<SetRow>>,
+    pub selected: i32,
+    /// Выбранная строка списка наборов: "" — заводские; None — ничего.
+    chosen: Option<String>,
+    shown_profiles: Option<ProfileShown>,
+    pub shown_stats: Option<StatsShown>,
+    shown_links: Vec<(LinkData, f64)>,
+    shown_history: Vec<(String, String)>,
     refused: Option<String>,
     up: bool,
     why: String,
     problem: Option<String>,
-    pending: HashMap<i64, &'static str>,
+    /// Последнее сообщение владельцу от программы (notice): номер и текст; щелчок по строке — прочитано.
+    notice: Option<(i64, String)>,
+    pending: HashMap<i64, Pending>,
     menu_block: Option<usize>,
     pub changes: Changes,
 }
@@ -109,18 +144,31 @@ impl View {
     pub fn new(ui: &AppWindow, link: Arc<Link>) -> View {
         let tiles = Rc::new(VecModel::default());
         ui.set_tiles(ModelRc::from(Rc::clone(&tiles)));
+        let sets = Rc::new(VecModel::default());
+        ui.set_sets(ModelRc::from(Rc::clone(&sets)));
         let view = View {
             ui: ui.as_weak(),
             link,
             hello: None,
             limits: None,
             state: None,
+            profiles: None,
+            history: None,
+            digest: None,
+            geometry: Geometry::default(),
             tiles,
+            sets,
             selected: -1,
+            chosen: None,
+            shown_profiles: None,
+            shown_stats: None,
+            shown_links: Vec::new(),
+            shown_history: Vec::new(),
             refused: None,
             up: false,
             why: "окно запускается".into(),
             problem: None,
+            notice: None,
             pending: HashMap::new(),
             menu_block: None,
             changes: Changes::default(),
@@ -147,6 +195,22 @@ impl View {
             Event::Message(Message::Limits(limits)) => {
                 self.limits = Some(limits);
                 self.refresh(false);
+                self.refresh_profiles();
+            }
+            Event::Message(Message::Profiles(profiles)) => {
+                let keep = self
+                    .chosen
+                    .as_deref()
+                    .is_some_and(|c| c.is_empty() || profiles.sets.iter().any(|s| s.name == c));
+                if !keep {
+                    self.chosen = profiles.standing.clone().or_else(|| profiles.was_named.clone());
+                }
+                self.profiles = Some(profiles);
+                self.refresh_profiles();
+            }
+            Event::Message(Message::History(history)) => {
+                self.history = Some(history.entries);
+                self.refresh_history();
             }
             Event::Message(Message::Reply(reply)) => {
                 if reply.re == 0 {
@@ -154,16 +218,39 @@ impl View {
                         self.refused = Some(reply.why.unwrap_or_else(|| "движок отказал".into()));
                         self.show_link();
                     }
-                } else if let Some(failure) = self.pending.remove(&reply.re) {
+                } else if let Some(pending) = self.pending.remove(&reply.re) {
                     self.problem = if reply.ok {
                         None
                     } else {
-                        Some(format!("{failure}: {}", reply.why.unwrap_or_default()))
+                        Some(format!("{}: {}", pending.failure, reply.why.unwrap_or_default()))
                     };
+                    if reply.ok
+                        && let Some(name) = pending.saved_as
+                    {
+                        self.ui().set_prof_name(SharedString::new());
+                        self.chosen = Some(name);
+                        self.refresh_profiles();
+                    }
+                    self.show_problem();
+                }
+            }
+            Event::Message(Message::Notice(n)) => {
+                if self.notice.as_ref().is_none_or(|(seq, _)| n.seq > *seq) {
+                    self.notice = Some((n.seq, n.text));
                     self.show_problem();
                 }
             }
             Event::Message(Message::Other) => {}
+        }
+    }
+
+    /// Новая сводка статистики (поток store.rs).
+    pub fn on_digest(&mut self, digest: Arc<Digest>) {
+        self.digest = Some(digest);
+        self.refresh_stats();
+        self.refresh_links();
+        if self.history.is_none() {
+            self.refresh_history();
         }
     }
 
@@ -185,12 +272,15 @@ impl View {
         }
     }
 
+    /// Строка под верхней полосой: отказ последней команды, иначе сообщение программы владельцу, иначе почему нет
+    /// показаний (у программы входа — например, процессором владеет прежнее окно), иначе сработала защита.
     fn show_problem(&self) {
         let ui = self.ui();
         let state = self.state.as_ref();
         let text = self
             .problem
             .clone()
+            .or_else(|| self.notice.as_ref().map(|(_, text)| text.clone()))
             .or_else(|| state.and_then(|s| s.sensor_error.clone()))
             .or_else(|| state.and_then(|s| s.trip.clone()))
             .unwrap_or_default();
@@ -200,15 +290,17 @@ impl View {
     fn greet(&mut self, hello: Hello) {
         let ui = self.ui();
         ui.set_cpu(format!("{}{}", hello.cpu, if hello.simulated { " · имитация" } else { "" }).into());
-        ui.set_cols(hello.layout.cols);
-        ui.set_rows(hello.layout.rows);
         let note = if hello.layout.confirmed {
             String::new()
         } else {
             hello.layout.note.clone().unwrap_or_default()
         };
         ui.set_note(note.into());
-        if self.selected < 0
+        self.geometry = die::geometry(&hello);
+        ui.set_die_nat_w(self.geometry.width);
+        ui.set_die_nat_h(self.geometry.height);
+        let valid = usize::try_from(self.selected).is_ok_and(|i| i < hello.blocks.len());
+        if !valid
             && let Some(first) = hello
                 .blocks
                 .iter()
@@ -219,6 +311,11 @@ impl View {
         }
         self.hello = Some(hello);
         self.refresh(true);
+        self.shown_stats = None;
+        self.refresh_stats();
+        self.shown_links.clear();
+        self.refresh_links();
+        self.refresh_profiles();
     }
 
     fn apply(&mut self, state: State) {
@@ -248,15 +345,29 @@ impl View {
             changed += 1;
         }
         self.changes.last += changed;
+        // Панель профилей зависит от потолков, надстройки автомодуля и хода измерения — больше ни от чего в состоянии.
+        let profiles_moved = self
+            .state
+            .as_ref()
+            .is_none_or(|old| old.limit != state.limit || old.auto != state.auto || old.busy != state.busy);
         self.state = Some(state);
         self.show_problem();
         self.refresh(false);
+        if profiles_moved {
+            self.refresh_profiles();
+        }
     }
 
     /// Строки плиток заново; rebuild — после знакомства: раскладка могла смениться, модель строится с нуля.
     fn refresh(&mut self, rebuild: bool) {
         let Some(hello) = self.hello.as_ref() else { return };
-        let rows: Vec<TileData> = hello.layout.tiles.iter().filter_map(|t| self.tile(hello, t)).collect();
+        let rows: Vec<TileData> = hello
+            .layout
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| self.tile(hello, i, t))
+            .collect();
         if rebuild || self.tiles.row_count() != rows.len() {
             self.tiles.set_vec(rows);
             return;
@@ -270,113 +381,336 @@ impl View {
     }
 
     /// Строка плитки; None — раскладка ссылается на блок, которого в знакомстве нет (испорченное сообщение).
-    fn tile(&self, hello: &Hello, t: &crate::wire::Tile) -> Option<TileData> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one tile's fields read top to bottom, as in DieView.OnPaint"
+    )]
+    fn tile(&self, hello: &Hello, index: usize, t: &crate::wire::Tile) -> Option<TileData> {
         let block = hello.blocks.get(t.block)?;
         let members = &block.members;
         let first = block.first;
+        let place = self.geometry.tiles.get(index).copied().unwrap_or_default();
+        let cluster = t.places.len() > 1;
+        let s = self.state.as_ref();
+        let thr = |i: usize| s.is_some_and(|s| s.thr.get(i).copied().unwrap_or(false));
+        let cur = |i: usize| s.and_then(|s| s.cur.get(i).copied().flatten());
         let mut data = TileData {
             block: slint_int(block.index),
-            col: i32::from(t.col),
-            row: i32::from(t.row),
+            x: place.x,
+            y: place.y,
+            w: place.w,
+            h: place.h,
+            cluster,
             fill: rgb(CELL),
             temp: "–".into(),
+            peak: "▲ –".into(),
+            mean: "ø –".into(),
             pair_color: rgb(TEXT),
             selected: self.selected == slint_int(block.index),
             ..Default::default()
         };
-        let empty: Vec<bool> = Vec::new();
-        let thr = self.state.as_ref().map_or(&empty, |s| &s.thr);
-        let grid = t.places.len() > 1;
-        let nums: Vec<NumData> = t
-            .places
-            .iter()
-            .enumerate()
-            .filter_map(|(k, &i)| {
-                let core = hello.cores.get(i)?;
-                Some(NumData {
-                    text: core.lp.to_string().into(),
-                    color: rgb(if thr.get(i).copied().unwrap_or(false) {
-                        BAD
-                    } else if core.kind == "P" {
-                        P_CORE
-                    } else {
-                        E_CORE
-                    }),
-                    col: if grid { slint_int(k % 2) } else { 0 },
-                    row: if grid { slint_int(k / 2) } else { 0 },
+        if cluster {
+            let cells: Vec<CellData> = t
+                .places
+                .iter()
+                .enumerate()
+                .filter_map(|(k, &i)| {
+                    let core = hello.cores.get(i)?;
+                    let temp = cur(i);
+                    Some(CellData {
+                        text: core.lp.to_string().into(),
+                        temp: temp.map_or_else(|| "–".into(), |v| format!("{v:.0}°").into()),
+                        fill: temp.map_or(rgb(CELL), heat_of),
+                        num_color: rgb(if thr(i) { BAD } else { E_CORE }),
+                        col: slint_int(k % 2),
+                        row: slint_int(k / 2),
+                    })
                 })
-            })
-            .collect();
-        data.nums = ModelRc::new(VecModel::from(nums));
-        let Some(s) = self.state.as_ref() else {
+                .collect();
+            data.cells = ModelRc::new(VecModel::from(cells));
+        } else {
+            data.number = hello
+                .cores
+                .get(first)
+                .map(|c| c.lp.to_string())
+                .unwrap_or_default()
+                .into();
+            data.number_color = rgb(if thr(first) {
+                BAD
+            } else if hello.cores.get(first).is_some_and(|c| c.kind == "E") {
+                E_CORE
+            } else {
+                P_CORE
+            });
+        }
+        let Some(s) = s else {
             return Some(data);
         };
         let temp = highest(&s.cur, members);
         if let Some(v) = temp {
             data.temp = format!("{v:.0}°").into();
-            data.fill = heat((v - 40.0) / 60.0);
+            data.fill = heat_of(v);
         }
         let peak = highest(&s.max, members);
+        if let Some(p) = peak {
+            data.peak = format!("▲ {p:.0}°").into();
+        }
         let mean = highest(&s.avg, members);
-        let parts: Vec<String> = [
-            mean.map(|m| format!("⌀ {}", m.round())),
-            peak.map(|p| format!("▲ {p:.0}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        data.stats = parts.join("  ").into();
-        data.loaded = members.iter().any(|&i| s.load.get(i).copied().unwrap_or(false));
-        if let Some(limit) = s.limit.as_ref().and_then(|l| l.get(first).copied()).filter(|&l| l > 0) {
-            let ratio = highest(&s.ratio, members);
+        let mean_ratio = highest(&s.avg_ratio, members);
+        let mean_text = mean.map_or_else(|| "ø –".to_string(), |m| format!("ø {}°", m.round()));
+        let ratio_text = mean_ratio.map(|r| format!("×{r:.1}"));
+        if cluster {
+            data.mean = mean_text.into();
+            data.mean_ratio = ratio_text.map(|r| format!("ø {r}")).unwrap_or_default().into();
+        } else {
+            data.mean = match ratio_text {
+                Some(r) => format!("{mean_text} · {r}"),
+                None => mean_text,
+            }
+            .into();
+        }
+        let c = panels::ceiling(
+            block,
+            s.limit.as_deref(),
+            self.limits.as_ref(),
+            panels::Overlay::of(Some(s)),
+        );
+        let ratio = highest(&s.ratio, members);
+        let fused = self.limits.as_ref().and_then(|l| l.fused.get(first).copied());
+        if let Some(limit) = c.now {
             data.pair = match ratio {
                 Some(r) => format!("{r:.1} / ×{limit}"),
                 None => format!("×{limit}"),
             }
             .into();
-            if let Some(l) = self.limits.as_ref() {
-                if let Some(&fused) = l.fused.get(first) {
-                    data.pair_color = rgb(match limit.cmp(&fused) {
-                        Ordering::Less => ACCENT,
-                        Ordering::Greater => BAD,
-                        Ordering::Equal => TEXT,
-                    });
-                }
-                if let Some(&was) = l.was.get(first)
-                    && was > 0
-                    && limit != was
-                {
-                    let d = limit - was;
-                    data.delta = format!("{}{}", if d > 0 { "+" } else { "−" }, d.abs()).into();
-                }
+            if let Some(fused) = fused {
+                data.pair_color = rgb(match limit.cmp(&fused) {
+                    Ordering::Less => ACCENT,
+                    Ordering::Greater => BAD,
+                    Ordering::Equal => TEXT,
+                });
+            }
+            data.delta = panels::signed(c.owner_delta()).into();
+        }
+        if c.auto != 0 {
+            data.auto = format!("авто {}", panels::signed(c.auto)).into();
+        }
+        data.ban = c.ban.is_some();
+        data.tip = panels::tile_tip(&panels::TileFacts {
+            block,
+            cores: &hello.cores,
+            cur: &s.cur,
+            temp,
+            peak,
+            mean,
+            ratio,
+            mean_ratio,
+            throttled: members.iter().any(|&i| thr(i)),
+            ceiling: c,
+            fused,
+        })
+        .into();
+        Some(data)
+    }
+
+    // ----- перемычки соседей -----
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "the same computation on the same input gives the same bits: unchanged"
+    )]
+    fn refresh_links(&mut self) {
+        let (Some(hello), Some(digest)) = (self.hello.as_ref(), self.digest.as_ref()) else {
+            return;
+        };
+        let links = panels::links(hello, &self.geometry, digest);
+        let same_links = links.len() == self.shown_links.len()
+            && links.iter().zip(&self.shown_links).all(|((a, da), (b, db))| {
+                da == db && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h && a.color == b.color && a.tip == b.tip
+            });
+        if same_links {
+            return;
+        }
+        let ui = self.ui();
+        ui.set_link_legend(!links.is_empty());
+        ui.set_links(ModelRc::new(VecModel::from(
+            links.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+        ))); // a dozen links, on a changed digest
+        self.shown_links = links;
+    }
+
+    /// Перемычки, как они показаны (скрытой проверке): сколько и разница у каждой, °C.
+    pub fn links_shown(&self) -> (usize, Vec<f64>) {
+        (
+            self.shown_links.len(),
+            self.shown_links.iter().map(|(_, d)| *d).collect(),
+        )
+    }
+
+    // ----- статистика -----
+
+    fn refresh_stats(&mut self) {
+        let Some(hello) = self.hello.as_ref() else { return };
+        let Some(block) = usize::try_from(self.selected).ok().and_then(|i| hello.blocks.get(i)) else {
+            return;
+        };
+        let shown = panels::stats_panel(block, self.digest.as_deref());
+        if self.shown_stats.as_ref() == Some(&shown) {
+            return;
+        }
+        let ui = self.ui();
+        set_text(&ui.get_stats_title(), &shown.title, |t| ui.set_stats_title(t));
+        set_text(&ui.get_stats_note(), &shown.note, |t| ui.set_stats_note(t));
+        set_text(&ui.get_chart_mean(), &shown.mean_path, |t| ui.set_chart_mean(t));
+        set_text(&ui.get_chart_peak(), &shown.peak_path, |t| ui.set_chart_peak(t));
+        set_text(&ui.get_chart_empty(), &shown.empty, |t| ui.set_chart_empty(t));
+        set_text(&ui.get_chart_fan_top(), &shown.fan_top, |t| ui.set_chart_fan_top(t));
+        set_text(&ui.get_actions_empty(), &shown.actions_empty, |t| {
+            ui.set_actions_empty(t);
+        });
+        ui.set_chart_columns(shown.columns);
+        let old = self.shown_stats.as_ref();
+        if old.is_none_or(|o| o.points != shown.points) {
+            ui.set_chart_points(ModelRc::new(VecModel::from(
+                shown.points.iter().map(panels::PointShown::point).collect::<Vec<_>>(),
+            )));
+        }
+        if old.is_none_or(|o| o.yticks != shown.yticks) {
+            ui.set_chart_yticks(ModelRc::new(VecModel::from(shown.ticks())));
+        }
+        if old.is_none_or(|o| o.actions != shown.actions) {
+            ui.set_actions(ModelRc::new(VecModel::from(shown.action_rows())));
+        }
+        self.shown_stats = Some(shown);
+    }
+
+    // ----- профили -----
+
+    fn refresh_profiles(&mut self) {
+        let (Some(hello), Some(profiles)) = (self.hello.as_ref(), self.profiles.as_ref()) else {
+            return;
+        };
+        let ui = self.ui();
+        let name = ui.get_prof_name();
+        let state = self.state.as_ref();
+        let shown = panels::profile_panel(&ProfileInput {
+            hello,
+            profiles,
+            limits: self.limits.as_ref(),
+            limit: state.and_then(|s| s.limit.as_deref()),
+            auto: panels::Overlay::of(state),
+            chosen: self.chosen.as_deref(),
+            name: name.as_str(),
+            busy: state.is_some_and(|s| s.busy),
+        });
+        if self.shown_profiles.as_ref() == Some(&shown) {
+            return;
+        }
+        if !ui.get_has_profiles() {
+            ui.set_has_profiles(true);
+        }
+        set_text(&ui.get_prof_was(), &shown.was, |t| ui.set_prof_was(t));
+        set_text(&ui.get_prof_now(), &shown.now, |t| ui.set_prof_now(t));
+        set_text(&ui.get_save_tip(), &shown.save_tip, |t| ui.set_save_tip(t));
+        set_text(&ui.get_save_as_text(), &shown.save_as_text, |t| ui.set_save_as_text(t));
+        set_text(&ui.get_save_note(), &shown.save_note, |t| ui.set_save_note(t));
+        let flags = [
+            (
+                ui.get_prof_attention(),
+                shown.attention,
+                AppWindow::set_prof_attention as fn(&AppWindow, bool),
+            ),
+            (ui.get_can_open(), shown.can_open, AppWindow::set_can_open),
+            (ui.get_can_save(), shown.can_save, AppWindow::set_can_save),
+            (ui.get_can_save_as(), shown.can_save_as, AppWindow::set_can_save_as),
+            (ui.get_can_accept(), shown.can_accept, AppWindow::set_can_accept),
+            (ui.get_can_revert(), shown.can_revert, AppWindow::set_can_revert),
+            (ui.get_can_delete(), shown.can_delete, AppWindow::set_can_delete),
+        ];
+        for (now, want, set) in flags {
+            if now != want {
+                set(&ui, want);
             }
         }
-        Some(data)
+        let old_rows = self
+            .shown_profiles
+            .as_ref()
+            .map(|p| p.rows.as_slice())
+            .unwrap_or_default();
+        if old_rows.len() == shown.rows.len() && self.sets.row_count() == shown.rows.len() {
+            for (i, (old, new)) in old_rows.iter().zip(&shown.rows).enumerate() {
+                if old != new {
+                    self.sets.set_row_data(i, new.row());
+                }
+            }
+        } else {
+            self.sets
+                .set_vec(shown.rows.iter().map(panels::SetShown::row).collect::<Vec<_>>());
+        }
+        self.shown_profiles = Some(shown);
+    }
+
+    fn refresh_history(&mut self) {
+        let entries = self
+            .history
+            .as_deref()
+            .or_else(|| self.digest.as_ref().and_then(|d| d.history.as_deref()));
+        let rows: Vec<LineRow> = entries
+            .map(|e| panels::history_rows(e, self.hello.as_ref()))
+            .unwrap_or_default();
+        let key: Vec<(String, String)> = rows.iter().map(|r| (r.time.to_string(), r.text.to_string())).collect();
+        let ui = self.ui();
+        let has = entries.is_some();
+        if ui.get_has_history() != has {
+            ui.set_has_history(has);
+        }
+        if key != self.shown_history {
+            ui.set_history(ModelRc::new(VecModel::from(rows)));
+            self.shown_history = key;
+        }
+    }
+
+    /// Строк истории, как они показаны (скрытой проверке).
+    pub fn history_shown(&self) -> usize {
+        self.shown_history.len()
     }
 
     // ----- команды владельца -----
 
     pub fn order(&mut self, command: &str, args: Map<String, Value>, failure: &'static str) {
+        self.order_then(command, args, failure, None);
+    }
+
+    fn order_then(&mut self, command: &str, args: Map<String, Value>, failure: &'static str, saved_as: Option<String>) {
+        // На эти команды программа может спросить владельца своим окошком (потолок выше заводского): пусть оно выйдет
+        // на передний план, а не мигает под окном.
+        if matches!(command, "limit.set" | "profile.open" | "profile.revert") {
+            self.link.allow_foreground();
+        }
         if let Some(id) = self.link.ask(command, args) {
-            self.pending.insert(id, failure);
+            self.pending.insert(id, Pending { failure, saved_as });
         } else {
-            self.problem = Some(format!("{failure}: нет связи с движком"));
+            self.problem = Some(format!("{failure}: нет связи с программой у часов"));
             self.show_problem();
         }
     }
 
+    /// Щелчок по плитке: выбрать блок — его статистика справа. Больше щелчок ничего не делает.
     pub fn clicked(&mut self, block: i32) {
+        if self.selected == block {
+            return;
+        }
         self.selected = block;
         self.refresh(false);
-        let mut args = Map::new();
-        args.insert("block".into(), block.into());
-        self.order("load.toggle", args, "Нагрузка не изменена");
+        self.refresh_stats();
     }
 
-    /// Правая кнопка: меню потолка от заводского предела вниз до ×8; что предлагать, решает движок.
+    pub fn reset_max(&mut self) {
+        self.order("max.reset", Map::new(), "Максимумы не сброшены");
+    }
+
+    /// Правая кнопка: меню потолка; что предлагать, решает движок.
     pub fn menu(&mut self, block: i32) {
-        self.selected = block;
-        self.refresh(false);
         let ui = self.ui();
         let found = self
             .hello
@@ -444,9 +778,72 @@ impl View {
         self.order("limit.set", args, "Потолок не изменён");
     }
 
+    /// Щелчок по строке под верхней полосой: убрать отказ; сообщение программы — прочитано (notices.seen: новому
+    /// окну оно уже не придёт).
     pub fn problem_dismissed(&mut self) {
-        self.problem = None;
+        if self.problem.take().is_none()
+            && let Some((seq, _)) = self.notice.take()
+        {
+            let mut args = Map::new();
+            args.insert("seq".into(), seq.into());
+            self.order("notices.seen", args, "Сообщение не отмечено прочитанным");
+        }
         self.show_problem();
+    }
+
+    pub fn set_clicked(&mut self, row: i32) {
+        let key = usize::try_from(row)
+            .ok()
+            .and_then(|i| self.shown_profiles.as_ref()?.rows.get(i))
+            .map(|r| r.key.clone()); // one name per click
+        if key.is_some() && key != self.chosen {
+            self.chosen = key;
+            self.refresh_profiles();
+        }
+    }
+
+    fn named(name: &str) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("name".into(), name.into());
+        args
+    }
+
+    pub fn profile_open(&mut self) {
+        if let Some(name) = self.chosen.clone() {
+            self.order("profile.open", Self::named(&name), "Профиль не открыт");
+        }
+    }
+
+    pub fn profile_save(&mut self) {
+        if let Some(name) = self.chosen.clone().filter(|n| !n.is_empty()) {
+            self.order("profile.save", Self::named(&name), "Профиль не сохранён");
+        }
+    }
+
+    pub fn profile_save_as(&mut self) {
+        let name = self.ui().get_prof_name().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.order_then("profile.save", Self::named(&name), "Профиль не сохранён", Some(name));
+    }
+
+    pub fn profile_accept(&mut self) {
+        self.order("profile.accept", Map::new(), "Не принято");
+    }
+
+    pub fn profile_revert(&mut self) {
+        self.order("profile.revert", Map::new(), "Не откачено");
+    }
+
+    pub fn profile_delete(&mut self) {
+        if let Some(name) = self.chosen.clone().filter(|n| !n.is_empty()) {
+            self.order("profile.delete", Self::named(&name), "Профиль не удалён");
+        }
+    }
+
+    pub fn name_edited(&mut self) {
+        self.refresh_profiles();
     }
 
     /// Строка плитки, как она показана сейчас (скрытой проверке).
@@ -455,29 +852,50 @@ impl View {
             .filter_map(|i| self.tiles.row_data(i))
             .find(|t| t.block == slint_int(block))
     }
+
+    /// Наборы, как они показаны в списке (скрытой проверке): ключ ("" — заводские) по порядку.
+    pub fn set_keys(&self) -> Vec<String> {
+        self.shown_profiles
+            .as_ref()
+            .map(|p| p.rows.iter().map(|r| r.key.clone()).collect())
+            .unwrap_or_default()
+    }
 }
 
-/// Одна и та же ли строка плитки. Сравнение Slint для моделей внутри строки — по адресу, а номера ядер строятся
+/// Одна и та же ли строка плитки. Сравнение Slint для моделей внутри строки — по адресу, а клетки ядер строятся
 /// заново на каждое состояние; поэтому они сравниваются по содержимому.
+#[expect(
+    clippy::float_cmp,
+    reason = "the same computation on the same input gives the same bits: unchanged"
+)]
 fn same(a: &TileData, b: &TileData) -> bool {
-    let nums = |t: &TileData| {
-        t.nums
+    let cells = |t: &TileData| {
+        t.cells
             .iter()
-            .map(|n| (n.text, n.color, n.col, n.row))
+            .map(|c| (c.text, c.temp, c.fill, c.num_color, c.col, c.row))
             .collect::<Vec<_>>()
     };
     a.block == b.block
-        && a.col == b.col
-        && a.row == b.row
-        && a.stats == b.stats
+        && a.x == b.x
+        && a.y == b.y
+        && a.w == b.w
+        && a.h == b.h
+        && a.cluster == b.cluster
+        && a.number == b.number
+        && a.number_color == b.number_color
+        && a.peak == b.peak
+        && a.mean == b.mean
+        && a.mean_ratio == b.mean_ratio
         && a.temp == b.temp
         && a.fill == b.fill
         && a.pair == b.pair
         && a.pair_color == b.pair_color
         && a.delta == b.delta
-        && a.loaded == b.loaded
+        && a.auto == b.auto
+        && a.ban == b.ban
         && a.selected == b.selected
-        && nums(a) == nums(b)
+        && a.tip == b.tip
+        && cells(a) == cells(b)
 }
 
 /// Ставит строку, только если она другая. 1 — поставлена, 0 — та же.

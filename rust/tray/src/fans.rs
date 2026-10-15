@@ -43,8 +43,8 @@ use windows::Win32::System::Ole::{
     SafeArrayUnaccessData,
 };
 use windows::Win32::System::Variant::{
-    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_BSTR, VT_I4, VT_UI1, VT_UI4, VT_UNKNOWN,
-    VariantClear,
+    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_BSTR, VT_EMPTY, VT_I4, VT_UI1, VT_UI4,
+    VT_UNKNOWN, VariantClear,
 };
 use windows::Win32::System::Wmi::{
     IWbemCallResult, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_E_INVALID_CLASS, WBEM_E_INVALID_NAMESPACE,
@@ -175,15 +175,16 @@ impl Fans for HpFans {
 }
 
 /// COM на этом потоке. `owned` — `CoInitializeEx` здесь удался и при уходе уравновешивается `CoUninitialize`.
+/// Его же берёт запуск окна через оболочку рабочего стола (launch.rs).
 #[derive(Debug)]
-struct Apartment {
+pub(crate) struct Apartment {
     owned: bool,
     /// Не Send: `CoUninitialize` должна идти на том же потоке, что и `CoInitializeEx`.
     _thread: PhantomData<*const ()>,
 }
 
 impl Apartment {
-    fn enter() -> Result<Self, HwError> {
+    pub(crate) fn enter() -> Result<Self, HwError> {
         // SAFETY: the reserved argument is null as required; no other pointers are passed.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
         if hr == RPC_E_CHANGED_MODE {
@@ -480,7 +481,7 @@ fn absent_or(e: &windows::core::Error, what: &str) -> HwError {
 }
 
 /// Причина ошибки COM для журнала: текст Windows, если он есть, и код.
-fn why(e: &windows::core::Error) -> String {
+pub(crate) fn why(e: &windows::core::Error) -> String {
     let text = e.message();
     let code = e.code().0;
     if text.trim().is_empty() {
@@ -490,8 +491,8 @@ fn why(e: &windows::core::Error) -> String {
     }
 }
 
-/// VARIANT, который сам освобождает то, что держит (строку, массив, объект).
-struct Var(VARIANT);
+/// VARIANT, который сам освобождает то, что держит (строку, массив, объект). Его же берёт launch.rs.
+pub(crate) struct Var(pub(crate) VARIANT);
 
 impl Drop for Var {
     fn drop(&mut self) {
@@ -519,8 +520,23 @@ impl Var {
     }
 
     /// 32-битное число: так WMI принимает свойства uint32.
-    fn int(value: i32) -> Self {
+    pub(crate) fn int(value: i32) -> Self {
         Self::with(VT_I4, VARIANT_0_0_0 { lVal: value })
+    }
+
+    /// Строка: VARIANT держит свою копию (BSTR) и освобождает её сам.
+    pub(crate) fn string(value: &str) -> Self {
+        Self::with(
+            VT_BSTR,
+            VARIANT_0_0_0 {
+                bstrVal: ManuallyDrop::new(BSTR::from(value)),
+            },
+        )
+    }
+
+    /// Пустой VARIANT (`VT_EMPTY`): «не задано».
+    pub(crate) fn empty() -> Self {
+        Self::with(VT_EMPTY, VARIANT_0_0_0 { llVal: 0 })
     }
 
     /// Встроенный объект WMI (свойство типа object): VARIANT держит свою ссылку на него.

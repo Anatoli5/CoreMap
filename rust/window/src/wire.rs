@@ -48,30 +48,136 @@ pub struct Hello {
     pub layout: Layout,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct Fans {
     pub rpm: Option<Vec<Option<f64>>>,
 }
 
-/// Числа без значения (датчик не ответил, ядро спало) приходят как null. Ряды — по ядрам.
+/// Числа без значения (датчик не ответил, ядро спало) приходят как null. Ряды — по ядрам; ряд целиком null (у
+/// программы входа — пока процессором владеет прежнее окно или движок, причина — в sensorError) — пустой ряд.
+/// Поля, которых у программы входа может не быть (ватты, ход измерения), — по умолчанию пустые: их отсутствие не
+/// ломает разбор состояния.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
     pub pkg: Option<f64>,
+    #[serde(default)]
     pub watts: Option<f64>,
+    #[serde(default)]
     pub busy: bool,
+    #[serde(default, deserialize_with = "row")]
     pub cur: Vec<Option<f64>>,
+    #[serde(default, deserialize_with = "row")]
     pub max: Vec<Option<f64>>,
+    #[serde(default, deserialize_with = "row")]
     pub ratio: Vec<Option<f64>>,
+    /// Средняя температура под нагрузкой (ø) и средний фактический множитель за то же время; null — нагрузки не было.
+    #[serde(default, deserialize_with = "row")]
     pub avg: Vec<Option<f64>>,
-    #[serde(deserialize_with = "flags")]
+    #[serde(default, deserialize_with = "row")]
+    pub avg_ratio: Vec<Option<f64>>,
+    #[serde(default, deserialize_with = "flags")]
     pub thr: Vec<bool>,
-    #[serde(deserialize_with = "flags")]
+    #[serde(default, deserialize_with = "flags")]
     pub load: Vec<bool>,
+    #[serde(default)]
     pub limit: Option<Vec<i64>>,
+    #[serde(default)]
     pub fans: Fans,
+    #[serde(default)]
     pub trip: Option<String>,
+    #[serde(default)]
     pub sensor_error: Option<String>,
+    /// Надстройка автомодуля по блокам (программа входа; у движка C# её нет). Форма поля — см. `AutoMark`; поле
+    /// неожиданной формы не ломает состояние, а пропускается.
+    #[serde(default, deserialize_with = "lenient")]
+    pub auto: Option<Vec<Option<AutoMark>>>,
+    /// Потолки владельца по ядрам — под поправкой автомодуля (программа входа; у движка C# нет): поправка блока b —
+    /// auto[b] − intended[первое ядро b].
+    #[serde(default, deserialize_with = "lenient")]
+    pub intended: Option<Vec<Option<i64>>>,
+}
+
+/// Что автомодуль держит у блока: потолок, который он поставил, или подробнее — потолок, от какого принятого и
+/// запрет поднимать обратно. null у блока — автомодуль его не трогает.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum AutoMark {
+    Ceiling(i64),
+    Detail {
+        #[serde(alias = "ceiling")]
+        to: Option<i64>,
+        /// Принятый потолок, от которого считается поправка; нет — считается от «было».
+        #[serde(alias = "accepted")]
+        base: Option<i64>,
+        /// Потолок, на который нельзя возвращаться до `until` (память перегрева).
+        ban: Option<i64>,
+        until: Option<String>,
+    },
+}
+
+impl AutoMark {
+    pub fn ceiling(&self) -> Option<i64> {
+        match self {
+            AutoMark::Ceiling(v) => Some(*v),
+            AutoMark::Detail { to, .. } => *to,
+        }
+    }
+
+    pub fn base(&self) -> Option<i64> {
+        match self {
+            AutoMark::Ceiling(_) => None,
+            AutoMark::Detail { base, .. } => *base,
+        }
+    }
+
+    pub fn ban(&self) -> Option<(i64, Option<&str>)> {
+        match self {
+            AutoMark::Ceiling(_) => None,
+            AutoMark::Detail { ban, until, .. } => ban.map(|b| (b, until.as_deref())),
+        }
+    }
+}
+
+/// Профиль запуска: что ставится при входе в Windows (Feed.Profiles, Profile.Describe/Details в C#-части).
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Startup {
+    pub exists: bool,
+    pub name: Option<String>,
+    pub disabled: bool,
+    pub describe: Option<String>,
+    pub details: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Сохранённый набор потолков: потолки по ядрам.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ProfileSet {
+    pub name: String,
+    pub ratios: Vec<i64>,
+}
+
+/// Профили и что из них стоит. standing / wasNamed: название набора, "" — заводские, null — ни один сохранённый.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Profiles {
+    #[serde(default)]
+    pub startup: Startup,
+    pub sets: Vec<ProfileSet>,
+    pub standing: Option<String>,
+    #[serde(default)]
+    pub was_named: Option<String>,
+    #[serde(default)]
+    pub can_accept: bool,
+}
+
+/// Журнал смен профиля (тема программы входа «history»): записи — объекты; какие поля окно читает, см.
+/// `samples::history_line`. Сама тема может прийти списком под любым из названий ниже.
+#[derive(Deserialize, Clone, Debug)]
+pub struct History {
+    #[serde(default, alias = "items", alias = "log", alias = "lines")]
+    pub entries: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Потолки по ядрам: заводские и «было»; choices — что можно поставить блоку, по убыванию, по номеру блока.
@@ -80,6 +186,13 @@ pub struct Limits {
     pub fused: Vec<i64>,
     pub was: Vec<i64>,
     pub choices: Vec<Vec<i64>>,
+}
+
+/// Сообщение владельцу (то, что программа сказала бы всплывающим окошком); прочитано — команда notices.seen {seq}.
+#[derive(Deserialize, Clone, Debug)]
+pub struct Notice {
+    pub seq: i64,
+    pub text: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -100,13 +213,40 @@ pub enum Message {
     Limits(Limits),
     #[serde(rename = "reply")]
     Reply(Reply),
+    #[serde(rename = "profiles")]
+    Profiles(Profiles),
+    #[serde(rename = "history")]
+    History(History),
+    #[serde(rename = "notice")]
+    Notice(Notice),
     #[serde(other)]
     Other,
 }
 
-/// Признаки по ядрам (троттлинг, нагрузка): движок пишет их 1 и 0, а не true и false (Out.Row в Wire.cs).
+/// Признаки по ядрам (троттлинг, нагрузка): движок пишет их 1 и 0, а не true и false (Out.Row в Wire.cs); ряд или
+/// значение null — «нет» (неизвестно).
 fn flags<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Vec<bool>, D::Error> {
-    Ok(Vec::<u8>::deserialize(from)?.into_iter().map(|v| v != 0).collect())
+    Ok(Option::<Vec<Option<u8>>>::deserialize(from)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.is_some_and(|v| v != 0))
+        .collect())
+}
+
+/// Ряд чисел по ядрам; null вместо ряда — пустой ряд (показаний нет).
+fn row<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Vec<Option<f64>>, D::Error> {
+    Ok(Option::<Vec<Option<f64>>>::deserialize(from)?.unwrap_or_default())
+}
+
+/// Необязательное поле новой формы: не разобралось — как будто его нет (форму задаёт другая программа, и её
+/// ошибка не должна гасить показ всего состояния).
+fn lenient<'de, D, T>(from: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(from)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[cfg(test)]
@@ -132,8 +272,103 @@ mod tests {
     }
 
     #[test]
+    fn state_carries_means_under_load() {
+        let Ok(Message::State(state)) = serde_json::from_str::<Message>(STATE) else {
+            panic!("состояние движка не разобралось");
+        };
+        assert_eq!(state.avg[0], Some(50.2));
+        assert_eq!(state.avg_ratio, [Some(51.0), None, Some(45.0), Some(45.0)]);
+        assert_eq!(state.auto, None);
+    }
+
+    #[test]
     fn unknown_topic_is_skipped_not_an_error() {
-        let message = serde_json::from_str::<Message>(r#"{"t":"profiles","sets":[]}"#);
+        let message = serde_json::from_str::<Message>(r#"{"t":"curves","sets":[]}"#);
         assert!(matches!(message, Ok(Message::Other)));
+    }
+
+    // Профили в том виде, в каком их пишет Feed.Profiles (Json.Text: поля по порядку, null у «ни один»).
+    const PROFILES: &str = r#"{"t":"profiles","startup":{"exists":true,"name":"csmart2","state":"ok","disabled":false,"describe":"при запуске ставится «csmart2»","details":null,"note":null},"sets":[{"name":"csmart2","ratios":[43,53,45,45,45,45]},{"name":"тихий","ratios":[40,40,40,40,40,40]}],"standing":null,"wasNamed":"csmart2","canAccept":true}"#;
+
+    #[test]
+    fn profiles_as_the_engine_writes_them() {
+        let Ok(Message::Profiles(p)) = serde_json::from_str::<Message>(PROFILES) else {
+            panic!("профили не разобрались");
+        };
+        assert_eq!(p.sets.len(), 2);
+        assert_eq!(p.sets[1].name, "тихий");
+        assert_eq!(p.standing, None);
+        assert_eq!(p.was_named.as_deref(), Some("csmart2"));
+        assert!(p.can_accept && p.startup.exists && !p.startup.disabled);
+    }
+
+    #[test]
+    fn auto_overlay_in_either_shape_and_a_bad_one_ignored() {
+        let with = |auto: &str| {
+            let text = STATE.replace(r#""trip":null"#, &format!(r#""auto":{auto},"trip":null"#));
+            match serde_json::from_str::<Message>(&text) {
+                Ok(Message::State(s)) => s.auto,
+                other => panic!("состояние с полем auto не разобралось: {other:?}"),
+            }
+        };
+        let plain = with("[null,41,null,null]").expect("потолки по блокам");
+        assert_eq!(plain[1].as_ref().and_then(AutoMark::ceiling), Some(41));
+        let detail = with(r#"[{"to":41,"base":43,"ban":43,"until":"2026-10-15T02:00:00"},null]"#).expect("подробно");
+        let mark = detail[0].as_ref().expect("блок 0");
+        assert_eq!((mark.ceiling(), mark.base()), (Some(41), Some(43)));
+        assert_eq!(mark.ban(), Some((43, Some("2026-10-15T02:00:00"))));
+        assert_eq!(with(r#""что-то другое""#), None);
+    }
+
+    #[test]
+    fn state_of_the_logon_program_while_another_part_owns_the_cpu() {
+        // Программа входа, пока процессором владеет прежнее окно: потолков нет, ряды датчиков — null, причина словами.
+        let text = r#"{"t":"state","n":7,"up":3.5,"pkg":null,"pkgMax":null,"since":3,"busy":false,"level":0,"cur":null,"max":null,"ratio":null,"avg":null,"avgRatio":null,"thr":null,"load":null,"limit":null,"fans":{"rpm":null,"max":false,"spin":false,"mode":0},"run":null,"trip":null,"sensorError":"открыто прежнее окно","busyShare":null,"auto":[null,null],"intended":null}"#;
+        let Ok(Message::State(state)) = serde_json::from_str::<Message>(text) else {
+            panic!("состояние программы входа не разобралось");
+        };
+        assert!(state.cur.is_empty() && state.load.is_empty() && state.limit.is_none() && state.intended.is_none());
+        assert_eq!(state.sensor_error.as_deref(), Some("открыто прежнее окно"));
+        // Её обычное состояние: ватт нет, средние и надстройка есть.
+        let text = r#"{"t":"state","n":8,"pkg":61,"busy":false,"cur":[60,null],"max":[70,null],"ratio":[45.2,null],"avg":[58.5,null],"avgRatio":[44.9,null],"thr":[0,0],"load":[1,0],"limit":[45,46],"fans":{"rpm":[2400,2100]},"run":null,"trip":null,"sensorError":null,"busyShare":[0.93,null],"auto":[44,null],"intended":[46,46]}"#;
+        let Ok(Message::State(state)) = serde_json::from_str::<Message>(text) else {
+            panic!("состояние программы входа не разобралось");
+        };
+        assert_eq!(state.watts, None);
+        assert_eq!(state.avg_ratio[0], Some(44.9));
+        assert_eq!(state.intended, Some(vec![Some(46), Some(46)]));
+        assert_eq!(
+            state
+                .auto
+                .as_ref()
+                .and_then(|a| a[0].as_ref())
+                .and_then(AutoMark::ceiling),
+            Some(44)
+        );
+    }
+
+    #[test]
+    fn notice_and_history_topics() {
+        let Ok(Message::Notice(n)) =
+            serde_json::from_str::<Message>(r#"{"t":"notice","seq":3,"text":"профиль поставлен"}"#)
+        else {
+            panic!("сообщение владельцу не разобралось");
+        };
+        assert_eq!((n.seq, n.text.as_str()), (3, "профиль поставлен"));
+        let text = r#"{"t":"history","entries":[{"time":"2026-10-15T01:20:00.0000000+03:00","at":1,"act":"open","name":"csmart2","before":[53],"after":[52]}]}"#;
+        let Ok(Message::History(h)) = serde_json::from_str::<Message>(text) else {
+            panic!("история не разобралась");
+        };
+        assert_eq!(h.entries.len(), 1);
+    }
+
+    #[test]
+    fn state_without_engine_only_fields() {
+        // Программа входа может не слать нагрузку, троттлинг, средние и вентиляторы: состояние всё равно читается.
+        let text = r#"{"t":"state","pkg":50,"cur":[48],"max":[55],"ratio":[45.0],"limit":[46]}"#;
+        let Ok(Message::State(state)) = serde_json::from_str::<Message>(text) else {
+            panic!("состояние без полей движка не разобралось");
+        };
+        assert!(state.load.is_empty() && state.thr.is_empty() && state.avg.is_empty() && !state.busy);
     }
 }

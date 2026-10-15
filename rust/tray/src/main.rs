@@ -1,6 +1,8 @@
-// Программа входа CoreMap: CoreMapTray.exe, значок у часов (DECISIONS #30, #31). При входе в Windows ставит профиль
-// потолков по правилам защиты, из меню значка переключает профили, после сна сверяет потолки. Ничего для настройки
-// (замеров, кривых, канала окна) в ней нет: настройка — части на C# (прежнее окно, движок), которые она запускает.
+// Программа входа CoreMap: CoreMapTray.exe, значок у часов (DECISIONS #30, #31, #32). При входе в Windows ставит
+// профиль потолков по правилам защиты, из меню значка переключает профили, после сна сверяет потолки, по выбору
+// владельца ограничивает нагрев (автомодуль). Окно CoreMapWindow.exe открывает она же («Окно» в меню, двойной щелчок)
+// и обслуживает его по каналу: показания, потолки, профили (app/serve.rs). Замеров и кривых в ней нет; прежнее окно на
+// C# — отдельная программа, которую владелец запускает сам.
 //
 //   CoreMapTray.exe                        значок; без прав администратора — спрашивает их у Windows (запрос на экране)
 //   CoreMapTray.exe --simulate --snapshot F [--saved]
@@ -13,8 +15,12 @@
 
 mod app;
 mod check;
+mod check_window;
 mod fans;
 mod journal;
+mod launch;
+mod layout;
+mod pipe;
 mod shell;
 
 use std::path::PathBuf;
@@ -22,13 +28,16 @@ use std::time::Duration;
 
 use machine::named::{self, Names};
 
-use crate::app::{App, Config};
+use crate::app::{App, Config, Confirm};
 use crate::shell::{Handler, Loop, Shell};
 
 /// Номер версии (файл VERSION, tools\rust.ps1) — его владелец видит в подсказке значка и называет.
 pub const VERSION: &str = env!("COREMAP_VERSION");
 /// Время сборки (tools\rust.ps1); после «|» — метка, которая только делает файл другим при пересборке.
 pub const BUILT: &str = env!("COREMAP_BUILT");
+/// Канал окна: к имени добавляется номер сеанса Windows (`pipe::session_pipe`). Своё имя, не канал движка на C#
+/// («CoreMap.Bridge.N»): движок, запущенный кнопкой прежнего окна, не должен столкнуться с программой входа.
+const PIPE: &str = "CoreMap.Logon";
 
 impl Handler for App {
     fn waits(&self) -> Vec<windows_sys::Win32::Foundation::HANDLE> {
@@ -88,6 +97,8 @@ fn main() {
         names,
         simulate: false,
         launch: true,
+        pipe: pipe::session_pipe(PIPE),
+        confirm: Confirm::Ask,
         grace: Duration::from_secs(2),
         wake_delay: Duration::from_secs(5),
         lease_wait: 10_000,

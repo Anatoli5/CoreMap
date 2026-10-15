@@ -1,5 +1,6 @@
-// Программа входа: что она делает с потолками и когда (DECISIONS #31). Вызовы Windows — в shell.rs, железо и
-// правила защиты — в библиотеке machine; здесь — решения.
+// Программа входа: что она делает с потолками и когда (DECISIONS #31, #32). Вызовы Windows — в shell.rs, железо и
+// правила защиты — в библиотеке machine; здесь — решения. Окно CoreMapWindow.exe говорит с этой программой по
+// каналу (app/serve.rs): она его открывает («Окно» в меню, двойной щелчок по значку) и одна им владеет.
 //
 // При входе в Windows: возврат потолков по метке оборванного замера, затем профиль запуска по правилам защиты
 // (machine::profile::startup). Дальше программа спит до действия владельца: меню значка, щелчок по набору,
@@ -34,12 +35,16 @@ use machine::{HwError, marker};
 use crate::journal::Journal;
 
 mod auto;
-use crate::shell::{self, Child, Event, Item, Loop, Menu, Shell};
+mod history;
+mod meter;
+mod serve;
+use crate::shell::{Event, Item, Loop, Menu, Shell};
 pub use auto::{AUTO_ON, AutoTiming, DEPTH_ID, LIMIT_ID};
+pub use serve::Confirm;
 
-pub const OPEN_ID: u32 = 1;
+/// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — двойной щелчок по значку).
+pub const WINDOW_ID: u32 = 1;
 pub const EXIT_ID: u32 = 2;
-pub const NEW_ID: u32 = 3;
 pub const FACTORY_ID: u32 = 100; // 101 и дальше — наборы в порядке последнего меню
 
 const RETRY: usize = 1;
@@ -48,22 +53,24 @@ const WAKE: usize = 3;
 const RETRIES: u8 = 3;
 const RETRY_EVERY: Duration = Duration::from_secs(10);
 const HOVER_GAP: Duration = Duration::from_secs(1);
-/// Класс окна движка на C# (Tray.WindowClass): ему шлётся просьба открыть новое окно.
-const ENGINE_CLASS: &str = "CoreMap.Tray";
 
 /// Настройки запуска: где лежит программа и данные, имена меток, задержки.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Папка программы: CoreMap.exe, modules\IntelMSR.bin.
+    /// Папка программы: CoreMapWindow.exe, modules\IntelMSR.bin, layouts\.
     pub root: PathBuf,
     pub data: PathBuf,
     pub names: Names,
     /// Процессор — имитация (скрытая проверка).
     pub simulate: bool,
-    /// Запускать ли части на C#; в скрытой проверке запуск только записывается.
+    /// Запускать ли окно на самом деле; в скрытой проверке запуск только записывается.
     pub launch: bool,
-    /// Пауза после конца C#-части, прежде чем вернуть себе право: движок, запущенный кнопкой «новое окно», создаёт
-    /// свою метку чуть позже, чем закрывается прежнее окно (outputs/ceiling-ownership-2026-10-14.md §2).
+    /// Канал окна (app/serve.rs).
+    pub pipe: String,
+    /// Кто отвечает на вопрос о потолке выше заводского: окошко Windows или (скрытая проверка) заданный ответ.
+    pub confirm: Confirm,
+    /// Пауза после конца C#-части, прежде чем вернуть себе право: движок, запущенный кнопкой «новое окно» прежнего
+    /// окна, создаёт свою метку чуть позже, чем закрывается прежнее окно (outputs/ceiling-ownership-2026-10-14.md §2).
     pub grace: Duration,
     /// Пауза после пробуждения перед сверкой: драйвер и другие программы (`ThrottleStop`, Omen Gaming Hub) успевают
     /// сделать своё.
@@ -84,26 +91,22 @@ pub enum Other {
     Tuning,
     /// Процесс движка (или прежний резидент на C#) без живого Core.
     Engine,
-    /// Эта программа только что запустила часть на C#, её метки ещё нет.
-    Starting,
 }
 
 impl Other {
     fn menu_text(self) -> &'static str {
         match self {
-            Self::OldWindow => "окно CoreMap открыто — профили переключаются в нём",
+            Self::OldWindow => "открыто прежнее окно CoreMap — профили переключаются в нём",
             Self::Tuning => "идёт настройка в окне CoreMap — профили ждут её конца",
             Self::Engine => "работает другая часть CoreMap — профили переключаются там",
-            Self::Starting => "запускается окно CoreMap",
         }
     }
 
     fn tip(self) -> &'static str {
         match self {
-            Self::OldWindow => "CoreMap — открыто окно программы",
+            Self::OldWindow => "CoreMap — открыто прежнее окно",
             Self::Tuning => "CoreMap — идёт настройка",
             Self::Engine => "CoreMap — работает другая часть CoreMap",
-            Self::Starting => "CoreMap — запускается окно программы",
         }
     }
 }
@@ -124,20 +127,10 @@ impl Device {
     }
 }
 
-/// То, чего программа ждёт вместе с сообщениями окна: метка C#-части или процесс, запущенный ею самой.
+/// То, чего программа ждёт вместе с сообщениями окна: метка C#-части (её держит главный поток той части всю жизнь
+/// процесса).
 #[derive(Debug)]
-enum Watched {
-    Mutex(named::Mutex, Other),
-    Child(Child, Other),
-}
-
-impl Watched {
-    fn other(&self) -> Other {
-        match self {
-            Self::Mutex(_, other) | Self::Child(_, other) => *other,
-        }
-    }
-}
+struct Watched(named::Mutex, Other);
 
 #[derive(Debug)]
 #[expect(
@@ -167,6 +160,19 @@ pub struct App {
     /// C#-часть только что закрылась, возврат права ещё впереди (пауза `grace`).
     take_back_pending: bool,
     listed: Vec<String>,
+    /// «Было» (Core.Was в C#): потолки, принятые последними — после входа то, что поставил профиль запуска; None —
+    /// потолки ещё не прочитаны.
+    was: Option<Vec<i32>>,
+    /// Набор, который владелец открыл или сохранил последним: так называются потолки, записанные под несколькими
+    /// названиями (Core.Preferred).
+    preferred: Option<String>,
+    /// Во сколько профиль запуска поставлен при входе («HH:mm»); None — не ставился.
+    at_startup: Option<String>,
+    /// Растёт при каждой смене профилей, наборов или «было»: окну пора заново собрать сообщение «профили».
+    version: u64,
+    history: history::History,
+    meter: meter::Meter,
+    serving: serve::Serving,
     auto: auto::Autopilot,
     lease: Rc<named::Mutex>,
     watched: Vec<Watched>,
@@ -188,6 +194,9 @@ impl App {
         let journal = Journal::new(&config.data);
         let (lease, _) = named::create(&config.names.lease, false).map_err(|e| format!("аренда потолков: {e}"))?;
         let blocks = topology.blocks.len();
+        let cores = topology.cores.len();
+        let serving = serve::Serving::new(config.pipe.clone(), config.confirm);
+        let history = history::History::new(config.data.join("profile-log.jsonl"));
         Ok(Self {
             config,
             topology,
@@ -207,6 +216,13 @@ impl App {
             power_while_away: false,
             take_back_pending: false,
             listed: Vec::new(),
+            was: None,
+            preferred: None,
+            at_startup: None,
+            version: 0,
+            history,
+            meter: meter::Meter::new(cores),
+            serving,
             auto: auto::Autopilot::new(blocks),
             lease: Rc::new(lease),
             watched: Vec::new(),
@@ -253,6 +269,22 @@ impl App {
         self.intended.as_deref()
     }
 
+    /// Канал окна: имя, вопросы владельцу, счёт окон и состояний (скрытая проверка).
+    #[must_use]
+    pub fn serving(&self) -> &serve::Serving {
+        &self.serving
+    }
+
+    pub fn serving_mut(&mut self) -> &mut serve::Serving {
+        &mut self.serving
+    }
+
+    /// Сколько ядер прочитано всего (скрытая проверка: без окна и автомодуля не растёт).
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.meter.reads
+    }
+
     // ----- кто держит потолки -----
 
     /// Кто сейчас держит потолки вместо этой программы; заодно начинает ждать его конца.
@@ -269,31 +301,21 @@ impl App {
         };
         if let Some((other, mutex)) = found {
             // Ждать конца того, кто держит потолки: его метку (её держит его главный поток всю жизнь процесса).
-            let watching = self
-                .watched
-                .iter()
-                .any(|w| matches!(w, Watched::Mutex(_, o) if *o == other));
+            let watching = self.watched.iter().any(|w| w.1 == other);
             if !watching && let Some(handle) = named::open(&mutex) {
-                self.watched.push(Watched::Mutex(handle, other));
+                self.watched.push(Watched(handle, other));
             }
             return Some(other);
         }
-        self.watched
-            .iter()
-            .find(|w| matches!(w, Watched::Child(..)))
-            .map(Watched::other)
+        None
     }
 
-    /// Дескрипторы, которых ждёт цикл программы.
+    /// Дескрипторы, которых ждёт цикл программы: метки C#-частей, затем события канала окна.
     #[must_use]
     pub fn waits(&self) -> Vec<windows_sys::Win32::Foundation::HANDLE> {
-        self.watched
-            .iter()
-            .map(|w| match w {
-                Watched::Mutex(m, _) => m.raw(),
-                Watched::Child(c, _) => c.raw(),
-            })
-            .collect()
+        let mut waits: Vec<_> = self.watched.iter().map(|w| w.0.raw()).collect();
+        waits.extend(self.serving.handles());
+        waits
     }
 
     /// Действие с потолками: под арендой, только если никто другой их не держит; драйвер открыт на время действия.
@@ -321,8 +343,10 @@ impl App {
             return Err(format!("потолки множителей недоступны: {}", e.0));
         }
         let result = act(self);
-        // Автомодуль опрашивает раз в 2 с: драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
+        // Автомодуль опрашивает раз в 2 с, окно — раз в полсекунды: пока работает кто-то из них, драйвер остаётся
+        // открытым, иначе каждый опрос заново грузил бы модуль.
         if !self.auto.choice.on
+            && !self.serving.attached()
             && let Some(device) = &mut self.device
         {
             device.cpu().release();
@@ -382,6 +406,7 @@ impl App {
             }
         }
         self.start_auto(shell);
+        self.open_server();
         if !shell.add_icon(&self.tip()) {
             self.schedule_retries(shell);
         }
@@ -404,8 +429,16 @@ impl App {
                     self.journal
                         .note(&format!("при входе поставлен профиль «{name}» в {at}"));
                 }
+                self.at_startup.clone_from(&startup.at_startup);
                 self.profile = startup.profile;
                 self.note = startup.note;
+                // Профиль ставился (целиком или нет) — в историю; не ставился (уже стоял, отключён) — писать нечего.
+                let partly = self.note.as_deref().is_some_and(|n| n.contains("не полностью"));
+                if self.at_startup.is_some() || partly {
+                    let name = self.profile.as_ref().map(|p| p.name.clone());
+                    let (boot, note) = (self.boot.clone(), self.note.clone()); // two dozen numbers, once at logon
+                    self.log_change("logon", name.as_deref(), &boot, None, note.as_deref());
+                }
             }
             Err(spoiled) => {
                 self.journal.error(&format!("профиль потолков не прочитан: {spoiled}"));
@@ -417,6 +450,8 @@ impl App {
             self.journal.note(note);
         }
         self.intended = self.limits.as_ref().map(|l| l.current().to_vec());
+        self.was.clone_from(&self.intended);
+        self.version += 1;
         let in_effect = self
             .profile
             .as_ref()
@@ -602,8 +637,9 @@ impl App {
         format!("{text}\nпри запуске — {startup}")
     }
 
-    /// Меню значка (Resident.Menu в C#): пояснение, наборы с галочкой на стоящем, «Новое окно», «Открыть прежнее
-    /// окно», «Выход».
+    /// Меню значка (Resident.Menu в C#): пояснение, наборы с галочкой на стоящем, автомодуль, «Окно» (по умолчанию —
+    /// оно же по двойному щелчку), «Выход». Прежнее окно на C# отсюда не открывается: это отдельная программа, владелец
+    /// запускает её сам (его слово 15.10: «не надо чтобы из нового резидента запускалась старое окно»).
     pub fn menu(&mut self) -> Vec<Item> {
         let other = self.other();
         let mut items = Vec::new();
@@ -662,16 +698,8 @@ impl App {
         items.push(self.auto_menu());
         items.push(separator());
         items.push(Item {
-            id: NEW_ID,
-            text: Some("Новое окно".into()),
-            checked: false,
-            enabled: true,
-            default: false,
-            children: Vec::new(),
-        });
-        items.push(Item {
-            id: OPEN_ID,
-            text: Some("Открыть прежнее окно".into()),
+            id: WINDOW_ID,
+            text: Some("Окно".into()),
             checked: false,
             enabled: true,
             default: true,
@@ -704,8 +732,12 @@ impl App {
             if app.intended.is_none() {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
             }
+            if app.was.is_none() {
+                app.was.clone_from(&app.intended);
+            }
             said
         });
+        self.version += 1;
         match done {
             Ok(Some(said)) => self.queue(&said),
             Ok(None) => {}
@@ -722,8 +754,7 @@ impl App {
             return;
         }
         match id {
-            OPEN_ID => self.open_old_window(shell),
-            NEW_ID => self.open_new_window(shell),
+            WINDOW_ID => self.open_window(shell),
             EXIT_ID => {
                 self.put_back("выход");
                 shell.remove_icon();
@@ -765,6 +796,7 @@ impl App {
                 .find(|s| same_name(&s.name, name))
                 .map(|s| s.ratios)
         };
+        let before = self.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
         let done = self.with_ceilings(|app| -> Result<(), String> {
             app.put_back("смена набора");
             let Some(ratios) = ratios else {
@@ -812,75 +844,29 @@ impl App {
         if let Some(limits) = &self.limits {
             self.intended = Some(limits.current().to_vec());
         }
+        self.version += 1;
         match done {
             Ok(Ok(())) => {
+                // Выбор в меню — «открыть и принять» сразу: стоящее — и «было».
+                self.was.clone_from(&self.intended);
+                if !name.is_empty() {
+                    self.preferred = Some(name.trim().to_string());
+                }
                 self.refusal = None;
+                self.log_change("menu", Some(name.trim()), &before, None, None);
                 None
             }
-            Ok(Err(refusal)) | Err(refusal) => {
+            Ok(Err(refusal)) => {
+                self.refusal = Some(refusal.clone());
+                if self.limits.as_ref().is_some_and(|l| l.current() != before.as_slice()) {
+                    self.log_change("menu", Some(name.trim()), &before, None, Some(&refusal));
+                }
+                Some(refusal)
+            }
+            Err(refusal) => {
                 self.refusal = Some(refusal.clone());
                 Some(refusal)
             }
-        }
-    }
-
-    fn csharp(&self) -> PathBuf {
-        self.config.root.join("CoreMap.exe")
-    }
-
-    /// Запуск части на C# с правами этой программы (запроса Windows нет).
-    fn start_csharp(&mut self, shell: &mut Shell, args: &str, what: Other) {
-        let args = if self.config.simulate {
-            format!("--simulate {args}").trim().to_string()
-        } else {
-            args.to_string()
-        };
-        if !self.config.launch {
-            self.launched.push(format!("CoreMap.exe {args}").trim().to_string());
-            return;
-        }
-        match shell::launch(&self.csharp(), &args, &self.config.root) {
-            // Пока у запущенной части нет своей метки, присутствие — её процесс.
-            Ok(child) => self.watched.push(Watched::Child(child, what)),
-            Err(e) => {
-                self.journal.error(&e);
-                self.notify(shell, &format!("Окно CoreMap не открылось: {e}"));
-            }
-        }
-    }
-
-    fn open_old_window(&mut self, shell: &mut Shell) {
-        self.put_back("открывается прежнее окно");
-        match self.other() {
-            Some(Other::Tuning | Other::Engine) => {
-                self.notify(
-                    shell,
-                    "Прежнее окно сейчас не открыть: к программе подключено новое окно или идёт измерение",
-                );
-            }
-            // Уже открыто — прежнее окно само выведет свою копию вперёд (Program.cs).
-            _ => self.start_csharp(shell, "", Other::Starting),
-        }
-    }
-
-    fn open_new_window(&mut self, shell: &mut Shell) {
-        self.put_back("запускается настройка");
-        match self.other() {
-            Some(Other::Starting) => {
-                self.notify(shell, "Окно CoreMap ещё запускается — подожди несколько секунд");
-            }
-            Some(Other::OldWindow) => {
-                self.notify(
-                    shell,
-                    "Сначала закрой прежнее окно CoreMap — или нажми в нём «новое окно»",
-                );
-            }
-            Some(Other::Tuning | Other::Engine) => {
-                if self.config.launch && !shell::post_to_class(ENGINE_CLASS, shell::OPEN_NEW, 0) {
-                    self.notify(shell, "Новое окно не открыть: движок CoreMap не отвечает");
-                }
-            }
-            _ => self.start_csharp(shell, "--tray --bridge --open", Other::Tuning),
         }
     }
 
@@ -907,7 +893,7 @@ impl App {
                     Err(e) => self.journal.error(&e),
                 }
             }
-            Event::Open => self.command(shell, OPEN_ID),
+            Event::Open => self.command(shell, WINDOW_ID),
             Event::Hover => {
                 if self.last_hover.is_none_or(|t| t.elapsed() >= HOVER_GAP) {
                     self.last_hover = Some(Instant::now());
@@ -935,6 +921,8 @@ impl App {
                 self.wake_repair(shell);
             }
             Event::Timer(auto::AUTO) => self.auto_tick(shell),
+            Event::Timer(serve::STATE) => self.serve_tick(shell),
+            Event::Timer(serve::GREET) => self.greet_tick(shell),
             Event::Timer(_) => {}
             Event::Suspend => {
                 self.journal.note("уход в сон");
@@ -973,17 +961,16 @@ impl App {
         }
     }
 
-    /// Кончилось то, чего программа ждала: C#-часть закрылась.
+    /// Сработал дескриптор из списка ожидания: метка C#-части (та закрылась) или событие канала окна.
     fn ended(&mut self, shell: &mut Shell, index: usize) {
         if index >= self.watched.len() {
+            self.serve_io(shell);
             return;
         }
         let watched = self.watched.remove(index);
-        if let Watched::Mutex(mutex, _) = &watched {
-            // Ожидание отдало брошенный мьютекс этой программе: сразу отпустить, иначе C#-часть, запущенная следом,
-            // решила бы, что её копия уже работает.
-            mutex.release();
-        }
+        // Ожидание отдало брошенный мьютекс этой программе: сразу отпустить, иначе C#-часть, запущенная следом,
+        // решила бы, что её копия уже работает.
+        watched.0.release();
         drop(watched);
         self.take_back_pending = true;
         shell.set_timer(TAKE_BACK, self.config.grace);
@@ -1009,9 +996,12 @@ impl App {
             }
             app.power_while_away = false;
             app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
+            // Что C#-часть приняла, программа входа не знает: «было» — то, что она оставила.
+            app.was.clone_from(&app.intended);
             app.journal.note("C#-часть закрылась — потолки снова мои");
             said
         });
+        self.version += 1;
         match done {
             Ok(Some(said)) => self.notify(shell, &said),
             Ok(None) => {}
@@ -1041,8 +1031,10 @@ impl App {
         if !reset || limits.same(&p.ratios) {
             return;
         }
+        let before = limits.current().to_vec();
         if let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
             let refused = limits.apply(cpu, topology, &p.ratios);
+            self.log_change("wake", Some(&p.name), &before, None, refused.as_deref());
             self.journal.note(&match refused {
                 None => format!("после сна во время работы окна профиль «{}» поставлен заново", p.name),
                 Some(r) => format!(
@@ -1090,6 +1082,7 @@ impl App {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
                 return None;
             };
+            let before = app.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
             let mut repaired = Vec::new();
             let mut foreign = Vec::new();
             let mut refusal = None;
@@ -1107,8 +1100,13 @@ impl App {
                         Some(r) => refusal = Some(r),
                     }
                 } else {
-                    foreign.push(block);
+                    // Копия блока (имя и ядра): дальше программа пишет историю, а топология взята на чтение.
+                    foreign.push(block.clone());
                 }
+            }
+            if !repaired.is_empty() {
+                let name = app.named(&intended);
+                app.log_change("wake", name.as_deref(), &before, None, refusal.as_deref());
             }
             let mut said = None;
             if !foreign.is_empty() {
@@ -1121,6 +1119,8 @@ impl App {
                     }
                 }
                 let names: Vec<&str> = foreign.iter().map(|b| b.name.as_str()).collect();
+                let blocks = names.join(", ");
+                app.log_change("foreign", None, &intended, Some(&blocks), None);
                 said = Some(format!(
                     "Потолки блоков {} изменила другая программа — оставляю их как есть",
                     names.join(", ")
@@ -1138,6 +1138,7 @@ impl App {
             }
             said.map(Ok)
         });
+        self.version += 1;
         match done {
             Ok(Some(Ok(said) | Err(said))) => self.notify(shell, &said),
             Ok(None) => {}
@@ -1151,7 +1152,9 @@ impl App {
 
     fn queue(&mut self, text: &str) {
         self.journal.note(&format!("сообщение: {text}"));
-        self.balloons.push_back(capital(text));
+        let text = capital(text);
+        self.serving.notice(&text);
+        self.balloons.push_back(text);
     }
 
     /// Сообщение владельцу: всплывающее у значка, по одному (Windows показывает одно за раз); каждое — в журнал.

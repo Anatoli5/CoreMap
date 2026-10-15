@@ -6,18 +6,20 @@
 // Права на канале — «узнать, кто я» (SECURITY_IDENTIFICATION), как у стороны окна в C#: движок может спросить
 // Windows, кто клиент, но действовать от его имени не может.
 //
-// Это единственный модуль окна с unsafe: перекрываемого ввода-вывода для каналов и номера сеанса Windows в
-// стандартной библиотеке нет, остаются вызовы Windows напрямую. Снаружи модуль безопасен: Link и engine_pipe.
+// Это единственный модуль окна с unsafe: перекрываемого ввода-вывода для каналов, номера сеанса Windows, процесса
+// на том конце канала и разрешения ему выйти на передний план в стандартной библиотеке нет, остаются вызовы Windows
+// напрямую. Снаружи модуль безопасен: Link и server_pipe.
 #![expect(
     unsafe_code,
-    reason = "Win32 calls the standard library lacks: overlapped named-pipe I/O, the session id"
+    reason = "Win32 calls the standard library lacks: overlapped named-pipe I/O, the session id, the pipe server's \
+              process id, AllowSetForegroundWindow"
 )]
 
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,19 +33,23 @@ use windows_sys::Win32::Storage::FileSystem::{
     WriteFile,
 };
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 
 use crate::wire::{Message, PROTOCOL};
 
 const CAP: usize = 1 << 20; // сообщение длиннее — нарушение протокола (Wire.Cap)
 
-/// Канал движка этого сеанса Windows: «CoreMap.Bridge.<номер сеанса>» (Engine.PipeName в C#-части).
-pub fn engine_pipe() -> String {
+/// Канал программы входа этого сеанса Windows: «CoreMap.Logon.<номер сеанса>» (`rust\tray`: `pipe::session_pipe`).
+/// Программа входа сама запускает окно с этим каналом (--pipe); без ключа окно ищет его же. Движок C#-части
+/// («CoreMap.Bridge.<сеанс>») окно получает только ключом --pipe — так его запускает проверка движка.
+pub fn server_pipe() -> String {
     let mut session = 0u32;
     // SAFETY: `session` is a valid, writable u32 for the duration of the call; the process id is our own.
     unsafe { ProcessIdToSessionId(std::process::id(), &raw mut session) };
-    format!("CoreMap.Bridge.{session}")
+    format!("CoreMap.Logon.{session}")
 }
 
 /// Ручка Windows, закрываемая ровно один раз.
@@ -81,6 +87,8 @@ struct Pipe {
     write_event: Handle,
     // Порядок кадров: две команды из разных мест не должны перемешаться байтами. Больше ничего не охраняет.
     writing: Mutex<()>,
+    /// Процесс на том конце канала; 0 — Windows не сказал.
+    server: u32,
 }
 
 impl Pipe {
@@ -106,11 +114,16 @@ impl Pipe {
             return Err(io::Error::last_os_error());
         }
         let handle = Handle(handle);
+        let mut server = 0u32;
+        // SAFETY: the handle is a valid pipe client handle just opened; `server` is writable for the call. A failure
+        // leaves 0 — «unknown», handled by the caller.
+        unsafe { GetNamedPipeServerProcessId(handle.0, &raw mut server) };
         Ok(Pipe {
             handle,
             read_event: event()?,
             write_event: event()?,
             writing: Mutex::new(()),
+            server,
         })
     }
 
@@ -211,6 +224,8 @@ pub struct Link {
     // Канал, пока он открыт: поток моста кладёт и убирает, команды окна берут копию указателя и сразу отпускают.
     pipe: Mutex<Option<Arc<Pipe>>>,
     next: AtomicI64,
+    /// Процесс программы на том конце канала (0 — неизвестен): ему окно разрешает выйти на передний план.
+    server: AtomicU32,
 }
 
 impl Link {
@@ -218,6 +233,7 @@ impl Link {
         let link = Arc::new(Link {
             pipe: Mutex::new(None),
             next: AtomicI64::new(1),
+            server: AtomicU32::new(0),
         });
         let me = Arc::clone(&link);
         thread::Builder::new()
@@ -240,7 +256,7 @@ impl Link {
                 Ok(pipe) => Arc::new(pipe),
                 Err(e) => {
                     let why = match e.raw_os_error().map(i32::cast_unsigned) {
-                        Some(ERROR_FILE_NOT_FOUND) => "движок не запущен".to_string(),
+                        Some(ERROR_FILE_NOT_FOUND) => "программа у часов не отвечает".to_string(),
                         Some(ERROR_PIPE_BUSY) => "канал занят другим окном".to_string(),
                         _ => format!("канал не открылся: {e}"),
                     };
@@ -250,6 +266,7 @@ impl Link {
                     continue;
                 }
             };
+            self.server.store(pipe.server, Ordering::Relaxed);
             *self.pipe.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&pipe));
             told.clear();
             let since = Instant::now();
@@ -280,6 +297,19 @@ impl Link {
                 Duration::from_secs(1)
             });
         }
+    }
+
+    /// Перед командой, на которую программа может спросить владельца своим окошком (потолок выше заводского):
+    /// Windows выводит на передний план только окно процесса, которому это разрешило окно на переднем плане.
+    /// Разрешается процессу на том конце канала; он неизвестен — любому (`ASFW_ANY`), иначе окошко осталось бы под
+    /// окном. Не получилось (окно само не на переднем плане) — окошко просто мигнёт на панели задач.
+    pub fn allow_foreground(&self) {
+        let server = match self.server.load(Ordering::Relaxed) {
+            0 => ASFW_ANY,
+            pid => pid,
+        };
+        // SAFETY: plain call with a process id; no pointers.
+        unsafe { AllowSetForegroundWindow(server) };
     }
 
     /// Команда движку; номер для ответа или None — канала нет.

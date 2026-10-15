@@ -1,7 +1,8 @@
 // Скрытая проверка программы входа: CoreMapTray.exe --simulate --snapshot <отчёт> [--saved]. Значка на экране нет,
 // прав администратора не нужно, процессор — имитация, данные — во временной папке, все метки Windows — с приставкой
 // «.Check.<номер процесса>»: настоящие части CoreMap проверку не видят и она их не видит. Окно, меню, сообщения,
-// таймеры и метки — настоящие, Windows. Проходит каждую строку правила «кто когда пишет потолки» (DECISIONS #31).
+// таймеры и метки — настоящие, Windows. Проходит каждую строку правила «кто когда пишет потолки» (DECISIONS #31) и
+// канал окна (DECISIONS #32, шаг 2): клиент в соседнем потоке подключается к нему, как окно, — check_window.rs.
 // Первая строка отчёта — «ok» или «FAILED»; tools\check.ps1 смотрит на неё.
 
 use std::fmt::Write as _;
@@ -16,7 +17,7 @@ use machine::events::{Event, EventLog};
 use machine::named::{self, Names};
 use machine::thermal::Thermal;
 
-use crate::app::{AUTO_ON, App, Config, DEPTH_ID, EXIT_ID, FACTORY_ID, LIMIT_ID, NEW_ID, OPEN_ID};
+use crate::app::{AUTO_ON, App, Config, Confirm, DEPTH_ID, EXIT_ID, FACTORY_ID, LIMIT_ID, WINDOW_ID};
 use crate::shell::{self, Item, Menu, Shell};
 
 /// Журнал без сбоев: проверка не зависит от истории машины.
@@ -29,30 +30,30 @@ impl EventLog for QuietLog {
     }
 }
 
-struct Report {
+pub struct Report {
     lines: Vec<String>,
     failed: bool,
 }
 
 impl Report {
-    fn check(&mut self, ok: bool, what: &str) {
+    pub fn check(&mut self, ok: bool, what: &str) {
         self.lines
             .push(format!("{} {what}", if ok { "ok    " } else { "FAILED" }));
         self.failed |= !ok;
     }
 
-    fn note(&mut self, text: &str) {
+    pub fn note(&mut self, text: &str) {
         self.lines.push(format!("       {text}"));
     }
 }
 
-fn pump(shell: &mut Shell, app: &mut App, for_: Duration) {
+pub fn pump(shell: &mut Shell, app: &mut App, for_: Duration) {
     shell::run(shell, app, Some(Instant::now() + for_));
 }
 
 /// Прокручивает цикл, пока не выполнится условие, но не дольше `limit`. Фиксированная пауза под нагрузкой полной
 /// проверки (дюжина процессов рядом) оказалась мала: конец «окна» доходил позже 0,9 с (outputs\s5u, 14.10).
-fn pump_until(shell: &mut Shell, app: &mut App, limit: Duration, done: impl Fn(&mut App) -> bool) {
+pub fn pump_until(shell: &mut Shell, app: &mut App, limit: Duration, done: impl Fn(&mut App) -> bool) {
     let deadline = Instant::now() + limit;
     while !done(app) && Instant::now() < deadline {
         pump(shell, app, Duration::from_millis(50));
@@ -61,21 +62,21 @@ fn pump_until(shell: &mut Shell, app: &mut App, limit: Duration, done: impl Fn(&
 
 /// Сколько раз строка встречается в tray.log: шаг ждёт свою запись, а не только снятие метки — иначе действие,
 /// отложенное на паузу (возврат права, сверка после пробуждения), срабатывает уже в следующем шаге и путает его.
-fn logged(app: &App, needle: &str) -> usize {
+pub fn logged(app: &App, needle: &str) -> usize {
     fs::read_to_string(app.journal().tray_path())
         .unwrap_or_default()
         .matches(needle)
         .count()
 }
 
-fn ceilings_now(app: &mut App) -> Vec<i32> {
+pub fn ceilings_now(app: &mut App) -> Vec<i32> {
     app.sim()
         .map(|s| s.current().iter().map(|&c| i32::from(c)).collect())
         .unwrap_or_default()
 }
 
 /// Держит мьютекс в своём потоке, пока не скажут; потом поток кончается, не отпустив его, — как закрытая C#-часть.
-fn hold(name: &str) -> mpsc::Sender<()> {
+pub fn hold(name: &str) -> mpsc::Sender<()> {
     let (stop, wait) = mpsc::channel::<()>();
     let (ready, started) = mpsc::channel::<()>();
     let name = name.to_string();
@@ -193,6 +194,8 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
         names: Names::check(pid),
         simulate: true,
         launch: false,
+        pipe: format!("CoreMap.Logon.Check.{pid}"),
+        confirm: Confirm::Answer(false),
         grace: Duration::from_millis(300),
         wake_delay: Duration::from_millis(300),
         lease_wait: 500,
@@ -298,9 +301,16 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
             let checked = sets(&seen).iter().filter(|i| i.checked).count();
             r.check(checked == 1, &format!("отмечен один набор (отмечено {checked})"));
             r.check(
-                seen.iter().any(|i| i.id == OPEN_ID && i.default),
-                "по умолчанию — «Открыть прежнее окно»",
+                seen.iter()
+                    .any(|i| i.id == WINDOW_ID && i.default && i.text.as_deref() == Some("Окно")),
+                "по умолчанию — «Окно» (двойной щелчок по значку открывает новое окно)",
             );
+            let old = seen.iter().filter(|i| {
+                i.text
+                    .as_deref()
+                    .is_some_and(|t| t.contains("Новое окно") || t.contains("прежнее окно"))
+            });
+            r.check(old.count() == 0, "в меню нет «Новое окно» и «Открыть прежнее окно»");
             r.check(seen.iter().any(|i| i.id == EXIT_ID && i.enabled), "«Выход» доступен");
         }
         Err(e) => r.check(false, &e),
@@ -349,14 +359,17 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         "пока открыто окно, наборы серые и без отметки",
     );
     r.check(
-        grey.first().and_then(|i| i.text.as_deref()) == Some("окно CoreMap открыто — профили переключаются в нём"),
+        grey.first().and_then(|i| i.text.as_deref())
+            == Some("открыто прежнее окно CoreMap — профили переключаются в нём"),
         "пояснение в меню: окно открыто",
     );
     let writes = app.sim().map_or(0, |s| s.writes);
     let reads = app.sim().map_or(0, |s| s.reads);
     let refused = app.switch("");
     r.check(
-        refused.as_deref().is_some_and(|t| t.contains("окно CoreMap открыто")),
+        refused
+            .as_deref()
+            .is_some_and(|t| t.contains("открыто прежнее окно CoreMap")),
         "щелчок по набору при открытом окне — отказ",
     );
     r.check(
@@ -366,12 +379,6 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     r.check(
         app.sim().map_or(0, |s| s.reads) == reads,
         "при открытом окне процессор даже не читается",
-    );
-    let launched = app.launched.len();
-    app.command(shell, NEW_ID);
-    r.check(
-        app.launched.len() == launched && app.said.iter().any(|s| s.contains("Сначала закрой прежнее окно")),
-        "«Новое окно» при открытом прежнем — отказ",
     );
     // «Окно» ведёт замер: блок 0 стоит на ступени, метка хранит потолки до замера.
     let intended = app.intended().map(<[i32]>::to_vec).unwrap_or_default();
@@ -412,20 +419,11 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         "окно закрылось — наборы снова доступны",
     );
 
-    // 5. Движок с живым Core: то же, что окно; «Прежнее окно» — отказ.
+    // 5. Движок с живым Core: то же, что окно.
     let engine = hold(&names.engine);
     let core = exist(&names.engine_core);
     pump(shell, app, Duration::from_millis(50));
-    let launched = app.launched.len();
-    app.command(shell, OPEN_ID);
-    r.check(
-        app.launched.len() == launched,
-        "«Прежнее окно» при работающей настройке — не запускается",
-    );
-    r.check(
-        app.said.iter().any(|s| s.contains("Прежнее окно сейчас не открыть")),
-        "и говорит почему",
-    );
+    let _ = app.menu(); // программа замечает движок (как при взгляде на значок)
     r.check(
         app.tip() == format!("CoreMap {} — идёт настройка", crate::VERSION),
         "подсказка: идёт настройка",
@@ -522,19 +520,26 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     app.wake_repair(shell);
     r.check(app.said.len() == said, "второй раз о той же правке не говорит");
 
-    // 9. Запуск C#-частей (в проверке только записывается).
-    app.command(shell, OPEN_ID);
-    app.command(shell, NEW_ID);
+    // 9. «Окно» запускает окно на Rust с каналом программы входа (в проверке только записывается), двойной щелчок по
+    //    значку — то же; второе, пока первое ещё открывается, не запускается. C#-частей программа не запускает.
+    let pipe = app.serving().pipe.clone();
+    app.command(shell, WINDOW_ID);
+    r.check(
+        app.launched == [format!("CoreMapWindow.exe --pipe {pipe}")],
+        &format!("«Окно» запускает CoreMapWindow.exe --pipe {pipe}"),
+    );
+    let said = app.said.len();
+    // Двойной щелчок по значку: сообщение значка, как его шлёт Проводник (младшее слово — WM_LBUTTONDBLCLK).
+    shell.post(0x8001, 0, 0x203);
+    pump(shell, app, Duration::from_millis(100));
+    r.check(
+        app.launched.len() == 1 && app.said[said..].iter().any(|s| s.contains("ещё открывается")),
+        "двойной щелчок, пока окно открывается, — второе не запускается",
+    );
     r.note(&format!("запуски: {:?}", app.launched));
     r.check(
-        app.launched.iter().any(|l| l == "CoreMap.exe --simulate"),
-        "«Открыть прежнее окно» запускает CoreMap.exe",
-    );
-    r.check(
-        app.launched
-            .iter()
-            .any(|l| l == "CoreMap.exe --simulate --tray --bridge --open"),
-        "«Новое окно» запускает движок на время настройки",
+        !app.launched.iter().any(|l| l.contains("CoreMap.exe")),
+        "части на C# программа входа не запускает",
     );
 
     let log = fs::read_to_string(app.journal().tray_path()).unwrap_or_default();
@@ -767,7 +772,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     }
     app.command(shell, AUTO_ON); // выключить: дальше меряется покой без опроса
 
-    // 10. Цена: память и процессор в покое.
+    // 10. Цена: память и процессор в покое, окна нет.
     let idle_from = shell::usage();
     pump(shell, app, Duration::from_secs(3));
     let idle_to = shell::usage();
@@ -788,6 +793,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         idle_to.cpu.saturating_sub(idle_from.cpu) < 200_000,
         "в покое процессор не тратится (меньше 20 мс за 3 с)",
     );
+
+    // 12. Окно по каналу (DECISIONS #32, шаг 2) — после замера цены: его клиент держит в этом же процессе все
+    //     полученные сообщения, и память после него — уже не память программы входа.
+    crate::check_window::run(r, app, shell, names, data);
 }
 
 /// Журналы автомодуля после снижений: строки действий с условиями и запретом, срезы с заголовком по всем блокам.

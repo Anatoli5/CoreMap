@@ -1,27 +1,53 @@
-// Окно CoreMap (DECISIONS #28): верхняя полоса, строка отказа, раздел «Кристалл» и меню потолка.
-// Что и каким цветом показывать, решает Rust (src/view.rs): сюда приходят готовые строки и цвета, отсюда уходят
-// щелчки. Плитка перерисовывается, только когда Rust заменил её строку модели, — а он заменяет только изменившуюся.
+// Окно CoreMap (DECISIONS #28, #32 шаг 2): верхняя полоса, строка отказа, три раздела — «Кристалл» (плитки блоков и
+// перемычки соседей), «Профили», «Статистика» выбранного блока — и меню потолка.
+// Что и каким цветом показывать, решает Rust (src/view.rs, src/panels.rs): сюда приходят готовые строки, цвета и
+// места в долях, отсюда уходят щелчки. Строка модели перерисовывается, только когда Rust её заменил, — а он заменяет
+// только изменившуюся.
+//
+// Раскладка — числами, а не вложенными раскладками: по тем же числам скрытая проверка (src/check.rs) целится щелчками.
+// Окно открывается по размеру содержимого (preferred-*): схема при масштабе 1 и панели по их естественной ширине; шире
+// или выше — схема растёт по высоте окна, панели забирают остальную ширину. Пустых полей нет.
 
-export struct NumData {
-    text: string,
-    color: color,
-    col: int,   // место номера на плитке кластера: 2 × 2
+export struct CellData {
+    text: string,      // номер ядра
+    temp: string,      // «52°»
+    fill: color,       // по температуре ядра
+    num-color: color,  // цвет номера: E-ядро, красным — сбрасывает частоту
+    col: int,          // место в кластере 2 × 2
     row: int,
 }
 
 export struct TileData {
     block: int,
-    col: int,
-    row: int,
-    nums: [NumData],
-    stats: string,     // «⌀ 72  ▲ 85»
-    temp: string,      // «45°»
+    x: float,          // место на схеме в долях её ширины и высоты
+    y: float,
+    w: float,
+    h: float,
+    cluster: bool,     // кластер E-ядер: рамка и четыре клетки ядер
+    number: string,    // номер P-ядра
+    number-color: color,
+    cells: [CellData], // ядра кластера
+    peak: string,      // «▲ 85°» — наибольшая с последнего сброса
+    mean: string,      // средняя под нагрузкой: у P-ядра «ø 72° · ×50.8» (температура и множитель), у кластера «ø 72°»
+    mean-ratio: string, // у кластера отдельной строкой: «ø ×50.8» — средний фактический множитель под нагрузкой
+    temp: string,      // «45°» — сейчас (у P-ядра)
     fill: color,       // по температуре
-    pair: string,      // «52.4 / ×53»
+    pair: string,      // «52.4 / ×53» — множитель сейчас / потолок
     pair-color: color, // жёлтый — потолок ниже заводского, красный — выше
     delta: string,     // разница с «было»: «−2»
-    loaded: bool,
+    auto: string,      // поправка автомодуля: «авто −2»
+    ban: bool,         // автомодулю нельзя поднимать обратно (память перегрева)
     selected: bool,
+    tip: string,
+}
+
+export struct LinkData {
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    color: color,
+    tip: string,
 }
 
 export struct MenuEntry {
@@ -32,86 +58,222 @@ export struct MenuEntry {
     above: bool,    // выше заводского — красным
 }
 
+export struct SetRow {
+    name: string,       // «заводские» или название профиля
+    standing: bool,     // стоит сейчас
+    was: bool,          // «было»
+    startup: bool,      // ставится при входе в Windows
+    disabled: bool,     // профиль запуска отключён после сбоя
+    selected: bool,
+    cells: [color],     // по блокам: отличие набора от того, что стоит сейчас
+    tip: string,
+}
+
+export struct LineRow {
+    time: string,
+    head: string,
+    text: string,
+    color: color,
+}
+
+export struct ChartPoint {
+    x: float,       // доли области графика
+    mean: float,
+    peak: float,
+    fan: float,     // доля полосы вентилятора; < 0 — оборотов нет
+    label: string,  // «×52»
+    count: string,  // число срезов
+    tip: string,
+}
+
+export struct Tick {
+    f: float,
+    text: string,
+}
+
 export global Palette {
     out property <color> bg: #14161a;
     out property <color> panel: #1c1f25;
     out property <color> cell: #2a2e36;
+    out property <color> line: #353a44;
     out property <color> text: #e6e8ec;
     out property <color> dim: #8b93a1;
     out property <color> accent: #ffd166;
     out property <color> bad: #ff5d5d;
     out property <color> warn-bg: #5a3d12;
     out property <color> warn-text: #ffd9a0;
+    out property <color> p-text: #f0b860;   // P-ядро (Theme.KindText в C#-части)
+    out property <color> e-text: #6fd0c8;   // E-ядро
+    out property <color> e-back: #163f3c;   // рамка кластера (темнее Theme.KindBack E, чтобы клетки ядер читались)
+    out property <color> mean: #ffb86b;     // средняя температура на графике
+    out property <color> peak: #ff8a7a;     // наибольшая
+    out property <color> fan: #6f8fb0;      // обороты вентилятора
+    out property <color> auto: #8fb8ff;     // поправка автомодуля
+}
+
+// Подсказка: обычный текст со строками (у встроенной подсказки Slint 1.18 текст — разметка, где перевод строки
+// склеивается с соседней строкой); длинная строка переносится по словам.
+component TipBox inherits Rectangle {
+    in property <string> text;
+    background: #262a31;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: #3d4350;
+    width: min(label.preferred-width, 460px) + 20px;
+    height: label.preferred-height + 14px;
+    label := Text {
+        x: 10px;
+        y: 7px;
+        width: root.width - 20px;
+        text: root.text;
+        color: #e6e8ec;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+}
+
+component Btn inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <string> tip;
+    callback clicked();
+    callback hover(bool);  // подсказку показывает окно (AppWindow.tip)
+    border-radius: 4px;
+    background: !root.enabled ? Palette.panel : touch.pressed ? Palette.line.brighter(0.2) : touch.has-hover ? Palette.line : Palette.cell;
+    border-width: 1px;
+    border-color: Palette.cell;
+    Text {
+        text: root.text;
+        color: root.enabled ? Palette.text : Palette.dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 13px;
+    }
+    touch := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
 }
 
 component TileView inherits Rectangle {
     in property <TileData> data;
+    in property <float> scale: 1;   // масштаб схемы: размеры ниже — при масштабе 1
     callback clicked();
     callback menu(length, length);  // правая кнопка: где, в координатах окна
+    callback hover(bool);           // курсор над плиткой или ушёл: подсказку показывает окно
 
-    property <length> pad: self.height * 0.07;
-    property <length> small: self.height * 0.125;
+    property <length> u: 1px * root.scale;
+    property <length> small: max(10px, 12 * root.u);
+    property <length> line: root.small * 1.3;
+    property <length> pad: 6 * root.u;
+    // Колонка чисел справа: у P-ядра от края, у кластера — справа от клеток ядер.
+    property <length> cell-w: 38 * root.u;
+    property <length> cell-gap: 4 * root.u;
+    property <length> cells-w: 2 * root.cell-w + root.cell-gap;
 
-    background: data.fill;
-    border-radius: 6px;
+    background: data.cluster ? Palette.e-back : data.fill;
+    border-radius: 6 * root.u;
+    border-width: data.cluster ? max(1.5px, 2 * root.u) : 0;
+    border-color: Palette.e-text;
 
-    for num in data.nums: Text {
-        x: root.pad + num.col * root.height * 0.25;
-        y: root.pad + num.row * root.height * 0.17;
-        text: num.text;
-        color: num.color;
-        font-size: data.nums.length > 1 ? root.height * 0.115 : root.small;
-    }
-
-    Text {
+    // P-ядро: полоса цвета рода слева, номер, температура сейчас крупно.
+    if !data.cluster: Rectangle {
         x: 0;
-        y: root.pad;
-        width: root.width - root.pad;
-        horizontal-alignment: right;
-        text: data.stats;
-        color: Palette.text;
-        font-size: root.small;
+        y: 0;
+        width: 4 * root.u;
+        height: root.height;
+        background: Palette.p-text;
+        border-top-left-radius: 6 * root.u;
+        border-bottom-left-radius: 6 * root.u;
     }
-
-    Text {
-        x: root.pad;
+    if !data.cluster: Text {
+        x: 10 * root.u;
+        y: root.pad;
+        text: data.number;
+        color: data.number-color;
+        font-size: root.small;
+        font-weight: 600;
+    }
+    if !data.cluster: Text {
+        x: 10 * root.u;
         y: root.height - root.pad - self.height;
         text: data.temp;
         color: Palette.text;
-        font-size: root.height * 0.29;
+        font-size: max(14px, 26 * root.u);
         font-weight: 600;
     }
 
-    HorizontalLayout {
-        x: 0;
-        y: root.height - root.pad - self.height;
-        width: root.width - root.pad;
-        height: root.small * 1.25;
-        alignment: end;
-        spacing: root.pad * 0.7;
+    // Кластер E-ядер: четыре клетки ядер 2 × 2 — у каждой своя температура и свой цвет; потолок у кластера один.
+    for cell in data.cells: Rectangle {
+        x: root.pad + cell.col * (root.cell-w + root.cell-gap);
+        y: root.pad + cell.row * ((root.height - 2 * root.pad - root.cell-gap) / 2 + root.cell-gap);
+        width: root.cell-w;
+        height: (root.height - 2 * root.pad - root.cell-gap) / 2;
+        background: cell.fill;
+        border-radius: 4 * root.u;
         Text {
-            text: data.pair;
-            color: data.pair-color;
-            font-size: root.small;
-            vertical-alignment: bottom;
+            x: 4 * root.u;
+            y: 2 * root.u;
+            text: cell.text;
+            color: cell.num-color;
+            font-size: max(9px, 10 * root.u);
+            font-weight: 600;
         }
-        if data.delta != "": Text {
-            text: data.delta;
+        Text {
+            x: 0;
+            width: parent.width - 4 * root.u;
+            y: parent.height - self.height - 2 * root.u;
+            horizontal-alignment: right;
+            text: cell.temp;
             color: Palette.text;
-            font-size: root.small;
-            vertical-alignment: bottom;
+            font-size: max(10px, 15 * root.u);
+            font-weight: 600;
+        }
+    }
+
+    // Числа справа. P-ядро: ▲ наибольшая, ø средняя и ø множитель под нагрузкой, внизу — множитель / потолок.
+    // Кластер: то же столбцом — по строке на число.
+    VerticalLayout {
+        x: data.cluster ? root.pad + root.cells-w + 6 * root.u : 0;
+        y: root.pad - 2 * root.u;
+        width: root.width - self.x - 8 * root.u;
+        height: root.height - 2 * root.pad + 4 * root.u;
+        spacing: 0;
+        alignment: space-between;
+        Text { text: data.peak; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
+        if data.cluster: Text { text: data.mean; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
+        if data.cluster: Text { text: data.mean-ratio; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
+        if !data.cluster: Text { text: data.mean; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
+        Rectangle { vertical-stretch: 1; }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 5 * root.u;
+            if data.auto != "": Rectangle {
+                width: auto-text.preferred-width + 8 * root.u;
+                background: #10203a;
+                border-radius: 3 * root.u;
+                border-width: data.ban ? 1px : 0;
+                border-color: Palette.bad;
+                auto-text := Text { text: data.auto; color: Palette.auto; font-size: root.small; horizontal-alignment: center; }
+            }
+            Text { text: data.pair; color: data.pair-color; font-size: root.small; }
+            if data.delta != "": Text { text: data.delta; color: Palette.text; font-size: root.small; font-weight: 600; }
         }
     }
 
     if data.selected: Rectangle {
-        border-width: 1px;
+        x: -3px;
+        y: -3px;
+        width: root.width + 6px;
+        height: root.height + 6px;
+        border-width: 2px;
         border-color: Palette.text;
-        border-radius: 6px;
-    }
-    if data.loaded: Rectangle {
-        border-width: max(2px, root.height * 0.03);
-        border-color: Palette.accent;
-        border-radius: 6px;
+        border-radius: 6 * root.u + 3px;
     }
 
     TouchArea {
@@ -122,6 +284,212 @@ component TileView inherits Rectangle {
                 root.menu(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
             }
         }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
+// График «температура от фактического множителя» выбранного блока: линия — средняя, ▲ — наибольшая, под ним полоса
+// оборотов вентилятора на той же оси множителя (своя шкала — не вторая ось на одном поле), под осью — число срезов.
+component Chart inherits Rectangle {
+    in property <[ChartPoint]> points;
+    in property <[Tick]> yticks;
+    in property <string> mean-path;
+    in property <string> peak-path;
+    in property <string> empty;     // вместо графика, когда точек нет
+    in property <string> fan-top;   // верх шкалы вентилятора: «5000»
+    in property <float> columns: 1; // сколько корзин множителя в ширину (с пустыми)
+    callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
+
+    property <length> left: 40px;
+    property <length> fan-h: max(28px, min(56px, root.height * 0.14));
+    property <length> label-h: 30px;
+    out property <length> plot-x: root.left;
+    out property <length> plot-y: 8px;
+    out property <length> plot-w: root.width - root.left - 10px;
+    out property <length> plot-h: root.height - root.plot-y - 22px - root.fan-h - root.label-h;
+    property <length> col-w: root.plot-w / max(1, root.columns);
+    property <length> fan-y: root.plot-y + root.plot-h + 18px;
+
+    if root.empty != "": Text {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        text: root.empty;
+        color: Palette.dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+
+    for t in root.yticks: Rectangle {
+        x: root.plot-x;
+        y: root.plot-y + (1 - t.f) * root.plot-h;
+        width: root.plot-w;
+        height: 1px;
+        background: Palette.line;
+    }
+    for t in root.yticks: Text {
+        x: 0;
+        width: root.left - 6px;
+        y: root.plot-y + (1 - t.f) * root.plot-h - 8px;
+        height: 16px;
+        text: t.text;
+        color: Palette.dim;
+        font-size: 11px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    // Столбец корзины: подсветка под курсором и подсказка с числами — больше, чем сама точка.
+    for p in root.points: Rectangle {
+        x: root.plot-x + p.x * root.plot-w - root.col-w / 2;
+        y: root.plot-y;
+        width: root.col-w;
+        height: root.plot-h + 18px + root.fan-h + root.label-h;
+        background: hover.has-hover ? #ffffff0c : transparent;
+        hover := TouchArea {
+            changed has-hover => {
+                root.tip(self.has-hover, "bin" + p.x, p.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+    }
+
+    // Обороты вентилятора: столбики от низа полосы.
+    if root.points.length > 0 && root.empty == "": Rectangle {
+        x: root.plot-x;
+        y: root.fan-y + root.fan-h;
+        width: root.plot-w;
+        height: 1px;
+        background: Palette.line;
+    }
+    if root.fan-top != "" && root.empty == "": Text {
+        x: 0;
+        width: root.left - 6px;
+        y: root.fan-y - 2px;
+        text: root.fan-top;
+        color: Palette.dim;
+        font-size: 10px;
+        horizontal-alignment: right;
+    }
+    if root.empty == "": Text {
+        x: 0;
+        width: root.left - 6px;
+        y: root.fan-y + root.fan-h - 12px;
+        text: "вент.";
+        color: Palette.dim;
+        font-size: 10px;
+        horizontal-alignment: right;
+    }
+    for p in root.points: Rectangle {
+        x: root.plot-x + p.x * root.plot-w - min(root.col-w * 0.6, 22px) / 2;
+        y: root.fan-y + root.fan-h * (1 - max(0, p.fan));
+        width: min(root.col-w * 0.6, 22px);
+        height: p.fan < 0 ? 0 : root.fan-h * p.fan;
+        background: Palette.fan;
+        border-top-left-radius: 3px;
+        border-top-right-radius: 3px;
+    }
+
+    // Линии: путь в рамке 1000 × 1000 растягивается на поле графика (толщина линии — снаружи поля).
+    Path {
+        x: root.plot-x - 1px;
+        y: root.plot-y - 1px;
+        width: root.plot-w + 2px;
+        height: root.plot-h + 2px;
+        viewbox-width: 1000;
+        viewbox-height: 1000;
+        fit: fill;
+        commands: root.peak-path;
+        stroke: Palette.peak.transparentize(0.35);
+        stroke-width: 2px;
+    }
+    Path {
+        x: root.plot-x - 1.5px;
+        y: root.plot-y - 1.5px;
+        width: root.plot-w + 3px;
+        height: root.plot-h + 3px;
+        viewbox-width: 1000;
+        viewbox-height: 1000;
+        fit: fill;
+        commands: root.mean-path;
+        stroke: Palette.mean;
+        stroke-width: 3px;
+        stroke-line-join: round;
+    }
+    for p in root.points: Text {
+        x: root.plot-x + p.x * root.plot-w - 6px;
+        y: root.plot-y + (1 - p.peak) * root.plot-h - 8px;
+        width: 12px;
+        height: 14px;
+        text: "▲";
+        color: Palette.peak;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    for p in root.points: Rectangle {
+        x: root.plot-x + p.x * root.plot-w - 5px;
+        y: root.plot-y + (1 - p.mean) * root.plot-h - 5px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: Palette.mean;
+        border-width: 2px;
+        border-color: Palette.panel;
+    }
+
+    // Ось множителя и число срезов под каждой корзиной.
+    for p in root.points: Text {
+        x: root.plot-x + p.x * root.plot-w - root.col-w / 2 - 6px;
+        width: root.col-w + 12px;
+        y: root.fan-y + root.fan-h + 3px;
+        text: p.label;
+        color: Palette.text;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+    for p in root.points: Text {
+        x: root.plot-x + p.x * root.plot-w - root.col-w / 2 - 6px;
+        width: root.col-w + 12px;
+        y: root.fan-y + root.fan-h + 16px;
+        text: p.count;
+        color: Palette.dim;
+        font-size: 10px;
+        horizontal-alignment: center;
+    }
+}
+
+// Список строк (история профилей, действия автомодуля): время, заголовок, текст; прокручивается.
+component Lines inherits Flickable {
+    in property <[LineRow]> rows;
+    in property <length> row-h: 18px;
+    in property <string> empty;
+    callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
+    content-height: max(self.height, root.rows.length * root.row-h);
+    if root.rows.length == 0: Text {
+        y: 0;
+        height: root.row-h;
+        text: root.empty;
+        color: Palette.dim;
+        font-size: 12px;
+    }
+    for r[i] in root.rows: HorizontalLayout {
+        y: i * root.row-h;
+        height: root.row-h;
+        width: root.width;
+        spacing: 8px;
+        Text { text: r.time; color: Palette.dim; font-size: 12px; width: 70px; vertical-alignment: center; }
+        if r.head != "": Text { text: r.head; color: r.color; font-size: 12px; vertical-alignment: center; }
+        Text { text: r.text; color: Palette.text; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+    }
+    for r[i] in root.rows: TouchArea {
+        y: i * root.row-h;
+        height: root.row-h;
+        width: root.width;
+        changed has-hover => {
+            root.tip(self.has-hover, "line" + i + r.time, r.time + "  " + r.head + "  " + r.text, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+        }
     }
 }
 
@@ -131,10 +499,6 @@ export component AppWindow inherits Window {
     background: Palette.bg;
     default-font-family: "Segoe UI";
     default-font-size: 14px;
-    preferred-width: 1280px;
-    preferred-height: 800px;
-    min-width: 480px;
-    min-height: 360px;
 
     in property <string> cpu;
     in property <string> pkg;
@@ -143,35 +507,151 @@ export component AppWindow inherits Window {
     in property <string> link;
     in property <bool> link-down;
     in property <string> problem;
-    in property <int> cols: 2;
-    in property <int> rows: 6;
     in property <[TileData]> tiles;
-    in property <string> note;
+    in property <[LinkData]> links;
+    in property <bool> link-legend;   // есть перемычки — под схемой их расшифровка
+    in property <string> note;        // приписка к раскладке (не подтверждена) — подсказкой у заголовка
     in property <string> menu-title;
     in property <[MenuEntry]> menu-entries;
     in property <bool> busy;
+    // Схема при масштабе 1 (src/die.rs): из неё — размер, с которым окно открывается.
+    in property <length> die-nat-w: 356px;
+    in property <length> die-nat-h: 580px;
+
+    // Профили
+    in property <bool> has-profiles;
+    in property <string> prof-was;
+    in property <string> prof-now;
+    in property <bool> prof-attention;
+    in property <[SetRow]> sets;
+    in-out property <string> prof-name;
+    in property <bool> can-open;
+    in property <bool> can-save;
+    in property <bool> can-save-as;
+    in property <bool> can-accept;
+    in property <bool> can-revert;
+    in property <bool> can-delete;
+    in property <string> save-tip;
+    in property <string> save-as-text: "сохранить как";
+    in property <string> save-note;
+    in property <[LineRow]> history;
+    in property <bool> has-history;
+
+    // Статистика
+    in property <string> stats-title;
+    in property <string> stats-note;
+    in property <[ChartPoint]> chart-points;
+    in property <[Tick]> chart-yticks;
+    in property <string> chart-mean;
+    in property <string> chart-peak;
+    in property <string> chart-empty;
+    in property <string> chart-fan-top;
+    in property <float> chart-columns: 1;
+    in property <[LineRow]> actions;
+    in property <string> actions-empty;
 
     callback tile-clicked(int);
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
     callback limit-chosen(int);
     callback problem-dismissed();
+    callback reset-max();
+    callback set-clicked(int);
+    callback profile-open();
+    callback profile-save();
+    callback profile-save-as();
+    callback profile-accept();
+    callback profile-revert();
+    callback profile-delete();
+    callback name-edited();
 
-    // Раскладка — числами, а не вложенными раскладками: по ним же скрытая проверка (src/check.rs) целится щелчками.
-    property <length> top-h: 36px;
+    // Подсказка — одна на окно: под элементом (над ним, если внизу нет места), в пределах окна, через 450 мс
+    // наведения. key — чей это текст: уход курсора с другого элемента её не гасит.
+    property <string> tip-key;
+    property <string> tip-text;
+    property <length> tip-x;
+    property <length> tip-y;
+    property <length> tip-w;
+    property <length> tip-h;
+    property <bool> tip-wanted;
+    out property <bool> tip-shown;
+    function tip(on: bool, key: string, text: string, x: length, y: length, w: length, h: length) {
+        if (on) {
+            root.tip-key = key;
+            root.tip-text = text;
+            root.tip-x = x;
+            root.tip-y = y;
+            root.tip-w = w;
+            root.tip-h = h;
+            root.tip-shown = false;
+            root.tip-wanted = text != "";
+        } else if (root.tip-key == key) {
+            root.tip-wanted = false;
+            root.tip-shown = false;
+        }
+    }
+    Timer {
+        interval: 450ms;
+        running: root.tip-wanted && !root.tip-shown;
+        triggered() => { root.tip-shown = true; }
+    }
+
+    out property <length> top-h: 36px;
     property <length> problem-h: root.problem != "" ? 30px : 0px;
-    property <length> margin: 12px;
-    property <length> head-h: 30px;
-    property <length> note-h: root.note != "" ? 52px : 0px;
-    out property <length> gap: 8px;
-    property <float> ratio: (root.cols * 158 - 8) / (root.rows * 104 - 8);
-    property <length> room-h: root.height - root.top-h - root.problem-h - 2 * root.margin - root.head-h - 12px - root.note-h;
-    property <length> room-w: root.width - 2 * root.margin - 24px;
-    property <length> die-h: min(root.room-h, root.room-w / root.ratio);
-    property <length> die-w: root.die-h * root.ratio;
-    out property <length> die-x: root.margin + 12px;
-    out property <length> die-y: root.top-h + root.problem-h + root.margin + root.head-h;
-    out property <length> tile-w: (root.die-w - (root.cols - 1) * root.gap) / root.cols;
-    out property <length> tile-h: (root.die-h - (root.rows - 1) * root.gap) / root.rows;
+    out property <length> margin: 12px;
+    out property <length> pad: 12px;
+    out property <length> head-h: 32px;
+    property <length> legend-h: 24px;
+    property <length> prof-nat-w: 340px;
+    property <length> stats-nat-w: 470px;
+    property <length> stats-min-w: 380px;
+
+    // Размер по содержимому: схема при масштабе 1 и панели по естественной ширине.
+    out property <length> natural-w: root.margin + root.die-nat-w + 2 * root.pad + root.margin + root.prof-nat-w + root.margin + root.stats-nat-w + root.margin;
+    out property <length> natural-h: root.top-h + root.margin + root.head-h + root.die-nat-h + root.legend-h + root.pad + root.margin;
+    preferred-width: root.natural-w;
+    preferred-height: root.natural-h;
+    min-width: 900px;
+    min-height: 560px;
+
+    // Схема растёт по высоте окна, но оставляет панелям их наименьшую ширину.
+    out property <length> body-y: root.top-h + root.problem-h + root.margin;
+    property <length> body-h: root.height - root.body-y - root.margin;
+    property <float> scale-h: (root.body-h - root.head-h - root.legend-h - root.pad) / root.die-nat-h;
+    property <float> scale-w: (root.width - 5 * root.margin - 2 * root.pad - 300px - root.stats-min-w) / root.die-nat-w;
+    out property <float> scale: max(0.5, min(root.scale-h, root.scale-w));
+    out property <length> die-w: root.die-nat-w * root.scale;
+    out property <length> die-h: root.die-nat-h * root.scale;
+    out property <length> die-x: root.margin + root.pad;
+    out property <length> die-y: root.body-y + root.head-h;
+
+    // Панели справа от схемы: профили — до 420 px, статистика — остальное.
+    property <length> right-x: root.margin + root.die-w + 2 * root.pad + root.margin;
+    property <length> right-w: root.width - root.right-x - root.margin;
+    out property <length> prof-x: root.right-x;
+    // По содержимому окна — естественная ширина; шире окно — растёт до 420 px, остальное — статистике.
+    out property <length> prof-w: max(300px, min(420px, root.right-w - root.stats-nat-w - root.margin));
+    out property <length> stats-x: root.prof-x + root.prof-w + root.margin;
+    out property <length> stats-w: root.width - root.stats-x - root.margin;
+
+    // Профили: где что лежит (скрытая проверка целится по этим же числам).
+    out property <length> btn-h: 26px;
+    out property <length> btn-w: 88px;
+    out property <length> btn-gap: 6px;
+    out property <length> set-h: 26px;
+    out property <length> row-a-y: root.body-y + root.head-h + 40px;
+    out property <length> sets-y: root.row-a-y + root.btn-h + 26px;
+    property <length> below-sets: 6px + root.btn-h + 6px + root.btn-h + 4px + 18px + (root.has-history ? 30px + 3 * 18px : 0px) + root.pad;
+    property <length> sets-room: root.body-y + root.body-h - root.sets-y - root.below-sets;
+    out property <length> sets-h: root.has-history ? max(min(3, root.sets.length) * root.set-h + 4px, min(root.sets.length * root.set-h + 4px, root.sets-room)) : root.sets-room;
+    out property <length> row-b-y: root.sets-y + root.sets-h + 6px;
+    out property <length> row-c-y: root.row-b-y + root.btn-h + 6px;
+    property <length> note-y: root.row-c-y + root.btn-h + 4px;
+    property <length> hist-y: root.note-y + 18px + 8px;
+
+    // Статистика
+    property <length> actions-h: min(6, max(1, root.actions.length)) * 18px;
+    out property <length> chart-y: root.body-y + root.head-h + 22px;
+    out property <length> chart-h: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.chart-y;
 
     out property <length> menu-x;
     out property <length> menu-y;
@@ -180,7 +660,7 @@ export component AppWindow inherits Window {
     out property <length> entry-h: 26px;
     property <length> menu-w: 290px;  // строка расшифровки значков помещается целиком
     out property <length> menu-left: min(root.menu-x, root.width - root.menu-w);
-    // Меню выше окна (потолок опускается до ×8 — до 50 строк) прокручивается внутри окна.
+    // Меню выше окна (потолков десятки) прокручивается внутри окна.
     out property <length> menu-h: min(root.menu-head-h + root.menu-entries.length * root.entry-h + 4px, root.height - 16px);
     out property <length> menu-top: max(0px, min(root.menu-y, root.height - root.menu-h - 8px));
 
@@ -221,40 +701,87 @@ export component AppWindow inherits Window {
         TouchArea { clicked => { root.problem-dismissed(); } }
     }
 
-    // Раздел «Кристалл»
+    // ----- Кристалл -----
     Rectangle {
         x: root.margin;
-        y: root.top-h + root.problem-h + root.margin;
-        width: root.die-w + 24px;
-        height: root.head-h + root.die-h + 12px + root.note-h;
+        y: root.body-y;
+        width: root.die-w + 2 * root.pad;
+        height: root.body-h;
         background: Palette.panel;
         border-radius: 8px;
         Text {
-            x: 12px;
+            x: root.pad;
             y: 9px;
             text: "Кристалл";
             color: Palette.dim;
             font-weight: 600;
         }
-        if root.note != "": Text {
-            x: 12px;
-            y: root.head-h + root.die-h + 6px;
-            width: root.die-w;
-            height: root.note-h - 6px;
-            text: root.note;
-            color: Palette.dim;
-            font-size: 12px;
-            wrap: word-wrap;
+        if root.note != "": Rectangle {
+            x: root.pad + 76px;
+            y: 6px;
+            width: 22px;
+            height: 22px;
+            Text { text: "≈"; color: Palette.dim; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                changed has-hover => {
+                    root.tip(self.has-hover, "note", "Схема — оценка\n" + root.note, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Сброс ▲ и ø: значок «по кругу» и те же знаки, что на плитках.
+        reset := Rectangle {
+            x: parent.width - root.pad - 64px;
+            y: 4px;
+            width: 64px;
+            height: 24px;
+            border-radius: 4px;
+            background: reset-touch.pressed ? Palette.line.brighter(0.2) : reset-touch.has-hover ? Palette.line : Palette.cell;
+            Path {
+                x: 7px;
+                y: 4px;
+                width: 16px;
+                height: 16px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: "M 19.5 12 A 7.5 7.5 0 1 1 16.8 6.2 M 17.5 1.8 L 17.5 6.6 L 12.7 6.6";
+                stroke: Palette.text;
+                stroke-width: 2px;
+                fill: transparent;
+            }
+            Text { x: 27px; text: "▲ ø"; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
+            reset-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.reset-max(); }
+                changed has-hover => {
+                    root.tip(self.has-hover, "reset", "Сбросить максимумы и средние\nОбнуляет ▲ наибольшую температуру и ø средние под нагрузкой (температуру и множитель)\nна всех плитках — дальше они считаются заново.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        if root.link-legend: HorizontalLayout {
+            alignment: start;
+            x: root.pad;
+            y: root.head-h + root.die-h + 4px;
+            height: root.legend-h - 4px;
+            spacing: 6px;
+            Text { text: "перемычка — сосед занят тоже, ядро горячее на"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 14px; height: 3px; y: (parent.height - self.height) / 2; background: #8b93a1; }
+            Text { text: "1°"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 14px; height: 5px; y: (parent.height - self.height) / 2; background: #ffb347; }
+            Text { text: "3°"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 14px; height: 8px; y: (parent.height - self.height) / 2; background: #ff5d5d; }
+            Text { text: "6°+"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
         }
     }
 
     for tile in root.tiles: TileView {
-        x: root.die-x + tile.col * (root.tile-w + root.gap);
-        y: root.die-y + tile.row * (root.tile-h + root.gap);
-        width: root.tile-w;
-        height: root.tile-h;
+        x: root.die-x + tile.x * root.die-w;
+        y: root.die-y + tile.y * root.die-h;
+        width: tile.w * root.die-w;
+        height: tile.h * root.die-h;
+        scale: root.scale;
         data: tile;
         clicked => { root.tile-clicked(tile.block); }
+        hover(on) => { root.tip(on, "tile" + tile.block, tile.tip, self.x, self.y, self.width, self.height); }
         menu(x, y) => {
             root.menu-x = x;
             root.menu-y = y;
@@ -262,6 +789,317 @@ export component AppWindow inherits Window {
             root.menu-shown = true;
             keys.focus();
         }
+    }
+
+    for link[i] in root.links: Rectangle {
+        x: root.die-x + link.x * root.die-w;
+        y: root.die-y + link.y * root.die-h;
+        width: link.w * root.die-w;
+        height: link.h * root.die-h;
+        background: link.color;
+        border-radius: min(self.width, self.height) / 2;
+        border-width: 1.5px;
+        border-color: Palette.panel;
+        TouchArea {
+            changed has-hover => {
+                root.tip(self.has-hover, "link" + i, link.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+    }
+
+    // ----- Профили -----
+    Rectangle {
+        x: root.prof-x;
+        y: root.body-y;
+        width: root.prof-w;
+        height: root.body-h;
+        background: Palette.panel;
+        border-radius: 8px;
+        Text { x: root.pad; y: 9px; text: "Профили"; color: Palette.dim; font-weight: 600; }
+        if !root.has-profiles: Text {
+            x: root.pad;
+            y: root.head-h;
+            width: parent.width - 2 * root.pad;
+            text: "Профилей нет: движок не прислал их (потолки недоступны или он их не знает).";
+            color: Palette.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+    if root.has-profiles: Text {
+        x: root.prof-x + root.pad;
+        y: root.body-y + root.head-h;
+        width: root.prof-w - 2 * root.pad;
+        text: root.prof-was;
+        color: Palette.dim;
+        font-size: 12px;
+        overflow: elide;
+    }
+    if root.has-profiles: Text {
+        x: root.prof-x + root.pad;
+        y: root.body-y + root.head-h + 18px;
+        width: root.prof-w - 2 * root.pad;
+        text: root.prof-now;
+        color: root.prof-attention ? Palette.accent : Palette.dim;
+        font-size: 12px;
+        overflow: elide;
+    }
+    // Строки «было / сейчас» обрезаются по ширине панели: целиком — в подсказке.
+    if root.has-profiles: TouchArea {
+        x: root.prof-x + root.pad;
+        y: root.body-y + root.head-h;
+        width: root.prof-w - 2 * root.pad;
+        height: 36px;
+        changed has-hover => {
+            root.tip(self.has-hover, "status", root.prof-was + "\n" + root.prof-now, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+        }
+    }
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.pad;
+        y: root.row-a-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "принять";
+        enabled: root.can-accept;
+        tip: "Принять то, что стоит сейчас\nТекущие потолки становятся «было»: разница на плитках обнуляется, «откатить» будет возвращать к ним.\n• если стоит сохранённый профиль — он же будет ставиться при входе в Windows\n• если стоят заводские — при входе ничего ставиться не будет\n• несохранённые потолки тоже можно принять, но после перезагрузки их не будет — для этого «сохранить»";
+        clicked => { root.profile-accept(); }
+        hover(on) => { root.tip(on, "accept", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
+        y: root.row-a-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "откатить";
+        enabled: root.can-revert;
+        tip: "Откатить к «было»\nВозвращает потолки, которые были приняты последними (или прочитаны при запуске).\n• всё, что менялось после этого, отменяется\n• сохранённые профили не меняются";
+        clicked => { root.profile-revert(); }
+        hover(on) => { root.tip(on, "revert", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    // Значки списка — строкой над ним; клетки справа в строке — чем набор отличается от того, что стоит сейчас.
+    if root.has-profiles: Text {
+        x: root.prof-x + root.pad;
+        y: root.row-a-y + root.btn-h + 6px;
+        width: root.prof-w - 2 * root.pad;
+        height: 16px;
+        text: "● стоит   ○ было   ► при входе   клетки: отличие";
+        color: Palette.dim;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    if root.has-profiles: Flickable {
+        x: root.prof-x + root.pad;
+        y: root.sets-y;
+        width: root.prof-w - 2 * root.pad;
+        height: root.sets-h;
+        content-height: max(self.height, root.sets.length * root.set-h);
+        for s[i] in root.sets: Rectangle {
+            y: i * root.set-h;
+            height: root.set-h;
+            width: parent.width;
+            border-radius: 4px;
+            background: s.selected ? Palette.line : set-touch.has-hover ? Palette.cell : transparent;
+            Text { x: 6px; width: 12px; text: s.standing ? "●" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
+            Text { x: 18px; width: 12px; text: s.was ? "○" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
+            Text { x: 30px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
+            Text {
+                x: 46px;
+                width: parent.width - 46px - 12 * 9px - 8px;
+                text: s.name;
+                color: Palette.text;
+                font-size: 13px;
+                vertical-alignment: center;
+                height: parent.height;
+                overflow: elide;
+            }
+            // Чем набор отличается от того, что стоит сейчас: клетка на блок (в порядке блоков).
+            for c[k] in s.cells: Rectangle {
+                x: parent.width - 8px - (s.cells.length - k) * 9px;
+                y: (parent.height - 12px) / 2;
+                width: 7px;
+                height: 12px;
+                border-radius: 1.5px;
+                background: c;
+            }
+            set-touch := TouchArea {
+                clicked => { root.set-clicked(i); }
+                changed has-hover => {
+                    root.tip(self.has-hover, "set" + i, s.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+    }
+
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.pad;
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "открыть";
+        enabled: root.can-open;
+        tip: "Открыть выбранный набор\nСтавит его потолки. «Было» остаётся прежним — разница видна на плитках (+N, −N).\n• оставить — «принять»; вернуться — «откатить»";
+        clicked => { root.profile-open(); }
+        hover(on) => { root.tip(on, "open", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "сохранить";
+        enabled: root.can-save;
+        tip: root.save-tip;
+        clicked => { root.profile-save(); }
+        hover(on) => { root.tip(on, "save", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.pad + 2 * (root.btn-w + root.btn-gap);
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "удалить";
+        enabled: root.can-delete;
+        tip: "Удалить выбранный профиль\n• если он ставился при входе в Windows — больше ничего ставиться не будет\n• потолки, которые стоят сейчас, остаются до перезагрузки";
+        clicked => { root.profile-delete(); }
+        hover(on) => { root.tip(on, "delete", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: Rectangle {
+        x: root.prof-x + root.pad;
+        y: root.row-c-y;
+        width: root.prof-w - 2 * root.pad - 128px - root.btn-gap;
+        height: root.btn-h;
+        background: Palette.bg;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: name-input.has-focus ? Palette.accent : Palette.cell;
+        name-input := TextInput {
+            x: 6px;
+            width: parent.width - 12px;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            color: Palette.text;
+            font-size: 13px;
+            text <=> root.prof-name;
+            edited => { root.name-edited(); }
+            accepted => { if (root.can-save-as) { root.profile-save-as(); } }
+        }
+        if root.prof-name == "": Text {
+            x: 6px;
+            height: parent.height;
+            vertical-alignment: center;
+            text: "новое название";
+            color: Palette.dim;
+            font-size: 12px;
+        }
+    }
+    if root.has-profiles: Btn {
+        x: root.prof-x + root.prof-w - root.pad - 128px;
+        y: root.row-c-y;
+        width: 128px;
+        height: root.btn-h;
+        text: root.save-as-text;
+        enabled: root.can-save-as;
+        tip: "Сохранить как профиль с названием из поля\nЗаписывает то, что стоит сейчас, и принимает его: он становится «было» и ставится при входе в Windows.\n• название уже есть — тот профиль перезаписывается";
+        clicked => { root.profile-save-as(); }
+        hover(on) => { root.tip(on, "save-as", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: Text {
+        x: root.prof-x + root.pad;
+        y: root.note-y;
+        width: root.prof-w - 2 * root.pad;
+        height: 18px;
+        text: root.save-note;
+        color: Palette.dim;
+        font-size: 11px;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    if root.has-profiles && root.has-history: Text {
+        x: root.prof-x + root.pad;
+        y: root.hist-y;
+        text: "История";
+        color: Palette.dim;
+        font-weight: 600;
+        font-size: 12px;
+    }
+    if root.has-profiles && root.has-history: Lines {
+        x: root.prof-x + root.pad;
+        y: root.hist-y + 20px;
+        width: root.prof-w - 2 * root.pad;
+        height: root.body-y + root.body-h - root.pad - self.y;
+        rows: root.history;
+        empty: "смен профиля ещё не было";
+        tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
+    }
+
+    // ----- Статистика -----
+    Rectangle {
+        x: root.stats-x;
+        y: root.body-y;
+        width: root.stats-w;
+        height: root.body-h;
+        background: Palette.panel;
+        border-radius: 8px;
+        stats-title := Text { x: root.pad; y: 9px; width: self.preferred-width; text: root.stats-title; color: Palette.dim; font-weight: 600; }
+        Text {
+            x: stats-title.x + stats-title.width + 12px;
+            y: 10px;
+            width: parent.width - root.pad - self.x;
+            text: root.stats-note;
+            color: Palette.dim;
+            font-size: 12px;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+        HorizontalLayout {
+            x: root.pad;
+            y: root.head-h;
+            height: 18px;
+            spacing: 6px;
+            alignment: start;
+            Rectangle { width: 16px; height: 3px; y: 8px; background: Palette.mean; }
+            Text { text: "ø средняя"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 6px; }
+            Text { text: "▲"; color: Palette.peak; font-size: 11px; vertical-alignment: center; }
+            Text { text: "наибольшая, °C — блок занят ≥ 50 %"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Rectangle { width: 6px; }
+            Rectangle { width: 8px; height: 10px; y: 4px; background: Palette.fan; }
+            Text { text: "вентилятор, об/мин"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+        }
+        Text {
+            x: root.pad;
+            y: parent.height - root.pad - root.actions-h - 24px;
+            text: "Автомодуль · действия с этим блоком";
+            color: Palette.dim;
+            font-weight: 600;
+            font-size: 12px;
+        }
+    }
+    Chart {
+        x: root.stats-x + root.pad - 4px;
+        y: root.chart-y;
+        width: root.stats-w - 2 * root.pad + 4px;
+        height: root.chart-h;
+        points: root.chart-points;
+        yticks: root.chart-yticks;
+        mean-path: root.chart-mean;
+        peak-path: root.chart-peak;
+        empty: root.chart-empty;
+        fan-top: root.chart-fan-top;
+        columns: root.chart-columns;
+        tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
+    }
+    Lines {
+        x: root.stats-x + root.pad;
+        y: root.body-y + root.body-h - root.pad - root.actions-h;
+        width: root.stats-w - 2 * root.pad;
+        height: root.actions-h;
+        rows: root.actions;
+        empty: root.actions-empty;
+        tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
     }
 
     // Меню потолка — слой поверх окна, а не PopupWindow: в Slint 1.18 всплывающее окно не сообщает, что его
@@ -341,5 +1179,12 @@ export component AppWindow inherits Window {
             }
             }
         }
+    }
+
+    // Подсказка поверх всего.
+    if root.tip-shown: TipBox {
+        text: root.tip-text;
+        x: max(4px, min(root.tip-x, root.width - self.width - 4px));
+        y: root.tip-y + root.tip-h + 6px + self.height <= root.height - 4px ? root.tip-y + root.tip-h + 6px : max(4px, root.tip-y - self.height - 6px);
     }
 }

@@ -1,10 +1,13 @@
-// Окно CoreMap на Rust и Slint (DECISIONS #28). Без прав администратора: с процессором работает движок
-// (C#-часть, роль --tray --bridge), окно говорит с ним по каналу моста — показывает состояние и шлёт команды.
+// Окно CoreMap на Rust и Slint (DECISIONS #28, #32). Без прав администратора: с процессором работает другая
+// программа (движок C#-части или программа входа), окно говорит с ней по каналу моста — показывает состояние и шлёт
+// команды. Статистику (срезы и журнал автомодуля) окно читает из папки данных само, в своём потоке (store.rs).
 //
-//   CoreMapWindow.exe                       окно; канал — тот, что слушает движок этого сеанса Windows
+//   CoreMapWindow.exe                       окно; канал — программы входа этого сеанса Windows (CoreMap.Logon.<сеанс>)
 //   CoreMapWindow.exe --pipe N              то же с каналом N
+//   CoreMapWindow.exe --data D              статистика из папки D (по умолчанию — data рядом с программой)
 //   CoreMapWindow.exe --pipe N --snapshot F [--size WxH]
-//                                           скрытая проверка (src/check.rs): без окна на экране, картинки и отчёт
+//                                           скрытая проверка (src/check.rs): без окна на экране, картинки и отчёт;
+//                                           её статистика — из своей временной папки с придуманными срезами
 //   CoreMapWindow.exe --probe               ничего не делает и выходит: пустил ли Windows свежую сборку (tools\rust.ps1)
 #![windows_subsystem = "windows"]
 
@@ -21,14 +24,22 @@ mod ui {
     )]
     slint::include_modules!();
 }
-use ui::{AppWindow, MenuEntry, NumData, TileData};
+use ui::{AppWindow, CellData, ChartPoint, LineRow, LinkData, MenuEntry, SetRow, Tick, TileData};
 
 mod check;
+mod die;
+mod panels;
 mod pipe;
+mod samples;
+// Тесты модуля samples по спецификации, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
+#[cfg(test)]
+mod samples_spec;
+mod store;
 mod view;
 mod wire;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
@@ -49,10 +60,40 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_limit_chosen(move |ratio| v.borrow_mut().limit_chosen(ratio));
     let v = Rc::clone(view);
     ui.on_problem_dismissed(move || v.borrow_mut().problem_dismissed());
+    let v = Rc::clone(view);
+    ui.on_reset_max(move || v.borrow_mut().reset_max());
+    let v = Rc::clone(view);
+    ui.on_set_clicked(move |row| v.borrow_mut().set_clicked(row));
+    let v = Rc::clone(view);
+    ui.on_profile_open(move || v.borrow_mut().profile_open());
+    let v = Rc::clone(view);
+    ui.on_profile_save(move || v.borrow_mut().profile_save());
+    let v = Rc::clone(view);
+    ui.on_profile_save_as(move || v.borrow_mut().profile_save_as());
+    let v = Rc::clone(view);
+    ui.on_profile_accept(move || v.borrow_mut().profile_accept());
+    let v = Rc::clone(view);
+    ui.on_profile_revert(move || v.borrow_mut().profile_revert());
+    let v = Rc::clone(view);
+    ui.on_profile_delete(move || v.borrow_mut().profile_delete());
+    let v = Rc::clone(view);
+    ui.on_name_edited(move || v.borrow_mut().name_edited());
 }
 
 thread_local! {
     static VIEW: RefCell<Option<Rc<RefCell<view::View>>>> = const { RefCell::new(None) };
+}
+
+/// Передаёт в поток окна то, что пришло из другого потока (канал, статистика), по порядку.
+fn to_view(work: impl FnOnce(&mut view::View) + Send + 'static) {
+    // Ошибка здесь значит, что цикл окна уже кончился (окно закрыто): показывать больше некому.
+    let _ = slint::invoke_from_event_loop(move || {
+        VIEW.with(|cell| {
+            if let Some(view) = cell.borrow().as_ref() {
+                work(&mut view.borrow_mut());
+            }
+        });
+    });
 }
 
 /// Метка сборки (tools\rust.ps1): в окне не показывается, но остаётся в файле — пересобранный с новой меткой файл
@@ -60,13 +101,26 @@ thread_local! {
 #[used]
 static STAMP: &str = env!("COREMAP_BUILT");
 
+/// Папка данных: `--data`, иначе data рядом с программой (её пишет программа входа).
+fn data_dir(args: &[String]) -> PathBuf {
+    arg(args, "--data").map_or_else(
+        || {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join("data")))
+                .unwrap_or_else(|| PathBuf::from("data"))
+        },
+        PathBuf::from,
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Пробный запуск после сборки (tools\rust.ps1): пустил ли Windows файл. Ничего не делает и выходит.
     if args.iter().any(|a| a == "--probe") {
         return;
     }
-    let pipe = arg(&args, "--pipe").unwrap_or_else(pipe::engine_pipe);
+    let pipe = arg(&args, "--pipe").unwrap_or_else(pipe::server_pipe);
     if let Some(snapshot) = arg(&args, "--snapshot") {
         let size = arg(&args, "--size")
             .and_then(|s| {
@@ -74,7 +128,12 @@ fn main() {
                     .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             })
             .unwrap_or((1920, 1040));
-        std::process::exit(check::run(pipe, &snapshot, size));
+        std::process::exit(check::run(
+            pipe,
+            &snapshot,
+            size,
+            arg(&args, "--data").map(PathBuf::from),
+        ));
     }
 
     // Рисует процессор, и только изменившиеся участки: тем же способом окно проверено на картинках (src/check.rs).
@@ -85,18 +144,11 @@ fn main() {
     // Номер версии (файл VERSION, tools\rust.ps1); метка сборки в заголовок не идёт — она только делает файл другим.
     ui.set_version(env!("COREMAP_VERSION").into());
     // События канала приходят в его потоке и передаются в поток окна по порядку.
-    let link = pipe::Link::start(pipe, |event| {
-        // Ошибка здесь значит, что цикл окна уже кончился (окно закрыто): событие больше некому показать.
-        let _ = slint::invoke_from_event_loop(move || {
-            VIEW.with(|cell| {
-                if let Some(view) = cell.borrow().as_ref() {
-                    view.borrow_mut().on_event(event);
-                }
-            });
-        });
-    });
+    let link = pipe::Link::start(pipe, |event| to_view(move |view| view.on_event(event)));
     let view = Rc::new(RefCell::new(view::View::new(&ui, link)));
     VIEW.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&view)));
     connect(&ui, &view);
+    // Поток статистики живёт, пока жив его отправитель, — до конца окна.
+    let _stats = store::start(data_dir(&args), |digest| to_view(move |view| view.on_digest(digest)));
     ui.run().expect("окно");
 }
