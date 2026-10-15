@@ -21,7 +21,11 @@ if ($installed -eq $version) { Write-Host "version $version is already delivered
 foreach ($name in $names) {
     if (-not (Test-Path (Join-Path $build $name))) { Write-Host "build\$name is missing - run tools\check.ps1 first"; exit 2 }
 }
-$running = Get-Process | Where-Object { $p = $_.Path; $p -and ($names | Where-Object { $p -eq (Join-Path $root $_) }) }
+# By process name, not by path: the logon program runs elevated, and Windows hides an elevated process's path from
+# an unelevated one - matching by path missed the running CoreMapTray.exe on 15.10 and its file was replaced under it.
+# A hidden check running from build\ has the same names and also blocks delivery; wait for it to end.
+$plain = $names | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }
+$running = Get-Process | Where-Object { $plain -contains $_.Name }
 if ($running) {
     Write-Host ('running now, close first: ' + (($running | ForEach-Object { $_.Name + '.exe' }) -join ', '))
     exit 1

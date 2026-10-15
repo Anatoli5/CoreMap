@@ -535,7 +535,8 @@ namespace CoreMap
             if (running.Length > 0) return;
             try
             {
-                CoreMap.Launch.Unelevated(file, "");
+                // Канал движка — явно: без ключа окно ищет канал программы у часов (DECISIONS #32, шаг 2), а не движка.
+                CoreMap.Launch.Unelevated(file, "--pipe " + Engine.PipeName());
                 if (onDemand) attachBy = Native.Now() + AttachWithin;
             }
             catch (Exception e)
