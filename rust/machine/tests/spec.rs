@@ -145,7 +145,7 @@ fn risky_applied() -> Vec<i32> {
 }
 
 // Profile.Startup note for a refusal, with Tuning.cs Set's range text for core 12 (fused ×54).
-const RISKY_NOTE: &str = "профиль применён не полностью: потолок 56 вне допустимого: от ×8 до ×54";
+const RISKY_NOTE: &str = "профиль применён не полностью: потолок 56 вне допустимого: от ×27 до ×55";
 
 fn list(values: &[i32]) -> String {
     let items: Vec<String> = values.iter().map(ToString::to_string).collect();
@@ -372,7 +372,8 @@ impl Cpu for Bench {
 }
 
 fn read_limits(cpu: &mut dyn Cpu, topo: &Topology) -> Limits {
-    Limits::read(cpu, topo).expect("ceilings are read").0
+    // The range depends on the CPU's name (base ratios, DECISIONS #34): the tests name the 275HX themselves.
+    Limits::read_for(cpu, topo, CPU).expect("ceilings are read").0
 }
 
 fn limits_with(setup: impl FnOnce(&mut Bench)) -> Limits {
@@ -1032,8 +1033,8 @@ fn sim_answers_like_the_measured_275hx() {
 #[test]
 fn sim_reset_returns_to_what_a_rebooted_275hx_answers() {
     // sim.rs: reset_to_factory = sleep or reboot; after a reboot the 275HX answers the measured 0x3635 at LP 12:
-    // ceiling ×53 under a fused ×54. Core 12 is raised to its fused ×54 (the top since DECISIONS #31) so that a reset
-    // to fused instead of to the boot value would show.
+    // ceiling ×53 under a fused ×54. Core 12 is raised to its fused ×54 so that a reset to fused instead of to the boot
+    // value would show.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
@@ -1046,18 +1047,22 @@ fn sim_reset_returns_to_what_a_rebooted_275hx_answers() {
 }
 
 #[test]
-fn choices_go_from_fused_down_to_the_cpus_lowest_multiplier() {
-    // DECISIONS #31, the owner's word of 15.10: the top is the fused maximum («Плюс 4 не надо… Никаких плюсов»; was
-    // fused+4), the bottom the CPU's lowest efficient multiplier x8 (LFM in 0xCE on the 275HX; was fused-14, an
-    // arbitrary span). Descending, as Tuning.cs Choices.
+fn choices_go_from_one_above_fused_down_to_the_base_ratio_of_the_core_type() {
+    // DECISIONS #34, the owner's word of 15.10: the top is fused + 1 («от заводского плюс один не больше»), the bottom
+    // the base ratio of the core's type - on the 275HX P x27 (2.7 GHz), E x21 (2.1 GHz): Intel's turbo range starts at
+    // base and BIOS offers no per-core ceiling below it. Descending, as Tuning.cs Choices.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let limits = read_limits(&mut sim, &topo);
-    for (core, fused, count) in [(0, 53, 46), (12, 54, 47), (23, 54, 47), (2, 46, 39), (21, 46, 39)] {
+    for (core, top, bottom) in [(0, 54, 27), (12, 55, 27), (23, 55, 27), (2, 47, 21), (21, 47, 21)] {
         let choices = limits.choices(core);
-        assert_eq!(choices.len(), count, "core {core}: {choices:?}");
-        assert_eq!(choices.first(), Some(&fused), "core {core}: nothing above fused");
-        assert_eq!(choices.last(), Some(&8), "core {core}");
+        assert_eq!(choices.first(), Some(&top), "core {core}: one above fused: {choices:?}");
+        assert_eq!(
+            choices.last(),
+            Some(&bottom),
+            "core {core}: the base ratio: {choices:?}"
+        );
+        assert_eq!(limits.floor(core), bottom);
         assert!(
             choices.windows(2).all(|w| w[0] == w[1] + 1),
             "consecutive and descending: {choices:?}"
@@ -1066,60 +1071,58 @@ fn choices_go_from_fused_down_to_the_cpus_lowest_multiplier() {
 }
 
 #[test]
-fn choices_never_go_below_eight() {
-    // DECISIONS #31: x8 (LFM) is the bottom for every core whatever its fused maximum, and fused the top; a CPU fused
-    // at x8 has the one choice x8.
+fn a_cpu_not_in_the_table_keeps_fourteen_below_fused_and_never_below_eight() {
+    // DECISIONS #34: without a known base ratio the bottom is the rule of 12.10 - fused - 14, never below x8 (LFM).
     let topo = hx();
     let mut bench = Bench::hx();
-    (bench.fused[0], bench.current[0]) = (10, 10);
-    (bench.fused[1], bench.current[1]) = (20, 20);
+    (bench.fused[1], bench.current[1]) = (10, 10);
     (bench.fused[10], bench.current[10]) = (8, 8);
+    let limits = Limits::read_for(&mut bench, &topo, "Some other CPU").expect("read").0;
+    assert_eq!(limits.choices(0), (39..=54).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(2), (32..=47).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(1), (8..=11).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(10), [9, 8]);
+}
+
+#[test]
+fn a_base_ratio_above_a_cores_fused_maximum_falls_back_to_the_old_rule() {
+    // A 275HX answering fused x20 on a P core (base x27 would be above it): the bottom is fused - 14, not below x8.
+    let topo = hx();
+    let mut bench = Bench::hx();
+    (bench.fused[0], bench.current[0]) = (20, 20);
     let limits = read_limits(&mut bench, &topo);
-    assert_eq!(limits.choices(0), (8..=10).rev().collect::<Vec<i32>>());
-    assert_eq!(limits.choices(1), (8..=20).rev().collect::<Vec<i32>>());
-    assert_eq!(limits.choices(10), [8]);
+    assert_eq!(limits.choices(0), (8..=21).rev().collect::<Vec<i32>>());
 }
 
 #[test]
 fn set_refuses_values_outside_the_range_with_the_csharp_text() {
-    // Tuning.cs Set: "потолок N вне допустимого: от ×min до ×max"; nothing is written. DECISIONS #31 (15.10): the range
-    // is x8..fused, so one step above fused is already refused, and so is the old top fused+4.
+    // Tuning.cs Set: "потолок N вне допустимого: от ×min до ×max"; nothing is written. DECISIONS #34 (15.10): the range
+    // is base..fused+1, so two steps above fused and one below base are refused.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
-    assert_eq!(
-        limits.set(&mut sim, &topo, 0, 54).as_deref(),
-        Some("потолок 54 вне допустимого: от ×8 до ×53")
-    );
-    assert_eq!(
-        limits.set(&mut sim, &topo, 0, 57).as_deref(),
-        Some("потолок 57 вне допустимого: от ×8 до ×53")
-    );
-    assert_eq!(
-        limits.set(&mut sim, &topo, 0, 7).as_deref(),
-        Some("потолок 7 вне допустимого: от ×8 до ×53")
-    );
-    assert_eq!(
-        limits.set(&mut sim, &topo, 2, 47).as_deref(),
-        Some("потолок 47 вне допустимого: от ×8 до ×46")
-    );
-    assert_eq!(
-        limits.set(&mut sim, &topo, 12, 55).as_deref(),
-        Some("потолок 55 вне допустимого: от ×8 до ×54")
-    );
+    for (core, ratio, text) in [
+        (0, 55, "потолок 55 вне допустимого: от ×27 до ×54"),
+        (0, 26, "потолок 26 вне допустимого: от ×27 до ×54"),
+        (0, 8, "потолок 8 вне допустимого: от ×27 до ×54"),
+        (2, 48, "потолок 48 вне допустимого: от ×21 до ×47"),
+        (2, 20, "потолок 20 вне допустимого: от ×21 до ×47"),
+        (12, 56, "потолок 56 вне допустимого: от ×27 до ×55"),
+    ] {
+        assert_eq!(limits.set(&mut sim, &topo, core, ratio).as_deref(), Some(text));
+    }
     assert_eq!(sim.writes, 0);
     assert_eq!(limits.current(), measured_current().as_slice());
 }
 
 #[test]
 fn set_accepts_both_ends_of_the_range() {
-    // Tuning.cs Set: any value of Choices is written; DECISIONS #31: the ends are x8 and fused. Each write moves the
-    // ceiling (core 12 boots at ×53 under its fused ×54; the others go down to x8 and back up to fused), so a write
-    // that never reached the CPU would show.
+    // Tuning.cs Set: any value of Choices is written; DECISIONS #34: the ends are the base ratio and fused + 1. Each
+    // write moves the ceiling, so a write that never reached the CPU would show.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
-    for (core, ratio) in [(12, 54), (1, 8), (6, 8), (1, 53), (6, 46)] {
+    for (core, ratio) in [(12, 55), (1, 27), (6, 21), (1, 54), (6, 47)] {
         assert_eq!(limits.set(&mut sim, &topo, core, ratio), None, "core {core} ×{ratio}");
         assert_eq!(limits.current()[core], ratio);
         assert_eq!(i32::from(sim.current()[core]), ratio);

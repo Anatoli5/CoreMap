@@ -64,16 +64,21 @@ namespace CoreMap
     /// Fused и Current — то, что программа знает после последнего обращения; читать их можно без замка.
     class CoreLimits
     {
-        // Ниже этого потолок не опускается: самый низкий экономичный множитель процессора (LFM, регистр 0xCE биты
-        // 47:40; у 275HX — ×8, проба 12.10). Прежде здесь было «14 ступеней ниже заводского» — граница, взятая
-        // агентом с потолка; владелец 15.10: «смысла ограничения вниз… зачем нам хуёвое ядро держать в состоянии
-        // перегрева» (DECISIONS #31). Понижение потолка только охлаждает ядро.
+        // Нижняя граница потолка по типу ядра — базовый множитель процессора: с базовой частоты Intel начинает диапазон
+        // разгона, ниже неё BIOS потолков не предлагает. Владелец 15.10: «выясни… какие адекватные пределы для этого
+        // поколения… снизу адекватные и чуть-чуть еще» (DECISIONS #34). 275HX: P 2,7 ГГц, E 2,1 ГГц (спецификация).
+        // Процессор не из таблицы — прежнее правило: Span ступеней ниже заводского, не ниже Lowest.
+        static readonly Dictionary<string, int[]> Bases = new Dictionary<string, int[]>
+        {
+            { "Intel(R) Core(TM) Ultra 9 275HX", new[] { 27, 21 } },
+        };
+        // Ниже этого потолок не опускается ни у какого процессора: самый низкий экономичный множитель (LFM, регистр
+        // 0xCE биты 47:40; у 275HX — ×8, проба 12.10).
         public const int Lowest = 8;
-        // Выше заводского предела потолок не поднимается. Было 4 ступени (DECISIONS #17, 13.10); владелец 15.10:
-        // «Плюс 4 не надо… Никаких плюсов… вверх расширять… продакшен такую утилиту я пускать не хочу… может…
-        // компьютер кого не спалит» (DECISIONS #31). Проверки выше заводского (профиль на испытании, подтверждение,
-        // метка) остаются: профиль старого вида может нести такие значения — они теперь просто не ставятся.
-        public const int Over = 0;
+        const int Span = 14;
+        // Выше заводского предела — на одну ступень. Владелец 15.10: «от заводского плюс один не больше» (DECISIONS #34;
+        // было 4 по #17, потом 0).
+        public const int Over = 1;
         const int Attempts = 3;  // столько раз ядро спрашивается о потолке, прежде чем чтение считается неудачным
 
         readonly PawnIo io;        // null — имитация: «процессор» — массив в памяти
@@ -82,6 +87,7 @@ namespace CoreMap
         readonly int[] lps;
         readonly object gate = new object();
         readonly bool[] silent;    // о потолке этого ядра процессор при последнем чтении не ответил: Current устарел
+        readonly int[] bases;      // базовый множитель ядра по его типу (Bases); 0 — процессора нет в таблице
 
         public readonly int[] Fused, Current;  // 0 — процессор не ответил ни разу
         /// Самопроверка на имитации: ядра, о потолке которых «процессор» не отвечает. В работе не используется.
@@ -95,6 +101,11 @@ namespace CoreMap
             Fused = new int[cores.Length];
             Current = new int[cores.Length];
             silent = new bool[cores.Length];
+            string name, identifier;
+            Topology.Identity(out name, out identifier);
+            int[] known;
+            if (!Bases.TryGetValue(name, out known)) known = new[] { 0, 0 };
+            bases = cores.Select(c => c.Kind == 'P' ? known[0] : known[1]).ToArray();
             if (io == null)
             {
                 simulated = new int[cores.Length];
@@ -117,12 +128,18 @@ namespace CoreMap
         /// Действующий потолок блока: он у блока общий и читается по первому ядру.
         public int Of(Block block) { return Current[block.First]; }
 
-        /// Значения, которые можно поставить ядру вручную, по убыванию: от заводского предела (плюс Over, сейчас 0) вниз
-        /// до самого низкого экономичного множителя процессора (Lowest).
+        /// Нижняя граница потолка ядра: базовый множитель его типа; процессора нет в таблице — Span ниже заводского.
+        public int Floor(int index)
+        {
+            int fused = Fused[index], b = bases[index];
+            return Math.Max(Lowest, b > 0 && b <= fused ? b : fused - Span);
+        }
+
+        /// Значения, которые можно поставить ядру вручную, по убыванию: от заводского предела плюс Over вниз до Floor.
         public int[] Choices(int index)
         {
-            int top = Fused[index] + Over;
-            return top < Lowest ? new int[0] : Enumerable.Range(Lowest, top - Lowest + 1).Reverse().ToArray();
+            int top = Fused[index] + Over, low = Floor(index);
+            return top < low ? new int[0] : Enumerable.Range(low, top - low + 1).Reverse().ToArray();
         }
 
         /// То же, но не выше заводского предела: в этих пределах работают измерения и подбор — кривые, поиск, ползунок.

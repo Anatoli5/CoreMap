@@ -1173,8 +1173,8 @@ namespace CoreMap
             check(code == 0, "вторая копия программы прошла по протоколу как окно и вышла сама, код " + code);
             check(peak > 0 && sawMutex, "пока окно подключено, Core жив и мьютекс движка существует");
             check(tipWithWindow != null && tipWithWindow.Contains("открыто окно"), "подсказка значка при окне: " + (tipWithWindow ?? "не менялась"));
-            check(asked.Count == 0, "владельца ни о чём не спрашивали: потолок выше заводского отказан раньше вопроса" +
-                (asked.Count > 0 ? " — спросили: " + string.Join(" | ", asked) : ""));
+            check(asked.Count == 2 && asked[0].Contains("выше заводского"),
+                "о потолке выше заводского владельца спросили дважды (отказ и согласие): " + string.Join(" | ", asked));
             Pump(() => !engine.Alive, 10);
             check(!engine.Alive && !held() && stops >= 1, "окно ушло — Core остановлен, мьютекс снят; остановок за проход: " + stops);
             check(resident.Available && !resident.WindowOpen && resident.Switch("") == null, "меню значка снова распоряжается потолками");

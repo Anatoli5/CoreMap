@@ -202,8 +202,10 @@ namespace CoreMap
             Check(Ok(client.Ask("limit.set", "block", 0, "ratio", fused - 2)) && Seen(client, s => At(s, "limit", first) == fused - 2), "потолок блока ставится: ×" + (fused - 2));
             Check(client.Wait(() => (bool)client.Last("profiles")["canAccept"], 2), "после этого профили говорят, что есть что принять");
             Dictionary<string, object> reply = client.Ask("limit.set", "block", 0, "ratio", fused + 1);
-            // Выше заводского не ставится вовсе (владелец 15.10: «Никаких плюсов», CoreLimits.Over = 0): отказ по диапазону.
-            Check(Refused(reply, "вне допустимого") && At(client.Last("state"), "limit", first) == fused - 2, "потолок выше заводского не ставится: " + Why(reply));
+            Check(Refused(reply, "не подтверждён") && At(client.Last("state"), "limit", first) == fused - 2, "потолок выше заводского без согласия владельца не ставится: " + Why(reply));
+            Check(Ok(client.Ask("limit.set", "block", 0, "ratio", fused + 1)) && Seen(client, s => At(s, "limit", first) == fused + 1), "с согласием — ставится: ×" + (fused + 1));
+            reply = client.Ask("limit.set", "block", 0, "ratio", fused + 2);
+            Check(Refused(reply, "вне допустимого"), "две ступени выше заводского — вне диапазона: " + Why(reply));
             reply = client.Ask("limit.set", "block", 0, "ratio", 200);
             Check(Refused(reply, "вне допустимого"), "потолок 200 — отказ: " + Why(reply));
             Check(Refused(client.Ask("limit.set", "block", 0)), "команда без аргумента — отказ");
