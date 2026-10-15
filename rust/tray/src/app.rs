@@ -32,7 +32,10 @@ use machine::topology::Topology;
 use machine::{HwError, marker};
 
 use crate::journal::Journal;
+
+mod auto;
 use crate::shell::{self, Child, Event, Item, Loop, Menu, Shell};
+pub use auto::{AUTO_ON, AutoTiming, DEPTH_ID, LIMIT_ID};
 
 pub const OPEN_ID: u32 = 1;
 pub const EXIT_ID: u32 = 2;
@@ -69,6 +72,8 @@ pub struct Config {
     pub lease_wait: u32,
     /// Сверка после пробуждения — не чаще раза за этот промежуток: одно пробуждение шлёт несколько событий.
     pub wake_gap: Duration,
+    /// Сроки автомодуля (опрос и регулятор).
+    pub auto: AutoTiming,
 }
 
 /// Кто сейчас держит потолки вместо этой программы.
@@ -162,6 +167,7 @@ pub struct App {
     /// C#-часть только что закрылась, возврат права ещё впереди (пауза `grace`).
     take_back_pending: bool,
     listed: Vec<String>,
+    auto: auto::Autopilot,
     lease: Rc<named::Mutex>,
     watched: Vec<Watched>,
     balloons: VecDeque<String>,
@@ -181,6 +187,7 @@ impl App {
         let store = Store::new(&config.data, &cpu, &topology.lps());
         let journal = Journal::new(&config.data);
         let (lease, _) = named::create(&config.names.lease, false).map_err(|e| format!("аренда потолков: {e}"))?;
+        let blocks = topology.blocks.len();
         Ok(Self {
             config,
             topology,
@@ -200,6 +207,7 @@ impl App {
             power_while_away: false,
             take_back_pending: false,
             listed: Vec::new(),
+            auto: auto::Autopilot::new(blocks),
             lease: Rc::new(lease),
             watched: Vec::new(),
             balloons: VecDeque::new(),
@@ -313,7 +321,10 @@ impl App {
             return Err(format!("потолки множителей недоступны: {}", e.0));
         }
         let result = act(self);
-        if let Some(device) = &mut self.device {
+        // Автомодуль опрашивает раз в 2 с: драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
+        if !self.auto.choice.on
+            && let Some(device) = &mut self.device
+        {
             device.cpu().release();
         }
         Ok(result)
@@ -370,6 +381,7 @@ impl App {
                 }
             }
         }
+        self.start_auto(shell);
         if !shell.add_icon(&self.tip()) {
             self.schedule_retries(shell);
         }
@@ -549,6 +561,14 @@ impl App {
     /// Подсказка значка (Resident.Tip в C#).
     #[must_use]
     pub fn tip(&mut self) -> String {
+        let text = self.tip_body();
+        match self.auto_tip() {
+            Some(auto) => format!("{text}\n{auto}"),
+            None => text,
+        }
+    }
+
+    fn tip_body(&mut self) -> String {
         if let Some(other) = self.other() {
             return other.tip().into();
         }
@@ -599,6 +619,7 @@ impl App {
                 checked: false,
                 enabled: false,
                 default: false,
+                children: Vec::new(),
             });
             items.push(separator());
         }
@@ -628,6 +649,7 @@ impl App {
                     checked: marked,
                     enabled: other.is_none(),
                     default: false,
+                    children: Vec::new(),
                 });
                 if k == 0 && !self.listed.is_empty() {
                     items.push(separator());
@@ -635,12 +657,15 @@ impl App {
             }
             items.push(separator());
         }
+        items.push(self.auto_menu());
+        items.push(separator());
         items.push(Item {
             id: NEW_ID,
             text: Some("Новое окно".into()),
             checked: false,
             enabled: true,
             default: false,
+            children: Vec::new(),
         });
         items.push(Item {
             id: OPEN_ID,
@@ -648,6 +673,7 @@ impl App {
             checked: false,
             enabled: true,
             default: true,
+            children: Vec::new(),
         });
         items.push(Item {
             id: EXIT_ID,
@@ -655,6 +681,7 @@ impl App {
             checked: false,
             enabled: true,
             default: false,
+            children: Vec::new(),
         });
         items
     }
@@ -687,10 +714,16 @@ impl App {
 
     /// Пункт меню.
     pub fn command(&mut self, shell: &mut Shell, id: u32) {
+        if self.auto_command(shell, id) {
+            shell.set_tip(&self.tip());
+            self.show_balloon(shell);
+            return;
+        }
         match id {
             OPEN_ID => self.open_old_window(shell),
             NEW_ID => self.open_new_window(shell),
             EXIT_ID => {
+                self.put_back("выход");
                 shell.remove_icon();
                 shell.destroy();
             }
@@ -731,6 +764,7 @@ impl App {
                 .map(|s| s.ratios)
         };
         let done = self.with_ceilings(|app| -> Result<(), String> {
+            app.put_back("смена набора");
             let Some(ratios) = ratios else {
                 return Err(format!("профиля «{name}» нет"));
             };
@@ -760,6 +794,7 @@ impl App {
             }
             app.note = None;
             app.intended = Some(limits.current().to_vec());
+            app.auto_new_set();
             app.journal.note(&format!(
                 "из меню поставлен {}",
                 if name.is_empty() {
@@ -813,6 +848,7 @@ impl App {
     }
 
     fn open_old_window(&mut self, shell: &mut Shell) {
+        self.put_back("открывается прежнее окно");
         match self.other() {
             Some(Other::Tuning | Other::Engine) => {
                 self.notify(
@@ -826,6 +862,7 @@ impl App {
     }
 
     fn open_new_window(&mut self, shell: &mut Shell) {
+        self.put_back("запускается настройка");
         match self.other() {
             Some(Other::Starting) => {
                 self.notify(shell, "Окно CoreMap ещё запускается — подожди несколько секунд");
@@ -881,7 +918,9 @@ impl App {
             }
             Event::Announced(pid) => {
                 self.journal.note(&format!("прежнее окно запущено (процесс {pid})"));
-                self.other();
+                if let Some(other) = self.other() {
+                    self.yield_to(other);
+                }
                 shell.set_tip(&self.tip());
             }
             Event::Timer(RETRY) => self.retry(shell),
@@ -893,13 +932,16 @@ impl App {
                 shell.kill_timer(WAKE);
                 self.wake_repair(shell);
             }
+            Event::Timer(auto::AUTO) => self.auto_tick(shell),
             Event::Timer(_) => {}
             Event::Suspend => {
                 self.journal.note("уход в сон");
+                self.put_back("уход в сон");
                 self.note_power_near_csharp();
             }
             Event::Wake => {
                 self.note_power_near_csharp();
+                self.auto.wake_pending = true; // опрос автомодуля ждёт сверку (ревизия H3)
                 // Несколько событий одного пробуждения (сон, экран) — одна сверка, и не раньше паузы на
                 // успокоение (ревизия L6).
                 let delay = match self.last_wake {
@@ -912,9 +954,13 @@ impl App {
                 };
                 shell.set_timer(WAKE, delay);
             }
-            Event::EndSession => self.journal.note("Windows завершает сеанс"),
+            Event::EndSession => {
+                self.journal.note("Windows завершает сеанс");
+                self.put_back("конец сеанса Windows");
+            }
             Event::Close => {
                 self.journal.note("выход по просьбе окна CoreMap");
+                self.put_back("выход");
                 shell.remove_icon();
                 shell.destroy();
             }
@@ -1016,6 +1062,7 @@ impl App {
     /// Сверка после пробуждения: сброшенные к заводским блоки получают своё значение; чужую правку — принять.
     pub fn wake_repair(&mut self, shell: &mut Shell) {
         self.last_wake = Some(Instant::now());
+        self.auto.wake_pending = false;
         // Пока C#-часть не закрылась или право ещё не возвращено, потолки могут стоять на ступени оборванного замера:
         // сверять их с тем, что должно стоять, рано — это сделает возврат права (по метке замера и профилю).
         if self.take_back_pending || self.other().is_some() {
@@ -1025,6 +1072,8 @@ impl App {
             return;
         }
         let done = self.with_ceilings(|app| {
+            // Опущенные автомодулем блоки — не сброс и не чужая правка: сначала вернуть им принятые.
+            app.put_back("пробуждение");
             // Метка замера могла остаться от C#-части, конца которой эта программа не видела (ревизия M3).
             if let Some(said) = app.recover() {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
@@ -1151,6 +1200,7 @@ fn separator() -> Item {
         checked: false,
         enabled: false,
         default: false,
+        children: Vec::new(),
     }
 }
 

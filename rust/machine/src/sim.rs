@@ -5,6 +5,7 @@
 
 use crate::HwError;
 use crate::mailbox::{Allowed, Cpu, Limit};
+use crate::thermal::{Reading, Thermal};
 use crate::topology::{Kind, Topology};
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,8 @@ pub struct SimCpu {
     pub writes: usize,
     /// Сколько раз «процессор» спросили о потолке — проверка видит, не трогала ли программа его вовсе.
     pub reads: usize,
+    /// Нагрузка по ядрам (доля работы 0…1) — её задаёт проверка; от неё и потолка зависит нагрев (`Thermal`).
+    pub load: Vec<f64>,
 }
 
 impl SimCpu {
@@ -45,6 +48,7 @@ impl SimCpu {
             deaf: vec![false; topology.cores.len()],
             writes: 0,
             reads: 0,
+            load: vec![0.0; topology.cores.len()],
         }
     }
 
@@ -87,5 +91,32 @@ impl Cpu for SimCpu {
             self.current[m] = ratio.get();
         }
         Ok(Some(0))
+    }
+}
+
+/// Нагрев имитации: 40 °C в покое, нагруженный блок — на 1,5 °C больше за каждую ступень потолка выше ×20 (одна
+/// ступень ≈ 1,5 °C, на кривых владельца — 2–5 °C у нагруженного блока). Фактический множитель — потолок.
+fn heat(load: f64, ceiling: u8) -> f64 {
+    40.0 + load * (f64::from(ceiling) - 20.0) * 1.5
+}
+
+impl Thermal for SimCpu {
+    fn package(&mut self) -> Result<Option<f64>, HwError> {
+        Ok(self
+            .current
+            .iter()
+            .zip(&self.load)
+            .map(|(&c, &l)| heat(l, c))
+            .reduce(f64::max))
+    }
+
+    fn block(&mut self, core: usize) -> Result<Reading, HwError> {
+        let load = self.load[core];
+        let ceiling = self.current[core];
+        Ok(Reading {
+            temp: Some(heat(load, ceiling)),
+            busy: Some(load),
+            ratio: (load >= 0.05).then_some(f64::from(ceiling)),
+        })
     }
 }

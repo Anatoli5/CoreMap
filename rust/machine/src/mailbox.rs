@@ -111,9 +111,11 @@ fn pause() {
 /// Потолки в настоящем процессоре: драйвер, замок ящика, привязка потока к ядру на время запроса.
 #[derive(Debug)]
 pub struct MailboxCpu {
-    msr: Box<dyn MsrDebug>,
+    pub(crate) msr: Box<dyn MsrDebug>,
     gate: named::Mutex,
-    lps: Vec<Lp>,
+    pub(crate) lps: Vec<Lp>,
+    /// Датчики автомодуля (thermal.rs): счётчики ядер с прошлого опроса, `TjMax` и опорный множитель.
+    pub(crate) sensors: crate::thermal::Counters,
 }
 
 /// `Msr` с `Debug` — чтобы `MailboxCpu` можно было показать в отладке.
@@ -130,6 +132,7 @@ impl MailboxCpu {
             msr,
             gate,
             lps: topology.lps(),
+            sensors: crate::thermal::Counters::new(topology.cores.len()),
         })
     }
 
@@ -298,6 +301,7 @@ mod tests {
             msr: Box::new(Register::default()),
             gate,
             lps: vec![Lp(lp)],
+            sensors: crate::thermal::Counters::new(1),
         }
     }
 

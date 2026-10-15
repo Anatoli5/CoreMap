@@ -53,6 +53,16 @@ impl Limits {
         }
     }
 
+    /// Перечитывает только первое ядро каждого блока — потолок у блока общий. Опрос автомодуля сравнивает только
+    /// их: так он не будит раз в 2 с кластеры E-ядер, которые Windows держит спящими (ревизия, L10).
+    pub fn refresh_blocks(&mut self, cpu: &mut dyn Cpu, topology: &Topology) -> Option<String> {
+        let firsts: Vec<usize> = topology.blocks.iter().map(|b| b.first).collect();
+        match self.read_cores(cpu, topology, &firsts) {
+            Ok(unread) => unread,
+            Err(e) => Some(e.0),
+        }
+    }
+
     /// Читает данные ядра. Неудачный ответ не стирает известное: заводской предел читается один раз, действующий
     /// потолок остаётся прежним — но ядро помечается, и чтение не выдаёт себя за удачное.
     fn read_cores(

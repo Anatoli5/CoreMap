@@ -89,6 +89,7 @@ fn main() {
         wake_delay: Duration::from_secs(5),
         lease_wait: 10_000,
         wake_gap: Duration::from_secs(30),
+        auto: app::AutoTiming::REAL,
     };
     let journal = journal::Journal::new(&config.data);
     let mut app = match App::with_system_log(config) {

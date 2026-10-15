@@ -5,6 +5,7 @@
 //! Библиотеку берёт программа входа в Windows (`tray`, `CoreMapTray.exe`); движок настройки возьмёт её при своём
 //! переносе на Rust. Окна здесь нет, потоков своих нет: всё вызывается из потока того, кто взял библиотеку.
 
+pub mod auto;
 pub mod clock;
 pub mod events;
 pub mod files;
@@ -15,6 +16,7 @@ pub mod named;
 pub mod pawnio;
 pub mod profile;
 pub mod sim;
+pub mod thermal;
 pub mod topology;
 
 mod affinity;

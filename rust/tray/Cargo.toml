@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 machine = { package = "coremap-machine", path = "../machine" }
+# data\tray.json (the auto module's settings) and its marker; already in the workspace through the library.
+serde_json = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

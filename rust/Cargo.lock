@@ -826,6 +826,7 @@ name = "coremap-tray"
 version = "0.1.0"
 dependencies = [
  "coremap-machine",
+ "serde_json",
  "windows-sys 0.61.2",
 ]
 

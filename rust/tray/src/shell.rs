@@ -44,14 +44,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE,
     DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMenuItemCount,
     GetMenuItemInfoW, GetSystemMetrics, HMENU, IDI_APPLICATION, IMAGE_ICON, KillTimer, LR_DEFAULTCOLOR, LR_SHARED,
-    LoadIconW, LoadImageW, MENUITEMINFOW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MFS_CHECKED, MFS_DEFAULT,
-    MFS_DISABLED, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MSG, MSGFLT_ALLOW, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
-    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW,
-    SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    LoadIconW, LoadImageW, MENUITEMINFOW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MFS_CHECKED,
+    MFS_DEFAULT, MFS_DISABLED, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, MSGFLT_ALLOW,
+    MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    PBT_POWERSETTINGCHANGE, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassW,
+    RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, SendMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_MOUSEMOVE, WM_NULL, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
 };
 
 /// Сообщение значка (как `IconMessage` в Tray.cs).
@@ -503,18 +503,104 @@ fn icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
 /// Строка меню значка.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
-    /// 0 — пояснение (серое) или разделитель.
+    /// 0 — пояснение (серое), разделитель или подменю.
     pub id: u32,
     /// None — разделитель.
     pub text: Option<String>,
     pub checked: bool,
     pub enabled: bool,
     pub default: bool,
+    /// Непусто — это подменю с такими строками.
+    pub children: Vec<Item>,
 }
 
-/// Меню Windows; уничтожается при выходе из области видимости.
+/// Меню Windows; уничтожается при выходе из области видимости (вместе с подменю).
 #[derive(Debug)]
 pub struct Menu(HMENU);
+
+/// Добавляет строки в меню; подменю создаются и прикрепляются к нему (уничтожаются вместе с ним).
+fn append(menu: HMENU, items: &[Item]) -> Result<(), String> {
+    for item in items {
+        let ok = match &item.text {
+            // SAFETY: the menu handle is valid; a separator has no text.
+            None => unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) },
+            Some(text) => {
+                // «&» в меню Windows — подчёркнутая буква; в названии профиля это просто знак.
+                let text = wide(&text.replace('&', "&&").replace('\t', " "));
+                let mut flags = MF_STRING;
+                if item.checked {
+                    flags |= MF_CHECKED;
+                }
+                if !item.enabled || (item.id == 0 && item.children.is_empty()) {
+                    flags |= MF_GRAYED;
+                }
+                if item.children.is_empty() {
+                    // SAFETY: the menu handle is valid; the text is NUL-terminated and copied by Windows.
+                    unsafe { AppendMenuW(menu, flags, item.id as usize, text.as_ptr()) }
+                } else {
+                    // SAFETY: no preconditions.
+                    let sub = unsafe { CreatePopupMenu() };
+                    if sub.is_null() {
+                        return Err(format!("подменю не создано, код {}", last_error()));
+                    }
+                    if let Err(e) = append(sub, &item.children) {
+                        // SAFETY: the submenu is not attached yet and is destroyed once here.
+                        unsafe { DestroyMenu(sub) };
+                        return Err(e);
+                    }
+                    // SAFETY: both handles are valid; once appended, the submenu belongs to `menu`.
+                    let attached = unsafe { AppendMenuW(menu, flags | MF_POPUP, sub as usize, text.as_ptr()) };
+                    if attached == 0 {
+                        // SAFETY: not attached: destroyed once here.
+                        unsafe { DestroyMenu(sub) };
+                    }
+                    attached
+                }
+            }
+        };
+        if ok == 0 {
+            return Err(format!("строка меню не добавлена, код {}", last_error()));
+        }
+        if item.default {
+            // SAFETY: the item with this id was just added.
+            unsafe { SetMenuDefaultItem(menu, item.id, 0) };
+        }
+    }
+    Ok(())
+}
+
+/// Строки меню, как их держит Windows (с подменю).
+fn read(menu: HMENU) -> Vec<Item> {
+    // SAFETY: the menu handle is valid.
+    let count = u32::try_from(unsafe { GetMenuItemCount(menu) }).unwrap_or(0);
+    let mut items = Vec::new();
+    for position in 0..count {
+        let mut text = [0u16; 256];
+        let mut info = MENUITEMINFOW {
+            cbSize: u32::try_from(size_of::<MENUITEMINFOW>()).unwrap_or(0),
+            fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
+            dwTypeData: text.as_mut_ptr(),
+            cch: u32::try_from(text.len() - 1).unwrap_or(0),
+            ..MENUITEMINFOW::default()
+        };
+        // SAFETY: `info` describes a writable text buffer of `cch` + 1 units that outlives the call.
+        if unsafe { GetMenuItemInfoW(menu, position, 1, &raw mut info) } == 0 {
+            continue;
+        }
+        let separator = info.fType & MF_SEPARATOR != 0;
+        let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+        let popup = !info.hSubMenu.is_null();
+        items.push(Item {
+            id: if popup { 0 } else { info.wID },
+            text: (!separator).then(|| String::from_utf16_lossy(&text[..len]).replace("&&", "&")),
+            checked: info.fState & MFS_CHECKED != 0,
+            enabled: info.fState & MFS_DISABLED == 0,
+            default: info.fState & MFS_DEFAULT != 0,
+            children: if popup { read(info.hSubMenu) } else { Vec::new() },
+        });
+    }
+    items
+}
 
 impl Menu {
     pub fn build(items: &[Item]) -> Result<Self, String> {
@@ -524,65 +610,14 @@ impl Menu {
             return Err(format!("меню не создано, код {}", last_error()));
         }
         let menu = Self(handle);
-        for item in items {
-            let ok = match &item.text {
-                // SAFETY: the menu handle is valid; a separator has no text.
-                None => unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, null()) },
-                Some(text) => {
-                    // «&» в меню Windows — подчёркнутая буква; в названии профиля это просто знак.
-                    let text = wide(&text.replace('&', "&&").replace('\t', " "));
-                    let mut flags = MF_STRING;
-                    if item.checked {
-                        flags |= MF_CHECKED;
-                    }
-                    if !item.enabled || item.id == 0 {
-                        flags |= MF_GRAYED;
-                    }
-                    // SAFETY: the menu handle is valid; the text is NUL-terminated and copied by Windows.
-                    unsafe { AppendMenuW(menu.0, flags, item.id as usize, text.as_ptr()) }
-                }
-            };
-            if ok == 0 {
-                return Err(format!("строка меню не добавлена, код {}", last_error()));
-            }
-            if item.default {
-                // SAFETY: the item with this id was just added.
-                unsafe { SetMenuDefaultItem(menu.0, item.id, 0) };
-            }
-        }
+        append(menu.0, items)?;
         Ok(menu)
     }
 
     /// Что Windows держит в меню: для скрытой проверки — меню собрано на самом деле, а не только в памяти программы.
     #[must_use]
     pub fn inspect(&self) -> Vec<Item> {
-        // SAFETY: the menu handle is valid.
-        let count = u32::try_from(unsafe { GetMenuItemCount(self.0) }).unwrap_or(0);
-        let mut items = Vec::new();
-        for position in 0..count {
-            let mut text = [0u16; 256];
-            let mut info = MENUITEMINFOW {
-                cbSize: u32::try_from(size_of::<MENUITEMINFOW>()).unwrap_or(0),
-                fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING,
-                dwTypeData: text.as_mut_ptr(),
-                cch: u32::try_from(text.len() - 1).unwrap_or(0),
-                ..MENUITEMINFOW::default()
-            };
-            // SAFETY: `info` describes a writable text buffer of `cch` + 1 units that outlives the call.
-            if unsafe { GetMenuItemInfoW(self.0, position, 1, &raw mut info) } == 0 {
-                continue;
-            }
-            let separator = info.fType & MF_SEPARATOR != 0;
-            let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
-            items.push(Item {
-                id: info.wID,
-                text: (!separator).then(|| String::from_utf16_lossy(&text[..len]).replace("&&", "&")),
-                checked: info.fState & MFS_CHECKED != 0,
-                enabled: info.fState & MFS_DISABLED == 0,
-                default: info.fState & MFS_DEFAULT != 0,
-            });
-        }
-        items
+        read(self.0)
     }
 }
 
