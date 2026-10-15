@@ -9,6 +9,9 @@
 //   are still attributed by 6006 alone; (b) SMT siblings form one block; (c) after a write only the written block is
 //   read back; (d) no mailbox request without its gate mutex and none over a busy mailbox; (e) «заводские» deletes
 //   profile.json and its .bak;
+// - the owner's rule of 15.10 on allowed ceilings (DECISIONS #31, the same in Tuning.cs CoreLimits since then): from
+//   the fused maximum down to x8, the CPU's lowest efficient multiplier (LFM, 0xCE bits 47:40); nothing above fused
+//   («Плюс 4 не надо… Никаких плюсов»). A ceiling above fused is refused before the mailbox;
 // - facts measured on the owner's Core Ultra 9 275HX (KNOWLEDGE.md: answers to command 0x1C) and on this machine's
 //   .NET Framework 4.8, the runtime of the C# writer (number and date formats).
 // The comment at each test names the spec line it rests on. Nothing here touches the CPU: the processor is `SimCpu`
@@ -124,12 +127,25 @@ fn measured_current() -> Vec<i32> {
     (0..24).map(|lp| i32::from(measured(lp).1)).collect()
 }
 
-// «csmart2» with core 12 at ×56: above its fused ×54, so the profile is risky (Profile.Risky).
+// «csmart2» with core 12 at ×56: above its fused ×54, so the profile is risky (Profile.Risky). Such a file can only
+// date from before 15.10: the startup rules still treat it as risky (trial, disabled after a failure), but since
+// DECISIONS #31 its ×56 is never written.
 fn risky() -> Vec<i32> {
     let mut ratios = SAFE.to_vec();
     ratios[12] = 56;
     ratios
 }
+
+// What stands after `risky()` is applied (DECISIONS #31): every block from the profile except core 12, which keeps
+// the ×53 the 275HX boots with (KNOWLEDGE.md: 0x3635) because its ×56 is refused, not clamped to ×54.
+fn risky_applied() -> Vec<i32> {
+    let mut ratios = SAFE.to_vec();
+    ratios[12] = 53;
+    ratios
+}
+
+// Profile.Startup note for a refusal, with Tuning.cs Set's range text for core 12 (fused ×54).
+const RISKY_NOTE: &str = "профиль применён не полностью: потолок 56 вне допустимого: от ×8 до ×54";
 
 fn list(values: &[i32]) -> String {
     let items: Vec<String> = values.iter().map(ToString::to_string).collect();
@@ -1016,11 +1032,12 @@ fn sim_answers_like_the_measured_275hx() {
 #[test]
 fn sim_reset_returns_to_what_a_rebooted_275hx_answers() {
     // sim.rs: reset_to_factory = sleep or reboot; after a reboot the 275HX answers the measured 0x3635 at LP 12:
-    // ceiling ×53 under a fused ×54.
+    // ceiling ×53 under a fused ×54. Core 12 is raised to its fused ×54 (the top since DECISIONS #31) so that a reset
+    // to fused instead of to the boot value would show.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
-    for (core, ratio) in [(0, 45), (12, 56), (2, 40)] {
+    for (core, ratio) in [(0, 45), (12, 54), (2, 40)] {
         assert_eq!(limits.set(&mut sim, &topo, core, ratio), None);
     }
     sim.reset_to_factory();
@@ -1029,16 +1046,18 @@ fn sim_reset_returns_to_what_a_rebooted_275hx_answers() {
 }
 
 #[test]
-fn choices_are_19_values_from_four_above_fused_to_fourteen_below() {
-    // Tuning.cs Choices: Range(-Over, Span + Over + 1) -> fused+4 down to fused-14, descending (inventory 4.3).
+fn choices_go_from_fused_down_to_the_cpus_lowest_multiplier() {
+    // DECISIONS #31, the owner's word of 15.10: the top is the fused maximum («Плюс 4 не надо… Никаких плюсов»; was
+    // fused+4), the bottom the CPU's lowest efficient multiplier x8 (LFM in 0xCE on the 275HX; was fused-14, an
+    // arbitrary span). Descending, as Tuning.cs Choices.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let limits = read_limits(&mut sim, &topo);
-    for (core, fused) in [(0, 53), (12, 54), (23, 54), (2, 46), (21, 46)] {
+    for (core, fused, count) in [(0, 53, 46), (12, 54, 47), (23, 54, 47), (2, 46, 39), (21, 46, 39)] {
         let choices = limits.choices(core);
-        assert_eq!(choices.len(), 19, "core {core}: {choices:?}");
-        assert_eq!(choices.first(), Some(&(fused + 4)), "core {core}");
-        assert_eq!(choices.last(), Some(&(fused - 14)), "core {core}");
+        assert_eq!(choices.len(), count, "core {core}: {choices:?}");
+        assert_eq!(choices.first(), Some(&fused), "core {core}: nothing above fused");
+        assert_eq!(choices.last(), Some(&8), "core {core}");
         assert!(
             choices.windows(2).all(|w| w[0] == w[1] + 1),
             "consecutive and descending: {choices:?}"
@@ -1048,37 +1067,45 @@ fn choices_are_19_values_from_four_above_fused_to_fourteen_below() {
 
 #[test]
 fn choices_never_go_below_eight() {
-    // Tuning.cs Choices: .Where(r => r >= 8).
+    // DECISIONS #31: x8 (LFM) is the bottom for every core whatever its fused maximum, and fused the top; a CPU fused
+    // at x8 has the one choice x8.
     let topo = hx();
     let mut bench = Bench::hx();
     (bench.fused[0], bench.current[0]) = (10, 10);
     (bench.fused[1], bench.current[1]) = (20, 20);
+    (bench.fused[10], bench.current[10]) = (8, 8);
     let limits = read_limits(&mut bench, &topo);
-    assert_eq!(limits.choices(0), (8..=14).rev().collect::<Vec<i32>>());
-    assert_eq!(limits.choices(1), (8..=24).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(0), (8..=10).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(1), (8..=20).rev().collect::<Vec<i32>>());
+    assert_eq!(limits.choices(10), [8]);
 }
 
 #[test]
 fn set_refuses_values_outside_the_range_with_the_csharp_text() {
-    // Tuning.cs Set: "потолок N вне допустимого: от ×min до ×max"; nothing is written.
+    // Tuning.cs Set: "потолок N вне допустимого: от ×min до ×max"; nothing is written. DECISIONS #31 (15.10): the range
+    // is x8..fused, so one step above fused is already refused, and so is the old top fused+4.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
     assert_eq!(
-        limits.set(&mut sim, &topo, 0, 58).as_deref(),
-        Some("потолок 58 вне допустимого: от ×39 до ×57")
+        limits.set(&mut sim, &topo, 0, 54).as_deref(),
+        Some("потолок 54 вне допустимого: от ×8 до ×53")
     );
     assert_eq!(
-        limits.set(&mut sim, &topo, 0, 38).as_deref(),
-        Some("потолок 38 вне допустимого: от ×39 до ×57")
+        limits.set(&mut sim, &topo, 0, 57).as_deref(),
+        Some("потолок 57 вне допустимого: от ×8 до ×53")
     );
     assert_eq!(
-        limits.set(&mut sim, &topo, 2, 51).as_deref(),
-        Some("потолок 51 вне допустимого: от ×32 до ×50")
+        limits.set(&mut sim, &topo, 0, 7).as_deref(),
+        Some("потолок 7 вне допустимого: от ×8 до ×53")
     );
     assert_eq!(
-        limits.set(&mut sim, &topo, 12, 59).as_deref(),
-        Some("потолок 59 вне допустимого: от ×40 до ×58")
+        limits.set(&mut sim, &topo, 2, 47).as_deref(),
+        Some("потолок 47 вне допустимого: от ×8 до ×46")
+    );
+    assert_eq!(
+        limits.set(&mut sim, &topo, 12, 55).as_deref(),
+        Some("потолок 55 вне допустимого: от ×8 до ×54")
     );
     assert_eq!(sim.writes, 0);
     assert_eq!(limits.current(), measured_current().as_slice());
@@ -1086,15 +1113,18 @@ fn set_refuses_values_outside_the_range_with_the_csharp_text() {
 
 #[test]
 fn set_accepts_both_ends_of_the_range() {
-    // Tuning.cs Set: any value of Choices is written; inventory 4.3: up to +4 above factory without confirmation.
+    // Tuning.cs Set: any value of Choices is written; DECISIONS #31: the ends are x8 and fused. Each write moves the
+    // ceiling (core 12 boots at ×53 under its fused ×54; the others go down to x8 and back up to fused), so a write
+    // that never reached the CPU would show.
     let topo = hx();
     let mut sim = SimCpu::new(&topo);
     let mut limits = read_limits(&mut sim, &topo);
-    for (core, ratio) in [(0, 57), (1, 39), (12, 58), (2, 50), (6, 32)] {
+    for (core, ratio) in [(12, 54), (1, 8), (6, 8), (1, 53), (6, 46)] {
         assert_eq!(limits.set(&mut sim, &topo, core, ratio), None, "core {core} ×{ratio}");
         assert_eq!(limits.current()[core], ratio);
         assert_eq!(i32::from(sim.current()[core]), ratio);
     }
+    assert_eq!(sim.writes, 5);
 }
 
 #[test]
@@ -1130,7 +1160,7 @@ fn apply_writes_only_the_blocks_that_differ() {
     let mut ratios = measured_current();
     ratios[0] = 50;
     ratios[6..=9].fill(40);
-    ratios[12] = 55;
+    ratios[12] = 54; // its fused maximum, the highest allowed since DECISIONS #31
     assert_eq!(limits.apply(&mut sim, &topo, &ratios), None);
     assert_eq!(sim.writes, 3);
     assert_eq!(limits.current(), ratios.as_slice());
@@ -1462,7 +1492,8 @@ fn a_failure_after_a_safe_profile_is_noted_and_the_profile_applied() {
 #[test]
 fn every_failure_kind_counts_and_nothing_else_does() {
     // Profile.cs FailureEvents and FirstEvent names; WHEA 17 deliberately excluded; events before `applied` do not count;
-    // DECISIONS #31: Kernel-Power 42 ends a trial stretch but is not a failure.
+    // DECISIONS #31: Kernel-Power 42 ends a trial stretch but is not a failure. Not a failure -> the profile is applied
+    // as far as allowed (DECISIONS #31: its ×56 is refused, the rest stands).
     let cases = [
         (
             event(KERNEL_POWER, 41, 1, at("12:30")),
@@ -1481,7 +1512,8 @@ fn every_failure_kind_counts_and_nothing_else_does() {
     ];
     for (i, (e, name)) in cases.iter().enumerate() {
         let mut rig = Rig::with(&format!("start-kind-{i}"), &draft(profile::TRIAL, &risky()), |_| {});
-        let p = rig.startup(&journal(&[*e])).profile.expect("the profile is reported");
+        let out = rig.startup(&journal(&[*e]));
+        let p = out.profile.expect("the profile is reported");
         if let Some(name) = name {
             let text = format!("{name} 14.10 12:30 — после применения профиля 14.10 10:00");
             assert_eq!(p.failure.as_deref(), Some(text.as_str()), "{e:?}");
@@ -1489,22 +1521,28 @@ fn every_failure_kind_counts_and_nothing_else_does() {
             assert!(rig.bench.tells.is_empty(), "{e:?}");
         } else {
             assert_ne!(p.state.as_deref(), Some(profile::FAILED), "{e:?} is not a failure");
-            assert_eq!(rig.bench.current_i32(), risky(), "{e:?}: the profile is applied");
+            assert_eq!(
+                rig.bench.current_i32(),
+                risky_applied(),
+                "{e:?}: the profile is applied"
+            );
+            assert_eq!(out.note.as_deref(), Some(RISKY_NOTE), "{e:?}");
         }
     }
 }
 
 #[test]
 fn a_failure_after_a_clean_shutdown_is_not_the_profiles() {
-    // Profile.Startup: a failure counts only if no 6006 came before it (same Windows session).
+    // Profile.Startup: a failure counts only if no 6006 came before it (same Windows session). The only note is the
+    // refusal of the ×56 (DECISIONS #31), not a failure.
     let mut rig = Rig::with("start-after-6006", &draft(profile::TRIAL, &risky()), |_| {});
     let log = journal(&[
         event(EVENT_LOG, 6006, 4, at("11:00")),
         event(KERNEL_POWER, 41, 1, at("12:30")),
     ]);
     let out = rig.startup(&log);
-    assert_eq!(out.note, None);
-    assert_eq!(rig.bench.current_i32(), risky());
+    assert_eq!(out.note.as_deref(), Some(RISKY_NOTE));
+    assert_eq!(rig.bench.current_i32(), risky_applied());
     let p = out.profile.expect("the profile is reported");
     assert_eq!(p.state.as_deref(), Some(profile::TRIAL));
     assert_eq!(p.boots, 1);
@@ -1564,7 +1602,8 @@ fn an_unreadable_log_blocks_a_risky_profile_only() {
 #[test]
 fn trial_counting_and_the_way_to_trusted() {
     // Profile.Startup: only in "trial": Boots++; Hours += stretch end - Applied; trusted at Boots >= 1 and Hours >= 3.
-    // DECISIONS #31 (a): the stretch ends at the first 6006 or Kernel-Power 42 after `applied`.
+    // DECISIONS #31 (a): the stretch ends at the first 6006 or Kernel-Power 42 after `applied`. DECISIONS #31 (15.10):
+    // the profile's ×56 is refused, so it is applied without it, noted, and no time of application is reported.
     let shutdown = |hhmm| event(EVENT_LOG, 6006, 4, at(hhmm));
     let hibernate = |hhmm| event(KERNEL_POWER, 42, 4, at(hhmm));
     let cases = [
@@ -1654,19 +1693,21 @@ fn trial_counting_and_the_way_to_trusted() {
         assert_eq!(p.state.as_deref(), Some(state_after), "{why}");
         assert_eq!(p.applied, morning(), "{why}");
         assert_eq!(rig.on_disk(), p, "{why}: the counters are written");
-        assert_eq!(rig.bench.current_i32(), risky(), "{why}: applied");
-        assert_eq!(out.at_startup.as_deref(), Some("09:00"), "{why}");
+        assert_eq!(rig.bench.current_i32(), risky_applied(), "{why}: applied");
+        assert_eq!(out.note.as_deref(), Some(RISKY_NOTE), "{why}");
+        assert_eq!(out.at_startup, None, "{why}");
     }
 }
 
 #[test]
 fn applied_is_written_before_the_cpu_is() {
     // Profile.cs 160-163: the time stamp goes to disk before the CPU write, so a hang right after it is blamed on this
-    // application, not the previous one.
+    // application, not the previous one. The profile is applied without its refused ×56 (DECISIONS #31).
     let mut rig = Rig::with("start-order", &draft(profile::TRIAL, &risky()), |_| {});
     rig.bench.peek = Some(rig.store.profile_path());
     let out = rig.startup(&journal(&[]));
-    assert_eq!(out.at_startup.as_deref(), Some("09:00"));
+    assert_eq!(out.note.as_deref(), Some(RISKY_NOTE));
+    assert_eq!(rig.bench.current_i32(), risky_applied());
     let first = rig.bench.peeked.first().expect("the CPU was written");
     let seen: serde_json::Value = serde_json::from_str(first).expect("profile.json was whole at the first CPU write");
     assert_eq!(
@@ -1935,7 +1976,8 @@ fn sets_of_another_cpu_are_none_and_damaged_sets_are_an_error() {
 #[test]
 fn save_records_what_stands_and_starts_a_trial_only_above_factory() {
     // Profile.Save: Ratios = Current, Saved = Applied = now, Boots 0, Hours 0, Failure null,
-    // State = Risky ? trial : trusted, Write().
+    // State = Risky ? trial : trusted, Write(). Since DECISIONS #31 the program itself never writes above fused, so a
+    // ×56 can stand only if another program put it there; save still records what stands and starts a trial.
     let mut rig = Rig::new("save", |_| {});
     let p = profile::save(&rig.store, &rig.limits, "заводской", morning()).expect("saved");
     assert_eq!(p.name, "заводской");
@@ -1946,8 +1988,10 @@ fn save_records_what_stands_and_starts_a_trial_only_above_factory() {
     assert!(p.hours.abs() < 1e-12);
     assert_eq!(rig.on_disk(), p);
 
-    assert_eq!(rig.limits.set(&mut rig.bench, &rig.topo, 12, 56), None);
+    rig.bench.current[12] = 56; // another program's write, past this library's range check
+    assert_eq!(rig.limits.refresh(&mut rig.bench, &rig.topo), None);
     let p = profile::save(&rig.store, &rig.limits, "разгон", morning()).expect("saved");
+    assert_eq!(p.ratios[12], 56, "what stands is recorded as it is");
     assert_eq!(p.state.as_deref(), Some(profile::TRIAL), "×56 over a fused ×54");
     assert_eq!(rig.on_disk(), p);
 }

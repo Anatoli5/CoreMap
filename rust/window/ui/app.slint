@@ -179,7 +179,9 @@ export component AppWindow inherits Window {
     out property <length> entry-h: 26px;
     property <length> menu-w: 250px;
     out property <length> menu-left: min(root.menu-x, root.width - root.menu-w);
-    out property <length> menu-top: max(0px, min(root.menu-y, root.height - root.menu-head-h - 8px - root.menu-entries.length * root.entry-h));
+    // Меню выше окна (потолок опускается до ×8 — до 50 строк) прокручивается внутри окна.
+    out property <length> menu-h: min(root.menu-head-h + root.menu-entries.length * root.entry-h + 4px, root.height - 16px);
+    out property <length> menu-top: max(0px, min(root.menu-y, root.height - root.menu-h - 8px));
 
     // Верхняя полоса
     Rectangle {
@@ -291,7 +293,7 @@ export component AppWindow inherits Window {
         x: root.menu-left;
         y: root.menu-top;
         width: root.menu-w;
-        height: root.menu-head-h + root.menu-entries.length * root.entry-h + 4px;
+        height: root.menu-h;
         background: Palette.panel;
         border-color: Palette.cell;
         border-width: 1px;
@@ -306,6 +308,9 @@ export component AppWindow inherits Window {
                 Text { text: root.menu-title; color: Palette.dim; vertical-alignment: center; }
             }
             Rectangle { height: 1px; background: Palette.cell; }
+            Flickable {
+            content-height: root.menu-entries.length * root.entry-h;
+            VerticalLayout {
             for entry in root.menu-entries: Rectangle {
                 height: root.entry-h;
                 background: touch.has-hover && !root.busy ? Palette.cell : transparent;
@@ -324,6 +329,8 @@ export component AppWindow inherits Window {
                         root.menu-shown = false;
                     }
                 }
+            }
+            }
             }
         }
     }

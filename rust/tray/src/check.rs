@@ -599,7 +599,18 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     //     выбранного, держа аренду и метку; стартующему прежнему окну возвращает принятые и отпускает аренду; остыв —
     //     возвращается по одной ступени.
     let accepted = app.intended().map(<[i32]>::to_vec).unwrap_or_default();
-    let block = app.topology().blocks[1].clone(); // P-ядро 1: при принятом потолке нагрев имитации выше 75 °C
+    // Горячий блок — с самым высоким принятым потолком (кроме кластера 2–5: ему ниже чужая правка): нагрев имитации
+    // 40 + (потолок − 20) · 1,5 выше 75 °C с ×44. Профиль — копия файлов владельца, номер блока заранее не известен
+    // (15.10 его csmart2 поставил ядру 1 ×43 — 74,5 °C, и проверка с жёстко взятым блоком 1 перестала греть).
+    let block = app
+        .topology()
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != 2)
+        .max_by_key(|&(_, b)| accepted.get(b.first).copied().unwrap_or(0))
+        .map_or_else(|| app.topology().blocks[1].clone(), |(_, b)| b.clone());
+    let lowered = format!("автомодуль: блок {} возвращён", block.name);
     let first = block.first;
     let marker = data.join("auto-held.json");
     app.command(shell, AUTO_ON);
@@ -626,7 +637,8 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     r.check(
         lowest < base && lowest >= floor && (heat <= 75.0 || lowest == floor),
         &format!(
-            "автомодуль: горячий блок 1 опущен ×{base} → ×{lowest} ({heat:.1} °C при пределе 75, не глубже ×{floor})"
+            "автомодуль: горячий блок {} опущен ×{base} → ×{lowest} ({heat:.1} °C при пределе 75, не глубже ×{floor})",
+            block.name
         ),
     );
     let now = ceilings_now(app);
@@ -644,7 +656,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     );
     let tip = app.tip();
     r.check(
-        tip.contains(&format!("авто: до 75 °C · 1 −{}", base - lowest)),
+        tip.contains(&format!("авто: до 75 °C · {} −{}", block.name, base - lowest)),
         &format!("автомодуль: подсказка ({})", tip.replace('\n', " / ")),
     );
     let window = hold(&names.old_window);
@@ -698,7 +710,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
             sim.load[m] = 0.0;
         }
     }
-    let raised = logged(app, "автомодуль: блок 1 возвращён");
+    let raised = logged(app, &lowered);
     pump_until(shell, app, Duration::from_secs(12), |a| {
         ceilings_now(a).get(first) == Some(&base)
     });
@@ -706,7 +718,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
         ceilings_now(app).get(first) == Some(&base),
         "автомодуль: остывший блок вернулся к принятому",
     );
-    let steps = logged(app, "автомодуль: блок 1 возвращён") - raised;
+    let steps = logged(app, &lowered) - raised;
     r.check(
         usize::try_from(base - again).is_ok_and(|n| n == steps),
         &format!("автомодуль: по одной ступени ({steps} из ×{again} в ×{base})"),

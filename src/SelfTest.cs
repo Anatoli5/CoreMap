@@ -183,10 +183,16 @@ namespace CoreMap
             Check(notice != null && notice.Contains(first.Name + " ×" + before[first.First]), "метка: владельцу сказано (" + notice + ")");
             Check(new LimitHold(limits, blocks, lps, cpu, dir).Recover() == null, "метка: без метки ничего не делается");
 
-            // 8. То же, но до измерения потолок был выше заводского: сам он не возвращается.
+            // 8. То же, но в метке потолок выше заводского: сам он не возвращается. Поставить такой потолок программа
+            // больше не даёт (DECISIONS #31, «никаких плюсов»), а метка от прежней сборки могла его хранить —
+            // поэтому метка пишется сюда напрямую, в том виде, в каком её пишет LimitHold.
             int over = limits.Fused[first.First] + 1, step = limits.Fused[first.First] - 7;
-            limits.Set(first.First, over);
-            new LimitHold(limits, blocks, lps, cpu, dir).Take();
+            int[] held = (int[])limits.Current.Clone();
+            foreach (int m in first.Members) held[m] = over;
+            Json.WriteFile(mark, new Dictionary<string, object>
+            {
+                { "cpu", cpu }, { "time", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") }, { "lps", lps }, { "limits", held },
+            });
             limits.Set(first.First, step);
             notice = new LimitHold(limits, blocks, lps, cpu, dir).Recover();
             Check(limits.Of(first) == step && !File.Exists(mark), "метка: выше заводского не поднимает, метка убрана");
