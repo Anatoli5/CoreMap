@@ -106,6 +106,9 @@ namespace CoreMap
 
         public bool Known(int index) { return Fused[index] > 0; }
 
+        /// Настоящий процессор, а не имитация в памяти.
+        public bool Real { get { return io != null; } }
+
         /// Действующий потолок блока: он у блока общий и читается по первому ядру.
         public int Of(Block block) { return Current[block.First]; }
 

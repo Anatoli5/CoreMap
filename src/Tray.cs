@@ -240,7 +240,10 @@ namespace CoreMap
 
     static class Tray
     {
-        const string WindowClass = "CoreMap.Tray";      // по нему окно программы находит резидента
+        const string WindowClass = "CoreMap.Tray";      // по нему окно программы находит резидента и движок
+        // Программа входа на Rust (CoreMapTray.exe, rust\tray; DECISIONS #31): ей окно сообщает о своём запуске,
+        // выключатель автозапуска запускает и закрывает её.
+        const string LogonClass = "CoreMap.Logon";
         const string CheckClass = "CoreMap.Tray.Check"; // скрытая проверка: её окно программа за резидента не примет
         const string Single = "Local\\CoreMap.Tray";    // одна копия резидента; у окна программы одиночка своя
         const uint IconMessage = 0x8001;                // от значка: lParam — что сделала мышь
@@ -275,14 +278,21 @@ namespace CoreMap
         static bool newPending;                // новое окно просили открыть, а прежнее ещё открыто: откроется, когда оно закроется
         static bool onDemand;                  // запущен кнопкой «новое окно» на время настройки: после неё выходит (DECISIONS #30)
         static int launches;                   // скрытая проверка: сколько раз новое окно было бы открыто
+        static int afterProcess;               // процесс прежнего окна, запустившего движок кнопкой (--after); 0 — нет
+        // Движок на время настройки открыл новое окно и ждёт, что оно подключится. Не подключилось к этому сроку
+        // (Smart App Control не пустил CoreMapWindow.exe, окно упало при запуске) — движок говорит об этом и выходит,
+        // а не висит до «Выхода» из меню значка (DECISIONS #31). Бесконечность — не ждёт.
+        const double AttachWithin = 60, ExitAfterTelling = 8;
+        static double attachBy = double.PositiveInfinity, exitAt = double.PositiveInfinity;
 
         /// Режим --tray. snapshot — скрытая проверка (только с --simulate): значка нет, резидент проходит запуск
         /// на имитации, пишет отчёт в файл и выходит; saved — с копией сохранённых профилей из data\.
         /// bridge — роль движка (--bridge): резидент ещё и слушает канал моста и держит Core, пока тот нужен;
         /// limit — свой защитный предел температуры для этого Core; open — сразу открыть новое окно (его просит
         /// кнопка прежнего окна, которое после этого закрывается).
-        public static int Run(bool simulated, string snapshot, bool saved, bool bridge = false, int limit = 0, bool open = false)
+        public static int Run(bool simulated, string snapshot, bool saved, bool bridge = false, int limit = 0, bool open = false, int after = 0)
         {
+            afterProcess = after;
             if (snapshot != null && !simulated) return 1;  // проверка на настоящем процессоре не предусмотрена
             simulate = simulated;
             hidden = snapshot != null;
@@ -293,6 +303,10 @@ namespace CoreMap
             using (hidden ? null : new Mutex(true, Single, out first))
             {
                 if (!first) return 0;  // резидент уже есть
+                // Программа входа на Rust узнаёт о движке сразу, а не при следующем взгляде на свой значок: иначе
+                // при позднем старте движка она вернула бы себе право на потолки раньше времени (DECISIONS #31,
+                // outputs/review-ownership-2026-10-14.md M3).
+                if (bridge && !hidden) AnnounceTo(LogonClass);
                 string temp = null;
                 try
                 {
@@ -311,7 +325,7 @@ namespace CoreMap
                         // Резидента запустили при открытом окне (выключателем в нём): метку и профиль при своём
                         // запуске уже отработало оно, а посреди его измерения метка — не признак обрыва.
                         applied = true;
-                        WatchRunning();
+                        WatchOldWindow();
                     }
                     else Reload();
                     if (bridge) StartEngine();
@@ -442,22 +456,28 @@ namespace CoreMap
             return true;
         }
 
-        /// Окно программы сообщает резиденту, что запустилось. Зовёт окно (Program.cs).
+        /// Окно программы сообщает резиденту и программе входа, что запустилось. Зовёт окно (Program.cs).
         public static void Announce()
         {
-            IntPtr tray = FindWindow(WindowClass, null);
+            AnnounceTo(WindowClass);
+            AnnounceTo(LogonClass);
+        }
+
+        static void AnnounceTo(string name)
+        {
+            IntPtr tray = FindWindow(name, null);
             if (tray != IntPtr.Zero) PostMessage(tray, WindowOpened, (IntPtr)GetCurrentProcessId(), IntPtr.Zero);
         }
 
-        /// Запускает резидента сейчас, если его ещё нет. Зовёт окно, когда владелец включает резидента:
+        /// Запускает программу входа сейчас, если её ещё нет. Зовёт окно, когда владелец включает запуск при входе:
         /// иначе значок появился бы только после следующего входа в Windows. null — сделано.
         public static string Launch()
         {
-            if (FindWindow(WindowClass, null) != IntPtr.Zero) return null;
+            if (FindWindow(LogonClass, null) != IntPtr.Zero) return null;
             try
             {
                 // Окно работает с правами администратора, поэтому запроса Windows не будет.
-                using (Process.Start(new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Program.Root })) { }
+                using (Process.Start(new ProcessStartInfo(Autostart.Logon) { UseShellExecute = false, WorkingDirectory = Program.Root })) { }
                 return null;
             }
             catch (Exception e) { return "значок не запущен: " + Program.Why(e); }
@@ -477,7 +497,7 @@ namespace CoreMap
             try
             {
                 // Прежнее окно работает с правами администратора, резидент их унаследует: запроса Windows не будет.
-                using (Process.Start(new ProcessStartInfo(Exe, (simulated ? "--simulate " : "") + "--tray --bridge --open")
+                using (Process.Start(new ProcessStartInfo(Exe, (simulated ? "--simulate " : "") + "--tray --bridge --open --after " + GetCurrentProcessId())
                     { UseShellExecute = false, WorkingDirectory = Program.Root })) { }
                 return null;
             }
@@ -493,7 +513,7 @@ namespace CoreMap
             if (OldWindowOpen())
             {
                 newPending = true;
-                if (watched == IntPtr.Zero) WatchRunning();  // ждать конца его процесса, чтобы открыть новое вовремя
+                if (watched == IntPtr.Zero) WatchOldWindow();  // ждать конца его процесса, чтобы открыть новое вовремя
                 return;
             }
             LaunchNewWindow();
@@ -513,7 +533,11 @@ namespace CoreMap
             Process[] running = Process.GetProcessesByName("CoreMapWindow");
             foreach (Process p in running) p.Dispose();
             if (running.Length > 0) return;
-            try { CoreMap.Launch.Unelevated(file, ""); }
+            try
+            {
+                CoreMap.Launch.Unelevated(file, "");
+                if (onDemand) attachBy = Native.Now() + AttachWithin;
+            }
             catch (Exception e)
             {
                 Program.Log("резидент, запуск нового окна: " + e);
@@ -521,11 +545,11 @@ namespace CoreMap
             }
         }
 
-        /// Просит резидента выйти. Зовёт окно, когда владелец выключает резидента.
+        /// Просит программу входа выйти. Зовёт окно, когда владелец выключает запуск при входе.
         public static void Dismiss()
         {
             const uint Close = 0x10;
-            IntPtr tray = FindWindow(WindowClass, null);
+            IntPtr tray = FindWindow(LogonClass, null);
             if (tray != IntPtr.Zero) PostMessage(tray, Close, IntPtr.Zero, IntPtr.Zero);
         }
 
@@ -539,6 +563,15 @@ namespace CoreMap
             if (watched == IntPtr.Zero) return;  // не открылся — открытое окно всё равно видно по мьютексу перед каждым действием
             resident.WindowOpen = true;
             ShowTip();
+        }
+
+        /// Прежнее окно, запустившее движок кнопкой «новое окно», назвало номер своего процесса (--after): ждать
+        /// его. Найти окно по видимому окну процесса нельзя — закрываясь, оно уже спрятано, а процесс ещё жив, и
+        /// движок ждал бы вечно (ревизия M1). Номера нет — искать, как раньше.
+        static void WatchOldWindow()
+        {
+            if (afterProcess != 0) Watch(afterProcess);
+            if (watched == IntPtr.Zero) WatchRunning();
         }
 
         /// Окно программы открыто, а о себе не сообщило (резидент запущен позже него): найти его процесс.
@@ -815,6 +848,8 @@ namespace CoreMap
                     DispatchMessage(ref m);
                 }
                 uint wait = retries > 0 ? RetryAfter : Infinite;
+                double deadline = Math.Min(attachBy, exitAt);
+                if (!double.IsInfinity(deadline)) wait = (uint)Math.Max(1, Math.Min(wait, (deadline - Native.Now()) * 1000));
                 if (!double.IsInfinity(until))
                 {
                     double left = until - Native.Now();
@@ -825,6 +860,13 @@ namespace CoreMap
                 uint count = watched != IntPtr.Zero ? 1u : 0u;
                 uint result = MsgWaitForMultipleObjectsEx(count, waits, wait, AnyInput, InputAvailable);
                 if (result == 0 && count == 1) WindowClosed();
+                else if (result == Timeout && Native.Now() >= exitAt)
+                {
+                    exitAt = double.PositiveInfinity;
+                    // За время сообщения окно могло подключиться: тогда движок остаётся (ревизия M5).
+                    if (engine == null || !engine.Alive && !newPending && !OldWindowOpen()) DestroyWindow(window);
+                }
+                else if (result == Timeout && Native.Now() >= attachBy) Unattached();
                 else if (result == Timeout && retries > 0) Retry();
                 else if (result == Infinite)
                 {
@@ -833,6 +875,18 @@ namespace CoreMap
                     else Thread.Sleep(1000);
                 }
             }
+        }
+
+        /// Срок вышел: к движку на время настройки так и не подключилось окно. Подключилось — ждать больше нечего.
+        static void Unattached()
+        {
+            attachBy = double.PositiveInfinity;
+            // Ждёт закрытия прежнего окна (окно на Rust получило отказ «закрой его, и это окно подключится») —
+            // обещание надо сдержать, срок отсчитается заново при запуске окна (ревизия L1).
+            if (!onDemand || engine == null || engine.Alive || newPending || OldWindowOpen()) return;
+            Program.Log("движок: новое окно не подключилось за " + AttachWithin + " с — движок закрывается");
+            Notify("Новое окно не подключилось к движку за минуту — движок закрывается. Причина может быть в Smart App Control: см. журнал CodeIntegrity");
+            exitAt = Native.Now() + ExitAfterTelling;  // всплывающее сообщение успевает показаться до ухода значка
         }
 
         // ----- скрытая проверка -----

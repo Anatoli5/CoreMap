@@ -1,0 +1,30 @@
+[package]
+name = "coremap-tray"
+version = "0.1.0"
+edition = "2024"
+description = "CoreMap's logon program: applies the startup profile, switches profiles from the tray, repairs ceilings after sleep."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "CoreMapTray"
+path = "src/main.rs"
+
+[dependencies]
+machine = { package = "coremap-machine", path = "../machine" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

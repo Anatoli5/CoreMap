@@ -121,13 +121,15 @@ namespace CoreMap
         {
             Read();
             if (!Exists || State == Failed || InEffect) return;
-            DateTime? cleanShutdown = null;
+            DateTime? cleanShutdown = null, stretchEnd = null;
             try
             {
                 DateTime failedAt;
                 string failure = FirstEvent(Applied, FailureEvents, out failedAt);
                 DateTime stoppedAt;
                 if (FirstEvent(Applied, "(Provider[@Name='EventLog'] and EventID=6006)", out stoppedAt) != null) cleanShutdown = stoppedAt;
+                DateTime endedAt;
+                if (FirstEvent(Applied, StretchEnd, out endedAt) != null) stretchEnd = endedAt;
                 // Сбой относится к профилю, только если случился в том же сеансе Windows, где профиль
                 // применили: до первого штатного завершения работы.
                 if (failure != null && !(cleanShutdown.HasValue && cleanShutdown.Value < failedAt))
@@ -154,7 +156,7 @@ namespace CoreMap
             if (State == Trial)
             {
                 Boots++;
-                if (cleanShutdown.HasValue) Hours += Math.Max(0, (cleanShutdown.Value - Applied).TotalHours);
+                if (stretchEnd.HasValue) Hours += Math.Max(0, (stretchEnd.Value - Applied).TotalHours);
                 if (Boots >= TrialBoots && Hours >= TrialHours) State = Trusted;
             }
             // Отметка времени пишется до записи в процессор: если машина зависнет сразу после неё, следующий запуск
@@ -166,6 +168,13 @@ namespace CoreMap
             else AtStartup = DateTime.Now.ToString("HH:mm");
             Write();
         }
+
+        // Конец отрезка, который идёт в часы пробного профиля: штатное завершение работы или уход в S4 — быстрое
+        // выключение либо гибернация (Kernel-Power 42). При быстром запуске событие 6006 не пишется (измерено: 10 из 23
+        // загрузок за 20 дней), и часы набирались только после полного выключения. Сбой же относится к профилю, как и
+        // прежде, до первого 6006: событие 42 пишет и гибернация, а сбой после пробуждения из неё идёт в счёт профиля.
+        // То же правило — в программе входа на Rust (rust\machine\src\profile.rs), DECISIONS #31.
+        const string StretchEnd = "(Provider[@Name='EventLog'] and EventID=6006) or (Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=42)";
 
         const string FailureEvents =
             "(Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41) or " +

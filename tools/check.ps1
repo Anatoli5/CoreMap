@@ -106,6 +106,13 @@ $procs += Start-Process -FilePath $out -ArgumentList "--simulate --tray --saved 
 # Hover on the curve graph without a mouse (MainForm.HoverCheck): the cursor is put on every point twice, with a
 # repaint after each; the highlighted block must not change, the point must stay under the cursor and have a tooltip.
 # First line of the report: ok / FAILED.
+# The logon program (rust\tray, CoreMapTrayNew.exe here; DECISIONS #31) on simulated ceilings, a temp copy of the
+# saved profiles and check-only names for every Windows object: no tray icon, no rights. It walks who may write ceilings
+# when (old window, engine, lease), the marker after a broken measurement, repair after sleep, a foreign change, its
+# menu as Windows holds it, and its own memory and idle CPU. First line of the report: ok / FAILED.
+$logon = Join-Path $dir 'logon.txt'
+$procs += Start-Process -FilePath (Join-Path $root 'CoreMapTrayNew.exe') -ArgumentList "--simulate --saved --snapshot $logon" -PassThru
+
 $hover = Join-Path $dir 'hover.txt'
 $procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover --snapshot $hover --size 1920x1040" -PassThru
 
@@ -150,6 +157,13 @@ elseif ((Get-Content $tray -TotalCount 1) -ne 'ok') {
     Select-String -Path $tray -Pattern '^FAILED' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
     $failed++
 }
+$logged = Get-Item $logon -ErrorAction SilentlyContinue
+if (-not $logged -or $logged.LastWriteTime -lt $stamp) { Write-Host 'no logon program report'; $failed++ }
+elseif ((Get-Content $logon -TotalCount 1) -ne 'ok') {
+    Write-Host "logon program check failed, see $logon"
+    Select-String -Path $logon -Pattern '^FAILED' -Encoding UTF8 | ForEach-Object { Write-Host $_.Line }
+    $failed++
+}
 $hovered = Get-Item $hover -ErrorAction SilentlyContinue
 if (-not $hovered -or $hovered.LastWriteTime -lt $stamp) { Write-Host 'no hover report'; $failed++ }
 elseif ((Get-Content $hover -TotalCount 1) -ne 'ok') {
@@ -158,5 +172,5 @@ elseif ((Get-Content $hover -TotalCount 1) -ne 'ok') {
     $failed++
 }
 if ($failed -gt 0) { exit 2 }
-Write-Host "snapshots, self-test, resident, hover and bridge checks ok: $dir"
+Write-Host "snapshots, self-test, resident, logon program, hover and bridge checks ok: $dir"
 exit 0

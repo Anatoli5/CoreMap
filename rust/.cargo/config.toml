@@ -1,0 +1,14 @@
+# The C runtime goes into each exe (static CRT). Without it a Rust exe built with MSVC imports VCRUNTIME140.dll,
+# which is not part of Windows: on a PC without the Visual C++ runtime the program would not start (measured on
+# CoreMapWindow.exe with dumpbin /dependents, 14.10; KNOWLEDGE.md, machine section). The owner's rule: the end user
+# installs nothing.
+#
+# The target is named explicitly so that the flag applies to the programs only, not to build scripts and procedural
+# macros (Cargo applies target rustflags to host artifacts when no target is given). Those stay as they were built and
+# already allowed by Smart App Control: with the flag on them every build script became a new file, and Smart App
+# Control refused two of Slint's (14.10 about 20:55, os error 4551). Output folder: target\x86_64-pc-windows-msvc\.
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

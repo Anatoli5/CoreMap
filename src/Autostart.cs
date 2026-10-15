@@ -1,4 +1,5 @@
-// Запуск резидента (CoreMap.exe --tray) при входе в Windows: задание в планировщике.
+// Запуск программы входа (CoreMapTray.exe, на Rust: rust\tray; DECISIONS #31) при входе в Windows: задание в
+// планировщике. Прежний резидент (CoreMap.exe --tray) заданием больше не запускается.
 //
 // Почему планировщик: программе нужны права администратора, а обычная автозагрузка (папка, реестр) такую
 // программу при входе не запускает — Windows не показывает запрос прав без действия человека. Задание с
@@ -25,9 +26,10 @@ namespace CoreMap
         const int CreateOrUpdate = 6, InteractiveToken = 3;
         const int NotFound = unchecked((int)0x80070002);
 
-        static string Exe { get { return typeof(Autostart).Assembly.Location; } }
+        /// Программа входа рядом с CoreMap.exe.
+        public static string Logon { get { return Path.Combine(Program.Root, "CoreMapTray.exe"); } }
 
-        /// Описание задания. exe — что запускать (с ключом --tray), user — идентификатор (SID) того, при чьём входе.
+        /// Описание задания. exe — что запускать (без ключей), user — идентификатор (SID) того, при чьём входе.
         public static string Xml(string exe, string user)
         {
             Func<string, string> text = SecurityElement.Escape;
@@ -79,7 +81,6 @@ namespace CoreMap
                 "  <Actions Context=\"Author\">",
                 "    <Exec>",
                 "      <Command>\"" + text(exe) + "\"</Command>",
-                "      <Arguments>--tray</Arguments>",
                 "      <WorkingDirectory>" + text(Path.GetDirectoryName(exe)) + "</WorkingDirectory>",
                 "    </Exec>",
                 "  </Actions>",
@@ -115,14 +116,14 @@ namespace CoreMap
             return definition;
         }
 
-        /// Запускает ли описание задания этот файл программы резидентом.
+        /// Запускает ли описание задания этот файл программы входа (без ключей).
         public static bool Runs(object definition, string exe)
         {
             object actions = Get(definition, "Actions");
             if ((int)Get(actions, "Count") != 1) return false;
             object action = Get(actions, "Item", 1);
             string path = ((string)Get(action, "Path") ?? "").Trim().Trim('"'), arguments = ((string)Get(action, "Arguments") ?? "").Trim();
-            return string.Equals(path, exe, StringComparison.OrdinalIgnoreCase) && arguments == "--tray";
+            return string.Equals(path, exe, StringComparison.OrdinalIgnoreCase) && arguments == "";
         }
 
         /// Ошибка вызова планировщика приходит обёрнутой: причина — внутри.
@@ -139,7 +140,7 @@ namespace CoreMap
             try
             {
                 object task = Call(Call(Service(), "GetFolder", "\\"), "GetTask", name);
-                return (bool)Get(task, "Enabled") && Runs(Get(task, "Definition"), Exe);
+                return (bool)Get(task, "Enabled") && Runs(Get(task, "Definition"), Logon);
             }
             catch (Exception e)
             {
@@ -152,9 +153,10 @@ namespace CoreMap
         /// Создаёт задание (или перезаписывает прежнее). null — сделано; иначе причина отказа.
         public static string Enable()
         {
+            if (!File.Exists(Logon)) return "запуск при входе не включён: рядом с программой нет CoreMapTray.exe";
             try
             {
-                string xml = Xml(Exe, WindowsIdentity.GetCurrent().User.Value);
+                string xml = Xml(Logon, WindowsIdentity.GetCurrent().User.Value);
                 // Кто и как запускает, сказано в самом описании; имя и пароль пусты.
                 Call(Call(Service(), "GetFolder", "\\"), "RegisterTask", TaskName, xml, CreateOrUpdate, null, null, InteractiveToken);
                 return null;

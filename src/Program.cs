@@ -34,7 +34,9 @@
 //                           подключено окно или идёт измерение (Engine.cs)
 // CoreMap.exe --tray --bridge --open   движок на время настройки: его запускает кнопка «новое окно» прежнего
 //                           окна (MainForm.NewWindow.cs). Открывает CoreMapWindow.exe без прав, когда прежнее окно
-//                           закрылось, и выходит сам, когда новое окно закрыто и измерения нет (Tray.cs)
+//                           закрылось, и выходит сам, когда новое окно закрыто и измерения нет (Tray.cs);
+//                           --after N — процесс прежнего окна, конца которого ждать. Его же запускает пункт
+//                           «Новое окно» программы входа CoreMapTray.exe (rust\tray)
 // CoreMap.exe --simulate --tray --bridge --snapshot F   проверка движка и моста: к резиденту на имитации
 //                           подключается вторая копия программы и проходит по протоколу как окно; Core создаётся
 //                           и останавливается, мерится память резидента до, во время и после; отчёт — в файл F
@@ -86,6 +88,13 @@ namespace CoreMap
             catch (Exception) { return "неизвестна"; }
         }
         public static string DataDir = Path.Combine(Root, "data");  // проверка --selftest подставляет временную папку
+
+        /// --after N: номер процесса прежнего окна, запустившего движок кнопкой «новое окно» (Tray.WatchOldWindow); 0 — нет.
+        static int After(string[] args)
+        {
+            int at = Array.IndexOf(args, "--after"), process;
+            return at >= 0 && at + 1 < args.Length && int.TryParse(args[at + 1], out process) ? process : 0;
+        }
 
         public static void Log(string text)
         {
@@ -210,7 +219,7 @@ namespace CoreMap
                 int guard;
                 int.TryParse(Option(args, "--limit"), out guard);
                 return Tray.Run(simulate, snapshot, Array.IndexOf(args, "--saved") >= 0, Array.IndexOf(args, "--bridge") >= 0, guard,
-                    Array.IndexOf(args, "--open") >= 0);
+                    Array.IndexOf(args, "--open") >= 0, After(args));
             }
             return Window(args, simulate);
         }

@@ -1,0 +1,25 @@
+[package]
+name = "coremap-machine"
+version = "0.1.0"
+edition = "2024"
+description = "CoreMap's hardware and safety library: PawnIO, the CPU's OC mailbox, per-core ceilings, topology, profile files, startup rules."
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "machine"
+
+[dependencies]
+serde_json = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_EventLog",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }

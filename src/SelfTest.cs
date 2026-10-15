@@ -353,6 +353,33 @@ namespace CoreMap
 
             TrayScenarios(Path.Combine(dir, "tray"), cores, blocks, lps, cpu);
             AutostartScenarios();
+            LeaseScenarios();
+        }
+
+        /// 15. Аренда потолков (Startup.cs, DECISIONS #31): старт окна ждёт, пока программа входа держит аренду, и не
+        /// ждёт дольше срока. Проверочная метка со своим именем: настоящую программу входа проверка не задевает.
+        static void LeaseScenarios()
+        {
+            string name = LimitsStartup.LeaseName + ".Check." + System.Diagnostics.Process.GetCurrentProcess().Id;
+            var taken = new System.Threading.ManualResetEvent(false);
+            var free = new System.Threading.ManualResetEvent(false);
+            var holder = new System.Threading.Thread(() =>
+            {
+                using (var m = new System.Threading.Mutex(true, name))
+                {
+                    taken.Set();
+                    free.WaitOne();
+                    m.ReleaseMutex();
+                }
+            });
+            holder.Start();
+            taken.WaitOne(2000);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            bool got = LimitsStartup.TakeLease(name, 300);
+            Check(!got && watch.ElapsedMilliseconds >= 250, "аренда: пока её держит программа входа, старт ждёт и по сроку идёт дальше (" + watch.ElapsedMilliseconds + " мс)");
+            free.Set();
+            holder.Join(2000);
+            Check(LimitsStartup.TakeLease(name, 300), "аренда: отпущена — старт её получает");
         }
 
         /// 13. Резидент (Tray.cs) без значка. «Процессор» у него свой, в памяти, и при каждом создании — с
@@ -429,11 +456,11 @@ namespace CoreMap
         /// планировщику; задание при этом не создаётся, и в планировщике ничего не меняется.
         static void AutostartScenarios()
         {
-            const string exe = "C:\\Папка с пробелом & знаком\\CoreMap.exe";
+            const string exe = "C:\\Папка с пробелом & знаком\\CoreMapTray.exe";
             object task = Autostart.Parse(Autostart.Xml(exe, System.Security.Principal.WindowsIdentity.GetCurrent().User.Value));
             object settings = Autostart.Get(task, "Settings"), principal = Autostart.Get(task, "Principal"), triggers = Autostart.Get(task, "Triggers");
-            Check(Autostart.Runs(task, exe) && !Autostart.Runs(task, "C:\\Другая папка\\CoreMap.exe"),
-                "автозапуск: описание задания принято планировщиком, запускает этот файл с --tray");
+            Check(Autostart.Runs(task, exe) && !Autostart.Runs(task, "C:\\Другая папка\\CoreMapTray.exe"),
+                "автозапуск: описание задания принято планировщиком, запускает этот файл программы входа без ключей");
             Check((int)Autostart.Get(triggers, "Count") == 1 && (int)Autostart.Get(Autostart.Get(triggers, "Item", 1), "Type") == 9,
                 "автозапуск: один запуск — при входе в Windows");
             Check((int)Autostart.Get(principal, "RunLevel") == 1 && (int)Autostart.Get(principal, "LogonType") == 3,

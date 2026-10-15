@@ -1,0 +1,5 @@
+// Resources of CoreMapTray.exe (build.rs compiles this with rc.exe).
+// 1 ICON: the CoreMap icon, the tray icon loads it by id 1 (src/shell.rs).
+// 1 24: the application manifest (RT_MANIFEST = 24, id 1 = the process manifest).
+1 ICON "../../assets/coremap.ico"
+1 24 "tray.manifest"

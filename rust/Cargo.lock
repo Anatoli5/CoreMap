@@ -814,6 +814,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coremap-machine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "coremap-tray"
+version = "0.1.0"
+dependencies = [
+ "coremap-machine",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "coremap-window"
 version = "0.1.0"
 dependencies = [

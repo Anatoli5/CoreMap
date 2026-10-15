@@ -1,7 +1,8 @@
-# Rust part of CoreMap (DECISIONS #28). For now one member: the window; the engine follows part by part.
+# Rust part of CoreMap (DECISIONS #28, #31): the window, the logon program (tray) and the library they will share
+# with the engine (machine: hardware access and safety rules). The engine follows part by part.
 # How the code is written and checked: AGENTS.md in this folder.
 [workspace]
-members = ["window"]
+members = ["window", "machine", "tray"]
 resolver = "3"
 
 [profile.release]
