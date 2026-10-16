@@ -61,6 +61,13 @@ const FOLDS: usize = 4;
 const OWN: usize = 1 + TAUS.len();
 /// «°C на ступень» — разница кривой между r + 0,5 и r − 0,5.
 const HALF_STEP: f64 = 0.5;
+/// В модель идут строки не старше 8 ч до самой новой (по времени строк, через все файлы). Зачем: без границы память и
+/// цена подгонки растут с журналом (6 ч строк — 17,5 МБ и 0,2 с на подгонку; 30 дней игры — сотни МБ и секунды каждые
+/// 5 с); последние часы — и есть нынешняя обстановка (консилиум: 20–40 мин на обстановку хватает). 8 ч — около 115 тыс.
+/// строк, ~23 МБ.
+pub const KEEP_MS: i64 = 8 * 3600 * 1000;
+/// Сплошная часть кривой — множители между 5-м и 95-м процентилями по времени (редкие крайние строки — не опыт блока).
+const SOLID: [(u64, u64); 2] = [(5, 100), (95, 100)];
 
 // ----- мощность и средние -----
 
@@ -154,14 +161,15 @@ pub const POWER_CORES: usize = 2;
 /// Строки одного файла срезов по порядку файла — как их оставляет разбор (`samples::Scratch::count_keeping`), второго
 /// чтения файла нет. Только строки по 0,25 с (время с миллисекундами): прежние по 2 с отстоят друг от друга больше
 /// `GAP_MS`, каждая начинала бы средние заново, и ни одна не годилась бы в счёт. Числа — f32 (в файле у них 2–3 знака),
-/// пусто — NaN: множитель, занятость, температура и напряжение блока и мощности процессора и видеокарты строки —
-/// у 275HX 208 байт на строку, 3 МБ на час журнала.
+/// пусто — NaN: множитель, занятость, температура и напряжение блока и мощности процессора, видеокарты и ядер строки —
+/// у 275HX 212 байт на строку, 3 МБ на час журнала. Строки раньше `from` не берутся (граница `KEEP_MS`, `trim`).
 #[derive(Clone, Debug, Default)]
 pub struct Log {
     names: Vec<String>,
     times: Vec<i64>,
     cells: Vec<[f32; 4]>,
     package: Vec<[f32; 3]>,
+    from: Option<i64>,
 }
 
 #[expect(
@@ -203,8 +211,12 @@ impl Log {
     }
 
     /// Строка: время (мс, `samples::row_time`), по блоку — множитель, занятость, температура, напряжение; мощность
-    /// процессора (корпус), видеокарты и ядер процессора (`POWER_CPU`, `POWER_GPU`, `POWER_CORES`).
+    /// процессора (корпус), видеокарты и ядер процессора (`POWER_CPU`, `POWER_GPU`, `POWER_CORES`). Строка раньше
+    /// границы (`admit_from`) не берётся.
     pub fn push(&mut self, at: i64, cells: impl Iterator<Item = [Option<f64>; 4]>, package: [Option<f64>; 3]) {
+        if self.from.is_some_and(|from| at < from) {
+            return;
+        }
         let before = self.cells.len();
         self.cells.extend(cells.map(|c| c.map(stored)));
         // Разбор отдаёт значения каждого блока заголовка — ни больше, ни меньше; иначе строки поедут.
@@ -217,6 +229,44 @@ impl Log {
         self.package.push(package.map(stored));
     }
 
+    /// Время последней строки (мс).
+    #[must_use]
+    pub fn newest(&self) -> Option<i64> {
+        self.times.last().copied()
+    }
+
+    /// Строки раньше `at` дальше не брать (граница только растёт); взятые не трогаются. Дёшево: разбор свежего файла
+    /// после самого нового не держит строки, которые выбросит следующая подгонка.
+    pub fn admit_from(&mut self, at: i64) {
+        self.from = Some(self.from.map_or(at, |from| from.max(at)));
+    }
+
+    /// `admit_from` и выбросить уже взятые строки раньше `at` (порядок остальных тот же). Сдвигает все строки — зовётся
+    /// перед подгонкой, не на каждый проход.
+    pub fn keep_from(&mut self, at: i64) {
+        self.admit_from(at);
+        let from = at;
+        if self.times.iter().all(|&t| t >= from) {
+            return;
+        }
+        let width = self.names.len();
+        let mut kept = 0;
+        for row in 0..self.times.len() {
+            if self.times[row] < from {
+                continue;
+            }
+            if kept != row {
+                self.times[kept] = self.times[row];
+                self.package[kept] = self.package[row];
+                self.cells.copy_within(row * width..(row + 1) * width, kept * width);
+            }
+            kept += 1;
+        }
+        self.times.truncate(kept);
+        self.package.truncate(kept);
+        self.cells.truncate(kept * width);
+    }
+
     fn get(&self, row: usize, block: usize, what: usize) -> Option<f64> {
         loaded(self.cells[row * self.names.len() + block][what])
     }
@@ -224,6 +274,17 @@ impl Log {
     fn power(&self, row: usize, which: usize) -> Option<f64> {
         loaded(self.package[row][which])
     }
+}
+
+/// Граница `KEEP_MS`: самая новая строка всех журналов минус 8 ч; у каждого журнала строки раньше неё выброшены и не
+/// берутся дальше. Возвращает границу; None — строк нет ни у одного (ничего не менялось).
+pub fn trim(logs: &mut [&mut Log]) -> Option<i64> {
+    let newest = logs.iter().filter_map(|l| l.newest()).max()?;
+    let cutoff = newest - KEEP_MS;
+    for log in logs.iter_mut() {
+        log.keep_from(cutoff);
+    }
+    Some(cutoff)
 }
 
 /// Целый CSV (заголовок и строки) через разбор окна — для тестов.
@@ -926,7 +987,7 @@ pub struct Reference {
     pub die: f64,
     /// По соседу: (номер, медиана его p).
     pub neighbours: Vec<(usize, f64)>,
-    /// Наблюдённые множители (сплошная часть кривой) и их медиана.
+    /// Наблюдённые множители — сплошная часть кривой: 5-й и 95-й процентили по времени (`SOLID`); медиана — по строкам.
     pub lo: f64,
     pub hi: f64,
     pub median: f64,
@@ -1111,9 +1172,11 @@ struct Gather {
     usable: usize,
     span_ms: i64,
     fallback: usize,
-    /// Строки под нагрузкой: D, множитель, p соседей (по соседу).
+    /// Строки под нагрузкой: D, множитель, его время (мс от прошлой строки: множитель строки — средний за этот
+    /// промежуток), p соседей (по соседу).
     level: Vec<f64>,
     ratio: Vec<f64>,
+    weight: Vec<i64>,
     near: Vec<Vec<f64>>,
 }
 
@@ -1197,6 +1260,7 @@ pub fn fit(logs: &[&Log], die: &Die) -> Model {
         {
             g.level.push(u.x[0]);
             g.ratio.push(r);
+            g.weight.push(u.span);
             for (into, &p) in g.near.iter_mut().zip(u.near) {
                 into.push(p);
             }
@@ -1523,8 +1587,7 @@ fn reference_of(g: &Gather, neighbours: &[usize]) -> Option<Reference> {
     if g.ratio.is_empty() {
         return None;
     }
-    let lo = g.ratio.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = g.ratio.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let [lo, hi] = SOLID.map(|share| by_time(&g.ratio, &g.weight, share));
     Some(Reference {
         die: median(&g.level)?,
         neighbours: neighbours
@@ -1532,8 +1595,8 @@ fn reference_of(g: &Gather, neighbours: &[usize]) -> Option<Reference> {
             .zip(&g.near)
             .map(|(&j, values)| Some((j, median(values)?)))
             .collect::<Option<Vec<_>>>()?,
-        lo,
-        hi,
+        lo: lo?,
+        hi: hi?,
         median: median(&g.ratio)?,
         rows: g.ratio.len(),
     })
@@ -1555,6 +1618,30 @@ fn slope_of(block: &BlockModel, die: &Die, i: usize, folds: &[Variants]) -> Opti
         lo: per.iter().copied().fold(value, f64::min),
         hi: per.iter().copied().fold(value, f64::max),
     })
+}
+
+/// Процентиль по времени — то же правило, что у линии 95 % графика (`samples::Hist::quantile`): наименьшее значение v,
+/// при котором время строк со значением не выше v — не меньше доли `share` всего времени. Всегда значение одной из
+/// строк. None — строк нет или всё время нулевое.
+fn by_time(values: &[f64], weights: &[i64], share: (u64, u64)) -> Option<f64> {
+    let mut order: Vec<(f64, u64)> = values
+        .iter()
+        .zip(weights)
+        .map(|(&v, &w)| (v, u64::try_from(w).unwrap_or(0)))
+        .collect();
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: u64 = order.iter().map(|o| o.1).sum();
+    if total == 0 || share.1 == 0 {
+        return None;
+    }
+    let mut below = 0u64;
+    for &(v, w) in &order {
+        below += w;
+        if below * share.1 >= total * share.0 {
+            return Some(v);
+        }
+    }
+    order.last().map(|o| o.0)
 }
 
 /// Медиана (у чётного числа — средняя двух средних).
@@ -2302,5 +2389,45 @@ mod tests {
         assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
         assert_eq!(median(&[4.0, 1.0, 2.0, 3.0]), Some(2.5));
         assert_eq!(median(&[]), None);
+    }
+
+    #[test]
+    fn percentiles_by_time_weigh_rows_by_their_interval() {
+        // 1000 строк ×40–44 по 250 мс и пять строк ×19: 0,5 % времени — 5-й процентиль их не видит.
+        let mut values: Vec<f64> = (0..1000).map(|k| 40.0 + f64::from(k % 5)).collect();
+        values.extend([19.0; 5]);
+        let weights = vec![250; values.len()];
+        assert_eq!(by_time(&values, &weights, SOLID[0]), Some(40.0));
+        assert_eq!(by_time(&values, &weights, SOLID[1]), Some(44.0));
+        // Те же пять строк, но по 30 с (после пропусков журнала их время больше): 13 % времени — уже видны.
+        let mut long = weights;
+        long[1000..].fill(30_000);
+        assert_eq!(by_time(&values, &long, SOLID[0]), Some(19.0));
+        // Значение — всегда одной из строк; пусто — ничего.
+        assert_eq!(by_time(&[41.5], &[250], SOLID[1]), Some(41.5));
+        assert_eq!(by_time(&[], &[], SOLID[0]), None);
+    }
+
+    #[test]
+    fn a_few_outlier_rows_do_not_widen_the_solid_part_of_the_curve() {
+        // Синтетический журнал: множители блока 0 — ×40–45; пять строк под нагрузкой на ×19 (короткий провал) — сплошная
+        // часть остаётся 40–45. Ловит: прежний диапазон «min–max по строкам» (блок 1 на его журнале — ×19–×43).
+        let (csv, die) = synthetic(6000, None);
+        let plain = fit(&[&log_from_csv(&csv)], &die);
+        let mut lines: Vec<String> = csv.lines().map(str::to_string).collect();
+        for line in &mut lines[3001..3006] {
+            let mut fields: Vec<&str> = line.split(',').collect();
+            fields[1] = "19.00";
+            fields[2] = "0.90";
+            *line = fields.join(",");
+        }
+        let dipped = fit(&[&log_from_csv(&(lines.join("\n") + "\n"))], &die);
+        let range = |m: &Model| m.blocks[0].reference.as_ref().map(|r| (r.lo, r.hi));
+        assert_eq!(range(&plain), Some((40.0, 45.0)));
+        assert_eq!(
+            range(&dipped),
+            Some((40.0, 45.0)),
+            "пять строк из тысяч — не опыт блока"
+        );
     }
 }

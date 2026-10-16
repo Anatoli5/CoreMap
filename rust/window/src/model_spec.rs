@@ -13,9 +13,10 @@
 // У каждого теста в комментарии — какую неверную реализацию он ловит.
 
 use crate::model::{
-    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU, REFERENCE, TAUS,
-    VoltCurve, WARM_MS, fit, log_from_csv, nnls, proxy,
+    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, KEEP_MS, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU,
+    REFERENCE, TAUS, VoltCurve, WARM_MS, fit, log_from_csv, nnls, proxy, trim,
 };
+use crate::samples::row_time;
 
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -1398,14 +1399,44 @@ fn within(x: f64, (lo, hi): (f64, f64)) -> bool {
     x >= lo - tol && x <= hi + tol
 }
 
+// Процентиль по времени (определение оркестратора 16.10, то же, что у линии 95 % графика): наименьшее значение v, при
+// котором суммарный вес строк со значением ≤ v — не меньше доли share = (числитель, знаменатель) всего веса. Вес строки
+// — миллисекунды от прошлой строки журнала. Счёт в целых — граница без ошибок округления.
+fn time_share(points: &[(f64, i64)], (num, den): (i64, i64)) -> f64 {
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: i64 = sorted.iter().map(|x| x.1).sum();
+    let mut acc = 0;
+    for (v, w) in sorted {
+        acc += w;
+        if acc * den >= num * total {
+            return v;
+        }
+    }
+    panic!("нет строк для процентиля")
+}
+
+// Опорные строки блока i в синтетическом журнале: пригодные, его нагрузка ≥ 0,5; (множитель, вес строки в мс).
+fn solid_points(s: &Synth, i: usize) -> Vec<(f64, i64)> {
+    (1..s.times.len())
+        .filter(|&t| s.usable[i][t] && s.loads[t][i].busy >= 50)
+        .map(|t| {
+            let r = s.loads[t][i].ratio.expect("при нагрузке ≥ 0,5 множитель есть");
+            (f64::from(r), s.times[t] - s.times[t - 1])
+        })
+        .collect()
+}
+
 #[test]
 fn reference_conditions_and_curve_follow_the_true_layer() {
     // Опорные условия — медианы по пригодным строкам блока с его нагрузкой ≥ 0,5: уровень кристалла, p соседей (не 4-с
-    // средняя и не быстрый вход), фактический множитель; диапазон сплошной части — min…max множителя тех же строк.
+    // средняя и не быстрый вход), фактический множитель (простая медиана строк); сплошная часть кривой — от 5-го до
+    // 95-го процентиля множителя по времени тех же строк (вес строки — мс от прошлой; строка 2600 весит 1000 мс).
     // Кривая — установившийся слой L3 при своей нагрузке 100 %: все свои входы равны p(r) = (r/45)³, входы соседей —
     // их медианным p. Сверка с истинными коэффициентами.
     // Ловит: опорные строки без порога нагрузки или по всем строкам, медиану не того (средняя вместо медианы, быстрый
-    // вход соседа), кривую только по быстрому коэффициенту, без соседей или без уровня кристалла, степень множителя не 3.
+    // вход соседа), кривую только по быстрому коэффициенту, без соседей или без уровня кристалла, степень множителя не 3;
+    // сплошную часть как min…max, как процентиль по строкам без веса времени или с другой долей.
     let truths = square();
     let s = synth(&truths, 4000, &GAPS, 15, false);
     let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
@@ -1423,8 +1454,8 @@ fn reference_conditions_and_curve_follow_the_true_layer() {
             .iter()
             .map(|&t| f64::from(s.loads[t][i].ratio.expect("при нагрузке ≥ 0,5 множитель есть")))
             .collect();
-        let lo = ratios.iter().copied().fold(f64::MAX, f64::min);
-        let hi = ratios.iter().copied().fold(f64::MIN, f64::max);
+        let solid = solid_points(&s, i);
+        let (lo, hi) = (time_share(&solid, (5, 100)), time_share(&solid, (95, 100)));
         assert!(
             close(rf.lo, lo, 1e-9) && close(rf.hi, hi, 1e-9),
             "блок {i}: {}..{} вместо {lo}..{hi}",
@@ -1977,5 +2008,332 @@ fn without_power_data_there_is_no_split_and_the_old_curves_stay() {
         if let Some(split) = &model.power {
             assert_eq!(split.rows, count);
         }
+    }
+}
+
+// ─── 10. Сплошная часть кривой: процентили по времени ─────────────────────────────────────────────────────────────
+
+// Нагрузки кристалла 2 × 2 без сна; у блока 0 множители ×40…×44 (из ×38…×48 генератора: 40 + r mod 6).
+fn narrow_loads() -> Vec<Vec<Load>> {
+    let mut out = loads(20_261_016, 4, 4000, 0);
+    for row in &mut out {
+        row[0].ratio = row[0].ratio.map(|r| 40 + r % 6);
+    }
+    out
+}
+
+// Сплошная часть кривой блока 0: по модели (got), по определению (want) и опорные строки (множитель, вес).
+struct Solid {
+    got: (f64, f64),
+    want: (f64, f64),
+    points: Vec<(f64, i64)>,
+}
+
+fn solid_range(together: Vec<Vec<Load>>) -> Solid {
+    solid_range_at(together, &[])
+}
+
+// То же со своими промежутками между строками (строка, промежуток перед ней в мс).
+fn solid_range_at(together: Vec<Vec<Load>>, gaps: &[(usize, i64)]) -> Solid {
+    let s = synth_from(&square(), together, times(4000, gaps), false, None);
+    let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+    let rf = model.blocks[0].reference.as_ref().expect("опорные условия");
+    let points = solid_points(&s, 0);
+    let want = (time_share(&points, (5, 100)), time_share(&points, (95, 100)));
+    Solid {
+        got: (rf.lo, rf.hi),
+        want,
+        points,
+    }
+}
+
+#[test]
+fn solid_range_ignores_a_few_outlier_rows_but_follows_a_large_share() {
+    // Тысячи опорных строк блока 0 на ×40…×44; в одном журнале 8 строк (2 с из ~8 мин) на ×19, в другом — каждая 10-я
+    // строка на ×19 (больше 5 % времени). Определение: 5-й и 95-й процентили по времени. Ловит: min…max (×19 растянул
+    // бы сплошную часть из-за 2 с), долю не по времени, порог «больше» вместо «не меньше».
+    let base = solid_range(narrow_loads());
+    let mut few = narrow_loads();
+    for row in few.iter_mut().skip(1000).take(8) {
+        row[0] = Load {
+            busy: 80,
+            ratio: Some(19),
+        };
+    }
+    let few = solid_range(few);
+    let mut many = narrow_loads();
+    for row in many.iter_mut().skip(100).step_by(10) {
+        row[0] = Load {
+            busy: 80,
+            ratio: Some(19),
+        };
+    }
+    let many = solid_range(many);
+    for (what, x) in [("без выбросов", &base), ("8 строк ×19", &few), ("10 % ×19", &many)] {
+        assert!(
+            close(x.got.0, x.want.0, 1e-9) && close(x.got.1, x.want.1, 1e-9),
+            "{what}: {:?} вместо {:?}",
+            x.got,
+            x.want
+        );
+    }
+    // Предпосылки: 8 строк ×19 — в опорных строках, их время меньше 5 %; в третьем журнале — больше 5 %.
+    let share = |points: &[(f64, i64)]| {
+        let low: i64 = points.iter().filter(|x| x.0 < 20.0).map(|x| x.1).sum();
+        let all: i64 = points.iter().map(|x| x.1).sum();
+        (low, all)
+    };
+    let (low, all) = share(&few.points);
+    assert!(low == 8 * 250 && low * 20 < all, "8 строк ×19: {low} мс из {all}");
+    let (low, all) = share(&many.points);
+    assert!(low * 20 > all, "каждая 10-я строка ×19: {low} мс из {all}");
+    assert!(
+        close(few.got.0, base.got.0, 0.0) && close(few.got.1, base.got.1, 0.0),
+        "выбросы сдвинули сплошную часть: {:?} против {:?}",
+        few.got,
+        base.got
+    );
+    assert!(
+        close(many.got.0, 19.0, 0.0),
+        "больше 5 % времени на ×19 — сплошная часть от ×19: {:?}",
+        many.got
+    );
+}
+
+#[test]
+fn solid_range_weighs_rows_by_their_time() {
+    // 80 строк блока 0 на ×19, каждой предшествует промежуток ровно 1 с (не перерыв — средние не начинаются заново):
+    // по числу строк это меньше 5 % опорных строк, по времени — больше. Определение — доля времени (вес строки — мс от
+    // прошлой), так что сплошная часть начинается с ×19. Ловит: процентиль по числу строк (дал бы ×40), вес строки —
+    // промежуток до следующей строки, а не до прошлой (×19 весили бы по 250 мс).
+    let mut long = narrow_loads();
+    let marked: Vec<usize> = (0..80).map(|k| 200 + 40 * k).collect();
+    for &t in &marked {
+        long[t][0] = Load {
+            busy: 80,
+            ratio: Some(19),
+        };
+    }
+    let gaps: Vec<(usize, i64)> = marked.iter().map(|&t| (t, 1000)).collect();
+    let long = solid_range_at(long, &gaps);
+    let low: i64 = long.points.iter().filter(|x| x.0 < 20.0).map(|x| x.1).sum();
+    let all: i64 = long.points.iter().map(|x| x.1).sum();
+    let rows = long.points.len();
+    assert!(
+        low == 80 * 1000 && low * 20 > all && 80 * 20 < rows,
+        "предпосылка: ×19 — {low} мс из {all}, 80 строк из {rows}"
+    );
+    assert!(
+        close(long.got.0, long.want.0, 1e-9) && close(long.got.1, long.want.1, 1e-9),
+        "{:?} вместо {:?}",
+        long.got,
+        long.want
+    );
+    assert!(
+        close(long.got.0, 19.0, 0.0),
+        "больше 5 % времени на ×19: {:?}",
+        long.got
+    );
+}
+
+#[test]
+fn solid_range_takes_the_value_where_the_share_is_reached_exactly() {
+    // Ручной журнал, 331 строка через 250 мс; у блока 0 опорные (нагрузка 0,8) только строки 310…329: одна на ×19, 18 на
+    // ×40, одна на ×50 — 20 строк по 250 мс. На ×19 набирается ровно 5 % времени, на ×40 — ровно 95 %. Определение —
+    // «не меньше доли»: сплошная часть ×19…×40, простая медиана ×40. Ловит: «больше доли» (дало бы ×40…×50), процентиль с
+    // интерполяцией между строками (значения не из строк).
+    let rows: Vec<(i64, Vec<Cell>)> = (0..331)
+        .map(|k: usize| {
+            let mut cells: Vec<Cell> = (0..4).map(|b| usual(k, b)).collect();
+            let (ratio, busy) = match k {
+                310 => ("19", "0.80"),
+                311..=328 => ("40", "0.80"),
+                329 => ("50", "0.80"),
+                _ => ("42", "0.30"),
+            };
+            cells[0].0 = ratio.to_string();
+            cells[0].1 = busy.to_string();
+            (START_MS + 250 * i64::try_from(k).expect("строк мало"), cells)
+        })
+        .collect();
+    let die = Die {
+        names: names(&["0", "1", "2", "3"]),
+        e: vec![false; 4],
+        neighbours: vec![vec![1, 2], vec![0, 3], vec![0, 3], vec![1, 2]],
+    };
+    let model = fit(&[&hand_log(&die.names, &rows)], &die);
+    let rf = model.blocks[0].reference.as_ref().expect("опорные условия");
+    assert!(
+        close(rf.lo, 19.0, 0.0) && close(rf.hi, 40.0, 0.0),
+        "сплошная часть ×{}…×{} вместо ×19…×40",
+        rf.lo,
+        rf.hi
+    );
+    assert!(close(rf.median, 40.0, 1e-9), "медиана ×{}", rf.median);
+}
+
+// ─── 11. Окно данных: восемь часов до новейшей строки ─────────────────────────────────────────────────────────────
+
+const HOUR: i64 = 3_600_000;
+
+// Журнал блоков 0–3 из строк с этим временем (мс от полуночи 15.10), обычные поля.
+fn timed_log(ms: &[i64]) -> Log {
+    let blocks = names(&["0", "1", "2", "3"]);
+    let rows: Vec<(i64, Vec<Cell>)> = ms
+        .iter()
+        .enumerate()
+        .map(|(k, &t)| (t, (0..4).map(|b| usual(k, b)).collect()))
+        .collect();
+    hand_log(&blocks, &rows)
+}
+
+// Время строки в масштабе журнала, как его читает окно (samples::row_time): мс от 1970-01-01 по местным часам.
+fn scale(ms: i64) -> i64 {
+    row_time(&stamp(ms)).expect("время строки").ms
+}
+
+// Строка для push: у каждого из четырёх блоков ×45, нагрузка 0,8, 60 °C, без напряжения; мощностей нет.
+fn push_row(log: &mut Log, ms: i64) {
+    log.push(
+        scale(ms),
+        std::iter::repeat_n([Some(45.0), Some(0.8), Some(60.0), None], 4),
+        [None; 3],
+    );
+}
+
+#[test]
+fn trim_drops_rows_older_than_eight_hours_before_the_newest_row_of_all_logs() {
+    // Журнал A: 01:00, 02:59:59.999, 03:00, 02:30 (часы назад), 04:00; журнал B: 05:00, 09:00, 11:00. Новейшая строка —
+    // 11:00 в B, граница — 03:00: в A остаются 03:00 (ровно на границе) и 04:00, B не меняется.
+    // Ловит: границу по своему файлу (A по своей 04:00 не потерял бы ничего), строку ровно на границе выброшенной
+    // («>» вместо «≥»), строку на 1 мс раньше оставленной, срез только с начала файла (02:30 после 03:00 осталась бы),
+    // окно не 8 ч, изменённый второй журнал.
+    assert_eq!(KEEP_MS, 8 * HOUR);
+    let mut a = timed_log(&[HOUR, 3 * HOUR - 1, 3 * HOUR, 2 * HOUR + HOUR / 2, 4 * HOUR]);
+    let mut b = timed_log(&[5 * HOUR, 9 * HOUR, 11 * HOUR]);
+    assert_eq!(b.newest(), Some(scale(11 * HOUR)));
+    let cut = trim(&mut [&mut a, &mut b]);
+    assert_eq!(cut, Some(scale(3 * HOUR)));
+    assert_eq!((a.rows(), a.newest()), (2, Some(scale(4 * HOUR))));
+    assert_eq!((b.rows(), b.newest()), (3, Some(scale(11 * HOUR))));
+}
+
+#[test]
+fn trim_without_rows_changes_nothing_and_an_empty_log_does_not_decide() {
+    // Ловит: границу из пустого журнала (ноль или минимум времени), изменение журналов, когда строк нет нигде.
+    let mut a = timed_log(&[]);
+    let mut b = timed_log(&[]);
+    assert_eq!(a.newest(), None);
+    assert_eq!(trim(&mut [&mut a, &mut b]), None);
+    let mut c = timed_log(&[HOUR, 2 * HOUR]);
+    assert_eq!(trim(&mut [&mut a, &mut c]), Some(scale(2 * HOUR) - KEEP_MS));
+    assert_eq!((a.rows(), c.rows()), (0, 2), "всё в пределах 8 ч — ничего не выброшено");
+}
+
+#[test]
+fn admit_from_rejects_later_older_rows_and_leaves_kept_ones() {
+    // API: admit_from меняет только приём следующих строк — push молча пропускает строки старше границы, граница только
+    // растёт (меньшая потом не действует); уже принятые строки не трогаются. Ловит: admit_from, выбрасывающий принятое;
+    // push, принимающий строку старше границы или отвергающий строку ровно на ней; границу, опущенную вторым вызовом.
+    let mut a = timed_log(&[HOUR, 2 * HOUR, 3 * HOUR]);
+    a.admit_from(scale(5 * HOUR));
+    assert_eq!(
+        (a.rows(), a.newest()),
+        (3, Some(scale(3 * HOUR))),
+        "admit_from не трогает принятое"
+    );
+    push_row(&mut a, 4 * HOUR);
+    assert_eq!(a.rows(), 3, "строка старше границы не принята");
+    push_row(&mut a, 5 * HOUR);
+    assert_eq!(
+        (a.rows(), a.newest()),
+        (4, Some(scale(5 * HOUR))),
+        "строка ровно на границе принята"
+    );
+    a.admit_from(scale(2 * HOUR));
+    push_row(&mut a, 4 * HOUR + HOUR / 2);
+    assert_eq!(a.rows(), 4, "меньшая граница не действует: 04:30 всё ещё старше 05:00");
+    push_row(&mut a, 6 * HOUR);
+    assert_eq!((a.rows(), a.newest()), (5, Some(scale(6 * HOUR))));
+}
+
+#[test]
+fn keep_from_drops_older_kept_rows_and_admits_from_the_same_time() {
+    // API: keep_from(at) = admit_from(at) и выбросить принятые строки старше at; строка ровно на at остаётся;
+    // выброшенное меньшая граница не возвращает. Ловит: keep_from, выбросивший строку на границе или оставивший строку
+    // старше её; keep_from без admit_from (строка старше границы, пришедшая потом, принята бы).
+    let mut b = timed_log(&[HOUR, 2 * HOUR, 3 * HOUR]);
+    b.keep_from(scale(2 * HOUR));
+    assert_eq!(
+        (b.rows(), b.newest()),
+        (2, Some(scale(3 * HOUR))),
+        "выброшена только 01:00"
+    );
+    b.keep_from(scale(HOUR));
+    assert_eq!(b.rows(), 2, "выброшенное не возвращается");
+    push_row(&mut b, HOUR + HOUR / 2);
+    assert_eq!(b.rows(), 2, "строка старше границы keep_from не принята");
+    push_row(&mut b, 2 * HOUR);
+    assert_eq!(b.rows(), 3, "строка ровно на границе принята");
+}
+
+// Числа слоя L3 блока: a, β, свои, соседи (быстрый, 4-с).
+fn coef_numbers(c: &Coef) -> Vec<f64> {
+    let mut v = vec![c.a, c.beta];
+    v.extend(c.own);
+    v.extend(c.neighbours.iter().flat_map(|n| [n.fast, n.slow]));
+    v
+}
+
+#[test]
+fn fit_on_trimmed_logs_equals_fit_on_the_recent_rows_only() {
+    // Синтетический журнал из 4000 строк с 10:00:00; второй журнал — 10 строк, последняя ровно через 8 ч после строки
+    // 2000 первого. trim оставляет в первом строки 2000…3999; модель по ним должна совпасть с моделью по журналу,
+    // собранному только из этих строк (первая оставшаяся строка — начало файла).
+    // Ловит: выброшенные строки, всё ещё влияющие на модель (средние, тянущиеся от них; разогрев от выброшенного
+    // начала; счёт строк и минут); срез, сбивший порядок или поля оставшихся строк.
+    let truths = square();
+    let s = synth(&truths, 4000, &GAPS, 15, false);
+    let text = s.csv(None, None);
+    let mut lines = text.lines();
+    let head = lines.next().expect("заголовок");
+    let rows: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+    let recent = format!("{head}\n{}\n", rows[2000..].join("\n"));
+    let edge = s.times[2000];
+    let late: Vec<i64> = (0..10).map(|k| edge + KEEP_MS - 250 * (9 - k)).collect();
+    let mut first = log_from_csv(&text);
+    let mut second = timed_log(&late);
+    assert_eq!(trim(&mut [&mut first, &mut second]), Some(scale(edge)));
+    assert_eq!((first.rows(), second.rows()), (2000, 10));
+    let trimmed = fit(&[&first, &second], &s.die);
+    let fresh = fit(&[&log_from_csv(&recent), &timed_log(&late)], &s.die);
+    assert_eq!(trimmed.rows, fresh.rows);
+    for (i, (x, y)) in trimmed.blocks.iter().zip(&fresh.blocks).enumerate() {
+        assert_eq!(x.usable, y.usable, "блок {i}: пригодных строк");
+        assert!(
+            close(x.minutes, y.minutes, 1e-9),
+            "блок {i}: минуты {} против {}",
+            x.minutes,
+            y.minutes
+        );
+        let (cx, cy) = (
+            x.coef.as_ref().expect("коэффициенты"),
+            y.coef.as_ref().expect("коэффициенты"),
+        );
+        let (fx, fy) = (coef_numbers(cx), coef_numbers(cy));
+        assert!(
+            fx.iter().zip(&fy).all(|(a, b)| close(*a, *b, 1e-9 * (1.0 + a.abs()))),
+            "блок {i}: {fx:?} против {fy:?}"
+        );
+        let (rx, ry) = (
+            x.reference.as_ref().expect("опора"),
+            y.reference.as_ref().expect("опора"),
+        );
+        assert!(
+            [(rx.die, ry.die), (rx.lo, ry.lo), (rx.hi, ry.hi), (rx.median, ry.median)]
+                .iter()
+                .all(|&(a, b)| close(a, b, 1e-9 * (1.0 + a.abs()))),
+            "блок {i}: опорные условия разные"
+        );
     }
 }

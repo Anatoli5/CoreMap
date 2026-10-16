@@ -59,8 +59,9 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     let bytes: usize = logs.iter().map(|l| l.bytes()).sum();
     let _ = writeln!(
         text,
-        "files with 0.25-s rows: {}, rows kept: {rows}, memory of kept rows: {:.1} MB, reading and parsing: {:.0} ms",
+        "files with 0.25-s rows: {}, rows kept (last {} h before the newest row, as in the window): {rows}, memory of kept rows: {:.1} MB, reading and parsing: {:.0} ms",
         logs.len(),
+        model::KEEP_MS / 3_600_000,
         mb(bytes),
         read_time.as_secs_f64() * 1000.0
     );
