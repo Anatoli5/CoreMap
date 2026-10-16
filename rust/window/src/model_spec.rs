@@ -1,7 +1,11 @@
-// Тесты тепловой модели (мощность p, средние, NNLS, напряжение V(r), пригодные строки, слой L3, кривые) по
-// спецификации; пишет отдельный агент, не читавший реализацию (rust\AGENTS.md, «Tests from the specification»).
-// Источники — бриф outputs\model-impl-brief-2026-10-16.md («Inputs per row», «Layer L3», «V(r) per block», список
-// тестов в «Rules») и описание API model.rs от 16.10.
+// Тесты тепловой модели (мощность p, средние, NNLS, пригодные строки, слой L3, выученная форма своего быстрого нагрева,
+// кривые) по спецификации; пишет отдельный агент, не читавший реализацию (rust\AGENTS.md, «Tests from the
+// specification»). Источники — бриф outputs\model-impl-brief-2026-10-16.md («Inputs per row», «Layer L3», список
+// тестов в «Rules»), описание API model.rs от 16.10 и его дополнение «learned shape of the own fast term» (16.10 днём:
+// шарнирная форма g(r), узлы floor(lo) + 2·j до hi − 1, правило колена); путь напряжения убран из модели решением
+// владельца 16.10 (напряжение задаёт сам процессор по множителю — не независимый вход), p = занятость·(r/45)³.
+// Ожидаемые числа для формы проверены заранее независимой записью генератора и подгонки формы по дополнению (scipy):
+// scratchpad\shape-spec\*.py этой сессии.
 //
 // Ожидаемые числа посчитаны вручную или независимо в самом тесте: синтетический журнал строится из известных
 // коэффициентов по определению слоя L3 — свои средние по определению из API, своя система уравнений строки (уровень
@@ -13,8 +17,8 @@
 // У каждого теста в комментарии — какую неверную реализацию он ловит.
 
 use crate::model::{
-    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, KEEP_MS, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU,
-    REFERENCE, TAUS, VoltCurve, WARM_MS, fit, log_from_csv, nnls, proxy, trim,
+    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, Hinge, KEEP_MS, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU,
+    REFERENCE, Reference, TAUS, WARM_MS, fit, log_from_csv, nnls, proxy, trim,
 };
 use crate::samples::row_time;
 
@@ -51,67 +55,44 @@ fn constants_are_the_numbers_of_the_brief() {
 
 // ─── 1. Мощность p ───────────────────────────────────────────────────────────────────────────────────────────────
 
-// p и признак «без напряжения»; None — значение не известно.
-fn pw(ratio: Option<f64>, busy: Option<f64>, volts: Option<f64>) -> Option<(f64, bool)> {
-    proxy(ratio, busy, volts).map(|x| (x.p, x.fallback))
-}
-
-fn power_is(got: Option<(f64, bool)>, p: f64, fallback: bool) -> bool {
-    got.is_some_and(|(g, f)| close(g, p, 1e-12) && f == fallback)
+// p строки известно и равно этому числу.
+fn power_is(got: Option<f64>, p: f64) -> bool {
+    got.is_some_and(|g| close(g, p, 1e-12))
 }
 
 #[test]
-fn proxy_without_volts_is_busy_times_cube_of_relative_ratio() {
-    // Ловит: множитель в первой степени или в квадрате вместо куба (без напряжения V/V45 = r/45 — закон куба, бриф),
-    // деление не на 45, нагрузку не множителем, не поднятый признак «без напряжения».
-    let p = pw(Some(45.0), Some(1.0), None);
-    assert!(power_is(p, 1.0, true), "{p:?}");
-    // 0,5 × 0,8 × 0,8² = 0,256
-    let p = pw(Some(36.0), Some(0.5), None);
-    assert!(power_is(p, 0.256, true), "{p:?}");
+fn proxy_is_busy_times_cube_of_relative_ratio() {
+    // Решение 16.10: форма мощности принята кубом (не измерена), напряжения в p нет.
+    // Ловит: множитель в первой степени или в квадрате вместо куба, деление не на 45, нагрузку не множителем.
+    let p = proxy(Some(45.0), Some(1.0));
+    assert!(power_is(p, 1.0), "{p:?}");
+    // 0,5 × 0,8³ = 0,256
+    let p = proxy(Some(36.0), Some(0.5));
+    assert!(power_is(p, 0.256), "{p:?}");
     // 1,2³ = 1,728
-    let p = pw(Some(54.0), Some(1.0), None);
-    assert!(power_is(p, 1.728, true), "{p:?}");
+    let p = proxy(Some(54.0), Some(1.0));
+    assert!(power_is(p, 1.728), "{p:?}");
     // 0,25 × (8/9)³ = 0,25 × 512/729
-    let p = pw(Some(40.0), Some(0.25), None);
-    assert!(power_is(p, 0.25 * 512.0 / 729.0, true), "{p:?}");
+    let p = proxy(Some(40.0), Some(0.25));
+    assert!(power_is(p, 0.25 * 512.0 / 729.0), "{p:?}");
     // Множитель есть — p по формуле и при нагрузке ниже порога сна: порог касается только строки без множителя.
-    let p = pw(Some(45.0), Some(0.02), None);
-    assert!(power_is(p, 0.02, true), "{p:?}");
-}
-
-#[test]
-fn proxy_with_volts_uses_relative_voltage_squared() {
-    // Ловит: напряжение в первой степени, куб множителя поверх напряжения, признак «без напряжения» при известном
-    // напряжении.
-    // 0,5 × 0,8 × 1,1² = 0,484
-    let p = pw(Some(36.0), Some(0.5), Some(1.1));
-    assert!(power_is(p, 0.484, false), "{p:?}");
-    // 1 × 1 × 0,9² = 0,81
-    let p = pw(Some(45.0), Some(1.0), Some(0.9));
-    assert!(power_is(p, 0.81, false), "{p:?}");
-    // 0,75 × 1,2 × 1,05² = 0,9 × 1,1025 = 0,99225
-    let p = pw(Some(54.0), Some(0.75), Some(1.05));
-    assert!(power_is(p, 0.992_25, false), "{p:?}");
+    let p = proxy(Some(45.0), Some(0.02));
+    assert!(power_is(p, 0.02), "{p:?}");
 }
 
 #[test]
 fn proxy_is_zero_for_a_sleeping_core_and_unknown_otherwise() {
     // Ловит: пустой множитель как «не известно» при любой нагрузке (спящее ядро выпадало бы из счёта и рвало средние
-    // соседей), спящее ядро с признаком «без напряжения», порог «не больше» вместо «меньше» (ровно 0,05 — уже не сон),
-    // значение без нагрузки (пустая нагрузка — не известно, даже с множителем и напряжением).
-    for (busy, volts) in [(0.0, None), (0.049, None), (0.01, Some(1.0))] {
-        let p = pw(None, Some(busy), volts);
-        assert!(power_is(p, 0.0, false), "спит при нагрузке {busy}: {p:?}");
+    // соседей), порог «не больше» вместо «меньше» (ровно 0,05 — уже не сон), значение без нагрузки (пустая нагрузка —
+    // не известно, даже с множителем).
+    for busy in [0.0, 0.049, 0.01] {
+        let p = proxy(None, Some(busy));
+        assert!(power_is(p, 0.0), "спит при нагрузке {busy}: {p:?}");
     }
-    assert!(pw(None, Some(0.05), None).is_none(), "0,05 — не сон");
-    assert!(pw(None, Some(0.6), None).is_none(), "занято, а множителя нет");
-    assert!(pw(None, None, None).is_none());
-    assert!(pw(Some(45.0), None, None).is_none(), "без нагрузки");
-    assert!(
-        pw(Some(45.0), None, Some(1.0)).is_none(),
-        "без нагрузки и с напряжением"
-    );
+    assert!(proxy(None, Some(0.05)).is_none(), "0,05 — не сон");
+    assert!(proxy(None, Some(0.6)).is_none(), "занято, а множителя нет");
+    assert!(proxy(None, None).is_none());
+    assert!(proxy(Some(45.0), None).is_none(), "без нагрузки");
 }
 
 // ─── 2. Скользящие средние ───────────────────────────────────────────────────────────────────────────────────────
@@ -472,39 +453,7 @@ fn nnls_stays_finite_with_a_zero_column_and_a_repeated_column() {
     assert!(close(got[3], want[1], 1e-8), "{got:?} против {want:?}");
 }
 
-// ─── 4. Напряжение V(r) ──────────────────────────────────────────────────────────────────────────────────────────
-
-// Точки (множитель, напряжение) по ступеням ×36…×48, по 20 на ступень: 0,80 В + 0,015 В на ступень, провал на ×42 и
-// ×43 (среднее ступени ×42 ниже, чем у ×41) и шум ±0,02 В — вход не монотонный ни по точкам, ни по средним ступеней.
-// На ступенях ×37…×46 часть точек дробная (фактический множитель — среднее за промежуток); края — целые.
-fn noisy_volts() -> Vec<(f64, f64)> {
-    let mut dice = Dice(21);
-    let mut points = Vec::new();
-    for step in 36_u32..=48 {
-        let dip = match step {
-            42 => 0.05,
-            43 => 0.03,
-            _ => 0.0,
-        };
-        let r = f64::from(step);
-        for k in 0..20 {
-            let at = if k < 5 && (37..=46).contains(&step) {
-                r + 0.25
-            } else {
-                r
-            };
-            points.push((at, 0.80 + 0.015 * (at - 36.0) - dip + 0.02 * dice.sign()));
-        }
-    }
-    points
-}
-
-// Ровная прямая 0,80 В + 0,015 В на ступень, ×36…×48, по 5 одинаковых точек на ступень.
-fn clean_volts() -> Vec<(f64, f64)> {
-    (36_u32..=48)
-        .flat_map(|s| [(f64::from(s), 0.80 + 0.015 * (f64::from(s) - 36.0)); 5])
-        .collect()
-}
+// ─── 4. Сетка множителей и неубывание ───────────────────────────────────────────────────────────────────────────────
 
 // Сетка множителей от lo до hi с шагом step (включая края).
 fn grid(lo: f64, hi: f64, step: f64) -> Vec<f64> {
@@ -528,112 +477,6 @@ fn rising(values: &[(f64, f64)], tol: f64) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[test]
-fn volt_curve_needs_two_whole_multiplier_steps() {
-    // Ловит: кривую по одной ступени (наклона нет — продолжение за диапазон не определено), счёт точек вместо ступеней,
-    // дробные множители одной ступени как разные ступени.
-    assert!(VoltCurve::fit(&[]).is_none());
-    assert!(VoltCurve::fit(&[(45.0, 1.0)]).is_none());
-    assert!(VoltCurve::fit(&[(45.0, 1.0), (45.0, 1.02), (45.3, 1.01), (45.0, 0.99)]).is_none());
-    assert!(VoltCurve::fit(&[(44.0, 0.98), (45.0, 1.0)]).is_some());
-}
-
-#[test]
-fn volt_curve_is_non_decreasing_on_noisy_and_on_falling_input() {
-    // Ловит: кривую, повторяющую провал ступени ×42 (напряжение не может падать с множителем — бриф: монотонная
-    // неубывающая), неубывание только в узлах ступеней, а не между ними, убывающее продолжение за край, выход далеко за
-    // разброс данных внутри диапазона.
-    let noisy = VoltCurve::fit(&noisy_volts()).expect("13 ступеней");
-    let shown: Vec<(f64, f64)> = grid(28.0, 56.0, 0.05).into_iter().map(|r| (r, noisy.at(r))).collect();
-    if let Err(why) = rising(&shown, 1e-12) {
-        panic!("напряжение падает: {why}");
-    }
-    let (low, high) = noisy_volts()
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(l, h), &(_, v)| (l.min(v), h.max(v)));
-    for r in grid(36.0, 48.0, 0.25) {
-        let v = noisy.at(r);
-        assert!(
-            v > low - 0.05 && v < high + 0.05,
-            "×{r}: {v} вне разброса данных {low}..{high}"
-        );
-    }
-    // Напряжение, падающее с множителем (шум или чужая шина): неубывающая кривая — не наклонная вниз.
-    let falling: Vec<(f64, f64)> = (36_u32..=48)
-        .map(|s| (f64::from(s), 1.2 - 0.02 * (f64::from(s) - 36.0)))
-        .collect();
-    let flat = VoltCurve::fit(&falling).expect("13 ступеней");
-    let shown: Vec<(f64, f64)> = grid(28.0, 56.0, 0.05).into_iter().map(|r| (r, flat.at(r))).collect();
-    if let Err(why) = rising(&shown, 1e-12) {
-        panic!("напряжение падает: {why}");
-    }
-}
-
-// За краем наблюдённого диапазона кривая — прямая с наклоном кривой у края: приращения на равных шагах равны,
-// значение у края непрерывно, наклон продолжения — как у кривой в последней сотой ступени перед краем.
-fn extends_linearly(c: &VoltCurve, what: &str) {
-    let (lo, hi) = c.range();
-    let end = (c.at(hi) - c.at(hi - 0.01)) / 0.01;
-    let start = (c.at(lo + 0.01) - c.at(lo)) / 0.01;
-    for d in [0.5, 1.0, 2.0, 4.0, 8.0] {
-        let up = c.at(hi) + end * d;
-        assert!(
-            close(c.at(hi + d), up, 1e-3 * (1.0 + d)),
-            "{what}: ×{}: {} вместо {up} (наклон у края {end})",
-            hi + d,
-            c.at(hi + d)
-        );
-        let down = c.at(lo) - start * d;
-        assert!(
-            close(c.at(lo - d), down, 1e-3 * (1.0 + d)),
-            "{what}: ×{}: {} вместо {down} (наклон у края {start})",
-            lo - d,
-            c.at(lo - d)
-        );
-    }
-    // Прямая: равные приращения на равных шагах.
-    let rise = |a: f64, b: f64| c.at(b) - c.at(a);
-    assert!(
-        close(rise(hi + 4.0, hi + 8.0), rise(hi, hi + 4.0), 1e-9),
-        "{what}: справа не прямая"
-    );
-    assert!(
-        close(rise(lo - 8.0, lo - 4.0), rise(lo - 4.0, lo), 1e-9),
-        "{what}: слева не прямая"
-    );
-    assert!(close(c.at(hi + 1e-6), c.at(hi), 1e-5), "{what}: разрыв у правого края");
-    assert!(close(c.at(lo - 1e-6), c.at(lo), 1e-5), "{what}: разрыв у левого края");
-}
-
-#[test]
-fn volt_curve_extends_linearly_with_the_end_slope() {
-    // Ловит: постоянное значение за краем (наклон 0 при растущей кривой), наклон по всему диапазону вместо наклона у
-    // края, разрыв на краю, диапазон не по наблюдённым множителям.
-    let clean = VoltCurve::fit(&clean_volts()).expect("13 ступеней");
-    let (lo, hi) = clean.range();
-    assert!(close(lo, 36.0, 1e-9) && close(hi, 48.0, 1e-9), "диапазон {lo}..{hi}");
-    extends_linearly(&clean, "ровная прямая");
-    let noisy = VoltCurve::fit(&noisy_volts()).expect("13 ступеней");
-    let (lo, hi) = noisy.range();
-    assert!(close(lo, 36.0, 1e-9) && close(hi, 48.0, 1e-9), "диапазон {lo}..{hi}");
-    extends_linearly(&noisy, "шумные точки");
-}
-
-#[test]
-fn volt_curve_follows_clean_linear_data_inside_and_outside() {
-    // На точной прямой 0,80 + 0,015·(r − 36) любой из допустимых видов (изотонная со сглаживанием, монотонная
-    // квадратичная) — та же прямая. Ловит: смещение (среднее не того набора точек), наклон за краем не тот, кривую не
-    // по множителю (по номеру ступени с нуля).
-    let clean = VoltCurve::fit(&clean_volts()).expect("13 ступеней");
-    for r in grid(36.0, 48.0, 0.5) {
-        let want = 0.80 + 0.015 * (r - 36.0);
-        assert!(close(clean.at(r), want, 0.002), "×{r}: {} вместо {want}", clean.at(r));
-    }
-    // За краями: ×52 — 0,80 + 0,015·16 = 1,04; ×30 — 0,80 − 0,015·6 = 0,71.
-    assert!(close(clean.at(52.0), 1.04, 0.005), "×52: {}", clean.at(52.0));
-    assert!(close(clean.at(30.0), 0.71, 0.005), "×30: {}", clean.at(30.0));
 }
 
 // ─── 5. Журнал: строки и столбцы ─────────────────────────────────────────────────────────────────────────────────
@@ -920,23 +763,10 @@ fn times(rows: usize, gaps: &[(usize, i64)]) -> Vec<i64> {
         .collect()
 }
 
-// p по определению брифа без напряжения: занятость × (r/45)³; спящее ядро — 0.
+// p по определению: занятость × (r/45)³; спящее ядро — 0.
 fn power(l: Load) -> f64 {
     l.ratio
         .map_or(0.0, |r| f64::from(l.busy) / 100.0 * (f64::from(r) / 45.0).powi(3))
-}
-
-// Напряжение, как его запишет журнал: четыре знака.
-fn shown4(v: f64) -> f64 {
-    format!("{v:.4}").parse().expect("число")
-}
-
-// p по определению брифа с напряжением: занятость × (r/45) × (V/V45)², V — записанное напряжение строки, V45 — по
-// той же зависимости V(r) на ×45; спящее ядро — 0.
-fn power_with(l: Load, volt: fn(u32) -> f64) -> f64 {
-    l.ratio.map_or(0.0, |r| {
-        f64::from(l.busy) / 100.0 * (f64::from(r) / 45.0) * (shown4(volt(r)) / shown4(volt(45))).powi(2)
-    })
 }
 
 fn column(p: &[Vec<f64>], b: usize) -> Vec<f64> {
@@ -976,13 +806,18 @@ fn has_next(times: &[i64], t: usize) -> bool {
     times.get(t + 1).is_some_and(|&n| n > times[t] && n - times[t] <= 1000)
 }
 
-// Известный слой L3 блока: a, β, 7 своих коэффициентов (быстрый вход, средние 0,5…16 с) и соседи (номер, коэффициент
-// быстрого входа, коэффициент 4-с средней).
+// Свой быстрый нагрев блока при полной своей нагрузке как функция фактического множителя, °C.
+type Shape = Box<dyn Fn(f64) -> f64>;
+
+// Известный слой L3 блока: a, β, 7 своих коэффициентов (быстрый вход, средние 0,5…16 с), соседи (номер, коэффициент
+// быстрого входа, коэффициент 4-с средней) и, если задана, форма своего быстрого нагрева: тогда быстрый член строки —
+// среднее занятость·f(r) в t и t+1 (спящее ядро — 0), а own[0] = 0; средние и соседи — по p, как всегда.
 struct Truth {
     a: f64,
     beta: f64,
     own: [f64; 7],
     near: Vec<(usize, f64, f64)>,
+    fast: Option<Shape>,
 }
 
 fn truth(a: f64, beta: f64, own: [f64; 7], near: &[(usize, f64, f64)]) -> Truth {
@@ -991,6 +826,20 @@ fn truth(a: f64, beta: f64, own: [f64; 7], near: &[(usize, f64, f64)]) -> Truth 
         beta,
         own,
         near: near.to_vec(),
+        fast: None,
+    }
+}
+
+// Истина с формой своего быстрого нагрева f и коэффициентами своих средних 0,5…16 с (history).
+fn truth_with_shape(a: f64, beta: f64, fast: Shape, history: [f64; 6], near: &[(usize, f64, f64)]) -> Truth {
+    let mut own = [0.0; 7];
+    own[1..].copy_from_slice(&history);
+    Truth {
+        a,
+        beta,
+        own,
+        near: near.to_vec(),
+        fast: Some(fast),
     }
 }
 
@@ -1037,6 +886,21 @@ impl Synth {
             f64::midpoint(self.p[t][b], self.p[t + 1][b])
         } else {
             self.p[t][b]
+        }
+    }
+
+    // Свой быстрый нагрев блока b в строке t по форме: среднее занятость·форма(r) в t и t+1 (без t+1 — в t); спящее
+    // ядро — 0.
+    fn heat(&self, b: usize, t: usize, shape: &dyn Fn(f64) -> f64) -> f64 {
+        let at = |k: usize| {
+            let load = self.loads[k][b];
+            load.ratio
+                .map_or(0.0, |r| f64::from(load.busy) / 100.0 * shape(f64::from(r)))
+        };
+        if has_next(&self.times, t) {
+            f64::midpoint(at(t), at(t + 1))
+        } else {
+            at(t)
         }
     }
 
@@ -1114,39 +978,17 @@ impl Synth {
 // T_i − β_i·ср(T_j, j ≠ i) = a_i + Σ own·x + Σ соседи (уровень кристалла — из температур других блоков той же строки).
 // whole — температуры целыми градусами, как в настоящем журнале; иначе с шестью знаками (практически без шума).
 fn synth(truths: &[Truth], rows: usize, gaps: &[(usize, i64)], sleep: u32, whole: bool) -> Synth {
-    synth_with(truths, rows, gaps, sleep, whole, None)
-}
-
-// То же; volt — зависимость V(r), по которой нагрев шёл с напряжением (p — по power_with), иначе закон куба.
-fn synth_with(
-    truths: &[Truth],
-    rows: usize,
-    gaps: &[(usize, i64)],
-    sleep: u32,
-    whole: bool,
-    volt: Option<fn(u32) -> f64>,
-) -> Synth {
     let loads = loads(20_261_016, truths.len(), rows, sleep);
-    synth_from(truths, loads, times(rows, gaps), whole, volt)
+    synth_from(truths, loads, times(rows, gaps), whole)
 }
 
 // То же из готовых нагрузок и времени строк (тест может связать нагрузки блоков).
-fn synth_from(
-    truths: &[Truth],
-    loads: Vec<Vec<Load>>,
-    times: Vec<i64>,
-    whole: bool,
-    volt: Option<fn(u32) -> f64>,
-) -> Synth {
+fn synth_from(truths: &[Truth], loads: Vec<Vec<Load>>, times: Vec<i64>, whole: bool) -> Synth {
     let n = truths.len();
     let rows = times.len();
     let p: Vec<Vec<f64>> = loads
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|&l| volt.map_or_else(|| power(l), |v| power_with(l, v)))
-                .collect()
-        })
+        .map(|row| row.iter().copied().map(power).collect())
         .collect();
     let means: Vec<(Vec<[f64; 6]>, Vec<i64>)> = (0..n).map(|b| means(&times, &column(&p, b))).collect();
     let die = Die {
@@ -1180,7 +1022,8 @@ fn synth_from(
                     .iter()
                     .copied()
                     .chain(tr.near.iter().flat_map(|&(_, f, sl)| [f, sl]));
-                tr.a + x.iter().zip(weights).map(|(v, w)| v * w).sum::<f64>()
+                let own_fast = tr.fast.as_ref().map_or(0.0, |f| s.heat(i, t, f));
+                tr.a + own_fast + x.iter().zip(weights).map(|(v, w)| v * w).sum::<f64>()
             })
             .collect();
         let temps = solve(&system, &force).expect("система строки решается");
@@ -1320,62 +1163,93 @@ fn synthetic_log_in_whole_degrees_is_recovered_roughly() {
     recovered(&model, &truths, &tol);
 }
 
-// Напряжение ядра от множителя без шума: 0,80 В на ×38 и 0,012 В на ступень (×45 — 0,884 В). Ровная прямая — любой
-// допустимый вид V(r) повторяет её точно, и V45 модели равно 0,884.
-fn volt_line(r: u32) -> f64 {
-    0.80 + 0.012 * (f64::from(r) - 38.0)
+// Всё числовое, что модель знает о блоке: пригодные строки и минуты, слой L3 в старом виде и с формой (вместе с самой
+// формой), опорные условия, кривая на ×30…×60 через 2.
+fn block_numbers(b: &BlockModel) -> Vec<f64> {
+    let mut v = vec![real(b.usable), b.minutes];
+    for c in [b.coef.as_ref(), b.shaped.as_ref()].into_iter().flatten() {
+        v.extend(coef_numbers(c));
+        v.push(c.shape.lo);
+        v.extend(&c.shape.knots);
+        v.extend(&c.shape.weights);
+    }
+    if let Some(rf) = &b.reference {
+        v.extend([rf.die, rf.lo, rf.hi, rf.median]);
+        v.extend(rf.neighbours.iter().flat_map(|&(j, p)| [real(j), p]));
+    }
+    v.extend(grid(30.0, 60.0, 2.0).into_iter().filter_map(|r| b.curve(r)));
+    v
+}
+
+// Модели совпадают поблочно: имена, наличие частей и все числа с допуском tol·(1 + |x|).
+fn same_models(x: &Model, y: &Model, tol: f64) {
+    assert_eq!(x.blocks.len(), y.blocks.len(), "число блоков");
+    let parts = |b: &BlockModel| {
+        [
+            b.coef.is_some(),
+            b.shaped.is_some(),
+            b.reference.is_some(),
+            b.drawn(),
+            b.knee().is_some(),
+        ]
+    };
+    for (bx, by) in x.blocks.iter().zip(&y.blocks) {
+        assert_eq!(bx.name, by.name);
+        assert_eq!(parts(bx), parts(by), "блок {}: части модели", bx.name);
+        let (nx, ny) = (block_numbers(bx), block_numbers(by));
+        assert!(
+            nx.len() == ny.len() && nx.iter().zip(&ny).all(|(a, b)| close(*a, *b, tol * (1.0 + a.abs()))),
+            "блок {}: {nx:?} против {ny:?}",
+            bx.name
+        );
+    }
 }
 
 #[test]
-fn synthetic_log_with_voltage_recovers_gains_and_the_curve() {
-    // Тот же кристалл, но нагрев шёл от p = занятость × (r/45) × (V/V45)² с записанным напряжением строки (бриф:
-    // «V is the logged volts when present», V45 — по V(r) блока); напряжение есть в каждой строке, где есть множитель.
-    // Модель должна вернуть коэффициенты, а кривая — идти по (r/45)·(V(r)/V45)², не по кубу.
-    // Ловит: напряжение строки без деления на V45 (p меньше в V45² ≈ 0,78 раза — свои коэффициенты больше на 28 %),
-    // закон куба при известном напряжении, кривую по кубу при наличии V(r), долю «без напряжения» не по строкам.
+fn volts_columns_of_old_logs_do_not_change_the_model() {
+    // Решение 16.10: напряжение задаёт сам процессор по множителю и условиям — не независимый вход, путь напряжения из
+    // модели убран; журналы 0.5.4 всё ещё несут столбцы <блок>.volts. Тот же журнал со столбцами напряжения (0,90 В на
+    // ×38 + 0,010 В на ступень, провал 0,025 В на ×44, шум ±0,015 В; у блоков 0 и 1 во всех строках, у блока 2 только
+    // в последних 60 % строк, у блока 3 столбец пуст, у спящего ядра поле пустое) и без них даёт ту же модель до
+    // последнего знака; p при полной своей нагрузке — куб при любом напряжении, кривые неубывающие.
+    // Ловит: напряжение в p строки (средние, соседи, раскладка), кривую напряжения в power_at или в кривой, строки без
+    // напряжения как неизвестные или с другим p (у блоков 2 и 3 изменились бы пригодные строки или коэффициенты).
     let truths = square();
-    let s = synth_with(&truths, 4000, &GAPS, 15, false, Some(volt_line));
-    let volts: Vec<Vec<Option<f64>>> = s
-        .loads
-        .iter()
-        .map(|row| row.iter().map(|l| l.ratio.map(|r| shown4(volt_line(r)))).collect())
-        .collect();
-    let model = fit(&[&log_from_csv(&s.csv(Some(&volts), None))], &s.die);
-    let tol = Tolerance {
-        beta: 0.005,
-        own_total: 0.01 * 21.0,
-        own_each: None,
-        near: 0.05,
-        a: 0.2,
-    };
-    recovered(&model, &truths, &tol);
-    for (i, (b, tr)) in model.blocks.iter().zip(&truths).enumerate() {
-        let v = b
-            .volts
-            .as_ref()
-            .unwrap_or_else(|| panic!("блок {i}: нет кривой напряжения"));
-        assert!(close(v.at(45.0), 0.884, 1e-3), "блок {i}: V(45) = {}", v.at(45.0));
-        // Спящие строки — p = 0 без признака; остальные с напряжением: «без напряжения» нет ни одной.
-        assert!(
-            close(b.fallback, 0.0, 1e-12),
-            "блок {i}: доля без напряжения {}",
-            b.fallback
-        );
-        let rf = b
-            .reference
-            .as_ref()
-            .unwrap_or_else(|| panic!("блок {i}: нет опорных условий"));
-        let mut steady = tr.a + tr.beta * rf.die;
-        for &(j, fast, slow) in &tr.near {
-            let p = rf.neighbours.iter().find(|x| x.0 == j).map_or(f64::NAN, |x| x.1);
-            steady += (fast + slow) * p;
+    let s = synth(&truths, 4000, &GAPS, 15, false);
+    let cut = 1600; // первые 40 % строк — без напряжения у блока 2
+    let mut dice = Dice(7);
+    let mut volts: Vec<Vec<Option<f64>>> = Vec::with_capacity(s.times.len());
+    for (t, row) in s.loads.iter().enumerate() {
+        let mut line = Vec::with_capacity(4);
+        for (b, l) in row.iter().enumerate() {
+            let shown = l.ratio.map(|ratio| {
+                let dip = if ratio == 44 { 0.025 } else { 0.0 };
+                0.90 + 0.010 * (f64::from(ratio) - 38.0) - dip + 0.015 * dice.sign()
+            });
+            line.push(match b {
+                0 | 1 => shown,
+                2 => shown.filter(|_| t >= cut),
+                _ => None,
+            });
         }
-        let own: f64 = tr.own.iter().sum();
-        for r in [38_u32, 42, 45, 48] {
-            let at = f64::from(r);
-            let want = steady + own * at / 45.0 * (volt_line(r) / volt_line(45)).powi(2);
-            let got = b.curve(at).unwrap_or_else(|| panic!("блок {i}: нет кривой"));
-            assert!(close(got, want, 0.1), "блок {i}, ×{r}: {got} вместо {want}");
+        volts.push(line);
+    }
+    let with = fit(&[&log_from_csv(&s.csv(Some(&volts), None))], &s.die);
+    let without = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+    assert_eq!(with.rows, without.rows);
+    same_models(&with, &without, 0.0);
+    for b in &with.blocks {
+        for r in [30.0_f64, 38.0, 45.0, 48.0, 60.0] {
+            assert!(
+                close(b.power_at(r), cube(r), 1e-12 * cube(r)),
+                "блок {}, ×{r}: {} вместо {}",
+                b.name,
+                b.power_at(r),
+                cube(r)
+            );
+        }
+        if let Err(why) = curve_rises(b) {
+            panic!("блок {}: кривая падает: {why}", b.name);
         }
     }
 }
@@ -1432,11 +1306,13 @@ fn reference_conditions_and_curve_follow_the_true_layer() {
     // Опорные условия — медианы по пригодным строкам блока с его нагрузкой ≥ 0,5: уровень кристалла, p соседей (не 4-с
     // средняя и не быстрый вход), фактический множитель (простая медиана строк); сплошная часть кривой — от 5-го до
     // 95-го процентиля множителя по времени тех же строк (вес строки — мс от прошлой; строка 2600 весит 1000 мс).
-    // Кривая — установившийся слой L3 при своей нагрузке 100 %: все свои входы равны p(r) = (r/45)³, входы соседей —
-    // их медианным p. Сверка с истинными коэффициентами.
+    // Кривая — установившийся слой L3 с формой (shaped) при своей нагрузке 100 %: быстрый свой член — g(r), средние
+    // своей нагрузки — p(r) = (r/45)³, входы соседей — их медианным p (дополнение 16.10: кривая — по shaped, не по
+    // coef). Сверка с истинными коэффициентами внутри сплошной части и с формулой API на числах модели везде.
     // Ловит: опорные строки без порога нагрузки или по всем строкам, медиану не того (средняя вместо медианы, быстрый
-    // вход соседа), кривую только по быстрому коэффициенту, без соседей или без уровня кристалла, степень множителя не 3;
-    // сплошную часть как min…max, как процентиль по строкам без веса времени или с другой долей.
+    // вход соседа), кривую только по быстрому члену, без соседей или без уровня кристалла, по coef вместо shaped,
+    // средние своей нагрузки не по кубу; сплошную часть как min…max, как процентиль по строкам без веса времени или с
+    // другой долей.
     let truths = square();
     let s = synth(&truths, 4000, &GAPS, 15, false);
     let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
@@ -1479,15 +1355,33 @@ fn reference_conditions_and_curve_follow_the_true_layer() {
             assert!(within(got, want), "блок {i}, сосед {j}: p {got} вне {want:?}");
             steady += (fast + slow) * got;
         }
+        // Внутри сплошной части выученная форма повторяет выпуклый свой нагрев истины K·(r/45)³ (на этих данных
+        // расхождение кривой ≤ 0,015 °C — проверено независимой подгонкой); за краями g продолжается прямой, а не
+        // кубом, и с кубом истины там не сверяется.
         let own: f64 = tr.own.iter().sum();
-        for r in [36.0_f64, 40.0, 45.0, 48.0, 52.0] {
-            let want = steady + own * (r / 45.0).powi(3);
+        for r in grid(rf.lo, rf.hi, 0.5) {
+            let want = steady + own * cube(r);
             let got = b.curve(r).unwrap_or_else(|| panic!("блок {i}: нет кривой"));
             assert!(close(got, want, 0.05), "блок {i}, ×{r}: {got} вместо {want}");
+        }
+        // И внутри, и за краями кривая — по формуле API на числах слоя с формой: a + β·D + g(r) + K·p(r) + соседи по
+        // их медианным p, p(r) = (r/45)³.
+        let sh = b
+            .shaped
+            .as_ref()
+            .unwrap_or_else(|| panic!("блок {i}: нет слоя с формой"));
+        for r in [30.0_f64, 36.0, 40.0, 45.0, 48.0, 52.0, 60.0] {
+            let mut want = sh.a + sh.beta * rf.die + sh.shape.at(r) + sh.own_total() * b.power_at(r);
+            for n in &sh.neighbours {
+                let p = rf.neighbours.iter().find(|x| x.0 == n.block).map_or(f64::NAN, |x| x.1);
+                want += (n.fast + n.slow) * p;
+            }
+            let got = b.curve(r).unwrap_or_else(|| panic!("блок {i}: нет кривой"));
             assert!(
-                close(b.power_at(r), (r / 45.0).powi(3), 1e-12),
-                "блок {i}: без напряжения — куб"
+                close(got, want, 1e-9 * (1.0 + want.abs())),
+                "блок {i}, ×{r}: {got} вместо {want} по формуле"
             );
+            assert!(close(b.power_at(r), cube(r), 1e-12), "блок {i}: p — куб");
         }
     }
 }
@@ -1496,35 +1390,23 @@ fn reference_conditions_and_curve_follow_the_true_layer() {
 fn ceiling_fan_package_and_power_columns_do_not_change_the_layer() {
     // Слова владельца: «потолок вообще не должен ебать агрессионную модель»; бриф: вентилятор — не вход, мощности
     // процессора и видеокарты — только в слое уровня кристалла (L4). Тот же журнал с постоянными и со случайными
-    // потолками, корпусом, вентиляторами, мощностями и видеокартой — слой L3 и опорные условия те же.
-    // Ловит: потолок как вход или подстановку потолка вместо пустого множителя спящего ядра, вентилятор или корпус как
-    // уровень кристалла, мощность в слое блока.
+    // потолками, корпусом, вентиляторами, мощностями и видеокартой — слой L3 (в старом виде и с формой, с самой формой
+    // и её узлами), опорные условия и кривые те же.
+    // Ловит: потолок как вход или подстановку потолка вместо пустого множителя спящего ядра, потолок вместо
+    // фактического множителя в форме или в её узлах, вентилятор или корпус как уровень кристалла, мощность в слое
+    // блока.
     let truths = square();
     let s = synth(&truths, 3000, &[(1500, 3000)], 15, false);
     let calm = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
     let wild = fit(&[&log_from_csv(&s.csv(None, Some(99)))], &s.die);
-    for (i, (x, y)) in calm.blocks.iter().zip(&wild.blocks).enumerate() {
-        assert_eq!(x.usable, y.usable, "блок {i}");
-        let (cx, cy) = (
-            x.coef.as_ref().expect("коэффициенты"),
-            y.coef.as_ref().expect("коэффициенты"),
-        );
-        let flat = |c: &Coef| {
-            let mut v = vec![c.a, c.beta];
-            v.extend(c.own);
-            v.extend(c.neighbours.iter().flat_map(|n| [n.fast, n.slow]));
-            v
-        };
-        let (fx, fy) = (flat(cx), flat(cy));
+    for b in &calm.blocks {
         assert!(
-            fx.iter().zip(&fy).all(|(a, b)| close(*a, *b, 1e-9 * (1.0 + a.abs()))),
-            "блок {i}: {fx:?} против {fy:?}"
+            b.coef.is_some() && b.shaped.is_some() && b.reference.is_some(),
+            "блок {}: слой и опора есть",
+            b.name
         );
-        for r in [40.0, 45.0, 50.0] {
-            let (gx, gy) = (x.curve(r).expect("кривая"), y.curve(r).expect("кривая"));
-            assert!(close(gx, gy, 1e-9), "блок {i}, ×{r}: {gx} против {gy}");
-        }
     }
+    same_models(&calm, &wild, 1e-9);
 }
 
 #[test]
@@ -1592,9 +1474,10 @@ fn unconstrained(s: &Synth, truths: &[Truth], i: usize) -> Vec<f64> {
 fn curve_is_non_decreasing_even_when_the_data_say_heat_cools() {
     // Данные, где без ограничения выходят отрицательные коэффициенты: у блока 0 16-с средняя своей нагрузки с весом −6
     // (охлаждение долгой нагрузкой), у блока 1 своя нагрузка охлаждает (−4), у блока 1 быстрый вход соседа 3 — −1,5,
-    // у блока 3 β = −0,2. Бриф: β, K, M ≥ 0 — «тепло не охлаждает», и поэтому кривая неубывающая по построению.
-    // Ловит: обычные МНК без ограничений, ограничение только суммы своих коэффициентов, отрицательный β, кривую,
-    // падающую за пределами наблюдённых множителей (закон куба без напряжения).
+    // у блока 3 β = −0,2. Бриф: β, K, M ≥ 0 — «тепло не охлаждает», и поэтому кривая неубывающая по построению;
+    // дополнение 16.10: то же у слоя с формой, и все веса формы w ≥ 0.
+    // Ловит: обычные МНК без ограничений (в любом из двух видов слоя), ограничение только суммы своих коэффициентов,
+    // отрицательный β, кривую, падающую за пределами наблюдённых множителей.
     let truths = vec![
         truth(
             25.0,
@@ -1629,76 +1512,26 @@ fn curve_is_non_decreasing_even_when_the_data_say_heat_cools() {
     assert!(free1[2] < -1.0, "блок 1, быстрый вход без ограничения: {}", free1[2]);
     let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
     for (i, b) in model.blocks.iter().enumerate() {
-        let c = b.coef.as_ref().unwrap_or_else(|| panic!("блок {i}: нет коэффициентов"));
-        assert!(c.beta >= 0.0, "блок {i}: β {}", c.beta);
-        assert!(c.own.iter().all(|&k| k >= 0.0), "блок {i}: свои {:?}", c.own);
-        assert!(
-            c.neighbours.iter().all(|n| n.fast >= 0.0 && n.slow >= 0.0),
-            "блок {i}: соседи {:?}",
-            c.neighbours.iter().map(|n| (n.fast, n.slow)).collect::<Vec<_>>()
-        );
-        if let Err(why) = curve_rises(b) {
-            panic!("блок {i}: кривая падает: {why}");
-        }
-    }
-}
-
-#[test]
-fn curve_is_non_decreasing_with_a_voltage_curve() {
-    // Журнал с напряжением: 0,90 В на ×38 + 0,010 В на ступень, провал 0,025 В на ×44 (среднее ×44 ниже, чем ×43) и шум
-    // ±0,015 В в каждой строке — у блоков 0 и 1 во всех строках, у блока 2 только в последних 60 % строк, у блока 3
-    // столбец пуст. Ловит: кривую напряжения, повторяющую провал (кривая блока падает), p по напряжению без деления на
-    // V(45), напряжение без кривой у блока с пустым столбцом, долю «без напряжения» не по пригодным строкам (у блока 2
-    // — доля пригодных строк без напряжения, у блоков 0 и 1 — 0, у блока 3 — 1).
-    let truths = square();
-    let s = synth(&truths, 4000, &GAPS, 0, false);
-    let cut = 1600; // первые 40 % строк — без напряжения у блока 2
-    let mut dice = Dice(7);
-    let mut volts: Vec<Vec<Option<f64>>> = Vec::with_capacity(s.times.len());
-    for (t, row) in s.loads.iter().enumerate() {
-        let mut line = Vec::with_capacity(4);
-        for (b, l) in row.iter().enumerate() {
-            let r = f64::from(l.ratio.expect("в этом журнале ядра не спят"));
-            let dip = if l.ratio == Some(44) { 0.025 } else { 0.0 };
-            let v = 0.90 + 0.010 * (r - 38.0) - dip + 0.015 * dice.sign();
-            let shown: f64 = format!("{v:.4}").parse().expect("число");
-            line.push(match b {
-                0 | 1 => Some(shown),
-                2 => (t >= cut).then_some(shown),
-                _ => None,
-            });
-        }
-        volts.push(line);
-    }
-    let model = fit(&[&log_from_csv(&s.csv(Some(&volts), None))], &s.die);
-    let share = real((0..cut).filter(|&t| s.usable[2][t]).count()) / real(used(&s, 2));
-    let fallback = [0.0, 0.0, share, 1.0];
-    for (i, b) in model.blocks.iter().enumerate() {
-        assert_eq!(b.volts.is_some(), i < 3, "блок {i}: кривая напряжения");
-        assert!(
-            close(b.fallback, fallback[i], 1e-9),
-            "блок {i}: доля без напряжения {} вместо {}",
-            b.fallback,
-            fallback[i]
-        );
-        for r in [30.0_f64, 38.0, 45.0, 48.0, 60.0] {
-            let want = b
-                .volts
-                .as_ref()
-                .map_or((r / 45.0).powi(3), |v| r / 45.0 * (v.at(r) / v.at(45.0)).powi(2));
+        // Оба вида слоя (старый — для «°C на ватт», с формой — для кривой) с неотрицательными коэффициентами.
+        for (what, layer) in ["coef", "shaped"].into_iter().zip([b.coef.as_ref(), b.shaped.as_ref()]) {
+            let c = layer.unwrap_or_else(|| panic!("блок {i}: нет слоя {what}"));
+            assert!(c.beta >= 0.0, "блок {i}, {what}: β {}", c.beta);
+            assert!(c.own.iter().all(|&k| k >= 0.0), "блок {i}, {what}: свои {:?}", c.own);
             assert!(
-                close(b.power_at(r), want, 1e-9 * want),
-                "блок {i}, ×{r}: {} вместо {want}",
-                b.power_at(r)
+                c.shape.weights.iter().all(|&w| w >= 0.0),
+                "блок {i}, {what}: веса формы {:?}",
+                c.shape.weights
+            );
+            assert!(
+                c.neighbours.iter().all(|n| n.fast >= 0.0 && n.slow >= 0.0),
+                "блок {i}, {what}: соседи {:?}",
+                c.neighbours.iter().map(|n| (n.fast, n.slow)).collect::<Vec<_>>()
             );
         }
         if let Err(why) = curve_rises(b) {
             panic!("блок {i}: кривая падает: {why}");
         }
     }
-    let v0 = model.blocks[0].volts.as_ref().expect("кривая напряжения");
-    let (lo, hi) = v0.range();
-    assert!(close(lo, 38.0, 1e-9) && close(hi, 48.0, 1e-9), "диапазон {lo}..{hi}");
 }
 
 // ─── 9. Раскладка мощности по блокам, «°C на ватт», кривые при одинаковой работе ─────────────────────────────────
@@ -1706,7 +1539,8 @@ fn curve_is_non_decreasing_with_a_voltage_curve() {
 // c_j ≥ 0, p строки (у мощности нет тепловой задержки), p кластера E ×4; power_cores, если он есть, иначе power_cpu;
 // блоки, нагруженные всегда вместе, определяются только суммой — без выдуманного деления; «°C на ватт» =
 // K_own,total / c_j; кривые при одинаковой работе T_i(r) = base_i + R_i·c_ref·p(r), c_ref — медиана ватт блоков того
-// же типа; без данных о мощности — прежние кривые.
+// же типа (с дополнения 16.10 вместо K·p — свой нагрев слоя с формой heat(r) = g(r) + K·p(r), пересчитанный к c_ref);
+// без данных о мощности — прежние кривые.
 
 // Мощности строк для журнала: power_cpu и столбец power_cores (None — столбца нет); None в строке — поле пустое.
 struct Watts<'a> {
@@ -1812,13 +1646,15 @@ fn power_split_uses_one_column_for_all_rows() {
 
 #[test]
 fn resistance_is_own_gain_per_watt_and_same_work_curves_use_the_median_watts() {
-    // «°C на ватт» = K_own,total / c_j: 2; 2; 4; 1,5. Кривая при одинаковой работе: base_i + R_i·c_ref·p(r), где base_i —
-    // кривая слоя L3 без своего нагрева, c_ref — медиана ватт блоков того же типа (P: 8; E: 14). Блоки 1 и 3 — сами на
-    // медиане: их кривая не меняется; блок 0 (9 Вт): R·8 − 18 = −2 на единицу p; блок 2 (5 Вт): R·8 − 20 = +12. Блоки 0
-    // и 1 с одинаковым R при одинаковой работе греются одинаково сверх своей базы.
+    // «°C на ватт» = K_own,total / c_j старого вида слоя (coef): 2; 2; 4; 1,5. Кривая при одинаковой работе (дополнение
+    // 16.10): curve(r) + (c_ref/c_j − 1)·heat(r), heat(r) = g(r) + K·p(r) слоя с формой — свой нагрев блока,
+    // пересчитанный к c_ref, медиане ватт блоков того же типа (P: 8; E: 14). Блоки 1 и 3 — сами на медиане: их кривая
+    // не меняется; блок 0 (9 Вт): сдвиг −1/9 своего нагрева (по истине R·8 − 18 = −2 на единицу p); блок 2 (5 Вт): +0,6
+    // своего нагрева (+12 на единицу p). Блоки 0 и 1 с одинаковым R при одинаковой работе греются одинаково сверх своей
+    // базы.
     // Ловит: R как ватты / K или K / (ватты/4) у кластера E; медиану по всем блокам без разделения на P и E; кривую без
-    // вычитания своего нагрева (base + R·c_ref·p + K·p) или по своим ваттам вместо медианы; значение вне своего
-    // интервала; интервал, не сходящийся на точных данных.
+    // вычитания своего нагрева или по своим ваттам вместо медианы; свой нагрев по старому виду (K·p) вместо формы;
+    // значение вне своего интервала; интервал, не сходящийся на точных данных.
     let truths = square();
     let mut s = synth(&truths, 4000, &GAPS, 15, false);
     s.die.e[3] = true;
@@ -1860,18 +1696,22 @@ fn resistance_is_own_gain_per_watt_and_same_work_curves_use_the_median_watts() {
             "блок {i}: опорные ватты {same} вместо {}",
             SAME[i]
         );
-        let own = b.coef.as_ref().expect("коэффициенты").own_total();
+        let sh = b.shaped.as_ref().expect("слой с формой");
+        let own_watts = b.power.as_ref().expect("ватты блока").watts;
         for r in [38.0_f64, 45.0, 48.0] {
             let curve = b.curve(r).expect("кривая");
             let shown = b.shown_curve(r).expect("кривая при одинаковой работе");
-            // По формуле брифа на числах самой модели.
-            let base = curve - own * cube(r);
-            let want = base + rs.value * same * cube(r);
+            // По формуле дополнения на числах самой модели: свой нагрев heat(r) = g(r) + K·p(r) слоя с формой,
+            // масштабированный к опорным ваттам своего типа.
+            let heat = sh.shape.at(r) + sh.own_total() * b.power_at(r);
+            let base = curve - heat;
+            let want = curve + (same / own_watts - 1.0) * heat;
             assert!(
                 close(shown, want, 1e-6 * want.abs()),
                 "блок {i}, ×{r}: {shown} вместо {want}"
             );
-            // По истине: сдвиг от кривой L3 — (R·c_ref − K)·p(r).
+            // По истине: сдвиг от кривой L3 — (c_ref/c_j − 1)·K·p(r) = (R·c_ref − K)·p(r); внутри наблюдённых ×38…×48
+            // форма повторяет свой нагрев истины (на этих данных расхождение сдвига ≤ 0,01 °C — независимая подгонка).
             let shift = (OHMS[i] * SAME[i] - truths[i].own.iter().sum::<f64>()) * cube(r);
             assert!(
                 close(shown - curve, shift, 0.05),
@@ -1902,7 +1742,7 @@ fn blocks_always_loaded_together_get_no_invented_split() {
         row[1] = row[0];
         row[3] = Load { busy: 1, ratio: None };
     }
-    let s = synth_from(&truths, together, times(4000, &GAPS), false, None);
+    let s = synth_from(&truths, together, times(4000, &GAPS), false);
     let cores = split_power(&s, 6.0, &WATTS);
     let none = vec![None; 4000];
     let watts = Watts {
@@ -2035,7 +1875,7 @@ fn solid_range(together: Vec<Vec<Load>>) -> Solid {
 
 // То же со своими промежутками между строками (строка, промежуток перед ней в мс).
 fn solid_range_at(together: Vec<Vec<Load>>, gaps: &[(usize, i64)]) -> Solid {
-    let s = synth_from(&square(), together, times(4000, gaps), false, None);
+    let s = synth_from(&square(), together, times(4000, gaps), false);
     let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
     let rf = model.blocks[0].reference.as_ref().expect("опорные условия");
     let points = solid_points(&s, 0);
@@ -2291,7 +2131,8 @@ fn fit_on_trimmed_logs_equals_fit_on_the_recent_rows_only() {
     // 2000 первого. trim оставляет в первом строки 2000…3999; модель по ним должна совпасть с моделью по журналу,
     // собранному только из этих строк (первая оставшаяся строка — начало файла).
     // Ловит: выброшенные строки, всё ещё влияющие на модель (средние, тянущиеся от них; разогрев от выброшенного
-    // начала; счёт строк и минут); срез, сбивший порядок или поля оставшихся строк.
+    // начала; счёт строк и минут; lo, hi и узлы формы по выброшенным строкам); срез, сбивший порядок или поля
+    // оставшихся строк.
     let truths = square();
     let s = synth(&truths, 4000, &GAPS, 15, false);
     let text = s.csv(None, None);
@@ -2334,6 +2175,457 @@ fn fit_on_trimmed_logs_equals_fit_on_the_recent_rows_only() {
                 .iter()
                 .all(|&(a, b)| close(a, b, 1e-9 * (1.0 + a.abs()))),
             "блок {i}: опорные условия разные"
+        );
+    }
+    // Дополнение 16.10: и слой с формой (веса, lo и узлы по оставшимся строкам), и кривые те же.
+    assert!(trimmed.blocks.iter().all(|b| b.shaped.is_some()), "слой с формой есть");
+    same_models(&trimmed, &fresh, 1e-9);
+}
+
+// ─── 12. Выученная форма своего быстрого нагрева ─────────────────────────────────────────────────────────────────
+// Источник — дополнение API от 16.10 (model-api-shape.md) и уточнение узлов того же дня. Слой с формой (shaped):
+// быстрый свой член — Σ w_m·hfast_m, hfast_m — среднее занятость·φ_m(r) в t и t+1 (спящее ядро — 0), φ_0 = 1,
+// φ_1 = r − lo, φ_{1+j} = max(0, r − k_j); узлы k_j = floor(lo) + 2·j, пока k_j ≤ hi − 1; все w ≥ 0, так что
+// g(r) = Σ w_m·φ_m(r) неубывающая и выпуклая; за узлами — последний наклон. Средние своей нагрузки и соседи — по p, как
+// прежде. Колено — узел с наибольшим весом w*, если w* ≥ 0,1 °C/ступень и наклон после ≥ 2× наклона до.
+
+// Колено формы как (где, наклон до, наклон после); None — колена нет.
+fn knee_of(h: &Hinge) -> Option<(f64, f64, f64)> {
+    h.knee().map(|k| (k.at, k.before, k.after))
+}
+
+// Форма из весов [w_0, w_1, веса узлов…]: lo = ×36, узлы ×38, ×40, … — столько, сколько весов узлов дано.
+fn hinge(weights: &[f64]) -> Hinge {
+    let knots = (1..weights.len().saturating_sub(1))
+        .map(|j| 36.0 + 2.0 * real(j))
+        .collect();
+    Hinge {
+        lo: 36.0,
+        knots,
+        weights: weights.to_vec(),
+    }
+}
+
+#[test]
+fn hinge_is_a_sum_of_ramps_continued_by_the_end_slopes() {
+    // g = 5 + 0,1·(r − 36) + 0·(r − 38)⁺ + 0,3·(r − 40)⁺ + 1,0·(r − 42)⁺ + 0·(r − 44)⁺; значения посчитаны вручную.
+    // Ловит: φ_1 = r вместо r − lo; вес j-го узла на соседнем узле; рампы без max(0, ·) (вклад ниже узла); продолжение
+    // за краями не прямой; наклон в самом узле с его весом (по формуле — только узлы строго левее r); пустые веса не
+    // как g ≡ 0.
+    let h = hinge(&[5.0, 0.1, 0.0, 0.3, 1.0, 0.0]);
+    let values = [
+        (20.0, 3.4),
+        (30.0, 4.4),
+        (36.0, 5.0),
+        (38.0, 5.2),
+        (40.0, 5.4),
+        (42.0, 6.2),
+        (44.0, 9.0),
+        (50.0, 17.4),
+        (60.0, 31.4),
+    ];
+    for (r, want) in values {
+        assert!(close(h.at(r), want, 1e-12), "g(×{r}) = {} вместо {want}", h.at(r));
+    }
+    let slopes = [
+        (20.0, 0.1),
+        (39.0, 0.1),
+        (41.0, 0.4),
+        (42.0, 0.4),
+        (43.0, 1.4),
+        (45.0, 1.4),
+        (80.0, 1.4),
+    ];
+    for (r, want) in slopes {
+        assert!(
+            close(h.slope_at(r), want, 1e-12),
+            "наклон на ×{r}: {} вместо {want}",
+            h.slope_at(r)
+        );
+    }
+    let empty = Hinge {
+        lo: 36.0,
+        knots: Vec::new(),
+        weights: Vec::new(),
+    };
+    assert!(
+        close(empty.at(45.0), 0.0, 0.0) && close(empty.slope_at(45.0), 0.0, 0.0) && empty.knee().is_none(),
+        "пустые веса — g ≡ 0"
+    );
+}
+
+#[test]
+fn knee_is_the_heaviest_knot_with_a_tenth_per_step_and_a_doubled_slope() {
+    // Ловит: колено на первом ненулевом узле, а не на наибольшем весе; «наклон до» без весов левее колена (только w_1);
+    // «после» как вес узла без наклона до; порог веса «больше» вместо «не меньше» или не 0,1; «после ≥ 2·до» строгое;
+    // поиск любого подходящего узла вместо проверки узла с наибольшим весом; колено у прямой.
+    // Наибольший вес 1,0 на ×42; левее него 0,1 + 0,3: до 0,4, после 1,4.
+    let k = knee_of(&hinge(&[5.0, 0.1, 0.0, 0.3, 1.0, 0.0])).expect("колено есть");
+    assert!(
+        close(k.0, 42.0, 0.0) && close(k.1, 0.4, 1e-12) && close(k.2, 1.4, 1e-12),
+        "{k:?}"
+    );
+    // Порог веса: ровно 0,1 при наклоне до 0 — колено есть; 0,0999 — нет.
+    let k = knee_of(&hinge(&[2.0, 0.0, 0.1, 0.0])).expect("вес ровно 0,1");
+    assert!(
+        close(k.0, 38.0, 0.0) && close(k.1, 0.0, 1e-12) && close(k.2, 0.1, 1e-12),
+        "{k:?}"
+    );
+    assert!(knee_of(&hinge(&[2.0, 0.0, 0.0999, 0.0])).is_none(), "вес меньше 0,1");
+    // Наклон после ровно вдвое больше — колено есть (0,25 → 0,5); чуть меньше — нет.
+    let k = knee_of(&hinge(&[2.0, 0.25, 0.25, 0.0])).expect("ровно вдвое");
+    assert!(
+        close(k.0, 38.0, 0.0) && close(k.1, 0.25, 1e-12) && close(k.2, 0.5, 1e-12),
+        "{k:?}"
+    );
+    assert!(knee_of(&hinge(&[2.0, 0.25, 0.2499, 0.0])).is_none(), "меньше чем вдвое");
+    // Наибольший вес 0,35 на ×40 не удваивает наклон 0,4 — колена нет, хотя узел ×38 (0,1 → 0,4) удвоил бы.
+    assert!(
+        knee_of(&hinge(&[2.0, 0.1, 0.3, 0.35])).is_none(),
+        "проверяется только узел с наибольшим весом"
+    );
+    // Прямая: без узлов и с нулевыми весами узлов.
+    assert!(knee_of(&hinge(&[2.0, 0.5])).is_none(), "прямая без узлов");
+    assert!(knee_of(&hinge(&[2.0, 1.5, 0.0, 0.0, 0.0])).is_none(), "прямая с узлами");
+}
+
+// Нагрузки кристалла 2 × 2 с множителями ×36…×52: множитель каждого отрезка генератора заменён на
+// 36 + (5·r + 3·занятость) mod 17 — постоянен на отрезке и при полной нагрузке проходит весь диапазон, так что форме
+// своего нагрева есть на чём учиться (у RATIOS всего 7 ступеней).
+fn wide_loads() -> Vec<Vec<Load>> {
+    let mut out = loads(20_261_016, 4, 4000, 15);
+    for l in out.iter_mut().flatten() {
+        let busy = l.busy;
+        l.ratio = l.ratio.map(|r| 36 + (5 * r + 3 * busy) % 17);
+    }
+    out
+}
+
+// Узлы по правилу: floor(lo) + 2·j, j = 1, 2, … пока узел ≤ hi − 1.
+fn knots_of(lo: f64, hi: f64) -> Vec<f64> {
+    // Узлов не больше, чем ступеней в диапазоне: перебор конечен и при пустом диапазоне.
+    (1_u32..=200)
+        .map(|j| lo.floor() + 2.0 * f64::from(j))
+        .take_while(|&k| k <= hi - 1.0)
+        .collect()
+}
+
+// Коэффициенты своих средних 0,5…16 с у истин с формой: по 1 на 1, 4 и 16 с.
+const HISTORY: [f64; 6] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+
+// Установившийся нагрев истины блока при своей нагрузке 100 % в опорных условиях модели: a + β·уровень + соседи по их
+// медианным p + свой быстрый нагрев (форма или own[0]·p(r)) + средние своей нагрузки·p(r).
+fn true_curve(tr: &Truth, rf: &Reference, r: f64) -> f64 {
+    let mut v = tr.a + tr.beta * rf.die;
+    for &(j, fast, slow) in &tr.near {
+        v += (fast + slow) * rf.neighbours.iter().find(|x| x.0 == j).map_or(f64::NAN, |x| x.1);
+    }
+    let own: f64 = tr.own.iter().sum();
+    v + own * cube(r) + tr.fast.as_ref().map_or(0.0, |f| f(r))
+}
+
+// Журнал с коленом у блока 0 и что о нём известно: свой быстрый нагрев 8 + 0,1·(r − lo) °C, после колена на
+// 1,4 °C/ступень круче (0,1 → 1,5 °C/ступень при полной нагрузке); колено — средний из узлов по правилу (lo, hi —
+// сплошная часть блока 0 на тех же нагрузках); средние своей нагрузки — HISTORY, соседи как у square()[0]; блоки 1–3 —
+// square().
+struct Bent {
+    s: Synth,
+    truths: Vec<Truth>,
+    knots: Vec<f64>,
+    knee: f64,
+}
+
+fn bent(whole: bool) -> Bent {
+    let first = synth_from(&square(), wide_loads(), times(4000, &GAPS), false);
+    let solid = solid_points(&first, 0);
+    let (lo, hi) = (time_share(&solid, (5, 100)), time_share(&solid, (95, 100)));
+    let knots = knots_of(lo, hi);
+    assert!(knots.len() >= 4, "предпосылка: узлы {knots:?} при ×{lo}…×{hi}");
+    let knee = knots[knots.len() / 2];
+    let mut truths = square();
+    truths[0] = truth_with_shape(
+        18.0,
+        0.55,
+        Box::new(move |r: f64| 8.0 + 0.1 * (r - lo) + 1.4 * (r - knee).max(0.0)),
+        HISTORY,
+        &[(1, 1.5, 2.0), (2, 0.0, 3.0)],
+    );
+    let s = synth_from(&truths, wide_loads(), times(4000, &GAPS), whole);
+    Bent { s, truths, knots, knee }
+}
+
+#[test]
+fn shaped_fit_recovers_a_knee_and_the_whole_layer_on_exact_data() {
+    // Блок 0 (bent): до колена свой нагрев почти плоский, после — крутой. Такая истина точно представима формой с
+    // узлами по правилу, и на точных данных (шесть знаков) модель возвращает её целиком (независимая подгонка: всё до
+    // 1e-4): lo и узлы, веса (w_0 = g(lo) = 8, w_1 = 0,1, на колене 1,4, остальные 0), средние и соседей на p, колено,
+    // кривую внутри данных и за их краями (там истинный нагрев — прямая с последним наклоном).
+    // Ловит: форму не от фактического множителя; узлы не по правилу; φ_1 = r вместо r − lo (w_0 = 8 − 0,1·lo); быстрый
+    // член по p в слое с формой (own[0] ≠ 0) или форму в старом виде слоя (coef); средние своей нагрузки или соседей на
+    // форме вместо p; колено не на наибольшем весе, наклоны колена не «до/после»; кривую по coef, с кубом вместо формы
+    // или с изгибом за краем данных; кривую без подъёма после колена.
+    let case = bent(false);
+    let model = fit(&[&log_from_csv(&case.s.csv(None, None))], &case.s.die);
+    let b = &model.blocks[0];
+    let rf = b.reference.as_ref().expect("опорные условия");
+    let sh = b.shaped.as_ref().expect("слой с формой");
+    let tr = &case.truths[0];
+    assert!(
+        close(sh.shape.lo, rf.lo, 1e-9),
+        "lo формы {} против ×{}",
+        sh.shape.lo,
+        rf.lo
+    );
+    assert!(
+        all_near(&sh.shape.knots, &case.knots, 1e-9),
+        "узлы {:?} вместо {:?}",
+        sh.shape.knots,
+        case.knots
+    );
+    let mut weights = vec![8.0, 0.1];
+    weights.extend(
+        case.knots
+            .iter()
+            .map(|&k| if close(k, case.knee, 1e-9) { 1.4 } else { 0.0 }),
+    );
+    assert!(
+        all_near(&sh.shape.weights, &weights, 0.02),
+        "веса {:?} вместо {weights:?}",
+        sh.shape.weights
+    );
+    assert!(
+        close(sh.own[0], 0.0, 0.0),
+        "быстрый член по p в слое с формой: {}",
+        sh.own[0]
+    );
+    assert!(
+        all_near(&sh.own[1..], &tr.own[1..], 0.05),
+        "свои средние {:?} вместо {:?}",
+        sh.own,
+        tr.own
+    );
+    assert!(
+        close(sh.beta, tr.beta, 0.002) && close(sh.a, tr.a, 0.05),
+        "β {}, a {}",
+        sh.beta,
+        sh.a
+    );
+    let near: Vec<f64> = sh.neighbours.iter().flat_map(|n| [n.fast, n.slow]).collect();
+    let want: Vec<f64> = tr.near.iter().flat_map(|&(_, fast, slow)| [fast, slow]).collect();
+    assert!(all_near(&near, &want, 0.01), "соседи {near:?} вместо {want:?}");
+    for other in &model.blocks {
+        assert!(
+            other.coef.as_ref().is_some_and(|c| c.shape.weights.is_empty()),
+            "блок {}: у старого вида слоя формы нет",
+            other.name
+        );
+    }
+    let (at, before, after) = b.knee().map(|k| (k.at, k.before, k.after)).expect("колено есть");
+    assert!(
+        close(at, case.knee, 1e-9) && close(before, 0.1, 0.01) && close(after, 1.5, 0.02),
+        "колено ×{at}: {before} → {after} вместо ×{}: 0,1 → 1,5",
+        case.knee
+    );
+    assert!(
+        knee_of(&sh.shape).is_some_and(|k| close(k.0, at, 0.0) && close(k.1, before, 0.0) && close(k.2, after, 0.0)),
+        "knee() блока — колено формы слоя с формой"
+    );
+    for r in grid(30.0, 60.0, 0.5) {
+        let (got, want) = (b.curve(r).expect("кривая"), true_curve(tr, rf, r));
+        assert!(close(got, want, 0.02), "×{r}: кривая {got} вместо {want}");
+    }
+    // Кривая показывает подъём: за 4 ступени после колена — больше чем втрое против 4 ступеней до него.
+    let c = |r: f64| b.curve(r).expect("кривая");
+    let (low, high) = (c(case.knee) - c(case.knee - 4.0), c(case.knee + 4.0) - c(case.knee));
+    assert!(
+        high > 3.0 * low && high - low > 4.0,
+        "до колена +{low}, после +{high} за 4 ступени"
+    );
+}
+
+#[test]
+fn knee_is_found_in_whole_degree_data() {
+    // Тот же журнал с коленом, температуры — целые градусы, как в настоящем журнале (шум округления ±0,5 °C). Колено —
+    // не дальше шага узлов (2 ступени) от истинного, наклоны — примерно; кривая внутри сплошной части близка к истине
+    // (независимая подгонка на этих данных: колено на истинном узле, 0,093 → 1,501 °C/ступень, кривая в пределах 0,04).
+    // Ловит: колено, теряющееся в шуме, форму, сглаженную до прямой, сдвиг колена, кривую не по форме.
+    let case = bent(true);
+    let model = fit(&[&log_from_csv(&case.s.csv(None, None))], &case.s.die);
+    let b = &model.blocks[0];
+    let (at, before, after) = b.knee().map(|k| (k.at, k.before, k.after)).expect("колено есть");
+    assert!(
+        (at - case.knee).abs() <= 2.0 + 1e-9 && close(before, 0.1, 0.1) && close(after, 1.5, 0.2),
+        "колено ×{at}: {before} → {after} вместо ×{}: 0,1 → 1,5",
+        case.knee
+    );
+    let rf = b.reference.as_ref().expect("опорные условия");
+    for r in grid(rf.lo, rf.hi, 0.5) {
+        let (got, want) = (b.curve(r).expect("кривая"), true_curve(&case.truths[0], rf, r));
+        assert!(close(got, want, 0.15), "×{r}: кривая {got} вместо {want}");
+    }
+}
+
+#[test]
+fn straight_own_heating_gives_no_knee() {
+    // Свой быстрый нагрев — прямая по множителю: блок 0 — 10 °C при любом множителе (наклон 0), блок 1 — 6 + 0,6·(r −
+    // 36), блок 2 — 4 + 1,5·(r − 36); блок 3 — square(). И на точных данных, и на целых градусах колена нет, а наклон
+    // прямой выучен (независимая подгонка на целых градусах: наибольший вес узла 0,002, w_1 = 0,600 и 1,500).
+    // Ловит: колено без порога веса 0,1 (у прямой с наклоном 0 «после ≥ 2·до» верно всегда — любой шумовой вес дал бы
+    // колено), без условия «вдвое круче» (у крутой прямой), форму, не выучившую наклон (g ≡ 0 тоже без колена — поэтому
+    // сверяется и наклон).
+    let ramps = [(10.0, 0.0), (6.0, 0.6), (4.0, 1.5)];
+    let plain = square();
+    for whole in [false, true] {
+        let mut truths = square();
+        for ((tr, old), (start, slope)) in truths.iter_mut().zip(&plain).zip(ramps) {
+            let own_line: Shape = Box::new(move |r: f64| start + slope * (r - 36.0));
+            *tr = truth_with_shape(old.a, old.beta, own_line, HISTORY, &old.near);
+        }
+        let s = synth_from(&truths, wide_loads(), times(4000, &GAPS), whole);
+        let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+        for (b, (_, slope)) in model.blocks.iter().zip(ramps) {
+            let h = &b.shaped.as_ref().expect("слой с формой").shape;
+            assert!(
+                b.knee().is_none() && h.knee().is_none(),
+                "блок {}, целые градусы {whole}: колено у прямой, веса {:?}",
+                b.name,
+                h.weights
+            );
+            assert!(
+                h.weights.len() >= 2 && close(h.weights[1], slope, 0.05) && h.weights[2..].iter().all(|&w| w < 0.05),
+                "блок {}, целые градусы {whole}: веса {:?} при наклоне {slope}",
+                b.name,
+                h.weights
+            );
+        }
+    }
+}
+
+// Неубывание и выпуклость выученной формы блока по сетке ×8…×80 (далеко за наблюдённым ×36…×52), согласие наклона с
+// приращениями, прямые продолжения ниже lo и правее hi (последний узел ≤ hi − 1).
+fn convex_beyond_the_data(b: &BlockModel) -> Result<(), String> {
+    let rf = b.reference.as_ref().ok_or("нет опорных условий")?;
+    let h = &b.shaped.as_ref().ok_or("нет слоя с формой")?.shape;
+    if !(close(h.lo, rf.lo, 1e-9) && all_near(&h.knots, &knots_of(rf.lo, rf.hi), 1e-9)) {
+        return Err(format!("lo {} и узлы {:?} при ×{}…×{}", h.lo, h.knots, rf.lo, rf.hi));
+    }
+    if h.weights.len() != h.knots.len() + 2 || h.weights.iter().any(|&w| w < 0.0) {
+        return Err(format!("веса {:?}", h.weights));
+    }
+    let values: Vec<(f64, f64)> = grid(8.0, 80.0, 0.25).into_iter().map(|r| (r, h.at(r))).collect();
+    rising(&values, 1e-9)?;
+    for three in values.windows(3) {
+        let bend = three[0].1 - 2.0 * three[1].1 + three[2].1;
+        if bend < -1e-9 * (1.0 + three[1].1.abs()) {
+            return Err(format!("вогнута у ×{}: {bend}", three[1].0));
+        }
+    }
+    for &(r, v) in &values {
+        let step = (h.at(r + 0.1) - v) / 0.1;
+        if !close(step, h.slope_at(r + 0.05), 1e-6 * (1.0 + step.abs())) {
+            return Err(format!(
+                "наклон у ×{r}: {} против приращения {step}",
+                h.slope_at(r + 0.05)
+            ));
+        }
+    }
+    let straight = |a: f64, d: f64| {
+        close(
+            h.at(a + 2.0 * d) - h.at(a + d),
+            h.at(a + d) - h.at(a),
+            1e-9 * (1.0 + d.abs()),
+        )
+    };
+    if !(straight(rf.lo, -10.0) && straight(rf.hi, 10.0)) {
+        return Err("за краями не прямая".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn learned_shape_is_rising_and_convex_far_beyond_the_data_whatever_the_truth() {
+    // Целые градусы (шум округления). Свой быстрый нагрев: блок 0 — вогнутая ломаная (1,5 °C/ступень до ×44, потом
+    // 0,1), блок 1 падает с множителем (20 − 0,5·(r − 36)), блок 2 — парабола с вершиной на ×44, блок 3 — прямая с
+    // волной 2·sin r. Без ограничения веса формы у каждого блока выходят отрицательными (независимый МНК на этих
+    // данных: −1,4; −0,4; −0,6; −3,1). Дополнение: все w ≥ 0 — g неубывающая и выпуклая при любых данных, ниже lo —
+    // прямая с наклоном w_1, правее последнего узла — прямая с наклоном w_1 + Σ w_j; узлы по правилу.
+    // Ловит: веса без ограничения; ограничение только неубывания (наклоны ≥ 0, веса узлов любого знака — вогнутая g);
+    // w_0 < 0; форму не из шарниров (многочлен, сплайн), изгибающуюся за краями данных; slope_at, не согласный с at;
+    // кривую, падающую из-за формы.
+    let shapes: [Shape; 4] = [
+        Box::new(|r: f64| 8.0 + 1.5 * (r - 36.0) - 1.4 * (r - 44.0).max(0.0)),
+        Box::new(|r: f64| 20.0 - 0.5 * (r - 36.0)),
+        Box::new(|r: f64| 15.0 - 0.1 * (r - 44.0).powi(2)),
+        Box::new(|r: f64| 10.0 + 0.6 * (r - 36.0) + 2.0 * r.sin()),
+    ];
+    let truths: Vec<Truth> = square()
+        .iter()
+        .zip(shapes)
+        .map(|(old, f)| truth_with_shape(old.a, old.beta, f, HISTORY, &old.near))
+        .collect();
+    let s = synth_from(&truths, wide_loads(), times(4000, &GAPS), true);
+    let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+    for b in &model.blocks {
+        if let Err(why) = convex_beyond_the_data(b) {
+            panic!("блок {}: форма {why}", b.name);
+        }
+        if let Err(why) = curve_rises(b) {
+            panic!("блок {}: кривая падает: {why}", b.name);
+        }
+    }
+}
+
+// Ручной журнал двух соседних блоков, 400 строк через 250 мс; у блока 0 нагрузка 0,8 всегда, множитель по номеру строки
+// k: k mod 10 = 0 — ×36,6 (10 % строк), k mod 50 = 49 — ×44 (2 %), остальные k mod 10 = 9 — top (8 %), прочие ×38…×41
+// (80 %). Сплошная часть блока 0 — ×36,6…top.
+fn knot_log(top: &str) -> (Log, Die) {
+    let die = Die {
+        names: names(&["0", "1"]),
+        e: vec![false; 2],
+        neighbours: vec![vec![1], vec![0]],
+    };
+    let rows: Vec<(i64, Vec<Cell>)> = (0..400)
+        .map(|k: usize| {
+            let mut cells: Vec<Cell> = (0..2).map(|b| usual(k, b)).collect();
+            cells[0].0 = match (k % 10, k % 50) {
+                (0, _) => "36.6".to_string(),
+                (_, 49) => "44".to_string(),
+                (9, _) => top.to_string(),
+                _ => (38 + k % 4).to_string(),
+            };
+            cells[0].1 = "0.80".to_string();
+            (START_MS + 250 * i64::try_from(k).expect("строк мало"), cells)
+        })
+        .collect();
+    (hand_log(&die.names, &rows), die)
+}
+
+#[test]
+fn knots_start_at_floor_of_lo_and_keep_a_whole_step_below_hi() {
+    // Уточнение 16.10 (после прогона на данных владельца: узел ×42 при hi = ×42,37 получил излом 8,5 °C/ступень по
+    // горстке строк и унёс его в пунктир): узлы floor(lo) + 2·j, пока узел ≤ hi − 1 — над каждым узлом хотя бы ступень
+    // наблюдённых данных. Сплошная часть ×36,6…×42,37 → узлы ×38, ×40; ×36,6…×43 → ×38, ×40, ×42.
+    // Ловит: узлы от lo, а не от floor(lo) (×38,6, ×40,6), или от ceil(lo) (×39, ×41); прежнее «узел < hi» (×42 при hi
+    // ×42,37); строгое «< hi − 1» (нет ×42 при hi ×43); шаг не 2; веса не по числу узлов.
+    for (top, want) in [("42.37", &[38.0, 40.0][..]), ("43", &[38.0, 40.0, 42.0][..])] {
+        let (log, die) = knot_log(top);
+        let model = fit(&[&log], &die);
+        let b = &model.blocks[0];
+        let rf = b.reference.as_ref().expect("опорные условия");
+        let hi: f64 = top.parse().expect("число");
+        assert!(
+            close(rf.lo, 36.6, 1e-4) && close(rf.hi, hi, 1e-4),
+            "предпосылка: сплошная часть ×{}…×{} вместо ×36,6…×{top}",
+            rf.lo,
+            rf.hi
+        );
+        let h = &b.shaped.as_ref().expect("слой с формой").shape;
+        assert!(close(h.lo, rf.lo, 1e-9), "lo формы {} против ×{}", h.lo, rf.lo);
+        assert!(
+            all_near(&h.knots, want, 1e-9) && h.weights.len() == want.len() + 2,
+            "hi ×{top}: узлы {:?} вместо {want:?}, весов {}",
+            h.knots,
+            h.weights.len()
         );
     }
 }

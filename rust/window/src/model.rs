@@ -8,9 +8,10 @@
 //
 // Слой L3 — температура блока i в строке t (из него — кривые и «°C на ступень»):
 //   T_i(t) = a + β·D_i(t) + Σ_k K_k·own_k(t) + Σ_{j∈соседи} [M_fast·pfast_j(t) + M_4s·ema4_j(t)]
-// • p — мощность ядра в долях «полностью занято на ×45 при опорном напряжении»: занятость × (r/45) × (V/V45)², где V —
-//   записанное напряжение, V45 — напряжение блока на ×45 по его кривой V(r); без напряжения — (r/45)³ (кубический закон,
-//   помечается «без напряжения»); множителя нет и занятость < 0,05 — ядро спало, p = 0; иначе p неизвестна;
+// • p — мощность ядра в долях «полностью занято на ×45»: занятость × (r/45)³ — форма мощности принята кубом, не измерена
+//   (поправка 16.10: напряжение ставит сам процессор по множителю и условиям, отдельным входом оно не было, с выученной
+//   формой ничего не добавляло — его в модели больше нет); множителя нет и занятость < 0,05 — ядро спало, p = 0; иначе
+//   p неизвестна. По p — средние, соседи и разделение мощности; своя быстрая нагрузка — выученная форма (ниже);
 // • pfast — средняя строк t и t+1: показание отвечает на нагрузку вокруг своего момента, включая следующую строку
 //   (консилиум, S2); own — pfast и шесть скользящих средних p (0,5, 1, 2, 4, 8, 16 с — история удвоением, слова
 //   владельца «горизонтально и вертикально, то есть темпорально»);
@@ -18,6 +19,10 @@
 // • соседи — те же, что у полос связи на схеме (сбоку или сверху-снизу, die.rs); дальние блоки действуют только через
 //   D (консилиум, S3);
 // • a свободен, остальные множители ≥ 0 — тепло не охлаждает; отсюда кривая не падает с множителем по построению.
+// Поправка 16.10 (владелец о кривых 0.5.4 на своих данных: «график идет там чуть ли не линейно до определенного уровня
+// и на каком-то… значении начинает резко уходить… твои линии регрессии… линейно»): форма своей быстрой нагрузки от
+// множителя больше не задана (r/45)³, а выучивается — `Hinge`, выпуклая неубывающая ломаная с узлами через 2 ступени
+// (`shaped`). Средние и соседи — по прежней p. Прежний вид (`coef`) остаётся для «°C на ватт» (K/c по p).
 // Счёт — МНК с неотрицательностью (Лоусон — Хенсон) по накопленным нормальным уравнениям блока; проверка — четыре
 // сплошных куска по времени (строки соседних моментов похожи — случайное деление подглядывало бы).
 //
@@ -27,7 +32,6 @@
 //
 // Здесь только счёт: ни окна, ни потоков, ни файлов. Строки приходят из того же разбора, что статистика графика
 // (samples.rs → store.rs, `Log`); рисует chart.rs; отчёт пишет model_report.rs.
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::samples;
@@ -61,6 +65,12 @@ const FOLDS: usize = 4;
 const OWN: usize = 1 + TAUS.len();
 /// «°C на ступень» — разница кривой между r + 0,5 и r − 0,5.
 const HALF_STEP: f64 = 0.5;
+/// Узлы формы своей нагрузки — через столько ступеней множителя по сплошной части кривой.
+const KNOT_STEP: f64 = 2.0;
+/// Излом формы (правило отчёта и подсказки, не подгонки): самый большой прирост наклона в узле — не меньше 0,1 °C на
+/// ступень при полной своей нагрузке, и наклон после узла хотя бы вдвое больше, чем до.
+const KNEE_MIN: f64 = 0.1;
+const KNEE_RATIO: f64 = 2.0;
 /// В модель идут строки не старше 8 ч до самой новой (по времени строк, через все файлы). Зачем: без границы память и
 /// цена подгонки растут с журналом (6 ч строк — 17,5 МБ и 0,2 с на подгонку; 30 дней игры — сотни МБ и секунды каждые
 /// 5 с); последние часы — и есть нынешняя обстановка (консилиум: 20–40 мин на обстановку хватает). 8 ч — около 115 тыс.
@@ -71,37 +81,17 @@ const SOLID: [(u64, u64); 2] = [(5, 100), (95, 100)];
 
 // ----- мощность и средние -----
 
-/// Мощность ядра в долях «полностью занято на ×45 при опорном напряжении»; `fallback` — по кубическому закону, без
-/// записанного напряжения.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Power {
-    pub p: f64,
-    pub fallback: bool,
-}
-
-/// p = занятость × (r/45) × v², v = `volts` = V/V45 (делит вызывающий); напряжения нет — v = r/45 (кубический закон).
+/// Мощность ядра в долях «полностью занято на ×45»: p = занятость × (r/45)³ — форма мощности принята кубом, не измерена.
 /// Множителя нет и занятость < `ASLEEP` — ядро спало, p = 0. Иначе — неизвестно.
 #[must_use]
-pub fn proxy(ratio: Option<f64>, busy: Option<f64>, volts: Option<f64>) -> Option<Power> {
+pub fn proxy(ratio: Option<f64>, busy: Option<f64>) -> Option<f64> {
     let busy = busy?;
     match ratio {
         Some(r) => {
             let k = r.max(0.0) / REFERENCE;
-            Some(match volts {
-                Some(v) => Power {
-                    p: busy * k * v * v,
-                    fallback: false,
-                },
-                None => Power {
-                    p: busy * k * k * k,
-                    fallback: true,
-                },
-            })
+            Some(busy * k * k * k)
         }
-        None if busy < ASLEEP => Some(Power {
-            p: 0.0,
-            fallback: false,
-        }),
+        None if busy < ASLEEP => Some(0.0),
         None => None,
     }
 }
@@ -152,7 +142,6 @@ impl Averages {
 const RATIO: usize = 0;
 const BUSY: usize = 1;
 const TEMP: usize = 2;
-const VOLTS: usize = 3;
 /// Мощности строки в `Log::package`: процессор целиком (MSR 0x611), видеокарта, только ядра (MSR 0x639, с 0.5.4).
 pub const POWER_CPU: usize = 0;
 pub const POWER_GPU: usize = 1;
@@ -161,13 +150,14 @@ pub const POWER_CORES: usize = 2;
 /// Строки одного файла срезов по порядку файла — как их оставляет разбор (`samples::Scratch::count_keeping`), второго
 /// чтения файла нет. Только строки по 0,25 с (время с миллисекундами): прежние по 2 с отстоят друг от друга больше
 /// `GAP_MS`, каждая начинала бы средние заново, и ни одна не годилась бы в счёт. Числа — f32 (в файле у них 2–3 знака),
-/// пусто — NaN: множитель, занятость, температура и напряжение блока и мощности процессора, видеокарты и ядер строки —
-/// у 275HX 212 байт на строку, 3 МБ на час журнала. Строки раньше `from` не берутся (граница `KEEP_MS`, `trim`).
+/// пусто — NaN: множитель, занятость и температура блока и мощности процессора, видеокарты и ядер строки — у 275HX
+/// 164 байта на строку, 2,4 МБ на час журнала. Напряжение (`<блок>.volts` журналов 0.5.4) разбор отдаёт, но оно не
+/// хранится: модель его не берёт. Строки раньше `from` не берутся (граница `KEEP_MS`, `trim`).
 #[derive(Clone, Debug, Default)]
 pub struct Log {
     names: Vec<String>,
     times: Vec<i64>,
-    cells: Vec<[f32; 4]>,
+    cells: Vec<[f32; 3]>,
     package: Vec<[f32; 3]>,
     from: Option<i64>,
 }
@@ -207,10 +197,10 @@ impl Log {
     /// Сколько памяти держат строки, байт.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.times.len() * 8 + self.cells.len() * 16 + self.package.len() * 12
+        self.times.len() * 8 + self.cells.len() * 12 + self.package.len() * 12
     }
 
-    /// Строка: время (мс, `samples::row_time`), по блоку — множитель, занятость, температура, напряжение; мощность
+    /// Строка: время (мс, `samples::row_time`), по блоку — множитель, занятость, температура, напряжение (не хранится); мощность
     /// процессора (корпус), видеокарты и ядер процессора (`POWER_CPU`, `POWER_GPU`, `POWER_CORES`). Строка раньше
     /// границы (`admit_from`) не берётся.
     pub fn push(&mut self, at: i64, cells: impl Iterator<Item = [Option<f64>; 4]>, package: [Option<f64>; 3]) {
@@ -218,7 +208,8 @@ impl Log {
             return;
         }
         let before = self.cells.len();
-        self.cells.extend(cells.map(|c| c.map(stored)));
+        self.cells
+            .extend(cells.map(|[ratio, busy, temp, _volts]| [ratio, busy, temp].map(stored)));
         // Разбор отдаёт значения каждого блока заголовка — ни больше, ни меньше; иначе строки поедут.
         debug_assert_eq!(
             self.cells.len() - before,
@@ -341,85 +332,111 @@ impl Die {
     }
 }
 
-// ----- кривая напряжения -----
-
-/// V(r) блока: неубывающая по наблюдённым множителям (средние по целым множителям, выровненные «соседним пулом» —
-/// изотоническая регрессия), между ними — по прямой, за краями — прямой с наклоном крайнего отрезка, не ниже нуля.
-#[derive(Clone, Debug, PartialEq)]
-pub struct VoltCurve {
-    /// (множитель, напряжение): множитель растёт, напряжение не падает.
-    points: Vec<(f64, f64)>,
-}
-
-impl VoltCurve {
-    /// По (множитель, напряжение) строк с напряжением и занятостью ≥ 0,5. None — меньше двух целых множителей.
-    #[must_use]
-    pub fn fit(points: &[(f64, f64)]) -> Option<VoltCurve> {
-        // По целому множителю: сумма множителей, сумма напряжений, строк.
-        let mut bins: BTreeMap<i64, (f64, f64, f64)> = BTreeMap::new();
-        for &(r, v) in points {
-            if !(r.is_finite() && v.is_finite()) {
-                continue;
-            }
-            let at = bins.entry(whole(r)).or_default();
-            at.0 += r;
-            at.1 += v;
-            at.2 += 1.0;
-        }
-        if bins.len() < 2 {
-            return None;
-        }
-        // Изотоническая регрессия по целым множителям, вес — строки: соседние пулы сливаются, пока левый выше правого.
-        let mut pools: Vec<(f64, f64, usize)> = Vec::with_capacity(bins.len()); // (сумма V, строк, корзин)
-        for &(_, v, n) in bins.values() {
-            pools.push((v, n, 1));
-            while pools.len() >= 2 {
-                let (b, a) = (pools[pools.len() - 1], pools[pools.len() - 2]);
-                if a.0 / a.1 <= b.0 / b.1 {
-                    break;
-                }
-                pools.pop();
-                let last = pools.len() - 1;
-                pools[last] = (a.0 + b.0, a.1 + b.1, a.2 + b.2);
-            }
-        }
-        let mut fitted = Vec::with_capacity(bins.len());
-        for (v, n, k) in pools {
-            fitted.extend(std::iter::repeat_n(v / n, k));
-        }
-        let points = bins.values().zip(fitted).map(|(&(r, _, n), v)| (r / n, v)).collect();
-        Some(VoltCurve { points })
-    }
-
-    #[must_use]
-    pub fn at(&self, ratio: f64) -> f64 {
-        let p = &self.points;
-        let line = |a: (f64, f64), b: (f64, f64)| {
-            let run = b.0 - a.0;
-            let slope = if run > 0.0 { (b.1 - a.1) / run } else { 0.0 };
-            a.1 + slope * (ratio - a.0)
-        };
-        let v = if ratio <= p[0].0 {
-            line(p[0], p[1])
-        } else if ratio >= p[p.len() - 1].0 {
-            line(p[p.len() - 2], p[p.len() - 1])
-        } else {
-            let k = p.partition_point(|q| q.0 <= ratio);
-            line(p[k - 1], p[k])
-        };
-        v.max(0.0)
-    }
-
-    /// Наблюдённые множители: (наименьший, наибольший).
-    #[must_use]
-    pub fn range(&self) -> (f64, f64) {
-        (self.points[0].0, self.points[self.points.len() - 1].0)
-    }
-}
-
 #[expect(clippy::cast_possible_truncation, reason = "multipliers are 0..80, rounded first")]
 fn whole(r: f64) -> i64 {
     r.round() as i64
+}
+
+// ----- форма своей нагрузки -----
+
+/// Форма своей быстрой нагрузки от фактического множителя, выученная по журналу: g(r) = w₀ + w₁·(r − lo) +
+/// `Σ w_{1+j}·max(0, r − k_j)`, все w ≥ 0 — растёт и выпукла по построению и может показать излом; за узлами — последний
+/// наклон (ниже lo — w₁). В уравнении блока каждый столбец умножен на занятость (`basis`), так что g — нагрев при полной
+/// своей нагрузке.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hinge {
+    pub lo: f64,
+    pub knots: Vec<f64>,
+    /// [w₀, w₁, w по узлам]; пусто — весов нет (g ≡ 0, прежний вид `coef`).
+    pub weights: Vec<f64>,
+}
+
+/// Излом формы: узел и наклоны сразу до и после него, °C на ступень при полной своей нагрузке.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knee {
+    pub at: f64,
+    pub before: f64,
+    pub after: f64,
+}
+
+impl Hinge {
+    /// Узлы по сплошной части [lo, hi]: целые множители floor(lo) + 2, + 4 …, у каждого выше — хотя бы ступень
+    /// наблюдённых множителей (k ≤ hi − 1): иначе наклон после узла задают единицы строк, и он уходит в пунктир (так
+    /// было у блока 1 на журнале 15.10: узел ×42 при hi ×42,4 — 8,5 °C на ступень).
+    fn layout(lo: f64, hi: f64) -> Hinge {
+        let mut knots = Vec::new();
+        let mut k = lo.floor() + KNOT_STEP;
+        while k <= hi - KNOT_STEP / 2.0 {
+            knots.push(k);
+            k += KNOT_STEP;
+        }
+        Hinge {
+            lo,
+            knots,
+            weights: Vec::new(),
+        }
+    }
+
+    /// Столбцов у формы в уравнении блока.
+    fn columns(&self) -> usize {
+        2 + self.knots.len()
+    }
+
+    /// Столбцы формы строки: `[busy, busy·(r − lo), busy·max(0, r − k_j)…]` — в `out`.
+    fn basis(&self, ratio: f64, busy: f64, out: &mut [f64]) {
+        out[0] = busy;
+        out[1] = busy * (ratio - self.lo);
+        for (o, k) in out[2..].iter_mut().zip(&self.knots) {
+            *o = busy * (ratio - k).max(0.0);
+        }
+    }
+
+    /// g(r).
+    #[must_use]
+    pub fn at(&self, ratio: f64) -> f64 {
+        let Some((&w0, rest)) = self.weights.split_first() else {
+            return 0.0;
+        };
+        let Some((&w1, bends)) = rest.split_first() else {
+            return w0;
+        };
+        w0 + w1 * (ratio - self.lo)
+            + bends
+                .iter()
+                .zip(&self.knots)
+                .map(|(w, k)| w * (ratio - k).max(0.0))
+                .sum::<f64>()
+    }
+
+    /// Наклон g на множителе r (узлы строго левее r).
+    #[must_use]
+    pub fn slope_at(&self, ratio: f64) -> f64 {
+        let w1 = self.weights.get(1).copied().unwrap_or(0.0);
+        w1 + self
+            .weights
+            .iter()
+            .skip(2)
+            .zip(&self.knots)
+            .filter(|&(_, &k)| k < ratio)
+            .map(|(w, _)| w)
+            .sum::<f64>()
+    }
+
+    /// Излом: узел с самым большим приростом наклона, если прирост не меньше `KNEE_MIN` и наклон после него хотя бы в
+    /// `KNEE_RATIO` раза больше, чем до; иначе — нет.
+    #[must_use]
+    pub fn knee(&self) -> Option<Knee> {
+        let (j, &w) = self
+            .weights
+            .iter()
+            .skip(2)
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))?;
+        let at = *self.knots.get(j)?;
+        let before = self.slope_at(at);
+        let after = before + w;
+        (w >= KNEE_MIN && after >= KNEE_RATIO * before).then_some(Knee { at, before, after })
+    }
 }
 
 // ----- МНК с неотрицательностью -----
@@ -717,10 +734,16 @@ impl How {
 
 /// Решение одной задачи: свободный член и множители всех столбцов (не взятые — 0).
 type Solved = (f64, Vec<f64>);
-/// Решения четырёх видов: (a) D, (b) + свои, (c) + соседи — слой L3 по брифу; (d) — диагностика отчёта: как (c), но
-/// β = 1 закреплён (уровень кристалла переходит в температуру блока целиком).
+/// Решения пяти видов: (a) D, (b) + свои, (c) + соседи — слой L3 с выученной формой; (d) — диагностика отчёта: как (c),
+/// но β = 1 закреплён (уровень кристалла переходит в температуру блока целиком); (e) — прежний вид (c): своя быстрая
+/// нагрузка — K·p, без формы (для «°C на ватт» и сравнения в отчёте).
 type Variants = [Option<Solved>; VARIANTS];
-const VARIANTS: usize = 4;
+const VARIANTS: usize = 5;
+const DIE_ONLY: usize = 0;
+const WITH_OWN: usize = 1;
+const FULL: usize = 2;
+const UNIT: usize = 3;
+const PROXY: usize = 4;
 
 /// Предсказание: a + c·x.
 fn predict(fit: &Solved, x: &[f64]) -> f64 {
@@ -729,7 +752,7 @@ fn predict(fit: &Solved, x: &[f64]) -> f64 {
 
 // ----- проход по строкам -----
 
-/// Годная строка блока: что о ней нужно счёту. x: [D, pfast, 6 средних, по соседу pfast и 4-с средняя].
+/// Годная строка блока: что о ней нужно счёту. x: [D, pfast, 6 средних, по соседу pfast и 4-с средняя, столбцы формы].
 struct Usable<'a> {
     block: usize,
     /// Строка по порядку всех файлов.
@@ -742,7 +765,6 @@ struct Usable<'a> {
     y: f64,
     busy: f64,
     ratio: Option<f64>,
-    fallback: bool,
     /// `p_j(t)` соседей по порядку `Die::neighbours`.
     near: &'a [f64],
 }
@@ -754,7 +776,6 @@ struct Snap {
     gap: i64,
     index: usize,
     p: Vec<Option<f64>>,
-    fallback: Vec<bool>,
     ema: Vec<[f64; 6]>,
     since: Vec<Option<i64>>,
     temp: Vec<Option<f64>>,
@@ -767,7 +788,6 @@ impl Snap {
     fn new(n: usize) -> Snap {
         Snap {
             p: vec![None; n],
-            fallback: vec![false; n],
             ema: vec![[0.0; 6]; n],
             since: vec![None; n],
             temp: vec![None; n],
@@ -797,8 +817,16 @@ fn columns_of(log: &Log, die: &Die) -> Vec<Option<usize>> {
 /// Проход по строкам всех файлов: средние, уровень кристалла, и годные строки блоков — в `emit`.
 struct Walk<'a> {
     die: &'a Die,
-    /// V45 блока (по его кривой напряжения); None — напряжение не используется, кубический закон.
-    v45: &'a [Option<f64>],
+    /// Узлы формы своей нагрузки по блоку (без весов).
+    shapes: &'a [Hinge],
+}
+
+/// Рабочие строки прохода — одни на весь проход: входы строки, p соседей, столбцы формы строк t и t+1.
+struct Buffers {
+    x: Vec<f64>,
+    near: Vec<f64>,
+    now: Vec<f64>,
+    then: Vec<f64>,
 }
 
 impl Walk<'_> {
@@ -806,9 +834,14 @@ impl Walk<'_> {
         let n = self.die.len();
         let mut prev = Snap::new(n);
         let mut cur = Snap::new(n);
-        let width = 2 + TAUS.len() + 2 * self.die.neighbours.iter().map(Vec::len).max().unwrap_or(0);
-        let mut x = vec![0.0; width];
-        let mut near = vec![0.0; width];
+        let width = (0..n).map(|i| width_of(self.die, i, self.shapes)).max().unwrap_or(1);
+        let hinge = self.shapes.iter().map(Hinge::columns).max().unwrap_or(2);
+        let mut buffers = Buffers {
+            x: vec![0.0; width],
+            near: vec![0.0; width],
+            now: vec![0.0; hinge],
+            then: vec![0.0; hinge],
+        };
         let mut index = 0;
         for (number, log) in logs.iter().enumerate() {
             let cols = columns_of(log, self.die);
@@ -820,7 +853,7 @@ impl Walk<'_> {
                 index += 1;
                 if row > 0 {
                     cur.gap = cur.at - prev.at;
-                    self.emit_row(&prev, &cur, number, &mut x, &mut near, &mut emit);
+                    self.emit_row(&prev, &cur, number, &mut buffers, &mut emit);
                 } else {
                     cur.gap = 0;
                 }
@@ -838,20 +871,18 @@ impl Walk<'_> {
         for i in 0..n {
             let value = |what| cols[i].and_then(|c| log.get(row, c, what));
             let (ratio, busy, temp) = (value(RATIO), value(BUSY), value(TEMP));
-            let volts = value(VOLTS).zip(self.v45[i]).map(|(v, v45)| v / v45);
-            let power = proxy(ratio, busy, volts);
+            let power = proxy(ratio, busy);
             into.ratio[i] = ratio;
             into.busy[i] = busy;
             into.temp[i] = temp;
-            into.p[i] = power.map(|w| w.p);
-            into.fallback[i] = power.is_some_and(|w| w.fallback);
+            into.p[i] = power;
             // p неизвестна — средние блока прерываются и начнутся заново с первой известной.
             averages[i] = match (power, averages[i]) {
                 (Some(w), Some(mut a)) => {
-                    a.advance(at, w.p);
+                    a.advance(at, w);
                     Some(a)
                 }
-                (Some(w), None) => Some(Averages::start(at, w.p)),
+                (Some(w), None) => Some(Averages::start(at, w)),
                 (None, _) => None,
             };
             into.ema[i] = averages[i].map_or([0.0; 6], |a| a.values);
@@ -867,18 +898,11 @@ impl Walk<'_> {
     }
 
     /// Строка `prev` с её следующей `next`: годные строки блоков — в `emit`.
-    fn emit_row(
-        &self,
-        prev: &Snap,
-        next: &Snap,
-        log: usize,
-        x: &mut [f64],
-        near: &mut [f64],
-        emit: &mut impl FnMut(&Usable),
-    ) {
+    fn emit_row(&self, prev: &Snap, next: &Snap, log: usize, buffers: &mut Buffers, emit: &mut impl FnMut(&Usable)) {
         if !(next.gap > 0 && next.gap <= GAP_MS) {
             return;
         }
+        let Buffers { x, near, now, then } = buffers;
         let warm = |j: usize| prev.since[j].is_some_and(|s| prev.at - s >= WARM_MS);
         let fast = |j: usize| Some(f64::midpoint(prev.p[j]?, next.p[j]?));
         for i in 0..self.die.len() {
@@ -909,7 +933,20 @@ impl Walk<'_> {
             if !ok {
                 continue;
             }
-            let m = width_of(self.die, i);
+            // Форма своей нагрузки — тоже средняя строк t и t+1; спавшее ядро (множителя нет, p = 0) — нули.
+            let shape = &self.shapes[i];
+            let at = OWN + 1 + 2 * self.die.neighbours[i].len();
+            let columns = shape.columns();
+            for (snap, into) in [(prev, &mut *now), (next, &mut *then)] {
+                match (snap.ratio[i], snap.busy[i]) {
+                    (Some(r), Some(b)) => shape.basis(r, b, into),
+                    _ => into[..columns].fill(0.0),
+                }
+            }
+            for m in 0..columns {
+                x[at + m] = f64::midpoint(now[m], then[m]);
+            }
+            let m = width_of(self.die, i, self.shapes);
             emit(&Usable {
                 block: i,
                 index: prev.index,
@@ -920,16 +957,30 @@ impl Walk<'_> {
                 y,
                 busy,
                 ratio: prev.ratio[i],
-                fallback: prev.fallback[i],
                 near: &near[..self.die.neighbours[i].len()],
             });
         }
     }
 }
 
-/// Сколько входов у блока: D, семь своих, по два на соседа.
-fn width_of(die: &Die, block: usize) -> usize {
-    1 + OWN + 2 * die.neighbours[block].len()
+/// Сколько входов у блока: D, семь своих, по два на соседа, столбцы формы.
+fn width_of(die: &Die, block: usize, shapes: &[Hinge]) -> usize {
+    1 + OWN + 2 * die.neighbours[block].len() + shapes[block].columns()
+}
+
+/// Столбцы вида `v` у блока с `nb` соседями и формой из `hc` столбцов. Порядок входов: [D | pfast | 6 средних | соседи |
+/// форма].
+fn variant_columns(v: usize, nb: usize, hc: usize) -> Vec<usize> {
+    let shape = OWN + 1 + 2 * nb..OWN + 1 + 2 * nb + hc;
+    let near = OWN + 1..OWN + 1 + 2 * nb;
+    let ema = 2..=OWN;
+    match v {
+        DIE_ONLY => vec![0],
+        WITH_OWN => std::iter::once(0).chain(ema).chain(shape).collect(),
+        FULL => std::iter::once(0).chain(ema).chain(near).chain(shape).collect(),
+        UNIT => ema.chain(near).chain(shape).collect(),
+        _ => (0..OWN + 1 + 2 * nb).collect(),
+    }
 }
 
 // ----- итог -----
@@ -944,6 +995,8 @@ pub struct Coef {
     pub own: [f64; 7],
     /// По соседу, в порядке `Die::neighbours`.
     pub neighbours: Vec<Near>,
+    /// Выученная форма своей быстрой нагрузки; у прежнего вида (`BlockModel::coef`) весов нет.
+    pub shape: Hinge,
 }
 
 impl Coef {
@@ -952,11 +1005,20 @@ impl Coef {
         self.own.iter().sum()
     }
 
-    fn of(die: &Die, block: usize, fit: &Solved) -> Coef {
+    /// Коэффициенты решения; `layout` — узлы формы блока: с ними (`shaped`) веса формы берутся из решения, без них —
+    /// форма пустая (прежний вид).
+    fn of(die: &Die, block: usize, layout: Option<&Hinge>, fit: &Solved) -> Coef {
         let c = &fit.1;
         let mut own = [0.0; 7];
         own.copy_from_slice(&c[1..=OWN]);
+        let at = OWN + 1 + 2 * die.neighbours[block].len();
+        let shape = layout.map_or_else(Hinge::default, |l| Hinge {
+            lo: l.lo,
+            knots: l.knots.clone(), // a dozen knots per solved block
+            weights: c[at..at + l.columns()].to_vec(),
+        });
         Coef {
+            shape,
             a: fit.0,
             beta: c[0],
             own,
@@ -996,7 +1058,7 @@ pub struct Reference {
 }
 
 /// Ошибка на отложенных данных: средние за 10 с температуры над кристаллом (T − D), °C (корень из средней квадратов):
-/// (a) только смещение и наклон на D, (b) + свои, (c) + соседи (полный L3).
+/// (a) только смещение и наклон на D, (b) + свои, (c) + соседи (полный L3 с выученной формой).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Errors {
     pub die_only: f64,
@@ -1004,6 +1066,8 @@ pub struct Errors {
     pub full: f64,
     /// Диагностика: (c) при β = 1.
     pub unit: f64,
+    /// (c) прежнего вида — своя быстрая нагрузка K·p без выученной формы.
+    pub proxy: f64,
     pub windows: usize,
 }
 
@@ -1024,14 +1088,6 @@ pub struct Slope {
     pub hi: f64,
 }
 
-/// Связь напряжения блока: корреляция с напряжением других блоков того же рода в тот же миг и с собственным множителем.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rail {
-    pub with_others: f64,
-    pub with_ratio: f64,
-    pub rows: usize,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockModel {
     pub name: String,
@@ -1039,17 +1095,18 @@ pub struct BlockModel {
     /// Годных строк для полного L3 и их время, мин.
     pub usable: usize,
     pub minutes: f64,
+    /// Прежний вид L3: своя быстрая нагрузка — K·p (p — куб, принят, не измерен). Из него — «°C на ватт» (K/c).
     pub coef: Option<Coef>,
-    pub volts: Option<VoltCurve>,
-    v45: Option<f64>,
-    /// Доля годных строк, где своя p — по кубическому закону (без напряжения).
+    /// L3 с выученной формой своей быстрой нагрузки: из него кривая, «°C на ступень», излом.
+    pub shaped: Option<Coef>,
+    /// Всегда 0: напряжения в модели больше нет (поправка 16.10), «без напряжения» не бывает. Поле ещё читает подсказка
+    /// блока (chart.rs) — убрать вместе с её строкой.
     pub fallback: f64,
     pub reference: Option<Reference>,
     pub errors: Option<Errors>,
     pub slope: Option<Slope>,
     /// Отношение большего суммарного своего коэффициента к меньшему у половин данных (стабильность).
     pub halves: Option<f64>,
-    pub rail: Option<Rail>,
     pub diagnosis: Option<Diagnosis>,
     /// Мощность блока из слоя разделения мощности; None — строк с мощностью нет.
     pub power: Option<BlockPower>,
@@ -1098,23 +1155,35 @@ pub struct PowerSplit {
 }
 
 impl BlockModel {
-    /// Своя p при полной своей нагрузке на этом множителе: (r/45)·(V(r)/V45)² по кривой напряжения, иначе (r/45)³.
+    /// Своя p при полной своей нагрузке на этом множителе: (r/45)³ (форма мощности принята кубом, не измерена).
     #[must_use]
+    #[expect(
+        clippy::unused_self,
+        reason = "a block's power at full load; since the voltage left (16.10) every block has the same cube"
+    )]
     pub fn power_at(&self, ratio: f64) -> f64 {
-        let k = ratio.max(0.0) / REFERENCE;
-        match (&self.volts, self.v45) {
-            (Some(c), Some(v45)) => {
-                let v = c.at(ratio) / v45;
-                k * v * v
-            }
-            _ => k * k * k,
-        }
+        proxy(Some(ratio), Some(1.0)).unwrap_or(0.0)
+    }
+
+    /// Свой нагрев при полной своей нагрузке на множителе r по коэффициентам `c`: форма + средние × p(r) (у прежнего
+    /// вида формы нет, и это K·p(r)).
+    #[must_use]
+    pub fn heat(&self, c: &Coef, ratio: f64) -> f64 {
+        c.shape.at(ratio) + c.own_total() * self.power_at(ratio)
     }
 
     /// Предсказанная температура на этом фактическом множителе при опорных условиях (своя нагрузка 100 %, соседи и
-    /// кристалл — медианы), абсолютная.
+    /// кристалл — медианы), абсолютная — по L3 с выученной формой.
     #[must_use]
     pub fn curve(&self, ratio: f64) -> Option<f64> {
+        let c = self.shaped.as_ref()?;
+        let r = self.reference.as_ref()?;
+        Some(self.curve_with(c, r, ratio))
+    }
+
+    /// То же по прежнему виду (K·p) — для сравнения в отчёте.
+    #[must_use]
+    pub fn proxy_curve(&self, ratio: f64) -> Option<f64> {
         let c = self.coef.as_ref()?;
         let r = self.reference.as_ref()?;
         Some(self.curve_with(c, r, ratio))
@@ -1127,30 +1196,37 @@ impl BlockModel {
             .zip(&r.neighbours)
             .map(|(n, &(_, p))| (n.fast + n.slow) * p)
             .sum();
-        c.a + c.beta * r.die + c.own_total() * self.power_at(ratio) + near
+        c.a + c.beta * r.die + self.heat(c, ratio) + near
     }
 
-    /// Кривая графика: при «одинаковой работе» (есть «°C на ватт» и опорная мощность рода) —
-    /// `база + R·c_ref·p(r)`, сравнима между блоками того же рода; иначе — `curve` (нагрузка этого ядра в этой игре).
+    /// Кривая графика: при «одинаковой работе» (есть «°C на ватт» и опорная мощность рода) свой нагрев блока
+    /// пересчитан на опорные ватты рода — `curve + (w_ref/w − 1)·heat(r)`, сравнима между блоками того же рода; иначе —
+    /// `curve` (нагрузка этого ядра в этой игре).
     #[must_use]
     pub fn shown_curve(&self, ratio: f64) -> Option<f64> {
         let t = self.curve(ratio)?;
-        let own = self.coef.as_ref()?.own_total();
-        Some(match (self.resistance, self.same_work) {
-            (Some(r), Some(w)) => t + (r.value * w - own) * self.power_at(ratio),
+        let c = self.shaped.as_ref()?;
+        Some(match (self.resistance, self.same_work, self.power) {
+            (Some(_), Some(w), Some(p)) if p.watts > 0.0 => t + (w / p.watts - 1.0) * self.heat(c, ratio),
             _ => t,
         })
     }
 
     /// На сколько градусов выше на ступень множителя (r ± 0,5) при коэффициентах `c`.
     fn step(&self, c: &Coef, ratio: f64) -> f64 {
-        c.own_total() * (self.power_at(ratio + HALF_STEP) - self.power_at(ratio - HALF_STEP))
+        self.heat(c, ratio + HALF_STEP) - self.heat(c, ratio - HALF_STEP)
+    }
+
+    /// Излом выученной формы (правило — `Hinge::knee`).
+    #[must_use]
+    pub fn knee(&self) -> Option<Knee> {
+        self.shaped.as_ref()?.shape.knee()
     }
 
     /// Кривую рисовать: есть коэффициенты, опорные условия и не меньше `MIN_MINUTES` данных.
     #[must_use]
     pub fn drawn(&self) -> bool {
-        self.coef.is_some() && self.reference.is_some() && self.minutes >= MIN_MINUTES
+        self.shaped.is_some() && self.reference.is_some() && self.minutes >= MIN_MINUTES
     }
 }
 
@@ -1171,7 +1247,6 @@ pub struct Model {
 struct Gather {
     usable: usize,
     span_ms: i64,
-    fallback: usize,
     /// Строки под нагрузкой: D, множитель, его время (мс от прошлой строки: множитель строки — средний за этот
     /// промежуток), p соседей (по соседу).
     level: Vec<f64>,
@@ -1210,20 +1285,19 @@ impl Tally3 {
     }
 }
 
-/// Решение вида `v`: (a) D; (b) D и свои; (c) все; (d) все, кроме D, при β = 1 (диагностика).
-fn solve_variant(sums: &Sums, v: usize) -> Option<Solved> {
-    let m = sums.m;
-    match v {
-        0 => sums.solve(&[0]),
-        1 => sums.solve(&(0..=OWN).collect::<Vec<_>>()),
-        2 => sums.solve(&(0..m).collect::<Vec<_>>()),
-        _ => sums.solve_how(
-            &(1..m).collect::<Vec<_>>(),
+/// Решение вида `v` блока с `nb` соседями (`variant_columns`); (d) — при β = 1.
+fn solve_variant(sums: &Sums, v: usize, nb: usize) -> Option<Solved> {
+    let columns = variant_columns(v, nb, sums.m - (OWN + 1 + 2 * nb));
+    if v == UNIT {
+        sums.solve_how(
+            &columns,
             How {
                 signed: false,
                 beta: Some(1.0),
             },
-        ),
+        )
+    } else {
+        sums.solve(&columns)
     }
 }
 
@@ -1234,66 +1308,37 @@ pub fn fit(logs: &[&Log], die: &Die) -> Model {
     let logs = in_order(logs);
     let rows: usize = logs.iter().map(|l| l.rows()).sum();
     let n = die.len();
-    let (volts, rails) = voltage(&logs, die);
-    let v45: Vec<Option<f64>> = volts
-        .iter()
-        .map(|c| c.as_ref().map(|c| c.at(REFERENCE)).filter(|v| *v > 0.0))
-        .collect();
-    let walk = Walk { die, v45: &v45 };
+    // Проход 0: годные строки и опорные условия — по ним узлы формы (сплошная часть кривой).
+    let (gather, references, shapes) = prepare(&logs, die, |_| true);
+    let walk = Walk { die, shapes: &shapes };
 
-    // Проход 1: суммы по кускам и опорные строки.
-    let mut folds: Vec<Vec<Sums>> = (0..n).map(|i| vec![Sums::new(width_of(die, i)); FOLDS]).collect();
-    let mut gather: Vec<Gather> = (0..n)
-        .map(|i| Gather {
-            near: vec![Vec::new(); die.neighbours[i].len()],
-            ..Gather::default()
-        })
+    // Проход 1: суммы по кускам.
+    let mut folds: Vec<Vec<Sums>> = (0..n)
+        .map(|i| vec![Sums::new(width_of(die, i, &shapes)); FOLDS])
         .collect();
-    walk.run(&logs, |u| {
-        folds[u.block][fold_of(u.index, rows)].add(u.x, u.y);
-        let g = &mut gather[u.block];
-        g.usable += 1;
-        g.span_ms += u.span;
-        g.fallback += usize::from(u.fallback);
-        if u.busy >= LOADED
-            && let Some(r) = u.ratio
-        {
-            g.level.push(u.x[0]);
-            g.ratio.push(r);
-            g.weight.push(u.span);
-            for (into, &p) in g.near.iter_mut().zip(u.near) {
-                into.push(p);
-            }
-        }
-    });
+    walk.run(&logs, |u| folds[u.block][fold_of(u.index, rows)].add(u.x, u.y));
 
-    // Решения: по всем данным, без каждого куска (три вида), по половинам.
+    // Решения: по всем данным, без каждого куска (пять видов), по половинам.
     let mut blocks: Vec<BlockModel> = Vec::with_capacity(n);
     let mut held: Vec<Vec<Variants>> = Vec::with_capacity(n);
-    for (i, ((sums, g), (curve, rail))) in folds.iter().zip(&gather).zip(volts.into_iter().zip(rails)).enumerate() {
+    for (i, ((sums, g), reference)) in folds.iter().zip(&gather).zip(references).enumerate() {
         let (block, fold_fits) = solve_block(
             die,
             i,
             sums,
-            g,
+            (g, &shapes[i]),
             BlockModel {
                 name: die.names[i].clone(), // a dozen names per fit
                 e: die.e[i],
                 usable: g.usable,
                 minutes: millis(g.span_ms) / 60_000.0,
                 coef: None,
-                volts: curve,
-                v45: v45[i],
-                fallback: if g.usable > 0 {
-                    count(g.fallback) / count(g.usable)
-                } else {
-                    0.0
-                },
-                reference: reference_of(g, &die.neighbours[i]),
+                shaped: None,
+                fallback: 0.0,
+                reference,
                 errors: None,
                 slope: None,
                 halves: None,
-                rail,
                 diagnosis: None,
                 power: None,
                 resistance: None,
@@ -1305,7 +1350,7 @@ pub fn fit(logs: &[&Log], die: &Die) -> Model {
     }
 
     held_out(&walk, &logs, rows, &held, &mut blocks);
-    let power = split_power(&logs, die, &v45, &mut blocks, &held);
+    let power = split_power(&logs, die, &mut blocks, &held);
     Model {
         blocks,
         rows,
@@ -1314,14 +1359,50 @@ pub fn fit(logs: &[&Log], die: &Die) -> Model {
     }
 }
 
+/// Годные строки блоков (`Gather`), опорные условия и узлы формы по строкам, которые берёт `keep` (по времени строки):
+/// проход с пустыми формами — годность строки от формы не зависит.
+fn prepare(logs: &[&Log], die: &Die, keep: impl Fn(i64) -> bool) -> (Vec<Gather>, Vec<Option<Reference>>, Vec<Hinge>) {
+    let n = die.len();
+    let flat = vec![Hinge::default(); n];
+    let walk = Walk { die, shapes: &flat };
+    let mut gather: Vec<Gather> = (0..n)
+        .map(|i| Gather {
+            near: vec![Vec::new(); die.neighbours[i].len()],
+            ..Gather::default()
+        })
+        .collect();
+    walk.run(logs, |u| {
+        if !keep(u.at) {
+            return;
+        }
+        let g = &mut gather[u.block];
+        g.usable += 1;
+        g.span_ms += u.span;
+        if u.busy >= LOADED
+            && let Some(r) = u.ratio
+        {
+            g.level.push(u.x[0]);
+            g.ratio.push(r);
+            g.weight.push(u.span);
+            for (into, &p) in g.near.iter_mut().zip(u.near) {
+                into.push(p);
+            }
+        }
+    });
+    let references: Vec<Option<Reference>> = gather
+        .iter()
+        .zip(&die.neighbours)
+        .map(|(g, near)| reference_of(g, near))
+        .collect();
+    let shapes = references
+        .iter()
+        .map(|r| r.as_ref().map_or_else(Hinge::default, |r| Hinge::layout(r.lo, r.hi)))
+        .collect();
+    (gather, references, shapes)
+}
+
 /// Слой разделения мощности и из него — «°C на ватт» блоков и опорная мощность кривой «одинаковая работа».
-fn split_power(
-    logs: &[&Log],
-    die: &Die,
-    v45: &[Option<f64>],
-    blocks: &mut [BlockModel],
-    held: &[Vec<Variants>],
-) -> Option<PowerSplit> {
+fn split_power(logs: &[&Log], die: &Die, blocks: &mut [BlockModel], held: &[Vec<Variants>]) -> Option<PowerSplit> {
     let n = die.len();
     // Один столбец на все строки: ядра и корпус — разные величины (корпус — ещё и некоторые ватты вне ядер), смесь
     // исказила бы c0 и c_j.
@@ -1346,12 +1427,11 @@ fn split_power(
             let mut known = true;
             for i in 0..n {
                 let value = |what| cols[i].and_then(|c| log.get(row, c, what));
-                let rel = value(VOLTS).zip(v45[i]).map(|(v, v45)| v / v45);
-                let Some(w) = proxy(value(RATIO), value(BUSY), rel) else {
+                let Some(p) = proxy(value(RATIO), value(BUSY)) else {
                     known = false;
                     break;
                 };
-                x[i] = w.p * if die.e[i] { 4.0 } else { 1.0 };
+                x[i] = p * if die.e[i] { 4.0 } else { 1.0 };
             }
             if known {
                 table.push(&x, power, at);
@@ -1390,7 +1470,7 @@ fn split_power(
         }
         let totals: Vec<f64> = held[i]
             .iter()
-            .filter_map(|f| f[2].as_ref())
+            .filter_map(|f| f[PROXY].as_ref())
             .map(|f| f.1[1..=OWN].iter().sum::<f64>())
             .collect();
         let k_lo = totals.iter().copied().fold(coef.own_total(), f64::min);
@@ -1510,48 +1590,55 @@ fn held_out(walk: &Walk, logs: &[&Log], rows: usize, held: &[Vec<Variants>], blo
         if t.windows > 0 {
             let rms = |v: usize| (t.sse[v] / count(t.windows)).sqrt();
             block.errors = Some(Errors {
-                die_only: rms(0),
-                own: rms(1),
-                full: rms(2),
-                unit: rms(3),
+                die_only: rms(DIE_ONLY),
+                own: rms(WITH_OWN),
+                full: rms(FULL),
+                unit: rms(UNIT),
+                proxy: rms(PROXY),
                 windows: t.windows,
             });
         }
     }
 }
 
-/// Решения блока: по всем данным (коэффициенты), без каждого куска (три вида — для ошибок и разброса «°C на ступень»),
-/// по половинам (стабильность). `block` приходит без них и уходит с ними.
+/// Решения блока: по всем данным (прежний вид — `coef`, с выученной формой — `shaped`), без каждого куска (пять видов —
+/// для ошибок и разброса «°C на ступень»), по половинам (стабильность K прежнего вида). `block` приходит без них и уходит
+/// с ними; `gathered` — его годные строки и узлы формы.
 fn solve_block(
     die: &Die,
     i: usize,
     sums: &[Sums],
-    gathered: &Gather,
+    (gathered, shape): (&Gather, &Hinge),
     mut block: BlockModel,
 ) -> (BlockModel, Vec<Variants>) {
-    let m = width_of(die, i);
+    let nb = die.neighbours[i].len();
+    let m = 1 + OWN + 2 * nb + shape.columns();
     let mut all = Sums::new(m);
     for s in sums {
         all.plus(s);
     }
     let enough = gathered.usable >= MIN_ROWS;
     block.coef = enough
-        .then(|| solve_variant(&all, 2))
+        .then(|| solve_variant(&all, PROXY, nb))
         .flatten()
-        .map(|f| Coef::of(die, i, &f));
-    // Диагностика отчёта: тот же L3 без неотрицательности и при β = 1.
+        .map(|f| Coef::of(die, i, None, &f));
+    block.shaped = enough
+        .then(|| solve_variant(&all, FULL, nb))
+        .flatten()
+        .map(|f| Coef::of(die, i, Some(shape), &f));
+    // Диагностика отчёта: L3 с формой без неотрицательности и при β = 1.
     block.diagnosis = enough
         .then(|| {
             let signed = all.solve_how(
-                &(0..m).collect::<Vec<_>>(),
+                &variant_columns(FULL, nb, shape.columns()),
                 How {
                     signed: true,
                     beta: None,
                 },
             )?;
             Some(Diagnosis {
-                signed: Coef::of(die, i, &signed),
-                unit: Coef::of(die, i, &solve_variant(&all, 3)?),
+                signed: Coef::of(die, i, Some(shape), &signed),
+                unit: Coef::of(die, i, Some(shape), &solve_variant(&all, UNIT, nb)?),
             })
         })
         .flatten();
@@ -1560,7 +1647,7 @@ fn solve_block(
         .map(|s| {
             let train = all.minus(s);
             let ok = enough && s.n > 0.0;
-            std::array::from_fn(|v| if ok { solve_variant(&train, v) } else { None })
+            std::array::from_fn(|v| if ok { solve_variant(&train, v, nb) } else { None })
         })
         .collect();
     block.halves = enough
@@ -1568,12 +1655,12 @@ fn solve_block(
             let mut first = sums[0].clone(); // one small matrix per block
             first.plus(&sums[1]);
             let second = all.minus(&first);
-            let total = |s: &Sums| solve_variant(s, 2).map(|f| Coef::of(die, i, &f).own_total());
+            let total = |s: &Sums| solve_variant(s, PROXY, nb).map(|f| Coef::of(die, i, None, &f).own_total());
             let (early, late) = (total(&first)?, total(&second)?);
             (early.min(late) > 0.0).then(|| early.max(late) / early.min(late))
         })
         .flatten();
-    block.slope = slope_of(&block, die, i, &fold_fits);
+    block.slope = slope_of(&block, die, i, shape, &fold_fits);
     (block, fold_fits)
 }
 
@@ -1602,14 +1689,14 @@ fn reference_of(g: &Gather, neighbours: &[usize]) -> Option<Reference> {
     })
 }
 
-/// «°C на ступень» по всем данным и по четырём подгонкам без куска.
-fn slope_of(block: &BlockModel, die: &Die, i: usize, folds: &[Variants]) -> Option<Slope> {
-    let (coef, reference) = (block.coef.as_ref()?, block.reference.as_ref()?);
+/// «°C на ступень» по выученной форме: по всем данным и по четырём подгонкам без куска.
+fn slope_of(block: &BlockModel, die: &Die, i: usize, shape: &Hinge, folds: &[Variants]) -> Option<Slope> {
+    let (coef, reference) = (block.shaped.as_ref()?, block.reference.as_ref()?);
     let at = reference.median;
     let per: Vec<f64> = folds
         .iter()
-        .filter_map(|f| f[2].as_ref())
-        .map(|f| block.step(&Coef::of(die, i, f), at))
+        .filter_map(|f| f[FULL].as_ref())
+        .map(|f| block.step(&Coef::of(die, i, Some(shape), f), at))
         .collect();
     let value = block.step(coef, at);
     Some(Slope {
@@ -1659,87 +1746,55 @@ fn median(values: &[f64]) -> Option<f64> {
     })
 }
 
-/// Кривые напряжения блоков (строки с напряжением и занятостью ≥ 0,5) и связь напряжения с другими блоками.
-fn voltage(logs: &[&Log], die: &Die) -> (Vec<Option<VoltCurve>>, Vec<Option<Rail>>) {
+// ----- сырые корзины (только отчёт) -----
+
+/// Сырая корзина: строк, средняя температура блока над остальными (T − D, то же правило уровня кристалла) и средний D —
+/// в строках, где блок занят не меньше заданного, по целому фактическому множителю.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawBin {
+    pub ratio: i64,
+    pub rows: usize,
+    pub above: f64,
+    pub level: f64,
+}
+
+/// Сырые корзины блока `block` для сравнения с выученной формой в отчёте.
+#[must_use]
+pub fn relative_bins(logs: &[&Log], die: &Die, block: usize, busy: f64) -> Vec<RawBin> {
     let n = die.len();
-    let mut points: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n];
-    let mut others: Vec<Pearson> = vec![Pearson::default(); n];
-    let mut own: Vec<Pearson> = vec![Pearson::default(); n];
-    let mut volts = vec![None; n];
-    let mut ratios = vec![None; n];
-    for log in logs {
+    let mut bins: std::collections::BTreeMap<i64, (usize, f64, f64)> = std::collections::BTreeMap::new();
+    for log in in_order(logs) {
         let cols = columns_of(log, die);
         for row in 0..log.rows() {
-            for i in 0..n {
-                let value = |what| cols[i].and_then(|c| log.get(row, c, what));
-                volts[i] = value(VOLTS);
-                ratios[i] = value(RATIO);
-                if let (Some(v), Some(r), Some(b)) = (volts[i], ratios[i], value(BUSY))
-                    && b >= LOADED
-                {
-                    points[i].push((r, v));
-                }
+            let value = |at: usize, what: usize| cols[at].and_then(|c| log.get(row, c, what));
+            let (Some(temp), Some(ratio), Some(load)) = (value(block, TEMP), value(block, RATIO), value(block, BUSY))
+            else {
+                continue;
+            };
+            if load < busy {
+                continue;
             }
-            for i in 0..n {
-                let (Some(v), Some(r)) = (volts[i], ratios[i]) else {
-                    continue;
-                };
-                let (sum, k) = (0..n)
-                    .filter(|&j| j != i && die.e[j] == die.e[i])
-                    .filter_map(|j| volts[j])
-                    .fold((0.0, 0usize), |(s, k), v| (s + v, k + 1));
-                if k > 0 {
-                    others[i].add(v, sum / count(k));
-                    own[i].add(v, r);
-                }
-            }
+            let (sum, known) = (0..n)
+                .filter(|&other| other != block)
+                .filter_map(|other| value(other, TEMP))
+                .fold((0.0, 0), |(sum, known), v| (sum + v, known + 1));
+            let Some(level) = samples::die_level(sum, known, n - 1) else {
+                continue;
+            };
+            let bin = bins.entry(whole(ratio)).or_default();
+            bin.0 += 1;
+            bin.1 += temp - level;
+            bin.2 += level;
         }
     }
-    let curves = points.iter().map(|p| VoltCurve::fit(p)).collect();
-    let rails = others
-        .iter()
-        .zip(&own)
-        .map(|(o, r)| {
-            Some(Rail {
-                with_others: o.r()?,
-                with_ratio: r.r()?,
-                rows: r.n,
-            })
+    bins.into_iter()
+        .map(|(ratio, (k, above, level))| RawBin {
+            ratio,
+            rows: k,
+            above: above / count(k),
+            level: level / count(k),
         })
-        .collect();
-    (curves, rails)
-}
-
-/// Корреляция Пирсона по суммам.
-#[derive(Clone, Copy, Debug, Default)]
-struct Pearson {
-    n: usize,
-    sx: f64,
-    sy: f64,
-    sxx: f64,
-    syy: f64,
-    sxy: f64,
-}
-
-impl Pearson {
-    fn add(&mut self, x: f64, y: f64) {
-        self.n += 1;
-        self.sx += x;
-        self.sy += y;
-        self.sxx += x * x;
-        self.syy += y * y;
-        self.sxy += x * y;
-    }
-
-    fn r(&self) -> Option<f64> {
-        if self.n < 3 {
-            return None;
-        }
-        let n = count(self.n);
-        let vx = self.sxx - self.sx * self.sx / n;
-        let vy = self.syy - self.sy * self.sy / n;
-        (vx > 0.0 && vy > 0.0).then(|| (self.sxy - self.sx * self.sy / n) / (vx * vy).sqrt())
-    }
+        .collect()
 }
 
 // ----- проверка по моменту, когда он сменил потолок (только отчёт) -----
@@ -1753,8 +1808,13 @@ pub struct SplitBlock {
     pub test: usize,
     pub before: Option<f64>,
     pub after: Option<f64>,
-    /// Предсказанная средняя после по видам (a)–(d).
+    /// Предсказанная средняя после по видам (a)–(e).
     pub predicted: [Option<f64>; VARIANTS],
+    /// Из чего сложено предсказанное после (средняя по проверочным строкам), по (c) и (c old): свободный член + (β − 1)·D,
+    /// своя быстрая нагрузка (форма или K·pfast), средние своей p, соседи; и средняя своя занятость и множитель там.
+    pub parts: [[f64; 4]; 2],
+    pub busy_test: Option<f64>,
+    pub ratio_test: Option<f64>,
     /// β подгонки (c) до момента и средний уровень кристалла D на строках подгонки и на проверочных.
     pub beta: Option<f64>,
     pub level_train: Option<f64>,
@@ -1765,16 +1825,13 @@ pub struct SplitBlock {
 pub fn split(logs: &[&Log], die: &Die, at_ms: i64) -> Vec<SplitBlock> {
     let logs = in_order(logs);
     let n = die.len();
-    let (volts, _) = voltage(&logs, die);
-    let v45: Vec<Option<f64>> = volts
-        .iter()
-        .map(|c| c.as_ref().map(|c| c.at(REFERENCE)).filter(|v| *v > 0.0))
-        .collect();
-    let walk = Walk { die, v45: &v45 };
+    // Узлы формы — по строкам подгонки (до момента).
+    let (_, _, shapes) = prepare(&logs, die, |at| at < at_ms);
+    let walk = Walk { die, shapes: &shapes };
     let home = logs
         .iter()
         .position(|l| l.times[0] <= at_ms && at_ms <= l.times[l.rows() - 1]);
-    let mut train: Vec<Sums> = (0..n).map(|i| Sums::new(width_of(die, i))).collect();
+    let mut train: Vec<Sums> = (0..n).map(|i| Sums::new(width_of(die, i, &shapes))).collect();
     let mut trained = vec![0usize; n];
     let mut level_train = vec![0.0; n];
     let mut before = vec![(0.0, 0usize); n];
@@ -1795,7 +1852,7 @@ pub fn split(logs: &[&Log], die: &Die, at_ms: i64) -> Vec<SplitBlock> {
         .map(|(i, s)| {
             std::array::from_fn(|v| {
                 if trained[i] >= MIN_ROWS {
-                    solve_variant(s, v)
+                    solve_variant(s, v, die.neighbours[i].len())
                 } else {
                     None
                 }
@@ -1804,8 +1861,27 @@ pub fn split(logs: &[&Log], die: &Die, at_ms: i64) -> Vec<SplitBlock> {
         .collect();
     let mut after = vec![(0.0, [0.0; VARIANTS], 0usize); n];
     let mut level_test = vec![0.0; n];
+    let mut parts = vec![[[0.0; 4]; 2]; n];
+    let mut load = vec![(0.0, 0.0, 0usize); n];
     walk.run(&logs, |u| {
         if u.at >= at_ms && Some(u.log) == home {
+            let nb = die.neighbours[u.block].len();
+            for (into, v) in parts[u.block].iter_mut().zip([FULL, PROXY]) {
+                if let Some((a, c)) = &fits[u.block][v] {
+                    let sum = |r: std::ops::Range<usize>| r.map(|k| c[k] * u.x[k]).sum::<f64>();
+                    let near = OWN + 1 + 2 * nb;
+                    into[0] += a + (c[0] - 1.0) * u.x[0];
+                    into[1] += sum(1..2) + sum(near..u.x.len());
+                    into[2] += sum(2..OWN + 1);
+                    into[3] += sum(OWN + 1..near);
+                }
+            }
+            let l = &mut load[u.block];
+            l.0 += u.busy;
+            if let Some(r) = u.ratio {
+                l.1 += r;
+                l.2 += 1;
+            }
             let a = &mut after[u.block];
             let level = u.x[0];
             level_test[u.block] += level;
@@ -1829,7 +1905,10 @@ pub fn split(logs: &[&Log], die: &Die, at_ms: i64) -> Vec<SplitBlock> {
                 before: mean(before[i].0, before[i].1),
                 after: mean(obs, k),
                 predicted: std::array::from_fn(|v| fits[i][v].as_ref().and(mean(pred[v], k))),
-                beta: fits[i][2].as_ref().map(|f| f.1[0]),
+                parts: parts[i].map(|p| p.map(|v| mean(v, k).unwrap_or(0.0))),
+                busy_test: mean(load[i].0, k),
+                ratio_test: mean(load[i].1, load[i].2),
+                beta: fits[i][FULL].as_ref().map(|f| f.1[0]),
                 level_train: mean(level_train[i], trained[i]),
                 level_test: mean(level_test[i], k),
             }
@@ -2088,29 +2167,18 @@ pub fn level(logs: &[&Log], die: &Die) -> Option<Level> {
 }
 
 /// Проверка мощности: мощность процессора ≈ `c0 + c_P·Σ_P p + c_E·4·Σ_E p` (кластер E — p первого ядра за четыре
-/// ядра).
+/// ядра), p — куб (принят, не измерен).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PowerCheck {
-    /// По кубическому закону на всех строках, где p всех блоков известна.
+    /// На всех строках, где p всех блоков известна.
     pub cube: Option<Cross>,
-    /// На строках, где у каждого блока с множителем есть напряжение: (кубический закон, по напряжению).
-    pub both: Option<(Option<Cross>, Option<Cross>)>,
 }
 
 #[must_use]
-pub fn power_check(logs: &[&Log], die: &Die, model: &Model) -> PowerCheck {
+pub fn power_check(logs: &[&Log], die: &Die) -> PowerCheck {
     let logs = in_order(logs);
     let n = die.len();
-    let v45: Vec<Option<f64>> = model.blocks.iter().map(|b| b.v45).collect();
     let mut cube = Table {
-        m: 2,
-        ..Table::default()
-    };
-    let mut both_cube = Table {
-        m: 2,
-        ..Table::default()
-    };
-    let mut both_volts = Table {
         m: 2,
         ..Table::default()
     };
@@ -2120,38 +2188,22 @@ pub fn power_check(logs: &[&Log], die: &Die, model: &Model) -> PowerCheck {
             let Some(power) = log.power(row, POWER_CPU) else {
                 continue;
             };
-            let at = log.times[row];
-            let (mut c, mut v) = ([0.0; 2], [0.0; 2]);
-            let (mut cube_ok, mut volts_ok) = (true, true);
+            let mut c = [0.0; 2];
+            let mut known = true;
             for i in 0..n {
                 let value = |what| cols[i].and_then(|col| log.get(row, col, what));
-                let (ratio, busy) = (value(RATIO), value(BUSY));
-                let group = usize::from(die.e[i]);
                 let weight = if die.e[i] { 4.0 } else { 1.0 };
-                match proxy(ratio, busy, None) {
-                    Some(w) => c[group] += weight * w.p,
-                    None => cube_ok = false,
-                }
-                let rel = value(VOLTS).zip(v45[i]).map(|(volts, v45)| volts / v45);
-                // Спавшее ядро (p = 0 без множителя) — не по кубу: напряжение ему не нужно.
-                match proxy(ratio, busy, rel) {
-                    Some(w) if !w.fallback => v[group] += weight * w.p,
-                    _ => volts_ok = false,
+                match proxy(value(RATIO), value(BUSY)) {
+                    Some(p) => c[usize::from(die.e[i])] += weight * p,
+                    None => known = false,
                 }
             }
-            if cube_ok {
-                cube.push(&c, power, at);
-                if volts_ok {
-                    both_cube.push(&c, power, at);
-                    both_volts.push(&v, power, at);
-                }
+            if known {
+                cube.push(&c, power, log.times[row]);
             }
         }
     }
-    PowerCheck {
-        cube: cube.cross(),
-        both: (!both_volts.y.is_empty()).then(|| (both_cube.cross(), both_volts.cross())),
-    }
+    PowerCheck { cube: cube.cross() }
 }
 
 // ----- числа -----
@@ -2254,7 +2306,7 @@ mod tests {
                 let source = if together && j == 2 { 1 } else { j };
                 r[ju] = ratio(source, k);
                 b[ju] = (busy(source, k) * 100.0).round() / 100.0;
-                p[ju] = proxy(Some(r[ju]), Some(b[ju]), None).map_or(0.0, |w| w.p);
+                p[ju] = proxy(Some(r[ju]), Some(b[ju])).unwrap_or(0.0);
                 averages[ju] = Some(match averages[ju] {
                     Some(mut a) => {
                         a.advance(at, p[ju]);
@@ -2319,12 +2371,14 @@ mod tests {
             let r = b.resistance.expect("°C на ватт");
             let k = b.coef.as_ref().map_or(0.0, Coef::own_total);
             assert!((r.value - k / pw.watts).abs() < 1e-9 && r.lo <= r.value && r.value <= r.hi);
-            // Кривая «одинаковой работы»: своя часть — R × медиана ватт (10) × p(r), остальное — как у кривой L3.
+            // Кривая «одинаковой работы»: свой нагрев блока пересчитан на медиану ватт рода (10), остальное — как у
+            // кривой L3.
             let reference = b.same_work.unwrap_or(0.0);
             assert!((reference - 10.0).abs() < 0.05, "медиана ватт P-блоков {reference}");
+            let shaped = b.shaped.as_ref().expect("форма");
             for x in [36.0, 45.0, 50.0] {
                 let (shown, plain) = (b.shown_curve(x).unwrap_or(0.0), b.curve(x).unwrap_or(0.0));
-                let want = plain + (r.value * reference - k) * b.power_at(x);
+                let want = plain + (reference / pw.watts - 1.0) * b.heat(shaped, x);
                 assert!((shown - want).abs() < 1e-9, "{} ×{x}: {shown} {want}", b.name);
             }
         }
@@ -2350,6 +2404,49 @@ mod tests {
     }
 
     #[test]
+    fn knots_keep_a_step_of_data_above_and_the_knee_needs_a_doubled_slope() {
+        let h = Hinge::layout(40.3, 45.05);
+        assert_eq!(h.knots, [42.0, 44.0], "×44 ≤ 45,05 − 1, ×46 — нет");
+        assert!(Hinge::layout(40.3, 42.9).knots.is_empty(), "×42 > 42,9 − 1");
+        let bent = Hinge {
+            weights: vec![0.5, 0.3, 3.0, 0.0],
+            ..h.clone() // two knots, once
+        };
+        assert!((bent.at(40.3) - 0.5).abs() < 1e-12 && (bent.at(43.0) - (0.5 + 0.3 * 2.7 + 3.0)).abs() < 1e-12);
+        assert_eq!(
+            bent.knee(),
+            Some(Knee {
+                at: 42.0,
+                before: 0.3,
+                after: 3.3
+            })
+        );
+        let mild = Hinge {
+            weights: vec![0.0, 0.3, 0.2, 0.0],
+            ..h
+        };
+        assert_eq!(mild.knee(), None, "0,3 → 0,5 — не вдвое");
+    }
+
+    #[test]
+    fn old_volts_columns_change_nothing() {
+        // Журналы 0.5.4 несут `<блок>.volts`: модель их не берёт — та же модель, что без них.
+        let (csv, die) = synthetic(3000, None);
+        let mut with = String::new();
+        for (k, line) in csv.lines().enumerate() {
+            with.push_str(line);
+            with.push_str(if k == 0 {
+                ",0.volts,1.volts,2.volts"
+            } else {
+                ",0.9,1.1,1.2"
+            });
+            with.push('\n');
+        }
+        let (a, b) = (fit(&[&log_from_csv(&csv)], &die), fit(&[&log_from_csv(&with)], &die));
+        assert_eq!(a.blocks, b.blocks);
+    }
+
+    #[test]
     fn known_gains_come_back_from_a_synthetic_log() {
         let (csv, die) = synthetic(6000, None);
         let log = log_from_csv(&csv);
@@ -2363,7 +2460,7 @@ mod tests {
             assert!((n.fast - 2.0).abs() < 0.3 && (n.slow - 4.0).abs() < 0.3, "{n:?}");
         }
         assert!(
-            b.errors.is_some_and(|e| e.full < 0.05 && e.full < e.die_only),
+            b.errors.is_some_and(|e| e.proxy < 0.05 && e.full < e.die_only),
             "{:?}",
             b.errors
         );
