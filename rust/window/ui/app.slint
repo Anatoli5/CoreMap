@@ -1744,7 +1744,7 @@ export component AppWindow inherits Window {
             enabled: root.auto-ready;
             toggled => { root.auto-toggled(); }
             hover(on) => {
-                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• работает в программе у часов, окно для этого не нужно\n• выключен — программа датчики для него не читает и потолки не трогает\n• то же — в меню значка у часов", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• работает в CoreMapTray, окно для этого не нужно\n• выключен — CoreMapTray датчики для него не читает и потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {

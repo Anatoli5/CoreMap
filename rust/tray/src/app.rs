@@ -42,7 +42,7 @@ mod serve;
 use crate::shell::{Event, Item, Loop, Menu, Shell};
 pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, STEP_UP_ID};
 pub use sense::LogCount;
-pub use serve::{Confirm, WINDOW_EXE};
+pub use serve::{Confirm, LEAVE_WITHIN, WINDOW_EXE};
 
 /// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — щелчок по значку).
 pub const WINDOW_ID: u32 = 1;
@@ -254,6 +254,12 @@ impl App {
     #[must_use]
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    /// Настройки запуска (скрытая проверка: вторая программа с теми же сроками, своим каналом и своей папкой).
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     #[must_use]
@@ -804,11 +810,8 @@ impl App {
         }
         match id {
             WINDOW_ID => self.open_window(shell),
-            EXIT_ID => {
-                self.put_back("выход");
-                shell.remove_icon();
-                shell.destroy();
-            }
+            // Сначала окно, потом программа (app/serve.rs, `leave`).
+            EXIT_ID => self.leave(shell),
             0 => {}
             _ => {
                 let k = usize::try_from(id - FACTORY_ID).unwrap_or(usize::MAX);
@@ -827,6 +830,14 @@ impl App {
         }
         shell.set_tip(&self.tip());
         self.show_balloon(shell);
+    }
+
+    /// Выход, когда окна уже нет (app/serve.rs, `leave`): поправки автомодуля — назад, значок убран, цикл программы
+    /// кончается.
+    pub(super) fn quit(&mut self, shell: &mut Shell) {
+        self.put_back("выход");
+        shell.remove_icon();
+        shell.destroy();
     }
 
     /// Щелчок по набору: ставит его и делает профилем запуска; «заводские» — профиля запуска больше нет. Как у
@@ -931,6 +942,8 @@ impl App {
 
     fn event(&mut self, shell: &mut Shell, event: Event) {
         match event {
+            // Программа выходит и ждёт, пока закроется окно: меню и щелчок открыли бы окно заново.
+            Event::Menu(..) | Event::Open if self.serving.leaving() => {}
             Event::Menu(x, y) => {
                 self.refresh_view();
                 let items = self.menu();
@@ -978,6 +991,7 @@ impl App {
             Event::Timer(sense::SENSE) => self.sense_tick(shell),
             Event::Timer(serve::STATE) => self.serve_tick(shell),
             Event::Timer(serve::GREET) => self.greet_tick(shell),
+            Event::Timer(serve::LEAVE) => self.leave_tick(shell),
             Event::Timer(_) => {}
             Event::Suspend => {
                 self.journal.note("уход в сон");
@@ -1003,13 +1017,14 @@ impl App {
             }
             Event::EndSession => {
                 self.journal.note("Windows завершает сеанс");
+                // Потолки — первыми: после этого сообщения Windows может закончить процесс в любой миг. Потом окно
+                // успевает запомнить себя, если Windows даст ему эти миллисекунды.
                 self.put_back("конец сеанса Windows");
+                self.leave(shell);
             }
             Event::Close => {
                 self.journal.note("выход по просьбе окна CoreMap");
-                self.put_back("выход");
-                shell.remove_icon();
-                shell.destroy();
+                self.leave(shell);
             }
             Event::IconRestored => {
                 shell.forget_icon();

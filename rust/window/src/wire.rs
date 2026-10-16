@@ -245,6 +245,10 @@ pub enum Message {
     Notice(Notice),
     #[serde(rename = "settings")]
     Settings(Settings),
+    /// Программа на том конце выходит (`CoreMapTray`: «Выход» в меню значка, конец сеанса Windows): окно запоминает себя
+    /// и закрывается, программа выходит после него. Движок C# этого сообщения не шлёт.
+    #[serde(rename = "bye")]
+    Bye,
     #[serde(other)]
     Other,
 }
@@ -305,6 +309,19 @@ mod tests {
         assert_eq!(state.avg[0], Some(50.2));
         assert_eq!(state.avg_ratio, [Some(51.0), None, Some(45.0), Some(45.0)]);
         assert_eq!(state.auto, None);
+    }
+
+    #[test]
+    fn bye_as_the_logon_program_writes_it() {
+        // rust/tray/src/app/serve.rs, BYE; поле, которое программа может добавить позже, не ломает разбор.
+        assert!(matches!(
+            serde_json::from_str::<Message>(r#"{"t":"bye"}"#),
+            Ok(Message::Bye)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Message>(r#"{"t":"bye","why":"выход"}"#),
+            Ok(Message::Bye)
+        ));
     }
 
     #[test]

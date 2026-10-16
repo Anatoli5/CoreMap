@@ -7,17 +7,18 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use machine::named::Names;
 use serde_json::{Value, json};
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CLOSE, WM_ENDSESSION};
 
-use crate::app::{AUTO_ON, App, AutoTiming, Choice, Confirm, WINDOW_EXE, WINDOW_ID};
-use crate::check::{Report, ceilings_now, hold, logged, pump, pump_until};
-use crate::shell::{self, Shell};
+use crate::app::{AUTO_ON, App, AutoTiming, Choice, Config, Confirm, EXIT_ID, LEAVE_WITHIN, WINDOW_EXE, WINDOW_ID};
+use crate::check::{QuietLog, Report, ceilings_now, hold, logged, pump, pump_until};
+use crate::shell::{self, Event, Loop, Shell};
 
 /// Клиент канала, как окно: свой поток читает сообщения и отдаёт их сюда; команды уходят через него же.
 struct Client {
@@ -429,12 +430,14 @@ const WINDOW_LIMIT: i32 = 88;
 const WINDOW_DEPTH: i32 = 6;
 const WINDOW_GESTURES: usize = 5;
 
-/// Окно проверки: CoreMapWindow.exe с ключами `pass` против канала программы входа; её цикл крутится, пока окно не
-/// выйдет (не дольше 90 с). Отчёт окна — в этот отчёт строками; пройдена — код 0 и отчёт «ok».
-fn window_pass(r: &mut Report, app: &mut App, shell: &mut Shell, exe: &Path, picture: &Path, pass: &[&str]) {
-    let report = PathBuf::from(format!("{}.txt", picture.display()));
-    let _ = fs::remove_file(&report); // отчёта прошлой проверки нет — тем лучше; не удалился — его выдаст код выхода
-    let started = Instant::now();
+/// Отчёт окна проверки — рядом с его картинкой.
+fn report_of(picture: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.txt", picture.display()))
+}
+
+/// Запускает CoreMapWindow.exe с ключами `pass` против канала программы входа. None — не запустился (сказано в отчёте).
+fn start_window(r: &mut Report, app: &App, exe: &Path, picture: &Path, pass: &[&str]) -> Option<Child> {
+    let _ = fs::remove_file(report_of(picture)); // отчёта прошлой проверки нет — тем лучше; не удалился — его выдаст код выхода
     let child = Command::new(exe)
         .arg("--pipe")
         .arg(&app.serving().pipe)
@@ -442,26 +445,46 @@ fn window_pass(r: &mut Report, app: &mut App, shell: &mut Shell, exe: &Path, pic
         .arg(picture)
         .args(pass)
         .spawn();
-    let mut child = match child {
-        Ok(child) => child,
+    match child {
+        Ok(child) => Some(child),
         Err(e) => {
             r.check(false, &format!("{WINDOW_EXE} {} не запустился: {e}", pass.join(" ")));
-            return;
+            None
         }
-    };
-    let deadline = started + Duration::from_secs(90);
-    let code = loop {
+    }
+}
+
+/// Крутит цикл программы, пока окно не выйдет, не дольше `limit`. Код выхода окна; None — не уложилось (окно убито).
+fn wait_exit(shell: &mut Shell, app: &mut App, child: &mut Child, limit: Duration) -> Option<i32> {
+    let deadline = Instant::now() + limit;
+    loop {
         pump(shell, app, Duration::from_millis(50));
         match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
+            Ok(Some(status)) => return status.code(),
             Ok(None) if Instant::now() < deadline => {}
             Ok(None) | Err(_) => {
-                let _ = child.kill(); // не уложилось — код None, проверка ниже это скажет
-                break None;
+                let _ = child.kill(); // не уложилось — код None, проверка это скажет
+                let _ = child.wait(); // убитый процесс забран; не вышло — его код и так None
+                return None;
             }
         }
+    }
+}
+
+/// Окно проверки: CoreMapWindow.exe с ключами `pass` против канала программы входа; её цикл крутится, пока окно не
+/// выйдет (не дольше 90 с). Отчёт окна — в этот отчёт строками; пройдена — код 0 и отчёт «ok».
+fn window_pass(r: &mut Report, app: &mut App, shell: &mut Shell, exe: &Path, picture: &Path, pass: &[&str]) {
+    let started = Instant::now();
+    let Some(mut child) = start_window(r, app, exe, picture, pass) else {
+        return;
     };
-    let text = fs::read_to_string(&report).unwrap_or_default();
+    let code = wait_exit(shell, app, &mut child, Duration::from_secs(90));
+    window_report(r, picture, pass, code, started);
+}
+
+/// Отчёт окна проверки — в этот отчёт строками; пройдена — код 0 и отчёт «ok».
+fn window_report(r: &mut Report, picture: &Path, pass: &[&str], code: Option<i32>, started: Instant) {
+    let text = fs::read_to_string(report_of(picture)).unwrap_or_default();
     r.note(&format!(
         "--- окно {WINDOW_EXE} {} против программы входа, картинка {} ---",
         pass.join(" "),
@@ -1081,4 +1104,184 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
 
     // 12n. Настоящее окно: настройки автомодуля щелчками и ползунками.
     real_window(r, app, shell, root, out, data);
+}
+
+/// Размер окна в его проходе --bye (rust/window/src/check.rs, `LEFT_SIZE`): в файле окна его нет, записать его туда
+/// может только «bye».
+const WINDOW_LEFT_SIZE: [u32; 2] = [1400, 860];
+
+/// Вторая программа входа в этом же процессе — для выхода, который кончает её цикл: своя папка данных и свой канал,
+/// сроки и имена меток — как у проверяемой. Только когда проверяемая уже вышла: события окон одного потока идут через
+/// одну очередь (shell.rs), и таймеры живой первой достались бы второй.
+fn another(r: &mut Report, first: &App, data: &Path, suffix: &str) -> Option<(App, Shell)> {
+    let config = Config {
+        data: data.join(suffix),
+        pipe: format!("{}.{suffix}", first.config().pipe),
+        ..first.config().clone()
+    };
+    if let Err(e) = fs::create_dir_all(&config.data) {
+        r.check(false, &format!("папка второй программы {}: {e}", config.data.display()));
+        return None;
+    }
+    let class = config.pipe.clone(); // имя класса окна — то же, что у канала: в процессе оно одно
+    let made = App::new(config, Box::new(QuietLog)).and_then(|app| Shell::new(&class, false).map(|shell| (app, shell)));
+    match made {
+        Ok((mut app, mut shell)) => {
+            app.start(&mut shell);
+            Some((app, shell))
+        }
+        Err(e) => {
+            r.check(false, &format!("вторая программа не запустилась: {e}"));
+            None
+        }
+    }
+}
+
+/// Размер из файла окна (data\window.json): [ширина, высота]; None — файла или поля нет. Окно пишет его числами
+/// с дробной частью («1500.0», rust/window/src/saved.rs): читать как целые нельзя — так первая версия шага читала None.
+fn window_size(file: &Path) -> Option<Vec<f64>> {
+    let value: Value = serde_json::from_str(&fs::read_to_string(file).ok()?).ok()?;
+    value["size"].as_array()?.iter().map(Value::as_f64).collect()
+}
+
+/// Шаг 14 — выход программы с открытым окном (владелец 15.10: «если мы закрываем движок, а интерфейс остается, то
+/// есть схуяли… чтобы трей сначала закрывал окно… а потом закрывался сам»). Последний шаг проверки: программа выходит.
+//  14a. Настоящее окно (--lost); канал пропадает без «bye», как при падении программы: окно остаётся и одной строкой
+//       говорит, что CoreMapTray не отвечает. Канал снова есть.
+//  14b. Настоящее окно (--bye) и «Выход» в меню: окно получает «bye», записывает себя в файл окна и закрывается в
+//       пределах `LEAVE_WITHIN`; программа выходит после него.
+//  14c. Вторая программа, окна нет: конец сеанса Windows — выход сразу, без ожидания.
+//  14d. Третья программа, окно (клиент проверки) «bye» получает, но не закрывается: щелчок по значку окно заново не
+//       открывает; программа выходит через `LEAVE_WITHIN` без него.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario, step after step, reads best as one piece"
+)]
+pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path, &Path, &Path)) {
+    let (root, out, data) = places;
+    let exe = root.join(WINDOW_EXE);
+    if !exe.exists() {
+        r.check(false, &format!("нет {WINDOW_EXE} рядом с программой входа"));
+        return;
+    }
+    // Папка окна — та же, что у шага 12n: в его файле окна — то, что записало закрытие прохода --settings.
+    let folder = data.join("window-check");
+    let folder_arg = folder.display().to_string();
+    let file = folder.join("window.json");
+
+    // 14a. Канал пропал без «bye».
+    let pass = ["--lost", "--data", folder_arg.as_str()];
+    let picture = out.with_file_name("logon-lost.png");
+    let started = Instant::now();
+    if let Some(mut child) = start_window(r, app, &exe, &picture, &pass) {
+        pump_until(shell, app, Duration::from_secs(15), |a| a.serving().attached());
+        let attached = app.serving().attached();
+        // Канал рвётся не раньше чем через 2 с после подключения: тогда окно пробует снова через секунду, а не через
+        // пять (pipe.rs окна) — проверка только короче, итог тот же.
+        pump(shell, app, Duration::from_millis(2200));
+        app.cut_pipe(shell);
+        let code = wait_exit(shell, app, &mut child, Duration::from_secs(30));
+        window_report(r, &picture, &pass, code, started);
+        r.check(attached, "окно подключилось до того, как канал пропал");
+    }
+    app.open_server();
+    r.check(
+        !app.serving().handles().is_empty(),
+        "канал окна снова есть (как после нового запуска программы)",
+    );
+
+    // 14b. «Выход» с открытым окном.
+    let pass = ["--bye", "--data", folder_arg.as_str()];
+    let picture = out.with_file_name("logon-bye.png");
+    let started = Instant::now();
+    let Some(mut child) = start_window(r, app, &exe, &picture, &pass) else {
+        return;
+    };
+    pump_until(shell, app, Duration::from_secs(15), |a| a.serving().attached());
+    let attached = app.serving().attached();
+    let before = window_size(&file);
+    let asked = Instant::now();
+    app.command(shell, EXIT_ID);
+    let code = wait_exit(shell, app, &mut child, LEAVE_WITHIN + Duration::from_secs(5));
+    let closed_in = asked.elapsed();
+    pump_until(shell, app, Duration::from_secs(1), |a| a.serving().left.is_some());
+    let after = window_size(&file);
+    window_report(r, &picture, &pass, code, started);
+    r.check(
+        attached && code == Some(0) && closed_in <= LEAVE_WITHIN,
+        &format!(
+            "«Выход» с открытым окном: окно закрылось через {} мс (срок {} с)",
+            closed_in.as_millis(),
+            LEAVE_WITHIN.as_secs()
+        ),
+    );
+    let left = app.serving().left.map(|t| t.duration_since(asked).as_millis());
+    r.check(
+        left.is_some() && logged(app, "выход: окно закрылось через") == 1 && logged(app, "окно не закрылось") == 0,
+        &format!("CoreMapTray вышел после окна, через {left:?} мс после «Выход»"),
+    );
+    let want = WINDOW_LEFT_SIZE.map(f64::from).to_vec();
+    r.check(
+        before.as_ref().is_some_and(|b| *b != want) && after.as_ref() == Some(&want),
+        &format!("файл окна после «bye»: размер {before:?} → {after:?}"),
+    );
+    // Что осталось от вышедшей программы в общей очереди событий — ей же (её таймеров больше нет).
+    pump(shell, app, Duration::from_millis(50));
+
+    // 14c. Окна нет, конец сеанса Windows: выход сразу.
+    if let Some((mut second, mut shell2)) = another(r, app, data, "s2") {
+        let asked = Instant::now();
+        shell2.post(WM_ENDSESSION, 1, 0);
+        pump_until(&mut shell2, &mut second, Duration::from_secs(2), |a| {
+            a.serving().left.is_some()
+        });
+        let left = second.serving().left.map(|t| t.duration_since(asked));
+        r.check(
+            left.is_some_and(|t| t < Duration::from_millis(500))
+                && logged(&second, "Windows завершает сеанс") == 1
+                && logged(&second, "сказано закрыться") == 0,
+            &format!("окна нет, конец сеанса Windows — выход сразу ({left:?})"),
+        );
+        pump(&mut shell2, &mut second, Duration::from_millis(50));
+    }
+
+    // 14d. Окно «bye» получило и не закрывается.
+    if let Some((mut third, mut shell3)) = another(r, app, data, "s3") {
+        let pipe = third.serving().pipe.clone();
+        let mut client = Client::hello(&pipe);
+        let greeted = wait(&mut shell3, &mut third, &mut client, Duration::from_secs(5), |c| {
+            !c.of("state").is_empty() || c.closed()
+        });
+        let asked = Instant::now();
+        shell3.post(WM_CLOSE, 0, 0);
+        wait(&mut shell3, &mut third, &mut client, Duration::from_secs(2), |c| {
+            !c.of("bye").is_empty()
+        });
+        // Щелчок по значку — так, как его разбирает цикл программы. (Меню здесь не зовётся: без защиты оно показалось бы
+        // на экране и ждало бы выбора; защита у них одна — `event` в app.rs.)
+        let launched = third.launched.len();
+        third.on(&mut shell3, Loop::Event(Event::Open));
+        let reopened = third.launched.len() - launched;
+        pump_until(&mut shell3, &mut third, LEAVE_WITHIN + Duration::from_secs(2), |a| {
+            a.serving().left.is_some()
+        });
+        let left = third.serving().left.map(|t| t.duration_since(asked));
+        client.collect();
+        let bye = client.got.iter().position(|v| v["t"] == "bye");
+        let quiet = bye.is_some_and(|at| client.got[at + 1..].iter().all(|v| v["t"] == "closed"));
+        r.check(
+            greeted && bye.is_some() && quiet && reopened == 0,
+            &format!(
+                "окну сказано «bye», после него ему ничего не шлётся; щелчок по значку, пока программа ждёт окно, его заново не открывает и вперёд не выводит ({reopened})"
+            ),
+        );
+        r.check(
+            // Срок таймера Windows отсчитывается тиками около 16 мс: допуск на один.
+            left.is_some_and(|t| {
+                t + Duration::from_millis(20) >= LEAVE_WITHIN && t < LEAVE_WITHIN + Duration::from_secs(1)
+            }) && logged(&third, "окно не закрылось за") == 1,
+            &format!("окно не закрылось — программа вышла без него через {left:?}"),
+        );
+        client.close();
+    }
 }

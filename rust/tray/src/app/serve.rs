@@ -9,7 +9,9 @@
 //   опроса, app/sense.rs), и сразу после исполненной команды; окна нет — нет ни таймера, ни чтения датчиков.
 // Новое, чего у движка не было: history — последние смены потолков (app/history.rs); settings — выбор владельца для
 // автомодуля и допустимые промежутки (по изменению); в state — доля работы ядер (busyShare), потолок автомодуля по
-// блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля (autoLimit).
+// блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля (autoLimit); bye — программа выходит:
+// окно запоминает себя и закрывается, программа выходит после него (`App::leave`; владелец 15.10: «чтобы трей сначала
+// закрывал окно… а потом закрывался сам»).
 //
 // Команды — тоже как у движка (src/Commands.cs): limit.set, profile.save/open/accept/revert/delete, max.reset,
 // notices.seen; новая — auto.set (настройки автомодуля из окна, app/auto.rs). Что окно помнит о себе (выбранные
@@ -58,6 +60,14 @@ const CONNECT_EVERY: Duration = Duration::from_secs(10);
 const COST_EVERY: Duration = Duration::from_secs(60);
 /// Окно запущено, а его процесса ещё не видно: второй щелчок в это время ничего не запускает.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+/// Таймер выхода: окно не закрылось за `LEAVE_WITHIN` после «bye» — программа выходит без него.
+pub const LEAVE: usize = 9;
+/// Сколько программа ждёт, пока окно закроется после «bye». Окну для этого нужно записать свой файл (меньше килобайта)
+/// и кончить свой цикл — миллисекунды (скрытая проверка их меряет). Срок нужен на окно, которое зависло: программа всё
+/// равно выходит, а владелец, выбравший «Выход», не ждёт исчезновения значка дольше нескольких секунд.
+pub const LEAVE_WITHIN: Duration = Duration::from_secs(3);
+/// Окну: программа выходит — запомни себя и закройся (rust/window/src/wire.rs, `Message::Bye`).
+const BYE: &str = r#"{"t":"bye"}"#;
 const PROTOCOL: i64 = 1;
 /// Название профиля длиннее (в знаках UTF-16, как Length в C#) не принимается.
 const NAME_LENGTH: usize = 64;
@@ -105,6 +115,16 @@ struct Session {
     last_cost: Option<Instant>,
 }
 
+/// Программа выходит и ждёт, пока закроется окно (`App::leave`).
+#[derive(Debug, Clone, Copy)]
+struct Leaving {
+    since: Instant,
+    /// Окно запущено, но ещё не подключилось: его ждут, чтобы сказать «bye» и ему.
+    awaiting: bool,
+    /// «bye» сказан окну.
+    told: bool,
+}
+
 /// Канал окна и всё, что программа о нём помнит.
 #[derive(Debug)]
 pub struct Serving {
@@ -119,6 +139,8 @@ pub struct Serving {
     notice_seq: u64,
     notices_seen: u64,
     launched_at: Option<Instant>,
+    /// Программа выходит и ждёт окно; None — не выходит.
+    leaving: Option<Leaving>,
     /// Буфер сообщения «состояние»: оно собирается дважды в секунду, память — одна и та же.
     text: String,
     pub confirm: Confirm,
@@ -127,6 +149,8 @@ pub struct Serving {
     /// Скрытая проверка: сколько окон подключалось, сколько состояний ушло.
     pub sessions: u64,
     pub states: u64,
+    /// Скрытая проверка: когда программа вышла (после окна или без него); None — не выходила.
+    pub left: Option<Instant>,
 }
 
 impl Serving {
@@ -142,11 +166,13 @@ impl Serving {
             notice_seq: 0,
             notices_seen: 0,
             launched_at: None,
+            leaving: None,
             text: String::new(),
             confirm,
             asked: Vec::new(),
             sessions: 0,
             states: 0,
+            left: None,
         }
     }
 
@@ -154,6 +180,12 @@ impl Serving {
     #[must_use]
     pub fn attached(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.greeted)
+    }
+
+    /// Программа выходит и ждёт, пока закроется окно.
+    #[must_use]
+    pub fn leaving(&self) -> bool {
+        self.leaving.is_some()
     }
 
     /// Сообщение владельцу — и окну (notice).
@@ -270,8 +302,9 @@ fn name_of(f: &Map<String, Value>) -> Option<&str> {
 impl App {
     // ----- канал -----
 
-    /// Создаёт канал окна. Не вышло — программа работает без окна, причина — в журнале и в ответе на «Окно».
-    pub(super) fn open_server(&mut self) {
+    /// Создаёт канал окна. Не вышло — программа работает без окна, причина — в журнале и в ответе на «Окно». Скрытая
+    /// проверка зовёт и сама: канал снова есть после `cut_pipe`.
+    pub fn open_server(&mut self) {
         let created = crate::pipe::session_user().and_then(|user| Server::create(&self.serving.pipe, &user));
         match created {
             Ok(server) => self.serving.server = Some(server),
@@ -299,6 +332,16 @@ impl App {
         if done {
             self.drop_client(shell, "отказано в знакомстве");
         }
+        // Программа выходит, а окно только что отключилось: теперь выходит и она.
+        self.leave_if_alone(shell);
+    }
+
+    /// Скрытая проверка: канал пропадает, как при падении программы, — без «bye», окно просто теряет связь. Снова —
+    /// `open_server`.
+    pub fn cut_pipe(&mut self, shell: &Shell) {
+        // Канал закрывается вместе с сервером (Drop: идущие операции обрываются и дожидаются, затем CloseHandle).
+        self.serving.server = None;
+        self.client_left(shell, "проверка: канал пропал без «bye»");
     }
 
     fn client_came(&mut self, shell: &Shell, pid: u32) {
@@ -326,6 +369,12 @@ impl App {
             next_connect: now,
             last_cost: None,
         });
+        // Программа уже выходит (окно запустили перед самым «Выходом»): это окно сразу получает «bye».
+        if let Some(leaving) = self.serving.leaving.as_mut() {
+            leaving.awaiting = false;
+            self.say_bye(shell);
+            return;
+        }
         shell.set_timer(GREET, GREET_EVERY);
     }
 
@@ -401,7 +450,8 @@ impl App {
         let Some(session) = self.serving.session.as_mut() else {
             return Ok(());
         };
-        if session.closing {
+        // Окну сказано «bye»: оно закрывается, его команды уже ничего не значат.
+        if session.closing || self.serving.leaving.is_some() {
             return Ok(());
         }
         if !session.greeted {
@@ -646,7 +696,8 @@ impl App {
 
     /// Что изменилось с прошлого раза: потолки и «было», профили, история, выбор автомодуля, сообщения владельцу.
     fn push_topics(&mut self, shell: &Shell) {
-        if !self.serving.attached() {
+        // После «bye» окну больше ничего не шлётся: оно уже не читает канал.
+        if !self.serving.attached() || self.serving.leaving.is_some() {
             return;
         }
         let mut out: Vec<String> = Vec::new();
@@ -724,7 +775,7 @@ impl App {
         let Some(session) = self.serving.session.as_ref() else {
             return;
         };
-        if !session.greeted {
+        if !session.greeted || self.serving.leaving.is_some() {
             return;
         }
         let mut s = std::mem::take(&mut self.serving.text);
@@ -1266,6 +1317,82 @@ impl App {
             Some("") => self.profile.is_some(),
             Some(name) => !self.at_startup(name) || self.profile.as_ref().is_some_and(profile::Profile::disabled),
         }
+    }
+
+    // ----- выход -----
+
+    /// Выход программы («Выход» в меню значка, просьба C#-части закрыться, конец сеанса Windows): сначала окно — ему
+    /// «bye», оно запоминает себя и закрывается; программа выходит, когда оно отключилось, или через `LEAVE_WITHIN`, если
+    /// оно не закрылось (`App::quit`). Окна нет и не открывается — выход сразу. Окно, запущенное меньше `LAUNCH_GRACE`
+    /// назад и ещё не подключившееся, ждётся тем же сроком: иначе оно открылось бы уже без программы.
+    pub(super) fn leave(&mut self, shell: &mut Shell) {
+        if self.serving.leaving.is_some() {
+            return;
+        }
+        let awaiting = self.serving.session.is_none()
+            && self.serving.server.is_some()
+            && self.serving.launched_at.is_some_and(|t| t.elapsed() < LAUNCH_GRACE);
+        self.serving.leaving = Some(Leaving {
+            since: Instant::now(),
+            awaiting,
+            told: false,
+        });
+        shell.kill_timer(STATE);
+        shell.kill_timer(GREET);
+        if self.serving.session.is_some() || awaiting {
+            shell.set_timer(LEAVE, LEAVE_WITHIN);
+        }
+        self.say_bye(shell);
+        self.leave_if_alone(shell);
+    }
+
+    /// «bye» подключённому окну.
+    fn say_bye(&mut self, shell: &Shell) {
+        let Some(pid) = self.serving.session.as_ref().map(|s| s.pid) else {
+            return;
+        };
+        if let Some(leaving) = self.serving.leaving.as_mut() {
+            leaving.told = true;
+        }
+        self.journal
+            .note(&format!("выход: окну (процесс {pid}) сказано закрыться"));
+        self.send(shell, BYE);
+    }
+
+    /// Программа выходит и ждать больше некого (окно отключилось, запущенного нет): выход.
+    fn leave_if_alone(&mut self, shell: &mut Shell) {
+        let Some(leaving) = self.serving.leaving else {
+            return;
+        };
+        if self.serving.left.is_some() || self.serving.session.is_some() || leaving.awaiting {
+            return;
+        }
+        if leaving.told {
+            self.journal.note(&format!(
+                "выход: окно закрылось через {} мс",
+                leaving.since.elapsed().as_millis()
+            ));
+        }
+        self.finish_leave(shell);
+    }
+
+    /// Таймер выхода: окно не закрылось (или запущенное не подключилось) за `LEAVE_WITHIN` — выход без него.
+    pub(super) fn leave_tick(&mut self, shell: &mut Shell) {
+        shell.kill_timer(LEAVE);
+        if self.serving.leaving.is_none() || self.serving.left.is_some() {
+            return;
+        }
+        self.journal.note(&format!(
+            "выход: окно не закрылось за {} с — выхожу без него",
+            LEAVE_WITHIN.as_secs()
+        ));
+        self.finish_leave(shell);
+    }
+
+    fn finish_leave(&mut self, shell: &mut Shell) {
+        shell.kill_timer(LEAVE);
+        self.serving.left = Some(Instant::now());
+        self.quit(shell);
     }
 
     // ----- окно на экране -----

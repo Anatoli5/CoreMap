@@ -714,7 +714,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             format!("У блока {}", compared[0].name)
         };
         shown.empty = if digest.tally.rows == 0 {
-            "Срезов пока нет. Их пишет программа у часов 4 раза в секунду, пока включён автомодуль и процессор нагружен."
+            "Срезов пока нет. Их пишет CoreMapTray 4 раза в секунду, пока включён автомодуль и процессор нагружен."
                 .into()
         } else if input.scale == Scale::AboveDie {
             format!(

@@ -52,6 +52,53 @@ pub fn server_pipe() -> String {
     format!("CoreMap.Logon.{session}")
 }
 
+/// Кто на том конце канала — для строк окна о связи. Программа входа (`CoreMapTray`, канал «CoreMap.Logon.…») зовётся
+/// своим именем: «программу у часов» владелец 15.10 не понял. Движок C#-части («CoreMap.Bridge.…») окно получает только
+/// ключом --pipe, его так запускает кнопка прежнего окна и проверка движка.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    Tray,
+    Engine,
+}
+
+impl Peer {
+    #[must_use]
+    pub fn of(pipe: &str) -> Peer {
+        if pipe.starts_with("CoreMap.Logon.") {
+            Peer::Tray
+        } else {
+            Peer::Engine
+        }
+    }
+
+    /// Связь была и оборвалась (программа закрыла канал или упала; через секунду окно пробует снова).
+    #[must_use]
+    pub fn lost(self) -> &'static str {
+        match self {
+            Peer::Tray => "связь с CoreMapTray прервалась",
+            Peer::Engine => "связь с движком CoreMap прервалась",
+        }
+    }
+
+    /// Канала нет: программа не запущена, упала или её закрыли без «bye». Автоматика (автомодуль) живёт в `CoreMapTray`.
+    #[must_use]
+    pub fn missing(self) -> &'static str {
+        match self {
+            Peer::Tray => "CoreMapTray не отвечает — автоматика не работает",
+            Peer::Engine => "движок CoreMap не отвечает",
+        }
+    }
+
+    /// Команда не ушла: канала нет.
+    #[must_use]
+    pub fn unreachable(self) -> &'static str {
+        match self {
+            Peer::Tray => "нет связи с CoreMapTray",
+            Peer::Engine => "нет связи с движком CoreMap",
+        }
+    }
+}
+
 /// Ручка Windows, закрываемая ровно один раз.
 #[derive(Debug)]
 struct Handle(HANDLE);
@@ -226,6 +273,8 @@ pub struct Link {
     next: AtomicI64,
     /// Процесс программы на том конце канала (0 — неизвестен): ему окно разрешает выйти на передний план.
     server: AtomicU32,
+    /// Кто на том конце (по имени канала).
+    peer: Peer,
 }
 
 impl Link {
@@ -234,6 +283,7 @@ impl Link {
             pipe: Mutex::new(None),
             next: AtomicI64::new(1),
             server: AtomicU32::new(0),
+            peer: Peer::of(&name),
         });
         let me = Arc::clone(&link);
         thread::Builder::new()
@@ -256,7 +306,7 @@ impl Link {
                 Ok(pipe) => Arc::new(pipe),
                 Err(e) => {
                     let why = match e.raw_os_error().map(i32::cast_unsigned) {
-                        Some(ERROR_FILE_NOT_FOUND) => "программа у часов не отвечает".to_string(),
+                        Some(ERROR_FILE_NOT_FOUND) => self.peer.missing().to_string(),
                         Some(ERROR_PIPE_BUSY) => "канал занят другим окном".to_string(),
                         _ => format!("канал не открылся: {e}"),
                     };
@@ -273,12 +323,20 @@ impl Link {
             deliver(Event::Up);
             // Окно говорит первым: знакомство — одно на соединение.
             let hello = format!(r#"{{"id":0,"c":"hello","proto":{PROTOCOL}}}"#);
-            let mut why = String::from("связь с движком прервалась");
+            let mut why = self.peer.lost().to_string();
             if pipe.send(&hello).is_ok() {
                 let mut body = Vec::new();
                 // Ошибка чтения — канал закрыт или оборван: для окна это одно, «связь прервалась».
                 while pipe.receive(&mut body).is_ok() {
                     match serde_json::from_slice::<Message>(&body) {
+                        Ok(Message::Bye) => {
+                            // Программа выходит и сказала об этом: окно закрывается (view.rs). Поток кончается, а канал
+                            // остаётся открытым до конца процесса окна (его держит `self.pipe`): программа видит конец
+                            // окна по обрыву канала и выходит после него, а окно на пути к закрытию не переподключается
+                            // и не пишет «не отвечает».
+                            deliver(Event::Message(Message::Bye));
+                            return;
+                        }
                         Ok(message) => deliver(Event::Message(message)),
                         Err(e) => {
                             why = format!("сообщение движка не разобралось: {e}");
@@ -312,6 +370,11 @@ impl Link {
         unsafe { AllowSetForegroundWindow(server) };
     }
 
+    /// Кто на том конце канала.
+    pub fn peer(&self) -> Peer {
+        self.peer
+    }
+
     /// Команда движку; номер для ответа или None — канала нет.
     pub fn ask(&self, command: &str, mut args: serde_json::Map<String, serde_json::Value>) -> Option<i64> {
         let pipe = self.pipe.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
@@ -322,5 +385,26 @@ impl Link {
         pipe.send(&serde_json::Value::Object(args).to_string())
             .ok()
             .map(|()| id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_logon_program_is_called_coremaptray() {
+        // Владелец 15.10 не понял «программу у часов»: окно называет её CoreMapTray. Канал по умолчанию — её.
+        assert_eq!(Peer::of(&server_pipe()), Peer::Tray);
+        assert_eq!(Peer::of("CoreMap.Logon.Check.4242"), Peer::Tray);
+        for engine in ["CoreMap.Bridge.1", "CoreMap.Check.4242", "CoreMap.BridgeCheck.x"] {
+            assert_eq!(Peer::of(engine), Peer::Engine, "{engine}");
+        }
+        assert_eq!(Peer::Tray.missing(), "CoreMapTray не отвечает — автоматика не работает");
+        for peer in [Peer::Tray, Peer::Engine] {
+            for text in [peer.lost(), peer.missing(), peer.unreachable()] {
+                assert!(!text.contains("у часов"), "{text}");
+            }
+        }
     }
 }

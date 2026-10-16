@@ -9,6 +9,9 @@
 // • --settings — против программы у часов, её запускает её скрытая проверка (rust/tray/src/check_window.rs): настройки
 //   автомодуля выключателями и ползунками, затем выбор блоков, подсветка, размер — и закрытие окна; картинка F;
 // • --reopened — второй запуск с той же папкой (--data): окно открылось таким, каким его закрыли; картинка F.
+// • --lost — CoreMapTray пропадает без «bye» (его проверка рвёт свой канал, как при падении): окно остаётся и одной
+//   строкой говорит, что CoreMapTray не отвечает; картинка F.
+// • --bye — CoreMapTray выходит («Выход» в меню) и говорит «bye»: окно записывает себя в файл окна и закрывается.
 //
 // Статистика — из своей временной папки: придуманные срезы за сегодня (полный день, 43 200 строк — цена разбора дня),
 // вчера и 40 дней назад (не должны войти), обрезанная последняя строка, журнал автомодуля и журнал профилей. Что
@@ -53,6 +56,8 @@ pub enum Mode {
     Full,
     Settings,
     Reopened,
+    Lost,
+    Bye,
 }
 
 /// Что проход --settings делает с настройками и окном, а --reopened и проверка программы у часов
@@ -62,6 +67,11 @@ const DEPTH_TO: i32 = 6;
 const CLOSED_SIZE: (u32, u32) = (1500, 900);
 /// Жестов с настройками в проходе --settings: включить, отсечка, глубина, подтягивание, выключить.
 const GESTURES: u32 = 5;
+/// Размер окна в проходе --bye: в файле окна его нет (там `CLOSED_SIZE`), записать его может только «bye». Его же ждёт
+/// проверка программы у часов (`rust/tray/src/check_window.rs`, `WINDOW_LEFT_SIZE`).
+const LEFT_SIZE: (u32, u32) = (1400, 860);
+/// Строка о связи, когда `CoreMapTray` пропал без «bye» (бриф владельца 15.10: `CoreMapTray`, а не «программа у часов»).
+const MISSING: &str = "CoreMapTray не отвечает — автоматика не работает";
 
 struct Check {
     ui: AppWindow,
@@ -98,6 +108,10 @@ pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>
     let created = std::fs::create_dir_all(&dir);
     // Окно открывается тем же путём, что настоящее (main.rs): размер и место из файла окна — до показа.
     let memory = crate::saved::open(&ui, &dir);
+    // Проход --bye: размер не тот, что в файле окна; щелчков в проходе нет — в файл его запишет только «bye».
+    if mode == Mode::Bye {
+        ui.window().set_size(PhysicalSize::new(LEFT_SIZE.0, LEFT_SIZE.1));
+    }
     ui.show().expect("окно");
     let shown = ui.window().size();
     let size = (shown.width, shown.height);
@@ -133,6 +147,8 @@ pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>
         Mode::Full => check.steps(),
         Mode::Settings => check.settings_steps(),
         Mode::Reopened => check.reopened_steps(),
+        Mode::Lost => check.lost_steps(),
+        Mode::Bye => check.bye_steps(),
     }
     // Своя временная папка статистики не остаётся после проверки; не удалилась — сказано в отчёте.
     if check.own_data
@@ -347,7 +363,7 @@ impl Check {
         let synthesized = match self.mode {
             Mode::Full => self.own_data,
             Mode::Settings => !self.data.join("samples").exists(),
-            Mode::Reopened => false,
+            Mode::Reopened | Mode::Lost | Mode::Bye => false,
         };
         let expected = if synthesized {
             match synthesize(&self.data, hello, limits, e_block, self.mode != Mode::Full) {
@@ -1651,10 +1667,7 @@ impl Check {
     fn auto_settings(&mut self) {
         let came = self.pump(|v| v.auto.is_some(), 5.0);
         let Some(start) = self.view.borrow().auto.clone() else {
-            self.check(
-                false,
-                "тема settings от программы у часов не пришла — настроек в окне нет",
-            );
+            self.check(false, "тема settings от CoreMapTray не пришла — настроек в окне нет");
             return;
         };
         let ui = &self.ui;
@@ -1670,7 +1683,7 @@ impl Check {
         self.check(
             shown,
             format!(
-                "настройки показаны так, как их прислала программа у часов: {} {} °C, глубина {}, подтягивание {}, отсечка {}–{} °C",
+                "настройки показаны так, как их прислал CoreMapTray: {} {} °C, глубина {}, подтягивание {}, отсечка {}–{} °C",
                 if start.on { "вкл" } else { "выкл" },
                 start.limit,
                 start.depth,
@@ -1768,7 +1781,7 @@ impl Check {
                 && text == format!("{LIMIT_TO}°")
                 && line > line_on,
             format!(
-                "отпустили на {LIMIT_TO} °C — одна команда ({}), программа у часов подтвердила, линия отсечки поднялась {line_on:.3} → {line:.3} («{text}»)",
+                "отпустили на {LIMIT_TO} °C — одна команда ({}), CoreMapTray подтвердил, линия отсечки поднялась {line_on:.3} → {line:.3} («{text}»)",
                 sent_after - sent - 1
             ),
         );
@@ -1900,11 +1913,62 @@ impl Check {
                 !a.on && a.limit == i64::from(LIMIT_TO) && a.depth == i64::from(DEPTH_TO) && a.step_up
             }) && self.ui.get_auto_limit() == LIMIT_TO
                 && self.ui.get_auto_depth() == DEPTH_TO,
-            format!("настройки автомодуля — от программы у часов, какими их оставили: {auto:?}"),
+            format!("настройки автомодуля — от CoreMapTray, какими их оставили: {auto:?}"),
         );
         self.statistics(&hello, &limits, &e);
         let shot = self.shot("main");
         self.check(shot, "картинка: окно открылось таким, каким его закрыли");
+    }
+
+    /// Проход --lost: проверка `CoreMapTray` рвёт свой канал без «bye», как при падении программы. Окно остаётся и
+    /// одной строкой о связи говорит, что `CoreMapTray` не отвечает и автоматика не работает.
+    fn lost_steps(&mut self) {
+        let came = self.pump(|v| v.hello.is_some(), 15.0);
+        if !self.check(came, "знакомство пришло") {
+            return;
+        }
+        let ui = self.ui.clone_strong();
+        // Строка — после второй попытки открыть канал: через 1 с, если связь жила не меньше 2 с, иначе через 5 (pipe.rs).
+        let said = self.pump(|_| ui.get_link().as_str() == MISSING, 10.0);
+        let line = self.ui.get_link().to_string();
+        let stays = self.ui.window().is_visible() && !self.view.borrow().left;
+        self.check(
+            said && stays && self.ui.get_link_down(),
+            format!("канал пропал без «bye» — окно осталось ({stays}), строка о связи: «{line}»"),
+        );
+        let shot = self.shot("main");
+        self.check(shot, "картинка: окно без CoreMapTray");
+    }
+
+    /// Проход --bye: `CoreMapTray` выходит («Выход» в меню значка) и говорит «bye». Окно записывает себя в файл окна —
+    /// размер этого прохода (`LEFT_SIZE`), которого там не было, — и закрывается.
+    fn bye_steps(&mut self) {
+        let file = self.data.join(crate::saved::FILE);
+        let read = || {
+            std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| crate::saved::parse(&t).ok())
+                .unwrap_or_default()
+        };
+        #[expect(clippy::cast_precision_loss, reason = "window sizes, exact in f32")]
+        let size = (LEFT_SIZE.0 as f32, LEFT_SIZE.1 as f32);
+        let before = read();
+        // «bye» приходит сразу после знакомства: проверка CoreMapTray шлёт «Выход», как только окно подключилось.
+        let left = self.pump(|v| v.left, 10.0);
+        let after = read();
+        let hello = self.view.borrow().hello.is_some();
+        let hidden = !self.ui.window().is_visible();
+        self.check(
+            hello && left && hidden,
+            format!("«bye» от CoreMapTray: окно закрылось (знакомство {hello}, «bye» {left}, скрыто {hidden})"),
+        );
+        self.check(
+            before.size != Some(size) && after.size == Some(size) && after.compared == before.compared,
+            format!(
+                "и записало себя в файл окна: размер {:?} → {:?}, блоки {:?}",
+                before.size, after.size, after.compared
+            ),
+        );
     }
 }
 

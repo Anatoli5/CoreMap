@@ -9,9 +9,10 @@
 //   CoreMapWindow.exe --pipe N --snapshot F [--size WxH]
 //                                           скрытая проверка (src/check.rs): без окна на экране, картинки и отчёт;
 //                                           её статистика и файл окна — в своей временной папке с придуманными срезами
-//   CoreMapWindow.exe --pipe N --snapshot F --data D --settings / --reopened
-//                                           скрытая проверка настроек автомодуля и памяти окна — против программы у
-//                                           часов (её запускает скрытая проверка CoreMapTray.exe)
+//   CoreMapWindow.exe --pipe N --snapshot F --data D --settings / --reopened / --lost / --bye
+//                                           скрытая проверка настроек автомодуля, памяти окна, потери связи и выхода
+//                                           CoreMapTray — против него самого (её запускает скрытая проверка
+//                                           CoreMapTray.exe)
 //   CoreMapWindow.exe --probe               ничего не делает и выходит: пустил ли Windows свежую сборку (tools\rust.ps1)
 #![windows_subsystem = "windows"]
 
@@ -180,6 +181,10 @@ fn main() {
             arg(&args, "--data").map(PathBuf::from),
             if args.iter().any(|a| a == "--reopened") {
                 check::Mode::Reopened
+            } else if args.iter().any(|a| a == "--lost") {
+                check::Mode::Lost
+            } else if args.iter().any(|a| a == "--bye") {
+                check::Mode::Bye
             } else if args.iter().any(|a| a == "--settings") {
                 check::Mode::Settings
             } else {

@@ -24,7 +24,7 @@ use crate::shell::{self, Item, Menu, Shell};
 
 /// Журнал без сбоев: проверка не зависит от истории машины.
 #[derive(Debug)]
-struct QuietLog;
+pub struct QuietLog;
 
 impl EventLog for QuietLog {
     fn first(&self, _since: Stamp, _condition: &str) -> Result<Option<Event>, String> {
@@ -851,8 +851,11 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     package_inputs(r, app, shell, data);
 
     // 13. Журнал срезов, когда что-то не так: файл дня удалён, перемещён, не открывается; обороты отказывают; потолки
-    //     не читаются. Последним шагом: файл дня после него может не открываться ещё 10 с.
+    //     не читаются. Файл дня после этого шага может не открываться ещё 10 с — дальше он не нужен.
     logging_failures(r, app, shell, data);
+
+    // 14. Выход с открытым окном: сначала окно, потом программа. Последним шагом: после него цикл программы кончен.
+    crate::check_window::leaving(r, app, shell, places);
 }
 
 /// Строк в error.log с этим текстом.

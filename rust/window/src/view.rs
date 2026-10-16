@@ -194,6 +194,8 @@ pub struct View {
     memory: Remembered,
     /// Сравниваемые блоки из файла окна ждут первого знакомства: только тогда известно, какие блоки есть.
     restore: Option<Vec<String>>,
+    /// Программа на том конце сказала «bye»: окно запомнило себя и закрывается (`leave`).
+    pub left: bool,
 }
 
 impl View {
@@ -252,6 +254,7 @@ impl View {
             sent: 0,
             memory,
             restore,
+            left: false,
         };
         view.show_link();
         view.show_problem();
@@ -353,8 +356,25 @@ impl View {
                     self.refresh_stats();
                 }
             }
+            Event::Message(Message::Bye) => self.leave(),
             Event::Message(Message::Other) => {}
         }
+    }
+
+    /// `CoreMapTray` выходит и сказал «bye» (владелец 15.10: «чтобы трей сначала закрывал окно… а потом закрывался
+    /// сам»): окно запоминает себя, как при закрытии, и закрывается — без программы оно ничего не показывает и ничем не
+    /// управляет. Программа выходит, когда процесс окна кончился (канал оборвался).
+    fn leave(&mut self) {
+        if self.left {
+            return;
+        }
+        self.left = true;
+        self.closing();
+        // Скрыть — окно уходит с экрана сразу; кончить цикл — main.rs выходит из `run` и процесс кончается (окно всё
+        // равно уйдёт, даже если скрыть не вышло). Скрытая проверка крутит цикл сама: там цикла Slint нет, и
+        // `quit_event_loop` отвечает ошибкой — это не сбой.
+        let _ = self.ui().hide(); // see above: the loop's end closes the window anyway
+        let _ = slint::quit_event_loop(); // see above: no Slint loop in the hidden check
     }
 
     /// Новая сводка статистики (поток store.rs).
@@ -874,7 +894,7 @@ impl View {
             self.pending.insert(id, pending);
             true
         } else {
-            self.problem = Some(format!("{}: нет связи с программой у часов", pending.failure));
+            self.problem = Some(format!("{}: {}", pending.failure, self.link.peer().unreachable()));
             self.show_problem();
             false
         }
