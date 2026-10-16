@@ -21,6 +21,8 @@ pub struct SimCpu {
     pub reads: usize,
     /// Нагрузка по ядрам (доля работы 0…1) — её задаёт проверка; от неё и потолка зависит нагрев (`Thermal`).
     pub load: Vec<f64>,
+    /// Счётчик энергии корпуса не читается (проверка пути, где мощность корпуса не прочиталась).
+    pub power_refused: bool,
 }
 
 impl SimCpu {
@@ -49,6 +51,7 @@ impl SimCpu {
             writes: 0,
             reads: 0,
             load: vec![0.0; topology.cores.len()],
+            power_refused: false,
         }
     }
 
@@ -118,5 +121,13 @@ impl Thermal for SimCpu {
             busy: Some(load),
             ratio: (load >= 0.05).then_some(f64::from(ceiling)),
         })
+    }
+
+    /// Мощность имитации — как у `SimBackend` в Sensors.cs: 12 Вт в покое и 9 Вт на каждое полностью занятое ядро.
+    fn package_power(&mut self) -> Result<Option<f64>, HwError> {
+        if self.power_refused {
+            return Err(HwError("чтение регистра 0x611 не удалось (проверка)".into()));
+        }
+        Ok(Some(12.0 + 9.0 * self.load.iter().sum::<f64>()))
     }
 }
