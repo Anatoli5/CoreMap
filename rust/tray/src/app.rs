@@ -39,8 +39,9 @@ mod history;
 mod meter;
 mod sense;
 mod serve;
+mod timeline;
 use crate::shell::{Event, Item, Loop, Menu, Shell};
-pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, LOG_ID, STEP_UP_ID};
+pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, LOG_ID};
 pub use sense::LogCount;
 pub use serve::{Confirm, LEAVE_WITHIN, WINDOW_EXE};
 
@@ -200,6 +201,10 @@ pub struct App {
     version: u64,
     history: history::History,
     meter: meter::Meter,
+    /// Наибольшие и средние под нагрузкой плиток — по блоку и потолку, из каждого чтения (app/meter.rs).
+    kept: meter::Kept,
+    /// Журнал событий для окна (app/timeline.rs).
+    timeline: timeline::Timeline,
     /// Журнал срезов и его опрос раз в 0,25 с (app/sense.rs).
     logging: sense::Logging,
     serving: serve::Serving,
@@ -228,7 +233,8 @@ impl App {
         let (lease, _) = named::create(&config.names.lease, false).map_err(|e| format!("аренда потолков: {e}"))?;
         let blocks = topology.blocks.len();
         let cores = topology.cores.len();
-        let serving = serve::Serving::new(config.pipe.clone(), config.confirm);
+        let serving = serve::Serving::new(config.pipe.clone(), config.confirm, cores);
+        let kept = meter::Kept::new(&topology.blocks, cores);
         let history = history::History::new(config.data.join("profile-log.jsonl"));
         Ok(Self {
             config,
@@ -254,6 +260,8 @@ impl App {
             version: 0,
             history,
             meter: meter::Meter::new(cores),
+            kept,
+            timeline: timeline::Timeline::default(),
             logging: sense::Logging::default(),
             serving,
             auto: auto::Autopilot::new(blocks),
@@ -344,13 +352,14 @@ impl App {
         self.auto.ticks
     }
 
-    /// Скрытая проверка: пишется ли журнал срезов, сколько было его опросов (из них опросов окна), сколько раз он
-    /// начинался и сколько раз открывался файл дня.
+    /// Скрытая проверка: идёт ли опрос срезов и пишутся ли строки, сколько было опросов (из них опросов окна), сколько
+    /// раз опрос начинался и сколько раз открывался файл дня.
     #[must_use]
     pub fn logging(&self) -> LogCount {
         let l = &self.logging;
         LogCount {
             on: l.on,
+            rows: l.rows,
             polls: l.polls,
             window_polls: l.window_polls,
             starts: l.starts,
@@ -374,7 +383,7 @@ impl App {
     /// регулятор — на коротких. Опрос автомодуля, регулятор и счёт цены опроса начинаются заново. Возвращает прежние.
     pub fn retime(&mut self, shell: &Shell, timing: AutoTiming) -> AutoTiming {
         let was = std::mem::replace(&mut self.config.auto, timing);
-        self.stop_logging(shell);
+        self.stop_sensing(shell);
         self.restart_costs();
         let choice = self.auto.choice;
         if choice.on {
@@ -448,8 +457,9 @@ impl App {
         Ok(result)
     }
 
-    /// Нужен ли драйвер между действиями: автомодуль опрашивает раз в 2 с, журнал срезов — 4 раза в секунду, окно — раз в
-    /// полсекунды; пока работает кто-то из них, драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
+    /// Нужен ли драйвер между действиями: автомодуль сверяет потолки раз в 2 с, опрос срезов читает 4 раза в секунду,
+    /// окно — раз в полсекунды; пока работает кто-то из них, драйвер остаётся открытым, иначе каждый опрос заново грузил
+    /// бы модуль.
     fn driver_needed(&self) -> bool {
         self.auto.choice.on || self.logging.on || self.serving.attached()
     }
@@ -517,6 +527,8 @@ impl App {
             }
         }
         self.start_auto(shell);
+        // Наибольшие и средние плиток от прошлого запуска — после профиля запуска: отбор по потолкам владельца.
+        self.load_maxima();
         self.open_server();
         if !shell.add_icon(&self.tip()) {
             self.schedule_retries(shell);
@@ -889,7 +901,8 @@ impl App {
     /// Выход, когда окна уже нет (app/serve.rs, `leave`): поправки автомодуля — назад, значок убран, цикл программы
     /// кончается.
     pub(super) fn quit(&mut self, shell: &mut Shell) {
-        self.put_back("выход");
+        self.put_back("выход", Some("exit"));
+        self.save_maxima();
         shell.remove_icon();
         shell.destroy();
     }
@@ -935,7 +948,7 @@ impl App {
         };
         let before = self.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
         let done = self.with_ceilings(|app| -> Result<(), String> {
-            app.put_back("смена набора");
+            app.put_back("смена набора", None);
             let Some(ratios) = ratios else {
                 return Err(format!("профиля «{name}» нет"));
             };
@@ -1049,9 +1062,10 @@ impl App {
             Event::Timer(_) => {}
             Event::Suspend => {
                 self.journal.note("уход в сон");
-                // Журнал срезов — до пробуждения и сверки после него: начнёт его снова опрос автомодуля.
-                self.stop_logging(shell);
-                self.put_back("уход в сон");
+                // Опрос срезов — до пробуждения и сверки после него: начнёт его снова опрос раз в 2 с.
+                self.stop_sensing(shell);
+                self.put_back("уход в сон", Some("sleep"));
+                self.save_maxima();
                 self.note_power_near_csharp();
             }
             Event::Wake => {
@@ -1073,7 +1087,7 @@ impl App {
                 self.journal.note("Windows завершает сеанс");
                 // Потолки — первыми: после этого сообщения Windows может закончить процесс в любой миг. Потом окно
                 // успевает запомнить себя, если Windows даст ему эти миллисекунды.
-                self.put_back("конец сеанса Windows");
+                self.put_back("конец сеанса Windows", Some("exit"));
                 self.leave(shell);
             }
             Event::Close => {
@@ -1191,7 +1205,7 @@ impl App {
         }
         let done = self.with_ceilings(|app| {
             // Опущенные автомодулем блоки — не сброс и не чужая правка: сначала вернуть им принятые.
-            app.put_back("пробуждение");
+            app.put_back("пробуждение", Some("sleep"));
             // Метка замера могла остаться от C#-части, конца которой эта программа не видела (ревизия M3).
             if let Some(said) = app.recover() {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());

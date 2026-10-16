@@ -37,13 +37,14 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use machine::clock::{Pattern, Stamp};
+use machine::files;
 use machine::profile::{self, Set, same_name};
 use machine::topology::Kind;
 use serde_json::{Map, Value, json};
 
 use super::auto::Choice;
 use super::history::Change;
-use super::meter::Watch;
+use super::meter::{Kept, Watch};
 use super::{App, Via, parts};
 use crate::layout::{self, Layout};
 use crate::pipe::{Happened, Server};
@@ -101,7 +102,6 @@ struct Session {
     greeted: bool,
     /// Знакомство отклонено: после отправки ответа канал рвётся.
     closing: bool,
-    watch: Watch,
     /// Что из сообщений по изменению уже ушло: заводские потолки и почему потолки не перечитались.
     sent_limits: Option<(Vec<i32>, Option<String>)>,
     sent_profiles: Option<String>,
@@ -139,6 +139,9 @@ pub struct Serving {
     /// Почему канала нет.
     trouble: Option<String>,
     session: Option<Session>,
+    /// Что видит окно: показания, наибольшие и средние под нагрузкой. Живёт дольше подключения окна (владелец 16.10:
+    /// наибольшие и средние — до его сброса), показания — только пока окно подключено (`watch`, `watch_mut`).
+    watch: Watch,
     layout: Option<Layout>,
     notices: VecDeque<(u64, String)>,
     notice_seq: u64,
@@ -160,12 +163,13 @@ pub struct Serving {
 
 impl Serving {
     #[must_use]
-    pub fn new(pipe: String, confirm: Confirm) -> Self {
+    pub fn new(pipe: String, confirm: Confirm, cores: usize) -> Self {
         Self {
             pipe,
             server: None,
             trouble: None,
             session: None,
+            watch: Watch::new(cores),
             layout: None,
             notices: VecDeque::new(),
             notice_seq: 0,
@@ -210,11 +214,11 @@ impl Serving {
 
     /// Что видит подключённое окно; None — окна нет или оно ещё не назвало себя.
     pub(super) fn watch_mut(&mut self) -> Option<&mut Watch> {
-        self.session.as_mut().filter(|s| s.greeted).map(|s| &mut s.watch)
+        if self.attached() { Some(&mut self.watch) } else { None }
     }
 
     pub(super) fn watch(&self) -> Option<&Watch> {
-        self.session.as_ref().filter(|s| s.greeted).map(|s| &s.watch)
+        self.attached().then_some(&self.watch)
     }
 
     /// Пора ли опросу окна: окно подключено и прошлый его опрос был не ближе `min` (`Watch::due`).
@@ -265,6 +269,33 @@ fn ints(text: &mut String, values: impl Iterator<Item = Option<i32>>) {
             }
             None => text.push_str("null"),
         }
+    }
+    text.push(']');
+}
+
+/// Поле byCeiling состояния: по блокам — значения по потолкам, по убыванию потолка:
+/// `[[{"ceiling":44,"max":81,"mean":76.5,"secs":312.5}, …], …]` (secs — секунды в средней, с десятыми).
+fn by_ceiling(text: &mut String, kept: &Kept, blocks: usize) {
+    text.push('[');
+    for b in 0..blocks {
+        if b > 0 {
+            text.push(',');
+        }
+        text.push('[');
+        for (n, e) in kept.by_ceiling(b).enumerate() {
+            if n > 0 {
+                text.push(',');
+            }
+            let _ = write!(text, "{{\"ceiling\":{}", e.ceiling); // into a String: cannot fail
+            key(text, "max");
+            fix(text, e.max, 0);
+            key(text, "mean");
+            fix(text, e.mean, 1);
+            key(text, "secs");
+            fix(text, Some(e.secs), 1);
+            text.push('}');
+        }
+        text.push(']');
     }
     text.push(']');
 }
@@ -360,7 +391,6 @@ impl App {
             since: now,
             greeted: false,
             closing: false,
-            watch: Watch::new(self.topology.cores.len()),
             sent_limits: None,
             sent_profiles: None,
             seen_current: Vec::new(),
@@ -373,6 +403,8 @@ impl App {
             next_connect: now,
             last_cost: None,
         });
+        // Новое окно: показаний прежнего опроса окна у него нет, наибольшие и средние — прежние.
+        self.serving.watch.new_session();
         // Программа уже выходит (окно запустили перед самым «Выходом»): это окно сразу получает «bye».
         if let Some(leaving) = self.serving.leaving.as_mut() {
             leaving.awaiting = false;
@@ -596,7 +628,7 @@ impl App {
             return;
         };
         if reason.is_some() {
-            session.watch.blank();
+            self.serving.watch.blank();
         }
         session.trouble = reason;
     }
@@ -611,9 +643,72 @@ impl App {
 
     /// Опрос окна окончен: показания за полсекунды и средние под нагрузкой при нынешних потолках (`Watch::polled`).
     fn feed_means(&mut self) {
-        if let (Some(session), Some(limits)) = (self.serving.session.as_mut(), &self.limits) {
-            session.watch.polled(limits.current(), Instant::now());
+        if let Some(watch) = self.serving.watch_mut() {
+            watch.polled(Instant::now());
         }
+    }
+
+    // ----- наибольшие и средние в data\maxima.json -----
+
+    fn maxima_path(&self) -> std::path::PathBuf {
+        self.config.data.join("maxima.json")
+    }
+
+    fn lps_numbers(&self) -> Vec<u32> {
+        self.store.lps().iter().map(|lp| lp.0).collect()
+    }
+
+    /// Наибольшие и средние — в data\maxima.json. Когда: выход программы, уход в сон, сброс владельцем и каждый раз,
+    /// когда наибольшая выросла или блок сброшен сменой потолка владельца (`keep_maxima`, — редко: таймера нет).
+    /// Средние пишутся вместе с этим; накопленное с последней записи при падении программы теряется.
+    pub(super) fn save_maxima(&mut self) {
+        let text = self.kept.to_json(self.store.cpu(), &self.lps_numbers());
+        self.kept.take_changed();
+        if let Err(e) = files::write_replacing(&self.maxima_path(), &text) {
+            self.journal.error(&format!("наибольшие и средние не записаны: {e}"));
+        }
+    }
+
+    /// После чтения датчиков: наибольшая выросла или блок сброшен — переписать файл.
+    pub(super) fn keep_maxima(&mut self) {
+        if self.kept.take_changed() {
+            self.save_maxima();
+        }
+    }
+
+    /// Запуск программы: наибольшие и средние из data\maxima.json. Ядро, у которого потолок владельца теперь другой,
+    /// чем при накоплении (профиль сменился, пока программа не работала), их теряет; потолок ещё не известен — отбор
+    /// при первом чтении с окном (`Watch::align`).
+    pub(super) fn load_maxima(&mut self) {
+        let path = self.maxima_path();
+        match files::read_object(&path) {
+            Ok(Some(map)) => {
+                let (cpu, lps) = (self.store.cpu().to_owned(), self.lps_numbers()); // once at start
+                if !self.kept.restore(&map, &cpu, &lps) {
+                    self.journal
+                        .note("наибольшие и средние в maxima.json — от другого процессора или раскладки: не взяты");
+                }
+            }
+            Ok(None) => {}
+            Err(spoiled) => self
+                .journal
+                .error(&format!("наибольшие и средние не прочитаны: {spoiled}")),
+        }
+        if let (Some(intended), Some(limits)) = (self.intended.as_deref(), self.limits.as_ref())
+            && self.kept.align(intended, limits.current())
+        {
+            self.journal
+                .note("наибольшие и средние: у блоков с другим потолком владельца, чем при накоплении, — сброшены");
+            self.save_maxima();
+        }
+    }
+
+    /// Скрытая проверка: перезапуск программы для наибольших и средних — запись, как при выходе, и чтение, как при
+    /// запуске, в новые, пустые.
+    pub fn restart_maxima(&mut self) {
+        self.save_maxima();
+        self.kept = super::meter::Kept::new(&self.topology.blocks, self.topology.cores.len());
+        self.load_maxima();
     }
 
     /// Опрос окна в опросе срезов (app/sense.rs) окончен: средние под нагрузкой, затем — что изменилось и состояние,
@@ -762,7 +857,8 @@ impl App {
         }
         let mut s = std::mem::take(&mut self.serving.text);
         s.clear();
-        let w = &session.watch;
+        let w = &self.serving.watch;
+        let k = &self.kept;
         self.serving.states += 1;
         s.push_str("{\"t\":\"state\"");
         key(&mut s, "n");
@@ -772,20 +868,20 @@ impl App {
         key(&mut s, "pkg");
         fix(&mut s, w.pkg, 0);
         key(&mut s, "pkgMax");
-        fix(&mut s, w.pkg_max, 0);
+        fix(&mut s, k.pkg_max, 0);
         key(&mut s, "since");
-        fix(&mut s, Some(w.since.elapsed().as_secs_f64()), 0);
+        fix(&mut s, Some(k.since_secs()), 0);
         s.push_str(",\"busy\":false,\"level\":0");
         key(&mut s, "cur");
         row(&mut s, &w.cur, 0);
         key(&mut s, "max");
-        row(&mut s, &w.max, 0);
+        row(&mut s, &k.max, 0);
         key(&mut s, "ratio");
         row(&mut s, &w.ratio, 1);
         key(&mut s, "avg");
-        row(&mut s, w.avg(), 1);
+        row(&mut s, k.avg(), 1);
         key(&mut s, "avgRatio");
-        row(&mut s, w.avg_ratio(), 1);
+        row(&mut s, k.avg_ratio(), 1);
         // Троттлинга программа входа не читает: признаки — нули (поле окну нужно).
         key(&mut s, "thr");
         ints(&mut s, w.cur.iter().map(|_| Some(0)));
@@ -795,7 +891,7 @@ impl App {
             &mut s,
             w.busy
                 .iter()
-                .map(|b| Some(i32::from(b.is_some_and(|b| b >= machine::auto::BUSY)))),
+                .map(|b| Some(i32::from(b.is_some_and(|b| b >= super::meter::BUSY)))),
         );
         key(&mut s, "limit");
         match (&self.limits, &session.trouble) {
@@ -826,6 +922,10 @@ impl App {
             None => s.push_str("null"),
         }
         // Отсечка автомодуля, °C — окно рисует её линией на графике статистики; null — автомодуль выключен.
+        // Наибольшая и средняя под нагрузкой блока по каждому потолку, что у него стоял с последнего сброса (владелец
+        // 16.10), по убыванию потолка: [{ceiling, max, mean, secs}] — подсказка плитки; поля max и avg — для нынешнего.
+        key(&mut s, "byCeiling");
+        by_ceiling(&mut s, k, self.topology.blocks.len());
         key(&mut s, "autoLimit");
         if self.auto.choice.on {
             s.push_str(&self.auto.choice.limit.to_string());
@@ -855,9 +955,10 @@ impl App {
                 _ => bad(),
             },
             "max.reset" => {
-                if let Some(session) = self.serving.session.as_mut() {
-                    session.watch.reset();
-                }
+                let meter = &self.meter;
+                self.kept.reset(|core| meter.latest(core).temp);
+                self.log_event("reset", None, None, None, serde_json::Map::new());
+                self.save_maxima();
                 None
             }
             "auto.set" => self.set_auto(shell, f),
@@ -931,6 +1032,8 @@ impl App {
         if let Err(e) = self.history.add(&change, Stamp::now()) {
             self.journal.error(&e);
         }
+        // Та же правка — в журнал событий окна: строка на каждый блок, у которого потолок сменился (app/timeline.rs).
+        self.ceiling_events(act, before, &after);
     }
 
     fn current(&self) -> Vec<i32> {

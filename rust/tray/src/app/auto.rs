@@ -1,22 +1,22 @@
-// Опрос раз в 2 с и автомодуль в программе входа (DECISIONS #31, «Auto module» и его подзапись; #32). Два независимых
-// выключателя (владелец 16.10, DECISIONS #32, подзапись 16.10: «отдельно какой-то выключатель для логирования и отдельно
-// выключатель для автоподстройки… это независимый процесс»): автомодуль — меняет ли он потолки, журнал срезов —
-// пишется ли он. Опрос идёт, пока включён хоть один из них и потолки у этой программы (не у C#-части, не в ожидании
-// возврата права или сверки после сна): процессор нагружен (доля работы по Windows) — показания блоков, сверка потолков
-// и (если включён) журнал срезов; включённый автомодуль читает ещё корпус в каждом опросе и, когда корпус близко к
-// пределу или блок не на принятом, тоже судит блоки — решение регулятора (machine::auto). Автомодуль выключен —
-// регулятора нет, потолков он не меняет; выключен и процессор не занят — ничего не читается. Оба выключены — опроса нет,
-// драйвер закрыт между действиями.
+// Автомодуль в программе входа (DECISIONS #31, #32; две отсечки — #40, подзапись «две отсечки», бриф
+// outputs/cutoffs-brief-2026-10-16.md) и опрос раз в 2 с. Два независимых выключателя (владелец 16.10, DECISIONS #32,
+// подзапись 16.10: «отдельно какой-то выключатель для логирования и отдельно выключатель для автоподстройки… это
+// независимый процесс»): автомодуль — меняет ли он потолки, журнал срезов — пишутся ли строки.
 //
-// Память перегрева (machine::memory) не пускает блок обратно на ступень, где он перегрелся, пока не выйдет запрет; она
-// восстанавливается при запуске из журнала действий data\auto-log.jsonl — там каждое решение с условиями: средняя и
-// наибольшая температура блока, фактический множитель, загрузка, температуры всех блоков (соседи), корпус,
-// вентиляторы. Пока блоки судятся (то же условие), идёт опрос раз в 0,25 с и пишется журнал срезов
-// data\samples\<дата>.csv — «матрица» владельца для будущих кривых (app/sense.rs); решает регулятор по-прежнему раз
-// в 2 с — по сумме показаний этого опроса за 2 с (app/meter.rs), сам ядра тогда не читает.
+// Один путь чтения датчиков: пока включён автомодуль или журнал срезов пишется, CoreMapTray читает первое ядро каждого
+// блока раз в 0,25 с — опросом срезов (app/sense.rs). Регулятор (machine::auto) получает каждое показание этого опроса
+// и сам датчиков не читает: аварийной отсечке нужно каждое показание. Опрос раз в 2 с (здесь) датчиков не читает: он
+// решает, нужен ли опрос раз в 0,25 с (автомодуль включён — всегда; иначе — журнал срезов включён и процессор занят
+// ≥ 10 % по Windows), пишутся ли строки (журнал включён и процессор занят), и сверяет потолки (чужая правка). Оба
+// выключены — опроса нет, драйвер закрыт между действиями.
 //
-// Блоки не на принятом — «надстройка» над принятыми потолками (`intended`): принятые не меняются, надстройка помнит,
-// какой блок куда сдвинут (вниз — снижение, вверх — подтягивание до заводского). Пока надстройка есть, программа держит аренду «CoreMap.Ceilings»: прежнее окно или движок,
+// Память срезов (machine::memory) не пускает блок обратно на потолок, с которого он срезан, пока уровень кристалла не
+// ниже, чем был при срезе; она восстанавливается при запуске из журнала действий data\auto-log.jsonl — там каждое
+// решение с условиями: что сработало (emergency, target, return) и по какому показанию или медиане, уровень кристалла,
+// последние 2-с медианы всех блоков, фактический множитель и загрузка блока, вентиляторы, видеокарта.
+//
+// Блоки не на профиле — «надстройка» над принятыми потолками (`intended`): принятые не меняются, надстройка помнит,
+// какой блок куда опущен. Пока надстройка есть, программа держит аренду «CoreMap.Ceilings»: прежнее окно или движок,
 // стартуя, ждут её, а эта программа, увидев их, возвращает принятые потолки и только тогда отпускает аренду — настройка
 // всегда начинается с принятых, а не со сниженных. Метка data\auto-held.json (принятые потолки и опущенные блоки)
 // переписывается при каждом изменении надстройки и убирается, когда всё вернулось.
@@ -33,10 +33,10 @@ use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use machine::auto::{Action, Controller, Frame, Settings, Timing};
-use machine::clock::{Pattern, Stamp};
+use machine::auto::{Cause, Controller, Decision, Frame, Settings, Timing};
+use machine::clock::Stamp;
 use machine::files;
-use machine::memory::{Memory, Spans};
+use machine::memory::Memory;
 use machine::thermal::{Reading, Thermal};
 use serde_json::{Map, Value, json};
 
@@ -45,22 +45,27 @@ use crate::fans::{Fans, HpFans, SimFans};
 
 /// Таймер опроса.
 pub const AUTO: usize = 4;
-/// Пункты подменю: включено; подтягивание вверх; отсечка — открыть окно (там она настраивается).
+/// Пункты подменю: включено; отсечки — открыть окно (там они настраиваются). Подтягивания выше профиля больше нет
+/// (бриф T: его заменит оптимизатор; владелец его правила отверг, по умолчанию оно было выключено).
 pub const AUTO_ON: u32 = 10;
-pub const STEP_UP_ID: u32 = 11;
 pub const AUTO_WINDOW_ID: u32 = 12;
 /// Пункт меню верхнего уровня «Журнал срезов» — свой выключатель, не в подменю автомодуля (владелец 16.10).
 pub const LOG_ID: u32 = 13;
-/// Отсечка, °C, — ползунок в окне с шагом 1 °C (план DECISIONS #32, шаг 2; вместо пресетов 75–95 в меню).
+/// Целевая отсечка, °C, — ползунок в окне с шагом 1 °C (план DECISIONS #32, шаг 2; вместо пресетов 75–95 в меню).
 pub const LIMIT_RANGE: RangeInclusive<i32> = 60..=95;
+/// Аварийная отсечка по умолчанию, °C: на 5 °C ниже 100 °C, где его `ThrottleStop` сбрасывает частоту (`TjMax` 105,
+/// смещение 5; KNOWLEDGE «Датчики»).
+pub const EMERGENCY_DEFAULT: i32 = 95;
+/// Аварийная отсечка — от целевой + 1 до этого, °C.
+pub const EMERGENCY_TOP: i32 = 100;
 /// Как часто писать в журнал цену опроса — так она измеряется на машине владельца.
 pub(super) const COST_EVERY: Duration = Duration::from_secs(60);
 /// Столько чтений подряд потолок блока должен расходиться с ожидаемым, чтобы считаться чужой правкой: одно чтение
 /// бывает и запоздалым ответом на собственную запись, и чужим запросом в ящике (`ThrottleStop` не берёт наш замок).
 const FOREIGN_READS: u8 = 2;
-/// С такой доли работы всего процессора (по Windows) блоки читаются и пишется журнал срезов, даже если корпус далеко от
-/// предела и автомодуль выключен: для журнала срезов и для подтягивания нужны блоки под нагрузкой. Простой Windows —
-/// 1–5 %; число — выбор агента, не мерено.
+/// С такой доли работы всего процессора (по Windows) пишется журнал срезов (DECISIONS #32, подзапись 16.10). Простой
+/// Windows — 1–5 %; число — выбор агента, не мерено. Автомодуля оно не касается: его опрос идёт всегда, пока он включён
+/// (бриф T: условий нагрузки нет нигде).
 const LOADED: f64 = 0.10;
 /// Обороты для окна, пока журнал срезов не пишется, и после отказа прошивки — не чаще: каждый раз — вызов прошивки
 /// (около 30 мс, замер на машине владельца 15.10), а отказавший может держать цикл программы до 4 с (fans.rs,
@@ -72,16 +77,15 @@ const FANS_RETRY: Duration = Duration::from_secs(60);
 /// Сроки автомодуля: опрос и сроки регулятора, опрос срезов и обороты при нём. Скрытая проверка их укорачивает.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoTiming {
-    /// Опрос автомодуля: решение регулятора, а без журнала срезов — и само чтение корпуса (и блоков).
+    /// Опрос раз в 2 с: нужен ли опрос срезов, пишутся ли строки, сверка потолков.
     pub tick: Duration,
-    /// Опрос срезов, пока пишется журнал: строка на каждый (выбор владельца 15.10, вариант А, — 0,25 с).
+    /// Опрос срезов — одно чтение датчиков для регулятора и строк журнала (выбор владельца 15.10, вариант А, — 0,25 с).
     pub sample: Duration,
     /// Обороты, пока пишется журнал: в строку того опроса, где прочитаны.
     pub fans: Duration,
     /// Видеокарта, пока пишется журнал: в строку того опроса, где прочитана (app/sense.rs, DECISIONS #37).
     pub gpu: Duration,
     pub control: Timing,
-    pub bans: Spans,
 }
 
 impl AutoTiming {
@@ -95,22 +99,22 @@ impl AutoTiming {
         // на нём 8–15 точек.
         gpu: Duration::from_secs(2),
         control: Timing::REAL,
-        bans: Spans::REAL,
     };
 }
 
-/// Выбор владельца, как он лежит в data\tray.json. Глубины больше нет (владелец 15.10, DECISIONS #38): регулятор
-/// опускает блок сколько нужно, но не ниже нижней границы допустимого потолка; ключ «depth» файла прежней сборки
-/// читается молча и больше не пишется. Два выключателя независимы (владелец 16.10: «отдельно какой-то выключатель для
-/// логирования и отдельно выключатель для автоподстройки… это независимый процесс»): `on` — меняет ли автомодуль
-/// потолки, `log` — пишется ли журнал срезов.
+/// Выбор владельца, как он лежит в data\tray.json. Глубины больше нет (владелец 15.10, DECISIONS #38), подтягивания
+/// выше профиля — тоже (бриф T): ключи «depth» и «stepUp» файла прежней сборки читаются молча и больше не пишутся. Два
+/// выключателя независимы (владелец 16.10: «отдельно какой-то выключатель для логирования и отдельно выключатель для
+/// автоподстройки… это независимый процесс»): `on` — меняет ли автомодуль потолки, `log` — пишется ли журнал срезов.
+/// Аварийная отсечка всегда выше целевой (бриф T: от целевой + 1 до 100 °C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Choice {
     /// Автомодуль меняет потолки (по умолчанию выключен).
     pub on: bool,
+    /// Целевая отсечка, °C.
     pub limit: i32,
-    /// Подтягивать прохладные блоки выше принятого, до заводского (DECISIONS #32; по умолчанию выключено).
-    pub step_up: bool,
+    /// Аварийная отсечка, °C.
+    pub emergency: i32,
     /// Журнал срезов data\samples (по умолчанию включён: файл прежней сборки без ключа «log» — тоже включён).
     pub log: bool,
 }
@@ -120,7 +124,7 @@ impl Default for Choice {
         Self {
             on: false,
             limit: 85,
-            step_up: false,
+            emergency: EMERGENCY_DEFAULT,
             log: true,
         }
     }
@@ -134,27 +138,37 @@ fn whole(value: &Value, range: &RangeInclusive<i32>) -> Option<i32> {
         .filter(|v| range.contains(v))
 }
 
+/// Допустимая аварийная отсечка при целевой `limit`.
+fn emergency_range(limit: i32) -> RangeInclusive<i32> {
+    (limit + 1)..=EMERGENCY_TOP
+}
+
 impl Choice {
     /// Выбор из data\tray.json. Каждое поле — само по себе: негодное или пропавшее берёт значение по умолчанию, а
-    /// годные соседние остаются (файл прежней сборки с пресетами 75–95 читается как есть, его «depth» не замечается).
+    /// годные соседние остаются (файл прежней сборки читается как есть, его «depth» и «stepUp» не замечаются).
+    /// Аварийной нет или она не выше целевой — 95 °C, а если целевая 95 — на градус выше неё.
     #[must_use]
     pub fn read(map: &Map<String, Value>) -> Self {
         let default = Self::default();
+        let limit = map
+            .get("limit")
+            .and_then(|v| whole(v, &LIMIT_RANGE))
+            .unwrap_or(default.limit);
         Self {
             on: map.get("auto").and_then(Value::as_bool).unwrap_or(default.on),
-            limit: map
-                .get("limit")
-                .and_then(|v| whole(v, &LIMIT_RANGE))
-                .unwrap_or(default.limit),
-            step_up: map.get("stepUp").and_then(Value::as_bool).unwrap_or(default.step_up),
+            limit,
+            emergency: map
+                .get("emergency")
+                .and_then(|v| whole(v, &emergency_range(limit)))
+                .unwrap_or(EMERGENCY_DEFAULT.max(limit + 1)),
             log: map.get("log").and_then(Value::as_bool).unwrap_or(default.log),
         }
     }
 
-    /// Те же настройки автомодуля (выключатель, отсечка, подтягивание): смена журнала срезов их не касается.
+    /// Те же настройки автомодуля (выключатель и обе отсечки): смена журнала срезов их не касается.
     #[must_use]
     pub fn same_auto(self, other: Self) -> bool {
-        (self.on, self.limit, self.step_up) == (other.on, other.limit, other.step_up)
+        (self.on, self.limit, self.emergency) == (other.on, other.limit, other.emergency)
     }
 
     /// Команда окна «log.set» {on}: журнал срезов включён или нет. Отказ, если «on» нет, оно не да/нет или есть
@@ -173,52 +187,70 @@ impl Choice {
     }
 
     /// Команда окна «auto.set»: какие поля пришли — те и меняются, остальные прежние. Отказ, если хоть одно поле
-    /// негодно или незнакомо (опечатка в имени не должна молча ничего не сделать; «depth» прежнего окна — тоже), или
-    /// настроек в команде нет.
+    /// негодно или незнакомо (опечатка в имени не должна молча ничего не сделать; «depth» и «stepUp» прежнего окна —
+    /// тоже), или настроек в команде нет. Аварийная проверяется по новой целевой. Пришла только целевая, и она не ниже
+    /// аварийной — аварийная поднимается на градус выше неё: последнее слово владельца — целевая, а аварийная по правилу
+    /// всегда выше (окно показывает новую темой settings).
     /// `id` и `c` — номер и имя самой команды, не настройки.
     pub fn changed(self, fields: &Map<String, Value>) -> Result<Self, String> {
         let mut next = self;
         let mut any = false;
+        let mut emergency = None;
         for (key, value) in fields {
             match key.as_str() {
                 "id" | "c" => continue,
                 "on" => next.on = value.as_bool().ok_or("«on» — да или нет")?,
-                "stepUp" => next.step_up = value.as_bool().ok_or("«stepUp» — да или нет")?,
                 "limit" => {
                     next.limit = whole(value, &LIMIT_RANGE).ok_or_else(|| {
                         format!(
-                            "отсечка — целое число °C от {} до {}",
+                            "целевая отсечка — целое число °C от {} до {}",
                             LIMIT_RANGE.start(),
                             LIMIT_RANGE.end()
                         )
                     })?;
                 }
+                "emergency" => emergency = Some(value),
                 other => return Err(format!("незнакомая настройка автомодуля «{other}»")),
             }
             any = true;
         }
-        if any {
-            Ok(next)
-        } else {
-            Err("в команде нет настроек автомодуля".into())
+        if !any {
+            return Err("в команде нет настроек автомодуля".into());
         }
+        let range = emergency_range(next.limit);
+        match emergency {
+            Some(value) => {
+                next.emergency = whole(value, &range).ok_or_else(|| {
+                    format!(
+                        "аварийная отсечка — целое число °C от {} (целевая + 1) до {}",
+                        range.start(),
+                        range.end()
+                    )
+                })?;
+            }
+            None if !range.contains(&next.emergency) => next.emergency = next.limit + 1,
+            None => {}
+        }
+        Ok(next)
     }
 
     /// Как выбор лежит в data\tray.json.
     #[must_use]
     pub fn file_text(self) -> String {
-        json!({ "auto": self.on, "limit": self.limit, "stepUp": self.step_up, "log": self.log }).to_string()
+        json!({ "auto": self.on, "limit": self.limit, "emergency": self.emergency, "log": self.log }).to_string()
     }
 
-    /// Тема окну «settings»: выбор и допустимая отсечка — её держит эта программа, окно по ней строит ползунок;
+    /// Тема окну «settings»: выбор и допустимые отсечки — их держит эта программа, окно по ним строит ползунки;
     /// журнал срезов — отдельным полем, со своей командой «log.set».
     #[must_use]
     pub fn topic(self) -> String {
+        let range = emergency_range(self.limit);
         json!({
             "t": "settings",
             "auto": {
-                "on": self.on, "limit": self.limit, "stepUp": self.step_up,
+                "on": self.on, "limit": self.limit, "emergency": self.emergency,
                 "limitRange": [LIMIT_RANGE.start(), LIMIT_RANGE.end()],
+                "emergencyRange": [range.start(), range.end()],
             },
             "log": { "on": self.log },
         })
@@ -231,23 +263,22 @@ impl Choice {
 pub struct Autopilot {
     pub choice: Choice,
     pub(super) controller: Option<Controller>,
-    /// По блокам: потолок, поставленный автомодулем (ниже или выше принятого); None — блок на принятом. Окно видит его
-    /// в состоянии (app/serve.rs, поле auto).
+    /// По блокам: потолок, поставленный автомодулем (ниже принятого); None — блок на принятом. Окно видит его в
+    /// состоянии (app/serve.rs, поле auto).
     pub(super) overlay: Vec<Option<i32>>,
-    /// Память перегрева.
+    /// Память срезов.
     memory: Memory,
     /// Время процессоров по Windows на прошлом опросе: (простой, всего).
     system: Option<(u64, u64)>,
     fans: Option<Box<dyn Fans>>,
     /// Когда обороты читались (или открывалась прошивка) последний раз; следующий раз — через срок, который зависит
-    /// от того, пишется ли журнал срезов и чем кончился прошлый раз.
+    /// от того, пишутся ли строки журнала срезов и чем кончился прошлый раз.
     fans_last: Option<Instant>,
     /// Чем кончился прошлый раз; None — обороты прочитаны (или ещё не спрашивались).
     fans_fault: Option<FanFault>,
     /// Последние прочитанные обороты; None — не известны. Их же видит окно.
     pub(super) rpm: Option<Vec<u32>>,
     fans_said: Option<String>,
-    fans_cost: Option<Duration>,
     /// Скрытая проверка: сколько раз обороты спрошены.
     pub(super) fan_calls: u64,
     /// Скрытая проверка: сколько сообщений таймера опроса пришло.
@@ -260,11 +291,24 @@ pub struct Autopilot {
     holding: bool,
     /// Пробуждение отмечено, сверка после него ещё впереди: опрос ждёт её (ревизия H3).
     pub wake_pending: bool,
+    /// Буферы одного решения регулятора — на все опросы срезов (4 раза в секунду): показания и потолки по блокам,
+    /// решения.
+    frame: FrameBuffers,
+    decisions: Vec<Decision>,
     origin: Instant,
     last_tick: Option<Instant>,
     last_cost: Option<Instant>,
-    last_said: Option<String>,
+    pub(super) last_said: Option<String>,
     last_tip: String,
+}
+
+/// Буферы кадра регулятора (`Frame`): заполняются заново в каждом опросе срезов.
+#[derive(Debug, Default)]
+struct FrameBuffers {
+    readings: Vec<Option<Reading>>,
+    ceilings: Vec<i32>,
+    accepted: Vec<i32>,
+    floor: Vec<i32>,
 }
 
 impl Autopilot {
@@ -274,20 +318,26 @@ impl Autopilot {
             choice: Choice::default(),
             controller: None,
             overlay: vec![None; blocks],
-            memory: Memory::new(Spans::REAL),
+            memory: Memory::default(),
             system: None,
             fans: None,
             fans_last: None,
             fans_fault: None,
             rpm: None,
             fans_said: None,
-            fans_cost: None,
             fan_calls: 0,
             ticks: 0,
             aside: vec![false; blocks],
             mismatch: vec![0; blocks],
             holding: false,
             wake_pending: false,
+            frame: FrameBuffers {
+                readings: Vec::with_capacity(blocks),
+                ceilings: Vec::with_capacity(blocks),
+                accepted: Vec::with_capacity(blocks),
+                floor: Vec::with_capacity(blocks),
+            },
+            decisions: Vec::with_capacity(blocks),
             origin: Instant::now(),
             last_tick: None,
             last_cost: None,
@@ -311,38 +361,12 @@ impl Device {
     }
 }
 
-/// Показания опроса: корпус и блоки (None — блок не читался).
-type Sampled = (Option<f64>, Vec<Option<Reading>>);
-
-/// Изменение потолка блока, сделанное автомодулем, — для журналов.
-struct Change {
-    name: String,
-    first: usize,
-    before: i32,
-    to: i32,
-    base: i32,
-}
-
-/// Что сказал опрос.
+/// Что сказал опрос раз в 2 с.
 enum Polled {
     Quiet,
     Said(String),
     /// Потолки сброшены (сон): поставить их на место — дело сверки после пробуждения.
     Reset,
-}
-
-/// Докуда дошёл опрос: от этого — пишется ли журнал срезов и что сказать в строке цены.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// Ничего: автомодуль выключен и процессор не занят — датчики не нужны ни регулятору, ни журналу срезов.
-    Nothing,
-    /// Только корпус: блоки не нужны, не прочитаны или опроса не было.
-    Package,
-    /// Блоки прочитаны, потолки — нет.
-    Blocks,
-    /// Блоки и потолки прочитаны: журнал срезов пишется — в строке потолки прочитанные, а не последние известные
-    /// (ревизия 15.10, п. 3; так было и до журнала раз в 0,25 с).
-    Ceilings,
 }
 
 /// Отказ оборотов: от него — когда спрашивать снова.
@@ -389,7 +413,7 @@ impl App {
         Controller::new(
             Settings {
                 limit: f64::from(c.limit),
-                step_up: c.step_up,
+                emergency: f64::from(c.emergency),
             },
             self.config.auto.control,
             self.topology.blocks.len(),
@@ -409,7 +433,6 @@ impl App {
         }
         let choice = self.auto.choice;
         if choice.on || choice.log {
-            self.meter.forget();
             shell.set_timer(AUTO, self.config.auto.tick);
         }
         if !choice.log {
@@ -418,24 +441,17 @@ impl App {
         if choice.on {
             self.auto.controller = Some(self.controller_for());
             self.journal.note(&format!(
-                "автомодуль включён: до {} °C{}",
-                self.auto.choice.limit,
-                if self.auto.choice.step_up {
-                    ", с подтягиванием"
-                } else {
-                    ""
-                }
+                "автомодуль включён: до {} °C, аварийная {} °C",
+                choice.limit, choice.emergency
             ));
         }
     }
 
-    /// Память перегрева из журнала действий: записанные снижения повторяются по порядку. Испорченные строки
-    /// пропускаются — говорится об этом одной строкой журнала программы.
+    /// Память срезов из журнала действий: записанные срезы повторяются по порядку. Испорченные строки пропускаются —
+    /// говорится об этом одной строкой журнала программы. Срезы прежних сборок («lower», до двух отсечек) уровня
+    /// кристалла не знают: их запись пускает возврат при любом уровне (бриф T).
     pub(crate) fn replay_memory(&mut self) {
-        // Журнала нет или он не читается — память пустая, но со сроками из настроек: прежде здесь оставалась память из
-        // `Autopilot::new` с настоящими сроками, и скрытая проверка с короткими сроками сравнивала запреты на 30 мин с
-        // запретами на 2 с (её шаг «из журнала действий восстанавливаются те же» то проходил, то нет).
-        let mut memory = Memory::new(self.config.auto.bans);
+        let mut memory = Memory::default();
         let text = match std::fs::read_to_string(self.log_path()) {
             Ok(text) => text,
             Err(e) => {
@@ -452,29 +468,31 @@ impl App {
                 bad += 1;
                 continue;
             };
-            if map.get("act").and_then(Value::as_str) != Some("lower") {
-                continue;
-            }
+            // Какое поле — температура среза: аварийная — показание, целевая — медиана, прежняя — средняя за окно.
+            let temp_key = match map.get("act").and_then(Value::as_str) {
+                Some("emergency") => "reading",
+                Some("target") => "median",
+                Some("lower") => "mean",
+                _ => continue,
+            };
             let first = map
                 .get("first")
                 .and_then(Value::as_u64)
                 .and_then(|v| usize::try_from(v).ok());
-            let ban = map
-                .get("ban")
+            let from = map
+                .get("from")
                 .and_then(Value::as_i64)
                 .and_then(|v| i32::try_from(v).ok());
-            let mean = map.get("mean").and_then(Value::as_f64);
-            let at = map.get("at").and_then(Value::as_i64);
-            match (first, ban, mean, at) {
-                (Some(first), Some(ban), Some(mean), Some(at)) => {
-                    memory.overheated(first, ban, mean, Stamp(at));
-                }
+            let temp = map.get(temp_key).and_then(Value::as_f64);
+            let die = map.get("die").and_then(Value::as_f64);
+            match (first, from, temp) {
+                (Some(first), Some(from), Some(temp)) => memory.cut(first, from, temp, die),
                 _ => bad += 1,
             }
         }
         if bad > 0 {
             self.journal.error(&format!(
-                "журнал автомодуля: {bad} строк не разобрано, память перегрева без них"
+                "журнал автомодуля: {bad} строк не разобрано, память срезов без них"
             ));
         }
         self.auto.memory = memory;
@@ -580,15 +598,17 @@ impl App {
             default: false,
             children: Vec::new(),
         };
-        // Отсечка — ползунком в окне (владелец 15.10: пресеты «место занимают только в меню»); здесь — что стоит, и
-        // пункт, который открывает окно. Включение и подтягивание остаются: ими владелец пользуется.
+        // Отсечки — ползунками в окне (владелец 15.10: пресеты «место занимают только в меню»); здесь — что стоит, и
+        // пункт, который открывает окно. Включение остаётся: им владелец пользуется. Подтягивания больше нет (бриф T).
         let children = vec![
             item(AUTO_ON, "Включено".into(), c.on),
-            item(STEP_UP_ID, "Подтягивать вверх, до заводского".into(), c.step_up),
             super::separator(),
             item(
                 AUTO_WINDOW_ID,
-                format!("Отсечка {} °C — настроить в окне", c.limit),
+                format!(
+                    "Отсечка {} °C, аварийная {} °C — настроить в окне",
+                    c.limit, c.emergency
+                ),
                 false,
             ),
         ];
@@ -624,7 +644,6 @@ impl App {
     pub(super) fn auto_command(&mut self, shell: &mut Shell, id: u32) -> bool {
         let mut next = self.auto.choice;
         match id {
-            STEP_UP_ID => next.step_up = !next.step_up,
             AUTO_ON => next.on = !next.on,
             LOG_ID => next.log = !next.log,
             AUTO_WINDOW_ID => {
@@ -674,23 +693,24 @@ impl App {
     /// Окно узнаёт о выборе темой «settings» (app/serve.rs, по изменению) и полем autoLimit состояния.
     fn apply_choice(&mut self, shell: &Shell, next: Choice, by: &str) {
         let was = std::mem::replace(&mut self.auto.choice, next);
-        if next.on && !was.on {
-            // Суммы показаний, набранные журналом или окном до включения, — не для первого решения регулятора.
-            self.meter.forget();
-        } else if !next.on && was.on {
-            self.put_back("автомодуль выключен");
+        if !next.on && was.on {
+            self.put_back("автомодуль выключен", Some("auto-off"));
             self.auto.controller = None;
         }
         if next.on && !next.same_auto(was) {
             // Новый выбор — опущенные возвращаются, регулятор начинает заново (прежние окна — при другой отсечке).
             // Сохранить надстройку через смену отсечки мог бы только сам регулятор (machine::auto) — не здесь.
-            self.put_back("новые настройки автомодуля");
+            self.put_back("новые настройки автомодуля", Some("settings"));
             self.auto.controller = Some(self.controller_for());
             self.auto.aside.fill(false);
         }
         if !next.log {
-            // Журнал выключен — опрос раз в 0,25 с и файл дня кончаются сразу, а не со следующим опросом раз в 2 с.
-            self.stop_logging(shell);
+            // Журнал выключен — строки и файл дня кончаются сразу, а не со следующим опросом раз в 2 с.
+            self.set_rows(false);
+        }
+        if !next.on && !next.log {
+            // Ни регулятору, ни журналу опрос раз в 0,25 с не нужен.
+            self.stop_sensing(shell);
         }
         // Опрос раз в 2 с нужен регулятору или журналу срезов; ни тому ни другому — его нет.
         let polled = |c: Choice| c.on || c.log;
@@ -704,10 +724,10 @@ impl App {
         self.save_choice();
         if !next.same_auto(was) {
             self.journal.note(&format!(
-                "автомодуль ({by}): {}, до {} °C, подтягивание {}",
+                "автомодуль ({by}): {}, до {} °C, аварийная {} °C",
                 if next.on { "включён" } else { "выключен" },
                 next.limit,
-                if next.step_up { "вкл" } else { "выкл" }
+                next.emergency
             ));
         }
         if next.log != was.log {
@@ -741,15 +761,9 @@ impl App {
         }
     }
 
-    /// Сколько запретов памяти перегрева действует сейчас при нынешнем пределе (скрытая проверка).
-    pub(crate) fn bans_now(&self) -> usize {
-        let limit = f64::from(self.auto.choice.limit);
-        let now = Stamp::now();
-        self.topology
-            .blocks
-            .iter()
-            .map(|b| self.auto.memory.active(b.first, limit, now).len())
-            .sum()
+    /// Сколько срезов памяти действует сейчас при нынешнем пределе (скрытая проверка).
+    pub(crate) fn cuts_now(&self) -> usize {
+        self.auto.memory.holding(f64::from(self.auto.choice.limit))
     }
 
     /// Строка подсказки: что автомодуль сейчас делает.
@@ -757,7 +771,10 @@ impl App {
         if !self.auto.choice.on && !self.auto.active() {
             return None;
         }
-        let mut text = format!("авто: до {} °C", self.auto.choice.limit);
+        let mut text = format!(
+            "авто: до {} °C, аварийная {} °C",
+            self.auto.choice.limit, self.auto.choice.emergency
+        );
         let intended = self.intended.as_deref().unwrap_or_default();
         for (block, overlay) in self.topology.blocks.iter().zip(&self.auto.overlay) {
             if let (Some(to), Some(&base)) = (overlay, intended.get(block.first)) {
@@ -772,11 +789,13 @@ impl App {
         Some(text)
     }
 
-    /// Опрос по таймеру. Таймер есть, пока включён автомодуль или журнал срезов (`apply_choice`):
-    /// - автомодуль включён — как всегда: корпус, при нужде блоки, сверка, решение регулятора; журнал срезов, если он
-    ///   включён и блоки с потолками прочитаны;
-    /// - автомодуль выключен, журнал включён — процессор занят (≥ `LOADED`): блоки, сверка потолков (чужая правка
-    ///   принимается) и журнал; регулятора нет, потолки не меняются; не занят — ничего не читается, журнал стоит.
+    /// Опрос раз в 2 с. Таймер есть, пока включён автомодуль или журнал срезов (`apply_choice`). Датчиков он не читает
+    /// (бриф T: один путь чтения — опрос срезов, app/sense.rs), он решает:
+    /// - нужен ли опрос срезов раз в 0,25 с: автомодулю — всегда, пока он включён (условий нагрузки нет); журналу
+    ///   срезов — пока процессор занят (≥ `LOADED` по Windows);
+    /// - пишутся ли строки журнала: журнал включён и процессор занят (DECISIONS #32, подзапись 16.10);
+    /// - сверка потолков под арендой: чужая правка принимается (автомодуль этот блок больше не трогает), сброс сном —
+    ///   дело сверки после пробуждения; потолки не прочитаны — опрос срезов стоит, владельцу — одно сообщение.
     pub(super) fn auto_tick(&mut self, shell: &mut Shell) {
         self.auto.ticks += 1;
         let choice = self.auto.choice;
@@ -793,45 +812,39 @@ impl App {
         self.auto.last_tick = Some(Instant::now());
         if let Some(other) = self.other() {
             // C#-часть стартует (или уже работает): вернуть принятые, пока она ждёт аренду, и отпустить её.
-            self.stop_logging(shell);
+            self.stop_sensing(shell);
             self.yield_to(other);
             return;
         }
         if self.take_back_pending || self.auto.wake_pending {
-            self.stop_logging(shell);
+            self.stop_sensing(shell);
             return; // потолки ставит на место возврат права или сверка после пробуждения
         }
         let started = Instant::now();
-        let share = self.system_share();
-        let mut reach = Reach::Nothing;
-        let polled = self.logging.on;
-        // Журнал срезов пишется, пока он включён, а блоки и потолки прочитаны (то же условие, что и раньше для строки
-        // раз в 2 с): опрос раз в 0,25 с — с этого решения до того, которое скажет «не нужно». Потолки не прочитаны —
-        // журнал стоит: его опрос открывал бы драйвер, который здесь после ошибки отпускается. Начинается журнал под
-        // той же арендой: иначе `with_ceilings` отпустил бы драйвер, который через 0,25 с снова нужен журналу.
-        let outcome = if choice.on || share >= LOADED {
-            reach = Reach::Package;
-            Some(self.with_ceilings(|app| {
-                let polled = app.poll(share, &mut reach);
-                if reach == Reach::Ceilings && choice.log {
-                    app.start_logging(shell);
+        let busy = self.system_share() >= LOADED;
+        let wanted = choice.on || (choice.log && busy);
+        // Опрос срезов начинается под той же арендой: иначе `with_ceilings` отпустил бы драйвер, который через 0,25 с
+        // снова нужен. Потолки не прочитаны — опроса нет: строка журнала без них была бы не прочитанной, а регулятор
+        // судил бы по последним известным (ревизия 15.10, п. 3).
+        let outcome = wanted.then(|| {
+            self.with_ceilings(|app| {
+                let checked = app.check_ceilings();
+                if matches!(checked, Ok(Polled::Quiet | Polled::Said(_))) {
+                    app.start_sensing(shell);
                 }
-                polled
-            }))
+                checked
+            })
+        });
+        if matches!(outcome, Some(Ok(Ok(Polled::Quiet | Polled::Said(_))))) {
+            self.set_rows(choice.log && busy);
         } else {
-            // Автомодуль выключен, процессор не занят: ни регулятору, ни журналу датчики не нужны — драйвер не
-            // трогается. Набранное окном — не для следующего раза (как в `sample`, когда блоки не судятся).
-            self.meter.forget();
-            None
-        };
-        if !(reach == Reach::Ceilings && choice.log) {
-            self.stop_logging(shell);
+            self.stop_sensing(shell);
         }
         let said = match outcome {
             None => None,
-            Some(Ok(Polled::Quiet)) => Some(None),
-            Some(Ok(Polled::Said(said))) => Some(Some(said)),
-            Some(Ok(Polled::Reset)) => {
+            Some(Ok(Ok(Polled::Quiet))) => Some(None),
+            Some(Ok(Ok(Polled::Said(said)) | Err(said))) => Some(Some(said)),
+            Some(Ok(Ok(Polled::Reset))) => {
                 // Сброс сном, пробуждения программа не заметила (бывает при современном сне): сверка — сейчас.
                 self.auto.wake_pending = true;
                 shell.set_timer(super::WAKE, self.config.wake_delay);
@@ -839,8 +852,8 @@ impl App {
             }
             Some(Err(reason)) => Some(Some(format!("{} ждёт: {reason}", self.poller()))),
         };
-        // Опроса датчиков не было (автомодуль выключен, процессор не занят) — сказанное прежде остаётся сказанным:
-        // иначе одна и та же беда повторялась бы с каждым новым «процессор занят».
+        // Потолков не читали (автомодуль выключен, процессор не занят) — сказанное прежде остаётся сказанным: иначе одна
+        // и та же беда повторялась бы с каждым новым «процессор занят».
         match said {
             Some(Some(said)) => {
                 // Одна и та же беда — одно сообщение, а не каждые 2 с (ревизия M5); драйвер — переоткрыть.
@@ -857,25 +870,18 @@ impl App {
         }
         if self.auto.last_cost.is_none_or(|t| t.elapsed() >= COST_EVERY) {
             self.auto.last_cost = Some(Instant::now());
-            let fans = self
-                .auto
-                .fans_cost
-                .take()
-                .map(|cost| format!(", из них обороты {} мкс", cost.as_micros()))
-                .unwrap_or_default();
             self.journal.note(&format!(
-                "{}: опрос {} мкс{}{fans}",
+                "{}: опрос раз в 2 с {} мкс{}",
                 match (choice.on, choice.log) {
                     (true, true) => "автомодуль",
                     (true, false) => "автомодуль (журнал срезов выключен)",
                     (false, _) => "автомодуль выключен, журнал срезов",
                 },
                 started.elapsed().as_micros(),
-                match (reach, polled) {
-                    (Reach::Nothing, _) => ", процессор не занят — датчики не читаются",
-                    (Reach::Package, _) => ", только корпус",
-                    (_, true) => ", с блоками (показания опроса срезов)",
-                    (_, false) => ", с блоками",
+                match (wanted, self.logging.rows) {
+                    (false, _) => ", процессор не занят — датчики и потолки не читаются",
+                    (true, true) => ", сверка потолков; датчики — опрос срезов, строки пишутся",
+                    (true, false) => ", сверка потолков; датчики — опрос срезов, строк нет",
                 }
             ));
         }
@@ -895,32 +901,13 @@ impl App {
         }
     }
 
-    /// Один опрос под арендой: показания, сверка потолков, решение регулятора (если он есть), запись.
-    fn poll(&mut self, share: f64, reach: &mut Reach) -> Polled {
-        let (package, readings) = match self.sample(share) {
-            Ok(Some(sampled)) => sampled,
-            Ok(None) => {
-                // Блоки не читались: прежние показания больше не окно подряд.
-                if let Some(controller) = &mut self.auto.controller {
-                    controller.forget();
-                }
-                return Polled::Quiet;
-            }
-            Err(said) => return Polled::Said(said),
+    /// Сверка потолков под арендой (раз в 2 с): чужая правка принимается, о ней — одно сообщение; метка и аренда — по
+    /// надстройке (чужая правка могла снять её последний блок, ревизия M2). Err — что сказать владельцу.
+    fn check_ceilings(&mut self) -> Result<Polled, String> {
+        let Some(foreign) = self.reconcile()? else {
+            return Ok(Polled::Reset);
         };
-        *reach = Reach::Blocks;
-        let foreign = match self.reconcile() {
-            Ok(Some(foreign)) => foreign,
-            Ok(None) => return Polled::Reset,
-            Err(said) => return Polled::Said(said),
-        };
-        *reach = Reach::Ceilings;
-        // Обороты для условий решения в журнале действий: пока пишется журнал срезов, их читает его опрос; выключенному
-        // автомодулю решать нечего — и читать их незачем (вызов прошивки — около 30 мс).
-        if self.auto.choice.on && !self.logging.on {
-            self.read_fans();
-        }
-        let mut said = (!foreign.is_empty()).then(|| {
+        let said = (!foreign.is_empty()).then(|| {
             format!(
                 "Потолки блоков {} изменила другая программа — {}",
                 foreign.join(", "),
@@ -931,14 +918,10 @@ impl App {
                 }
             )
         });
-        if let Some(refused) = self.act(&readings, package) {
-            said = Some(refused);
-        }
-        // Чужая правка могла снять последний блок надстройки: метка и аренда — по надстройке (ревизия M2).
         if let Err(e) = self.mark() {
             self.journal.error(&format!("метка автомодуля: {e}"));
         }
-        said.map_or(Polled::Quiet, Polled::Said)
+        Ok(said.map_or(Polled::Quiet, Polled::Said))
     }
 
     /// Доля работы всего процессора с прошлого опроса по Windows; первый опрос — 0. На имитации — доля работы её ядер
@@ -970,71 +953,15 @@ impl App {
         share
     }
 
-    /// Показания: корпус и, если нужны, блоки — включённому автомодулю, когда корпус близко к пределу или надстройка
-    /// есть; ему и журналу срезов — когда процессор нагружен (`share`). Ok(None) — блоки не нужны.
-    ///
-    /// Пока ядра читает кто-то другой — опрос срезов раз в 0,25 с или окно раз в полсекунды, — у ядра счётчики одни:
-    /// показание блока — сумма их чтений с прошлого решения (app/meter.rs), своего чтения нет; корпус — их последнее
-    /// чтение, если оно свежее половины опроса. Никто не читает — корпус и блоки читаются здесь, как раньше.
-    fn sample(&mut self, share: f64) -> Result<Option<Sampled>, String> {
-        let poller = self.poller();
-        let Some(device) = self.device.as_mut() else {
-            return Ok(None);
-        };
-        let package = match self.meter.package_within(self.config.auto.tick / 2) {
-            Some(read) => read.value,
-            None => device
-                .thermal()
-                .package()
-                .map_err(|e| format!("{poller}: температура не прочитана — {e}"))?,
-        };
-        let overlay = self.auto.active();
-        // Выключенный автомодуль регулятора не держит: блоки — только по занятости процессора (журналу срезов).
-        let watch = self
-            .auto
-            .controller
-            .as_ref()
-            .is_some_and(|c| c.watch_blocks(package, overlay));
-        if !watch && share < LOADED {
-            // Блоки не судятся: набранное окном — не для следующего решения (оно должно быть по свежему времени).
-            self.meter.forget();
-            return Ok(None);
-        }
-        let sensing = self.serving.attached() || self.logging.on;
-        let mut readings = Vec::with_capacity(self.topology.blocks.len());
-        for (b, block) in self.topology.blocks.iter().enumerate() {
-            // Отставленный после чужой правки блок не судится: показаний для регулятора нет. Набранное опросом срезов
-            // или окном — прочь, чтобы, когда блок снова под присмотром, первое решение было по свежему времени.
-            if self.auto.aside[b] {
-                self.meter.drain(block.first);
-                readings.push(None);
-                continue;
-            }
-            if !(sensing && self.meter.has(block.first)) {
-                if let Ok(reading) = device.thermal().block(block.first) {
-                    // Тем же путём, что опрос срезов и окна: открытое окно складывает и это чтение.
-                    super::sense::record(&mut self.meter, self.serving.watch_mut(), block.first, reading);
-                } else {
-                    // Блок не прочитался: в этом опросе его нет (как и раньше); сумма — заново.
-                    self.meter.drain(block.first);
-                    readings.push(None);
-                    continue;
-                }
-            }
-            readings.push(Some(self.meter.drain(block.first)));
-        }
-        Ok(Some((package, readings)))
-    }
-
-    /// Обороты вентиляторов: пока пишется журнал срезов — раз в 2 с (`AutoTiming::fans`), иначе и после отказа — не
-    /// чаще раза в 10 с (каждый раз — вызов прошивки), прошивка не открылась — раз в минуту. На имитации прошивка не
-    /// трогается. Зовут опрос срезов, опрос автомодуля (пока журнал не пишется) и опрос окна. true — обороты прочитаны
-    /// сейчас (они идут в строку среза только тогда).
+    /// Обороты вентиляторов: пока пишутся строки журнала срезов — раз в 2 с (`AutoTiming::fans`), иначе и после отказа —
+    /// не чаще раза в 10 с (каждый раз — вызов прошивки; для условий в журнале действий автомодуля этого хватает),
+    /// прошивка не открылась — раз в минуту. На имитации прошивка не трогается. Зовут опрос срезов и опрос окна. true —
+    /// обороты прочитаны сейчас (они идут в строку среза только тогда).
     pub(super) fn read_fans(&mut self) -> bool {
         let now = Instant::now();
         let every = match self.auto.fans_fault {
             Some(FanFault::Open) => FANS_RETRY,
-            None if self.logging.on => self.config.auto.fans,
+            None if self.logging.rows => self.config.auto.fans,
             Some(FanFault::Read) | None => FANS_EVERY,
         };
         // Пол-опроса срезов — допуск на дрожание таймера: обороты в каждой восьмой строке, а не то в восьмой, то в
@@ -1069,9 +996,7 @@ impl App {
         let Some(fans) = self.auto.fans.as_mut() else {
             return false;
         };
-        let started = Instant::now();
         let read = fans.rpm();
-        self.auto.fans_cost = Some(started.elapsed());
         self.auto.fan_calls += 1;
         match read {
             Ok(rpm) => {
@@ -1158,197 +1083,189 @@ impl App {
         Ok(Some(foreign))
     }
 
-    /// Решение регулятора и запись; снижение ставит запрет в памяти перегрева. Каждое решение — строка журнала
-    /// действий с условиями. Возвращает отказ, если он был. Автомодуль выключен — регулятора нет: решать нечего, потолки
-    /// не меняются (владелец 16.10: выключатель — про изменение множителей).
-    fn act(&mut self, readings: &[Option<Reading>], package: Option<f64>) -> Option<String> {
+    /// Решения регулятора по этому опросу срезов — под арендой, сразу после чтения датчиков (app/sense.rs): каждое
+    /// показание первого ядра блока идёт в регулятор, аварийная отсечка — по нему же. Автомодуль выключен — регулятора
+    /// нет, решать нечего (владелец 16.10: выключатель — про изменение множителей). `package` — корпус этого опроса,
+    /// для журнала действий. Возвращает отказ, если он был.
+    pub(super) fn react(&mut self, package: Option<f64>) -> Option<String> {
         self.auto.controller.as_ref()?;
-        let topology = &self.topology;
         let limits = self.limits.as_ref()?;
         let intended = self.intended.as_deref()?;
-        let ceilings: Vec<i32> = topology.blocks.iter().map(|b| limits.current()[b.first]).collect();
-        let fused: Vec<i32> = topology.blocks.iter().map(|b| limits.fused()[b.first]).collect();
-        // Ниже этого регулятор блок не опускает: та же граница, что у ручного потолка (`Limits::set` ниже не пишет).
-        let floor: Vec<i32> = topology.blocks.iter().map(|b| limits.floor(b.first)).collect();
-        // Возвращать регулятор может только то, что сдвинул сам: блок ниже принятого, но не в надстройке, опустил
-        // кто-то другой — для регулятора его «принятый» — то, что стоит. Иначе прохладный блок поднимался бы поверх
-        // чужой правки (найдено скрытой проверкой 14.10).
-        let accepted: Vec<i32> = topology
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(b, block)| {
-                let base = intended[block.first];
-                if self.auto.overlay[b].is_some() {
-                    base
-                } else {
-                    ceilings[b].min(base)
-                }
-            })
-            .collect();
-        // Блок, у которого потолок расходится с ожидаемым и ещё не подтверждён как чужая правка, не судится.
-        let judged: Vec<Option<Reading>> = readings
-            .iter()
-            .zip(&self.auto.mismatch)
-            .map(|(reading, &mismatch)| if mismatch > 0 { None } else { *reading })
-            .collect();
+        let topology = &self.topology;
+        let Autopilot {
+            frame,
+            aside,
+            mismatch,
+            overlay,
+            ..
+        } = &mut self.auto;
+        frame.readings.clear();
+        frame.ceilings.clear();
+        frame.accepted.clear();
+        frame.floor.clear();
+        for (b, block) in topology.blocks.iter().enumerate() {
+            let ceiling = limits.current()[block.first];
+            let base = intended[block.first];
+            frame.ceilings.push(ceiling);
+            // Возвращать регулятор может только то, что сдвинул сам: блок ниже принятого, но не в надстройке, опустил
+            // кто-то другой — для регулятора его профиль — то, что стоит. Иначе прохладный блок поднимался бы поверх
+            // чужой правки (найдено скрытой проверкой 14.10).
+            frame
+                .accepted
+                .push(if overlay[b].is_some() { base } else { ceiling.min(base) });
+            // Ниже этого регулятор блок не опускает: та же граница, что у ручного потолка (`Limits::set` ниже не пишет).
+            frame.floor.push(limits.floor(block.first));
+            // Отставленный после чужой правки блок и блок, у которого потолок расходится с ожидаемым и ещё не признан
+            // чужой правкой, не судятся.
+            let judged = !aside[b] && mismatch[b] == 0;
+            frame.readings.push(judged.then(|| self.meter.latest(block.first)));
+        }
         let now = self.auto.origin.elapsed();
-        let stamp = Stamp::now();
         let limit = f64::from(self.auto.choice.limit);
-        let frame = Frame {
-            readings: &judged,
-            ceilings: &ceilings,
-            accepted: &accepted,
-            fused: &fused,
-            floor: &floor,
-        };
-        let Autopilot { controller, memory, .. } = &mut self.auto;
-        let banned = |b: usize, to: i32| {
-            topology
-                .blocks
+        let Autopilot {
+            controller,
+            memory,
+            frame,
+            decisions,
+            ..
+        } = &mut self.auto;
+        let blocks = &topology.blocks;
+        let allowed = |b: usize, to: i32, die: Option<f64>| {
+            blocks
                 .get(b)
-                .is_some_and(|block| memory.blocking(block.first, to, limit, stamp).is_some())
+                .is_some_and(|block| memory.allows(block.first, to, limit, die))
         };
-        let decision = controller.as_mut()?.step(now, &frame, &banned)?;
-        let (b, to) = match decision.action {
-            Action::Lower { block, to } | Action::Raise { block, to } => (block, to),
+        let view = Frame {
+            readings: &frame.readings,
+            ceilings: &frame.ceilings,
+            accepted: &frame.accepted,
+            floor: &frame.floor,
         };
-        let name = topology.blocks[b].name.clone();
-        let first = topology.blocks[b].first;
-        let before = ceilings[b];
-        let base = accepted[b];
-        let was = self.auto.overlay[b];
+        controller.as_mut()?.step(now, &view, &allowed, decisions);
+        if decisions.is_empty() {
+            return None;
+        }
+        let decisions = std::mem::take(&mut self.auto.decisions);
+        let mut refused = None;
+        for decision in &decisions {
+            if let Some(refusal) = self.apply(decision, package) {
+                refused = Some(refusal);
+            }
+        }
+        self.auto.decisions = decisions;
+        refused
+    }
+
+    /// Одно решение регулятора: надстройка и метка — до записи в процессор, потолок, затем память срезов и журналы.
+    /// Возвращает отказ.
+    fn apply(&mut self, d: &Decision, package: Option<f64>) -> Option<String> {
+        let (name, first) = {
+            let block = &self.topology.blocks[d.block];
+            (block.name.clone(), block.first)
+        };
+        let base = self.auto.frame.accepted[d.block];
+        let was = self.auto.overlay[d.block];
         // Метка — до записи в процессор: с новой надстройкой.
-        self.auto.overlay[b] = (to != base).then_some(to);
+        self.auto.overlay[d.block] = (d.to != base).then_some(d.to);
         if let Err(e) = self.mark() {
-            self.auto.overlay[b] = was;
+            self.auto.overlay[d.block] = was;
             return Some(format!("Автомодуль: метка не записана, потолок не тронут — {e}"));
         }
         let topology = &self.topology;
         let (limits, cpu) = parts(&mut self.limits, &mut self.device)?;
-        if let Some(refusal) = limits.set(cpu, topology, first, to) {
-            self.auto.overlay[b] = was;
+        if let Some(refusal) = limits.set(cpu, topology, first, d.to) {
+            self.auto.overlay[d.block] = was;
             return Some(format!("Автомодуль: потолок блока {name} не изменён — {refusal}"));
         }
-        let change = Change {
-            name,
-            first,
-            before,
-            to,
-            base,
-        };
-        self.record(&decision, &change, stamp, readings, package);
+        self.record(d, &name, first, base, package);
         None
     }
 
-    /// Сделанное решение: запрет в памяти перегрева (снижение), строка журнала программы и строка журнала действий.
-    fn record(
-        &mut self,
-        decision: &machine::auto::Decision,
-        change: &Change,
-        stamp: Stamp,
-        readings: &[Option<Reading>],
-        package: Option<f64>,
-    ) {
-        let Change {
-            name,
-            first,
-            before,
-            to,
-            base,
-        } = change;
-        let window = decision.window;
-        let mean = window.map_or_else(|| "?".into(), |w| format!("{:.0}", w.mean));
-        let ban = decision
-            .ban
-            .zip(window)
-            .map(|(at, w)| self.auto.memory.overheated(*first, at, w.mean, stamp));
-        let (act, text) = match decision.action {
-            Action::Lower { .. } => (
-                "lower",
-                format!(
-                    "автомодуль: блок {name} опущен ×{before} → ×{to} ({mean} °C, наибольшая {}){}",
-                    window.map_or_else(|| "?".into(), |w| format!("{:.0}", w.max)),
-                    ban.map(|ban| format!(
-                        "; ×{} и выше — не раньше {} ({}-й перегрев)",
-                        ban.at,
-                        ban.until.local(Pattern::Time),
-                        ban.strikes
-                    ))
-                    .unwrap_or_default()
-                ),
+    /// Сделанное решение: срез — в память срезов; строка журнала программы и строка журнала действий со всеми
+    /// условиями (бриф T): что сработало и по какому показанию или медиане, уровень кристалла, последние 2-с медианы всех
+    /// блоков, фактический множитель и загрузка блока, вентиляторы и видеокарта, если известны.
+    fn record(&mut self, d: &Decision, name: &str, first: usize, base: i32, package: Option<f64>) {
+        let stamp = Stamp::now();
+        if d.cause != Cause::Return {
+            self.auto.memory.cut(first, d.from, d.temp, d.die);
+        }
+        let die = d.die.map_or_else(|| "?".into(), |v| format!("{v:.0}"));
+        let (from, to, temp) = (d.from, d.to, d.temp);
+        let text = match d.cause {
+            Cause::Emergency => format!(
+                "автомодуль: блок {name} — аварийная отсечка ×{from} → ×{to} (показание {temp:.0} °C, аварийная {} °C; кристалл {die} °C)",
+                self.auto.choice.emergency
             ),
-            Action::Raise { .. } if to <= base => (
-                "raise",
-                format!(
-                    "автомодуль: блок {name} возвращён ×{before} → ×{to} (прохладен под нагрузкой {} с)",
-                    decision.cool.as_secs()
-                ),
+            Cause::Target => format!(
+                "автомодуль: блок {name} опущен ×{from} → ×{to} (2-с медиана {temp:.1} °C выше {} °C и не падает; кристалл {die} °C)",
+                self.auto.choice.limit
             ),
-            Action::Raise { .. } => (
-                "raise",
-                format!(
-                    "автомодуль: блок {name} поднят выше принятого ×{before} → ×{to} (прохладен под нагрузкой {} с, \
-                     ×{base} принятый)",
-                    decision.cool.as_secs()
-                ),
+            Cause::Return => format!(
+                "автомодуль: блок {name} возвращён ×{from} → ×{to} (паузу все 2-с медианы не выше {} °C; кристалл {die} °C)",
+                self.auto.choice.limit
             ),
         };
         self.journal.note(&text);
-        let mut line = self.conditions(stamp, act, readings, package);
-        line.insert("block".into(), json!(name));
-        line.insert("first".into(), json!(first));
-        line.insert("from".into(), json!(before));
-        line.insert("to".into(), json!(to));
-        line.insert("accepted".into(), json!(base));
-        line.insert("limit".into(), json!(self.auto.choice.limit));
-        if let Some(w) = window {
-            line.insert("mean".into(), json!(round(w.mean, 1)));
-            line.insert("max".into(), json!(round(w.max, 1)));
-            line.insert("busy".into(), json!(round(w.busy, 2)));
-            line.insert("ratio".into(), json!(w.ratio.map(|r| round(r, 2))));
-        }
-        line.insert("cool".into(), json!(decision.cool.as_secs()));
-        if let Some(ban) = ban {
-            line.insert("ban".into(), json!(ban.at));
-            line.insert("until".into(), json!(ban.until.roundtrip()));
-            line.insert("strikes".into(), json!(ban.strikes));
-        }
-        self.log_line(&Value::Object(line));
-    }
-
-    /// Условия для строки журнала действий: время, что сделано, корпус, вентиляторы, по блокам потолок, фактический
-    /// множитель, доля работы, температура (соседи читаются отсюда).
-    fn conditions(
-        &self,
-        stamp: Stamp,
-        act: &str,
-        readings: &[Option<Reading>],
-        package: Option<f64>,
-    ) -> serde_json::Map<String, Value> {
-        let column = |f: fn(&Reading) -> Option<f64>, digits: i32| -> Vec<Option<f64>> {
-            readings
-                .iter()
-                .map(|r| r.as_ref().and_then(f).map(|v| round(v, digits)))
-                .collect()
-        };
+        let medians: Vec<Option<f64>> = self
+            .auto
+            .controller
+            .as_ref()
+            .map(|c| c.medians().map(|m| m.map(|v| round(v, 1))).collect())
+            .unwrap_or_default();
         let ceilings: Vec<Option<i32>> = self
             .topology
             .blocks
             .iter()
             .map(|b| self.limits.as_ref().map(|l| l.current()[b.first]))
             .collect();
-        let mut map = serde_json::Map::new();
-        map.insert("time".into(), json!(stamp.roundtrip()));
-        map.insert("at".into(), json!(stamp.0));
-        map.insert("act".into(), json!(act));
-        map.insert("package".into(), json!(package.map(|p| round(p, 0))));
-        map.insert("fans".into(), json!(self.auto.rpm));
-        map.insert("ceilings".into(), json!(ceilings));
-        map.insert("temps".into(), json!(column(|r| r.temp, 0)));
-        map.insert("ratios".into(), json!(column(|r| r.ratio, 2)));
-        map.insert("busys".into(), json!(column(|r| r.busy, 2)));
-        map
+        let gpu = self.last_gpu().map(|g| {
+            json!({
+                "temp": g.temp.map(|v| round(v, 0)),
+                "power": g.power.map(|v| round(v, 1)),
+                "busy": g.busy.map(|v| round(v, 2)),
+            })
+        });
+        let mut line = Map::new();
+        line.insert("time".into(), json!(stamp.roundtrip()));
+        line.insert("at".into(), json!(stamp.0));
+        line.insert("act".into(), json!(d.cause.act()));
+        line.insert("block".into(), json!(name));
+        line.insert("first".into(), json!(first));
+        line.insert("from".into(), json!(from));
+        line.insert("to".into(), json!(to));
+        line.insert("accepted".into(), json!(base));
+        line.insert("limit".into(), json!(self.auto.choice.limit));
+        line.insert("emergency".into(), json!(self.auto.choice.emergency));
+        // Что сработало: аварийная — одно показание, целевая и возврат — 2-с медиана.
+        let trigger = if d.cause == Cause::Emergency {
+            "reading"
+        } else {
+            "median"
+        };
+        // Температура среза и уровень кристалла — без округления: из них при запуске восстанавливается память срезов, а
+        // она сравнивает уровень кристалла строго («ниже, чем при срезе»). Округлённый вверх, он пустил бы возврат при
+        // том же кристалле (найдено скрытой проверкой: 47,46 °C записалось бы как 47,5).
+        line.insert(trigger.into(), json!(temp));
+        line.insert("die".into(), json!(d.die));
+        line.insert("medians".into(), json!(medians));
+        line.insert("ratio".into(), json!(d.ratio.map(|v| round(v, 2))));
+        line.insert("busy".into(), json!(d.busy.map(|v| round(v, 2))));
+        line.insert("package".into(), json!(package.map(|p| round(p, 0))));
+        line.insert("fans".into(), json!(self.auto.rpm));
+        line.insert("gpu".into(), json!(gpu));
+        line.insert("ceilings".into(), json!(ceilings));
+        // Журнал событий окна (app/timeline.rs): то же решение с итогом блока на покидаемом потолке; неизвестное — не пишется.
+        let mut conditions = Map::new();
+        for name in [trigger, "die", "medians", "ratio", "busy"] {
+            // Неизвестное не пишется: ни null, ни список из одних null (медиан ещё нет — первое окно не закрылось).
+            let known = |v: &&Value| !v.is_null() && v.as_array().is_none_or(|a| a.iter().any(|x| !x.is_null()));
+            if let Some(value) = line.get(name).filter(known) {
+                conditions.insert(name.into(), value.clone()); // a few numbers per decision
+            }
+        }
+        self.known_surroundings(&mut conditions);
+        self.log_line(&Value::Object(line));
+        self.log_event(d.cause.act(), Some(d.block), Some((from, to)), None, conditions);
     }
 
     pub(super) fn log_line(&mut self, line: &Value) {
@@ -1360,13 +1277,17 @@ impl App {
     /// Вернуть принятые потолки блокам надстройки (C#-часть стартует, сон, выход, смена набора, новые настройки).
     /// Пишет без проверки присутствия: стартующая C#-часть ждёт аренду, которую держит эта программа, и ещё ничего
     /// не прочитала. Блок, которому вернуть не удалось, остаётся опущенным — с меткой и арендой (ревизия M1).
-    pub(super) fn put_back(&mut self, why: &str) {
+    /// `reason` — для журнала событий окна (app/timeline.rs, kind «putback»): auto-off, settings, sleep, exit, csharp;
+    /// None — смена набора: её строки «profile» и так идут от того потолка, что стоял, с поправкой.
+    pub(super) fn put_back(&mut self, why: &str, reason: Option<&'static str>) {
         if !self.auto.active() {
             return;
         }
         let topology = &self.topology;
         let intended = self.intended.clone().unwrap_or_default(); // a few dozen numbers, once per put-back
         let mut back = Vec::new();
+        // Блоки, которым вернулся принятый: (блок, с какого, на какой) — строки журнала событий после записи.
+        let mut moved = Vec::new();
         if let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
             for (b, block) in topology.blocks.iter().enumerate() {
                 if self.auto.overlay[b].is_none() {
@@ -1375,10 +1296,14 @@ impl App {
                 let Some(&want) = intended.get(block.first) else {
                     continue;
                 };
+                let from = limits.current()[block.first];
                 match limits.set(cpu, topology, block.first, want) {
                     None => {
                         self.auto.overlay[b] = None;
                         back.push(format!("{} ×{want}", block.name));
+                        if from != want {
+                            moved.push((b, from, want));
+                        }
                     }
                     Some(refusal) => self.journal.error(&format!(
                         "автомодуль: блоку {} не вернулся ×{want}: {refusal}",
@@ -1397,6 +1322,12 @@ impl App {
         let stamp = Stamp::now();
         let line = json!({ "time": stamp.roundtrip(), "at": stamp.0, "act": "back", "why": why, "blocks": back });
         self.log_line(&line);
+        if let Some(reason) = reason {
+            for (b, from, to) in moved {
+                let conditions = self.own_conditions(b);
+                self.log_event("putback", Some(b), Some((from, to)), Some(reason), conditions);
+            }
+        }
         if let Err(e) = self.mark() {
             self.journal.error(&format!("метка автомодуля: {e}"));
         }
@@ -1409,7 +1340,7 @@ impl App {
                 Other::OldWindow => "открывается прежнее окно",
                 _ => "запускается настройка",
             };
-            self.put_back(why);
+            self.put_back(why, Some("csharp"));
         }
         if let Some(controller) = &mut self.auto.controller {
             controller.forget();
@@ -1433,8 +1364,9 @@ fn round(value: f64, digits: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    // Настройки автомодуля по плану (DECISIONS #32, шаг 2; #38): отсечка 60–95 °C с шагом 1 °C, подтягивание по
-    // умолчанию выключено, глубины нет; негодное в файле — значение по умолчанию у этого поля, в команде — отказ.
+    // Настройки автомодуля по плану (DECISIONS #32, шаг 2; #38; бриф T): целевая отсечка 60–95 °C с шагом 1 °C,
+    // аварийная — от целевой + 1 до 100 °C, по умолчанию 95; глубины и подтягивания нет; негодное в файле — значение по
+    // умолчанию у этого поля, в команде — отказ.
     use super::*;
 
     fn map(text: &str) -> Map<String, Value> {
@@ -1442,19 +1374,20 @@ mod tests {
     }
 
     #[test]
-    fn file_of_the_previous_build_is_read_as_is_and_its_depth_ignored() {
-        // Файл, записанный сборкой с глубиной (0.5.3 и раньше): «depth» любого вида не мешает остальному.
+    fn file_of_the_previous_build_is_read_as_is_its_depth_and_step_up_ignored() {
+        // Файлы, записанные сборками с глубиной (0.5.3 и раньше) и с подтягиванием (0.5.5 и раньше): лишние ключи любого
+        // вида не мешают остальному; аварийной в них нет — 95 °C.
         for text in [
             r#"{"auto":true,"limit":75,"depth":6,"stepUp":true}"#,
-            r#"{"auto":true,"limit":75,"depth":99,"stepUp":true}"#,
-            r#"{"auto":true,"limit":75,"depth":"глубоко","stepUp":true}"#,
+            r#"{"auto":true,"limit":75,"depth":99,"stepUp":false}"#,
+            r#"{"auto":true,"limit":75,"depth":"глубоко","stepUp":"да"}"#,
         ] {
             assert_eq!(
                 Choice::read(&map(text)),
                 Choice {
                     on: true,
                     limit: 75,
-                    step_up: true,
+                    emergency: 95,
                     log: true,
                 },
                 "{text}: a file without «log» (0.5.4 and earlier) keeps the samples log on"
@@ -1463,16 +1396,36 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_written_without_depth() {
+    fn the_file_is_written_without_depth_and_step_up() {
         let text = Choice {
             on: true,
             limit: 77,
-            step_up: false,
+            emergency: 93,
             log: false,
         }
         .file_text();
-        assert!(!text.contains("depth"), "{text}");
-        assert_eq!(text, r#"{"auto":true,"limit":77,"log":false,"stepUp":false}"#);
+        assert!(!text.contains("depth") && !text.contains("stepUp"), "{text}");
+        assert_eq!(text, r#"{"auto":true,"emergency":93,"limit":77,"log":false}"#);
+    }
+
+    #[test]
+    fn the_emergency_limit_defaults_to_95_and_stays_above_the_target_in_the_file() {
+        assert_eq!(Choice::default().emergency, 95);
+        for (text, emergency) in [
+            (r#"{"limit":80,"emergency":90}"#, 90),
+            (r#"{"limit":80,"emergency":100}"#, 100),
+            (r#"{"limit":80,"emergency":81}"#, 81),
+            // негодное — по умолчанию
+            (r#"{"limit":80,"emergency":80}"#, 95),
+            (r#"{"limit":80,"emergency":101}"#, 95),
+            (r#"{"limit":80,"emergency":92.5}"#, 95),
+            (r#"{"limit":80,"emergency":"90"}"#, 95),
+            // целевая 95: по умолчанию 95 не выше неё — на градус выше
+            (r#"{"limit":95}"#, 96),
+            (r#"{"limit":95,"emergency":95}"#, 96),
+        ] {
+            assert_eq!(Choice::read(&map(text)).emergency, emergency, "{text}");
+        }
     }
 
     // Два независимых выключателя (владелец 16.10): журнал срезов и автомодуль. Файл без «log» — журнал включён; каждая
@@ -1502,7 +1455,7 @@ mod tests {
         let was = Choice {
             on: true,
             limit: 81,
-            step_up: true,
+            emergency: 92,
             log: true,
         };
         let next = was.log_changed(&map(r#"{"id":4,"c":"log.set","on":false}"#));
@@ -1545,7 +1498,7 @@ mod tests {
             assert_eq!(c.limit, limit, "{text}");
         }
         // Ничего годного: всё по умолчанию, автомодуль выключен.
-        assert_eq!(Choice::read(&map(r#"{"auto":"да","stepUp":1}"#)), d);
+        assert_eq!(Choice::read(&map(r#"{"auto":"да","emergency":1}"#)), d);
         // Края промежутка — годные.
         assert_eq!(Choice::read(&map(r#"{"limit":60}"#)).limit, 60);
         assert_eq!(Choice::read(&map(r#"{"limit":95}"#)).limit, 95);
@@ -1556,19 +1509,47 @@ mod tests {
         let was = Choice {
             on: true,
             limit: 80,
-            step_up: false,
+            emergency: 95,
             log: true,
         };
         let next = was.changed(&map(r#"{"id":7,"c":"auto.set","limit":82}"#));
         assert_eq!(next, Ok(Choice { limit: 82, ..was }));
-        let next = was.changed(&map(r#"{"stepUp":true,"on":false}"#));
+        let next = was.changed(&map(r#"{"emergency":90,"on":false}"#));
         assert_eq!(
             next,
             Ok(Choice {
                 on: false,
-                step_up: true,
+                emergency: 90,
                 ..was
             })
+        );
+        // Аварийная проверяется по новой целевой, пришедшей в той же команде.
+        let next = was.changed(&map(r#"{"limit":92,"emergency":93}"#));
+        assert_eq!(
+            next,
+            Ok(Choice {
+                limit: 92,
+                emergency: 93,
+                ..was
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_raised_to_the_emergency_limit_lifts_the_emergency_limit_above_it() {
+        // Последнее слово владельца — целевая; аварийная по правилу брифа всегда выше неё (целевая + 1 … 100).
+        let was = Choice {
+            on: true,
+            limit: 80,
+            emergency: 90,
+            log: true,
+        };
+        assert_eq!(was.changed(&map(r#"{"limit":90}"#)).map(|c| c.emergency), Ok(91));
+        assert_eq!(was.changed(&map(r#"{"limit":95}"#)).map(|c| c.emergency), Ok(96));
+        assert_eq!(
+            was.changed(&map(r#"{"limit":89}"#)).map(|c| c.emergency),
+            Ok(90),
+            "still above: unchanged"
         );
     }
 
@@ -1582,15 +1563,23 @@ mod tests {
             r#"{"limit":"85"}"#,
             r#"{"limit":null}"#,
             r#"{"on":1}"#,
-            r#"{"stepUp":"нет"}"#,
-            // глубины больше нет: окно прежней сборки получает отказ, а не молчаливое «принято»
+            // аварийная — от целевой + 1 до 100, целым числом
+            r#"{"emergency":85}"#,
+            r#"{"emergency":84}"#,
+            r#"{"emergency":101}"#,
+            r#"{"emergency":95.5}"#,
+            r#"{"emergency":"95"}"#,
+            r#"{"limit":90,"emergency":90}"#,
+            // подтягивания и глубины больше нет: окно прежней сборки получает отказ, а не молчаливое «принято»
+            r#"{"stepUp":true}"#,
             r#"{"depth":4}"#,
             // годное рядом с негодным не применяется частично
             r#"{"on":true,"limit":200}"#,
+            r#"{"on":true,"emergency":200}"#,
             // опечатка в имени не должна молча ничего не сделать
             r#"{"limt":80}"#,
             // и рядом с годной: годная не применяется, а опечатка не теряется молча
-            r#"{"limit":80,"stepUP":true}"#,
+            r#"{"limit":80,"emergancy":96}"#,
             // ни одной настройки
             r#"{"id":3,"c":"auto.set"}"#,
             r"{}",
@@ -1600,18 +1589,21 @@ mod tests {
     }
 
     #[test]
-    fn the_topic_carries_the_choice_and_the_range() {
+    fn the_topic_carries_the_choice_and_both_ranges() {
         let choice = Choice {
             on: true,
             limit: 77,
-            step_up: true,
+            emergency: 93,
             log: false,
         };
         let topic: Value = serde_json::from_str(&choice.topic()).unwrap_or(Value::Null);
         assert_eq!(topic["t"], "settings");
         assert_eq!(
             topic["auto"],
-            json!({ "on": true, "limit": 77, "stepUp": true, "limitRange": [60, 95] })
+            json!({
+                "on": true, "limit": 77, "emergency": 93,
+                "limitRange": [60, 95], "emergencyRange": [78, 100],
+            })
         );
         assert_eq!(topic["log"], json!({ "on": false }), "the log switch has its own field");
         // Файл и команда говорят одними именами: записанное читается обратно тем же.

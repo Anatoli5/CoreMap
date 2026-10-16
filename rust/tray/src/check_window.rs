@@ -194,6 +194,214 @@ fn number_or_null(v: &Value) -> bool {
     v.is_number() || v.is_null()
 }
 
+/// 12c'. Наибольшие и средние под нагрузкой живут дольше окна и программы (владелец 16.10: «сохранять их пока я не нажму
+/// reset вручную… максимумы не должны сохраняться, если у тебя профиль сменился. Если я отредактировал ядро, то
+/// максимум по нему от старого множителя не нужен»; по потолкам — его слово 16.10: максимум с ×48 на плитке после
+/// среза до ×47 — дезинформация): переживают перезапуск программы (`App::restart_maxima` — запись, как при выходе, и
+/// чтение, как при запуске); смена потолка блока в окне сбрасывает этот блок, и только его; срез автомодуля переключает
+/// плитку на значения нового потолка, прежние остаются в byCeiling; «сбросить максимумы» обнуляет и пишет файл.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario, step after step, reads best as one piece"
+)]
+fn maxima(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client, data: &Path) {
+    let blocks = app.topology().blocks.clone(); // a dozen blocks, once
+    let (a, b) = (blocks[0].clone(), blocks[1].clone());
+    let (fa, fb) = (a.first, b.first);
+    let set = |app: &mut App, load_a: f64, load_b: f64| {
+        if let Some(sim) = app.sim() {
+            for &m in &a.members {
+                sim.load[m] = load_a;
+            }
+            for &m in &b.members {
+                sim.load[m] = load_b;
+            }
+        }
+    };
+    // Следующее состояние окну после этого места.
+    let next_state = |shell: &mut Shell, app: &mut App, client: &mut Client| -> Value {
+        client.collect();
+        let from = client.got.len();
+        wait(shell, app, client, Duration::from_secs(3), |c| {
+            c.got[from..].iter().any(|v| v["t"] == "state")
+        });
+        client.got[from..]
+            .iter()
+            .rev()
+            .find(|v| v["t"] == "state")
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    set(app, 1.0, 1.0);
+    let averaged = wait(shell, app, client, Duration::from_secs(5), |c| {
+        c.last("state")
+            .is_some_and(|s| s["avg"][fa].is_number() && s["avg"][fb].is_number())
+    });
+    set(app, 0.0, 0.0);
+    next_state(shell, app, client);
+    let before = next_state(shell, app, client);
+
+    // Перезапуск программы: те же наибольшие и средние.
+    app.restart_maxima();
+    let after = next_state(shell, app, client);
+    let file = fs::read_to_string(data.join("maxima.json")).unwrap_or_default();
+    r.check(
+        averaged
+            && before["avg"][fa].is_number()
+            && after["max"] == before["max"]
+            && after["avg"] == before["avg"]
+            && after["avgRatio"] == before["avgRatio"]
+            && after["byCeiling"] == before["byCeiling"]
+            && file.contains("\"byCeiling\""),
+        &format!(
+            "наибольшие и средние пережили перезапуск программы (data\\maxima.json): блок {} — ▲ {} ø {} до, ▲ {} ø {} после",
+            a.name, before["max"][fa], before["avg"][fa], after["max"][fa], after["avg"][fa]
+        ),
+    );
+
+    // Потолок блока a сменён в окне (плитка): сбрасывается блок a, и только он.
+    let index = |first: usize| blocks.iter().position(|x| x.first == first).unwrap_or(0);
+    let ceiling_a = ceilings_now(app).get(fa).copied().unwrap_or(0);
+    let events_from = events_today(data).len();
+    let (_, ok, why) = order(
+        shell,
+        app,
+        client,
+        "limit.set",
+        &json!({ "block": index(fa), "ratio": ceiling_a - 1 }),
+    );
+    let dropped = wait(shell, app, client, Duration::from_secs(3), |c| {
+        c.last("state").is_some_and(|s| s["avg"][fa].is_null())
+    });
+    let edited = client.last("state").cloned().unwrap_or(Value::Null);
+    r.check(
+        ok && dropped
+            && edited["max"][fa] == edited["cur"][fa]
+            && edited["avg"][fb] == before["avg"][fb]
+            && edited["max"][fb] == before["max"][fb],
+        &format!(
+            "потолок блока {} сменён в окне ({why}): его средняя сброшена, ▲ — с нынешнего ({}); у блока {} — как были (ø {}, ▲ {})",
+            a.name, edited["max"][fa], b.name, edited["avg"][fb], edited["max"][fb]
+        ),
+    );
+    let edits = events_after(data, events_from, "edit");
+    let line = edits.first().cloned().unwrap_or(Value::Null);
+    r.check(
+        edits.len() == 1
+            && line["block"] == a.name.as_str()
+            && line["from"] == ceiling_a
+            && line["to"] == ceiling_a - 1
+            && line["period"]["ceiling"] == ceiling_a
+            && same(&line["period"]["max"], &before["max"][fa])
+            && same(&line["period"]["mean"], &before["avg"][fa])
+            && line["period"]["maxTime"].is_string()
+            && line["conditions"]["temp"].is_number(),
+        &format!("журнал событий: правка плитки — одна строка edit с итогом блока на покидаемом ×{ceiling_a}: {line}"),
+    );
+    let _ = order(
+        shell,
+        app,
+        client,
+        "limit.set",
+        &json!({ "block": index(fa), "ratio": ceiling_a }),
+    );
+
+    // Срез автомодуля (аварийная отсечка блока b на заданных 99 °C, сразу затем 60 °C) — не смена потолка владельца:
+    // плитка переключается на значения нового потолка (средней там нет — блок не нагружен), прежние остаются в
+    // byCeiling (▲ 99 °C, что к срезу привела, и прежняя средняя); возврат показывает их на плитке снова.
+    let ceiling_b = ceilings_now(app).get(fb).copied().unwrap_or(0);
+    let block_b = index(fb);
+    let events_cut = events_today(data).len();
+    app.command(shell, AUTO_ON);
+    let force = |app: &mut App, t: Option<f64>| {
+        if let Some(sim) = app.sim() {
+            for &m in &b.members {
+                sim.forced[m] = t;
+            }
+        }
+    };
+    force(app, Some(99.0));
+    let started = Instant::now();
+    while Instant::now() < started + Duration::from_secs(3) && ceilings_now(app).get(fb) == Some(&ceiling_b) {
+        pump(shell, app, Duration::from_millis(10));
+    }
+    force(app, Some(60.0));
+    let lowered = ceilings_now(app).get(fb).copied().unwrap_or(0);
+    next_state(shell, app, client);
+    let at_cut = next_state(shell, app, client);
+    let cut_line = events_after(data, events_cut, "emergency")
+        .into_iter()
+        .find(|v| v["block"] == b.name.as_str())
+        .unwrap_or(Value::Null);
+    r.check(
+        cut_line["from"] == ceiling_b
+            && cut_line["period"]["ceiling"] == ceiling_b
+            && cut_line["period"]["max"] == 99.0
+            && same(&cut_line["period"]["mean"], &before["avg"][fb])
+            && cut_line["conditions"]["reading"] == 99.0
+            && cut_line["conditions"].get("busy").is_some(),
+        &format!("журнал событий: срез — строка emergency с итогом блока на покидаемом ×{ceiling_b}: {cut_line}"),
+    );
+    let listed = at_cut["byCeiling"][block_b].as_array().cloned().unwrap_or_default();
+    let old = listed
+        .iter()
+        .find(|e| e["ceiling"] == ceiling_b)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let new = listed
+        .iter()
+        .find(|e| e["ceiling"] == lowered)
+        .cloned()
+        .unwrap_or(Value::Null);
+    force(app, None);
+    app.command(shell, AUTO_ON); // выключить: срез возвращается
+    let back = wait(shell, app, client, Duration::from_secs(3), |c| {
+        c.last("state").is_some_and(|s| s["avg"][fb] == before["avg"][fb])
+    });
+    let returned = client.last("state").cloned().unwrap_or(Value::Null);
+    r.check(
+        lowered < ceiling_b
+            && at_cut["avg"][fb].is_null()
+            && old["max"] == 99.0
+            && old["mean"] == before["avg"][fb]
+            && old["secs"].as_f64().is_some_and(|s| s > 0.0)
+            && new["ceiling"] == lowered
+            && new["mean"].is_null()
+            && back
+            && returned["max"][fb] == 99.0,
+        &format!(
+            "срез автомодуля блока {} ×{ceiling_b} → ×{lowered}: на плитке — значения ×{lowered} (ø {}), ×{ceiling_b} — в byCeiling ({old}); возврат — снова ø {}, ▲ {}",
+            b.name, at_cut["avg"][fb], returned["avg"][fb], returned["max"][fb]
+        ),
+    );
+
+    // «Сбросить максимумы»: средних нет, файл переписан тем же; в журнале событий — строка reset без блока.
+    let events_reset = events_today(data).len();
+    let (_, ok, _) = order(shell, app, client, "max.reset", &json!({}));
+    let resets = events_after(data, events_reset, "reset");
+    r.check(
+        resets.len() == 1
+            && resets[0].get("block").is_none()
+            && resets[0].get("period").is_none()
+            && resets[0]["time"].is_string(),
+        &format!("журнал событий: сброс — одна строка reset без блока и периода ({resets:?})"),
+    );
+    let file: Value =
+        serde_json::from_str(&fs::read_to_string(data.join("maxima.json")).unwrap_or_default()).unwrap_or(Value::Null);
+    let cleared = file["blocks"].as_array().is_some_and(|blocks| {
+        !blocks.is_empty()
+            && blocks.iter().all(|block| {
+                block["byCeiling"]
+                    .as_array()
+                    .is_some_and(|list| list.iter().all(|e| e["secs"] == 0.0 && e["run"] == 0.0))
+            })
+    });
+    r.check(
+        ok && cleared,
+        "max.reset: средние сброшены и в data\\maxima.json (ни у одного блока нет секунд в средней)",
+    );
+}
+
 /// Читает ли окно на Rust это состояние: поля и их виды — как в rust/window/src/wire.rs (State, Fans). Без поля
 /// окно не разберёт сообщение и покажет «сообщение движка не разобралось».
 fn window_reads_state(state: &Value, cores: usize) -> Result<(), String> {
@@ -261,8 +469,8 @@ fn window_reads_hello(hello: &Value) -> Result<(), String> {
     )
 }
 
-/// 12m (см. run). Горячий блок — с самым высоким потолком: корпус имитации близко к пределу 75 °C, условие журнала
-/// выполнено без доли работы по Windows. Регулятор на настоящих сроках за несколько секунд ничего не решает.
+/// 12m (см. run). Горячий блок — с самым высоким потолком. Автомодуль включён — опрос срезов идёт всегда (бриф T), без
+/// доли работы по Windows; строк журнала при этом нет (процессор не занят), опрос тот же.
 fn logging_with_window(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client) {
     let cores = u64::try_from(app.topology().cores.len()).unwrap_or(0);
     let now = ceilings_now(app);
@@ -360,11 +568,13 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
     r.check(
         auto["on"] == false
             && auto["limit"].is_i64()
-            && auto["stepUp"].is_boolean()
+            && auto["emergency"].as_i64().is_some_and(|e| auto["limit"].as_i64().is_some_and(|l| e > l))
             && auto["limitRange"] == json!([60, 95])
+            && auto["emergencyRange"] == json!([auto["limit"].as_i64().unwrap_or(0) + 1, 100])
+            && auto.get("stepUp").is_none()
             && auto.get("depth").is_none()
             && auto.get("depthRange").is_none(),
-        &format!("settings при знакомстве (глубины нет): {auto}"),
+        &format!("settings при знакомстве (аварийная отсечка выше целевой, её промежуток — до 100 °C; глубины и подтягивания нет): {auto}"),
     );
     r.check(
         settings["log"] == json!({ "on": true }),
@@ -380,6 +590,10 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
         json!({ "limit": 96 }),
         json!({ "limit": 85.5 }),
         json!({ "depth": 4 }),
+        json!({ "stepUp": true }),
+        json!({ "emergency": 101 }),
+        json!({ "limit": 80, "emergency": 80 }),
+        json!({ "emergency": "95" }),
         json!({ "on": true, "limit": 59 }),
         json!({ "limt": 80 }),
         json!({}),
@@ -415,8 +629,29 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
             topic["auto"], on["autoLimit"]
         ),
     );
+    // Аварийная отсечка (бриф T): {emergency} — в тему settings и tray.json; целевая, поднятая до аварийной, поднимает
+    // аварийную на градус выше себя.
+    let (_, ok_e, why_e) = order(shell, app, client, "auto.set", &json!({ "emergency": 92 }));
+    let topic_e = client.last("settings").cloned().unwrap_or(Value::Null);
+    let written_e = fs::read_to_string(&file).unwrap_or_default();
+    let (_, ok_l, _) = order(shell, app, client, "auto.set", &json!({ "limit": 92 }));
+    let topic_l = client.last("settings").cloned().unwrap_or(Value::Null);
+    r.check(
+        ok_e && topic_e["auto"]["emergency"] == json!(92)
+            && topic_e["auto"]["emergencyRange"] == json!([78, 100])
+            && written_e.contains("\"emergency\":92")
+            && ok_l
+            && topic_l["auto"]["limit"] == json!(92)
+            && topic_l["auto"]["emergency"] == json!(93)
+            && app.auto_choice().emergency == 93,
+        &format!(
+            "auto.set {{emergency: 92}}: принято {why_e}, тема {}, tray.json {written_e}; целевая 92 подняла аварийную: {}",
+            topic_e["auto"], topic_l["auto"]
+        ),
+    );
+    let (_, ok_b, _) = order(shell, app, client, "auto.set", &json!({ "limit": 77, "emergency": 95 }));
     let (id, ok, _) = order(shell, app, client, "auto.set", &json!({ "on": false }));
-    let off_again = client.state_after(id).is_some_and(|s| s["autoLimit"].is_null());
+    let off_again = ok_b && client.state_after(id).is_some_and(|s| s["autoLimit"].is_null());
     r.check(
         off && ok && off_again,
         "отсечка автомодуля в состоянии: выключен — null, включён на 77 °C — 77, выключен снова — null",
@@ -477,7 +712,8 @@ fn log_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut C
 }
 
 /// Что настоящее окно делает в своей проверке настроек (rust/window/src/check.rs, `settings`): включает автомодуль,
-/// тянет ползунок отсечки до 88 °C, включает подтягивание, выключает автомодуль — четыре жеста (глубины нет, #38).
+/// тянет ползунок целевой отсечки до 88 °C, меняет аварийную, выключает автомодуль — четыре жеста (глубины и
+/// подтягивания нет, #38, бриф T). Проход окна ведёт агент окна (бриф W): если в нём другие жесты, эти числа — за ним.
 const WINDOW_LIMIT: i32 = 88;
 const WINDOW_GESTURES: usize = 4;
 /// Щелчков по «запись» в той же проверке окна: выключить и включить журнал срезов.
@@ -600,14 +836,15 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     );
     let after = app.auto_choice();
     let written = fs::read_to_string(data.join("tray.json")).unwrap_or_default();
+    // Аварийную окно ставит своим жестом: её значение — дело прохода окна; здесь — что она выше целевой и записана.
     let want = Choice {
         on: false,
         limit: WINDOW_LIMIT,
-        step_up: true,
+        emergency: after.emergency,
         log: true,
     };
     r.check(
-        after == want && written == want.file_text(),
+        after == want && after.emergency > WINDOW_LIMIT && written == want.file_text(),
         &format!("выбор из окна дошёл до программы входа: {after:?}; tray.json {written}"),
     );
     let gestures = logged(app, "автомодуль (окно)") - lines;
@@ -663,13 +900,37 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     // Прежний выбор: следующие шаги проверки рассчитаны на него.
     let mut back = serde_json::Map::new();
     back.insert("limit".into(), json!(before.limit));
-    back.insert("stepUp".into(), json!(before.step_up));
+    back.insert("emergency".into(), json!(before.emergency));
     back.insert("on".into(), json!(before.on));
     let refused = app.set_auto(shell, &back);
     r.check(
         refused.is_none(),
         &format!("прежний выбор автомодуля возвращён {refused:?}"),
     );
+}
+
+/// Строки сегодняшнего журнала событий (data\events\<день>.jsonl) по порядку; испорченные пропускаются.
+fn events_today(data: &Path) -> Vec<Value> {
+    let day = machine::clock::Stamp::now().local(machine::clock::Pattern::Date);
+    fs::read_to_string(data.join("events").join(format!("{day}.jsonl")))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Одно и то же число, как бы оно ни было записано (73 и 73.0 — одно; null — ни с чем).
+fn same(a: &Value, b: &Value) -> bool {
+    a.as_f64().is_some_and(|x| b.as_f64() == Some(x))
+}
+
+/// Строки журнала событий после первых `from` с этим `kind`.
+fn events_after(data: &Path, from: usize, kind: &str) -> Vec<Value> {
+    events_today(data)
+        .into_iter()
+        .skip(from)
+        .filter(|v| v["kind"] == kind)
+        .collect()
 }
 
 /// Строки data\profile-log.jsonl по порядку (испорченные пропускаются).
@@ -703,6 +964,33 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
         app.reads() == reads_before,
         "без окна датчики не читаются: автомодуль выключен, процессор не занят — опрос раз в 2 с их не трогает (канал ждёт окно)",
     );
+
+    // 12'. Окна нет, журнал срезов включён, процессор занят: опрос срезов читает блоки, и горячее показание поднимает
+    //      наибольшую плитки — окно, подключившись, её видит (владелец 16.10: плитки копят, пока он играет без окна).
+    //      Автомодуль выключен: 97 °C никто не срезает.
+    let unseen = app.topology().blocks[3].clone();
+    let warm_all = |app: &mut App, hot: Option<f64>, load: f64| {
+        if let Some(sim) = app.sim() {
+            sim.load.fill(load);
+            for &m in &unseen.members {
+                sim.forced[m] = hot;
+            }
+        }
+    };
+    warm_all(app, None, 0.15);
+    let polled = {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !app.logging().rows {
+            pump(shell, app, Duration::from_millis(50));
+        }
+        app.logging().rows
+    };
+    let events_before = events_today(data).len();
+    warm_all(app, Some(97.0), 0.15);
+    pump(shell, app, Duration::from_millis(500));
+    warm_all(app, None, 0.0);
+    let events_after_max = events_today(data).len();
+    let attached_before = app.serving().attached();
 
     // 12a. Знакомство: ответ, hello, limits, profiles, потом состояния.
     let mut client = Client::hello(&pipe);
@@ -760,6 +1048,17 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
         &format!("состояние: {count} за {seconds:.1} с (дважды в секунду)"),
     );
     let state = client.last("state").cloned().unwrap_or(Value::Null);
+    r.check(
+        events_after_max == events_before,
+        "журнал событий: новый максимум строки не пишет (только итог потолка при его смене)",
+    );
+    r.check(
+        polled && !attached_before && state["max"][unseen.first] == 97.0,
+        &format!(
+            "без окна (журнал включён, процессор занят) показание 97 °C блока {} подняло ▲ плитки — окно, подключившись, видит {}",
+            unseen.name, state["max"][unseen.first]
+        ),
+    );
     match window_reads_state(&state, cores) {
         Ok(()) => r.check(true, "состояние — в том виде, что читает окно на Rust (wire.rs)"),
         Err(field) => r.check(false, &format!("состояние: окно не прочтёт поле {field}")),
@@ -824,6 +1123,9 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             sim.load[m] = 0.0;
         }
     }
+
+    // 12c'. Наибольшие и средние — до сброса владельцем: переживают перезапуск, сбрасываются сменой его потолка блока.
+    maxima(r, app, shell, &mut client, data);
 
     // 12m. Журнал срезов на настоящих сроках, пока окно открыто: опрос срезов читает все ядра (окну они нужны) — и это
     //      единственное чтение: чтений ядер ровно «опросов × ядер», окно раз в полсекунды и автомодуль раз в 2 с сами
@@ -1423,6 +1725,29 @@ pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path,
     pump_until(shell, app, Duration::from_secs(15), |a| a.serving().attached());
     let attached = app.serving().attached();
     let before = window_size(&file);
+    // Поправка автомодуля перед «Выходом»: блок срезан аварийной отсечкой на заданных 99 °C — выход возвращает ему
+    // принятый и пишет строку putback (reason exit) с итогом на покидаемом потолке.
+    let cut = app.topology().blocks[0].clone();
+    let base = ceilings_now(app).get(cut.first).copied().unwrap_or(0);
+    if !app.auto_choice().on {
+        app.command(shell, AUTO_ON);
+    }
+    let force = |app: &mut App, t: Option<f64>| {
+        if let Some(sim) = app.sim() {
+            for &m in &cut.members {
+                sim.forced[m] = t;
+            }
+        }
+    };
+    force(app, Some(99.0));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && ceilings_now(app).get(cut.first) == Some(&base) {
+        pump(shell, app, Duration::from_millis(10));
+    }
+    force(app, None);
+    pump(shell, app, Duration::from_millis(100));
+    let lowered = ceilings_now(app).get(cut.first).copied().unwrap_or(0);
+    let events_from = events_today(data).len();
     let asked = Instant::now();
     app.command(shell, EXIT_ID);
     let code = wait_exit(shell, app, &mut child, LEAVE_WITHIN + Duration::from_secs(5));
@@ -1442,6 +1767,24 @@ pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path,
     r.check(
         left.is_some() && logged(app, "выход: окно закрылось через") == 1 && logged(app, "окно не закрылось") == 0,
         &format!("CoreMapTray вышел после окна, через {left:?} мс после «Выход»"),
+    );
+    let exits: Vec<Value> = events_after(data, events_from, "putback")
+        .into_iter()
+        .filter(|v| v["block"] == cut.name.as_str())
+        .collect();
+    let line = exits.first().cloned().unwrap_or(Value::Null);
+    r.check(
+        lowered < base
+            && exits.len() == 1
+            && line["reason"] == "exit"
+            && line["from"] == lowered
+            && line["to"] == base
+            && line["period"]["ceiling"] == lowered
+            && ceilings_now(app).get(cut.first) == Some(&base),
+        &format!(
+            "журнал событий: «Выход» вернул срезанному блоку {} ×{lowered} → ×{base} — строка putback (reason exit): {line}",
+            cut.name
+        ),
     );
     let want = WINDOW_LEFT_SIZE.map(f64::from).to_vec();
     r.check(

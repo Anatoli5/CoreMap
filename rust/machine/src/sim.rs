@@ -23,6 +23,9 @@ pub struct SimCpu {
     pub load: Vec<f64>,
     /// Счётчик энергии корпуса не читается (проверка пути, где мощность корпуса не прочиталась).
     pub power_refused: bool,
+    /// Температура ядра, заданная проверкой, °C; None — по нагреву имитации. Нагрев имитации мгновенный и стоит на
+    /// месте, а правилам отсечек нужны падающая медиана, одно горячее показание и уровень кристалла (бриф T).
+    pub forced: Vec<Option<f64>>,
 }
 
 impl SimCpu {
@@ -52,6 +55,7 @@ impl SimCpu {
             reads: 0,
             load: vec![0.0; topology.cores.len()],
             power_refused: false,
+            forced: vec![None; topology.cores.len()],
         }
     }
 
@@ -117,7 +121,7 @@ impl Thermal for SimCpu {
         let load = self.load[core];
         let ceiling = self.current[core];
         Ok(Reading {
-            temp: Some(heat(load, ceiling)),
+            temp: Some(self.forced[core].unwrap_or_else(|| heat(load, ceiling))),
             busy: Some(load),
             ratio: (load >= 0.05).then_some(f64::from(ceiling)),
         })

@@ -1,26 +1,26 @@
-// Показания ядер, когда их читает один опрос, а берут трое: журнал срезов (раз в 0,25 с, app/sense.rs), окно (раз в
-// полсекунды) и автомодуль (раз в 2 с).
+// Показания ядер, когда их читает один опрос, а берут несколько: регулятор и журнал срезов (раз в 0,25 с,
+// app/sense.rs), окно (раз в полсекунды) и наибольшие и средние плиток.
 //
 // Доля работы и фактический множитель — по приращениям счётчиков ядра между двумя чтениями (machine::thermal), и
-// счётчики у ядра одни. Если бы автомодуль читал ядро сам, пока его читает опрос срезов или окно, его показание
-// покрывало бы не 2 с, а то, что осталось с последнего чужого чтения (доли секунды). Поэтому каждое чтение ядра идёт
-// сюда (`Meter::record`), а автомодуль забирает сумму за всё время со своего прошлого раза (`Meter::drain`): доля
-// работы — среднее по времени, множитель — среднее по времени работы. Это ровно то, что дало бы одно чтение через 2 с:
-// приращения счётчиков складываются. Никто больше не читает — автомодуль читает сам, и сумма состоит из одного его
-// чтения, как раньше. Последнее показание каждого ядра (`Meter::latest`) — строка среза; последняя температура корпуса
-// (`Meter::package_within`) — автомодулю, чтобы не читать её второй раз.
+// счётчики у ядра одни. Последнее показание каждого ядра (`Meter::latest`) — показание опроса срезов: его берут
+// регулятор автомодуля и строка среза. Каждое чтение идёт ещё в `Kept` — наибольшие и средние под нагрузкой плиток, по
+// блоку и потолку, — и, если окно подключено, в `Watch` (app/sense.rs, `record`): одно чтение — один раз каждому.
 //
-// `Watch` — что видит окно. Так же, как автомодуль, окно складывает каждое чтение ядра в свою сумму и забирает её в
-// своём опросе раз в полсекунды (`Watch::polled`): доля работы и множитель в состоянии окна и в средней под нагрузкой —
-// за полсекунды с прошлого опроса окна, кто бы ни читал ядро в это время. Прежде, пока шёл журнал срезов, окно брало
-// последнее показание за 0,25 с — каждое второе, а после начала журнала порой одно и то же дважды (ревизия 15.10,
-// п. 1). Наибольшая температура — по каждому чтению сразу: пик между опросами окна не теряется. Средняя под
-// нагрузкой — правило Core.Average в C#-части (ниже).
+// `Watch` — что видит окно из своего опроса раз в полсекунды: доля работы и множитель — за полсекунды с прошлого
+// опроса окна, кто бы ни читал ядро в это время (ревизия 15.10, п. 1). `Kept` копит из всех чтений, открыто окно или
+// нет, и переживает перезапуск программы (владелец 16.10).
 
 use std::time::{Duration, Instant};
 
-use machine::auto::BUSY;
+use machine::clock::Stamp;
 use machine::thermal::Reading;
+use machine::topology::Block;
+use serde_json::{Map, Value, json};
+
+/// С какой доли работы ядро «нагружено» для окна: признак нагрузки в состоянии и средняя под нагрузкой. Это не правило
+/// автомодуля (у его отсечек условий нагрузки нет, бриф T): нагрузку теперь даёт игра, а не кнопки программы, и
+/// «нагружено» — ядро работает хотя бы половину времени (прежде это число было и у автомодуля).
+pub const BUSY: f64 = 0.5;
 
 /// Сумма показаний одного ядра со времени, когда её забрали в прошлый раз.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -56,21 +56,11 @@ impl Sum {
     }
 }
 
-/// Температура корпуса из опроса: когда прочитана и что дала (None — датчик не дал действительного показания).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PackageRead {
-    pub value: Option<f64>,
-    pub at: Instant,
-}
-
-/// Чтения ядер и их суммы для автомодуля.
+/// Чтения ядер: когда каждое ядро прочитано последний раз и что дало.
 #[derive(Debug, Clone)]
 pub struct Meter {
     last: Vec<Option<Instant>>,
     latest: Vec<Reading>,
-    sums: Vec<Sum>,
-    /// Последняя температура корпуса и когда она прочитана.
-    package: Option<PackageRead>,
     /// Сколько ядер прочитано всего — скрытая проверка видит, не читает ли программа без окна и не читает ли дважды.
     pub reads: u64,
 }
@@ -81,31 +71,19 @@ impl Meter {
         Self {
             last: vec![None; cores],
             latest: vec![Reading::default(); cores],
-            sums: vec![Sum::default(); cores],
-            package: None,
             reads: 0,
         }
     }
 
     /// Ядро прочитано в `at`: показание покрывает время с его прошлого чтения. Возвращает это время, секунды (None —
-    /// первое чтение: сравнивать не с чем); его же складывает окно (`Watch::core`).
+    /// первое чтение: сравнивать не с чем); его складывает окно (`Watch::core`).
     pub fn record(&mut self, core: usize, reading: Reading, at: Instant) -> Option<f64> {
         self.reads += 1;
-        let slot = self.sums.get_mut(core)?;
-        let since = self.last[core]
+        let slot = self.latest.get_mut(core)?;
+        *slot = reading;
+        self.last[core]
             .replace(at)
-            .map(|t| at.saturating_duration_since(t).as_secs_f64());
-        self.latest[core] = reading;
-        if let Some(seconds) = since {
-            slot.add(seconds, reading);
-        }
-        since
-    }
-
-    /// Было ли чтение ядра после прошлого `drain`.
-    #[must_use]
-    pub fn has(&self, core: usize) -> bool {
-        self.sums.get(core).is_some_and(|s| s.time > 0.0)
+            .map(|t| at.saturating_duration_since(t).as_secs_f64())
     }
 
     /// Последнее показание ядра как оно прочитано: доля работы и множитель — за промежуток до прошлого чтения.
@@ -113,151 +91,410 @@ impl Meter {
     pub fn latest(&self, core: usize) -> Reading {
         self.latest.get(core).copied().unwrap_or_default()
     }
+}
 
-    /// Корпус прочитан в `at`.
-    pub fn record_package(&mut self, value: Option<f64>, at: Instant) {
-        self.package = Some(PackageRead { value, at });
-    }
+/// Столько секунд подряд блок должен быть нагружен, прежде чем его показания идут в среднюю: он ещё греется
+/// (`AverageSkip` в Core.cs — 4 опроса окна по полсекунды, 2 с).
+const WARM_SECS: f64 = 2.0;
 
-    /// Температура корпуса, прочитанная не раньше чем `age` назад; None — такой нет (читать самому).
-    #[must_use]
-    pub fn package_within(&self, age: Duration) -> Option<PackageRead> {
-        self.package.filter(|read| read.at.elapsed() <= age)
-    }
+/// Наибольшая и средние под нагрузкой блока при одном потолке, который у него стоял (владелец 16.10: максимум,
+/// достигнутый на ×48, после среза автомодуля до ×47 — не про ×47). Средние — по времени: каждое показание весит
+/// промежуток, который оно покрывает (опрос срезов — 0,25 с, опрос окна — 0,5 с).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Entry {
+    ceiling: i32,
+    max: Option<f64>,
+    /// Когда наибольшая достигнута (мировое время, тики `Stamp`).
+    max_at: Option<i64>,
+    /// Σ температура × секунды и Σ секунды (в средней).
+    temp: f64,
+    secs: f64,
+    /// Σ множитель × доля работы × секунды и Σ доля работы × секунды (множитель — средний по времени работы).
+    ratio: f64,
+    run: f64,
+}
 
-    /// Показание ядра за всё время с прошлого раза (температура — последняя) и начать сумму заново.
-    pub fn drain(&mut self, core: usize) -> Reading {
-        let Some(sum) = self.sums.get_mut(core).map(std::mem::take) else {
-            return Reading::default();
-        };
-        let (busy, ratio) = sum.mean();
-        Reading {
-            temp: self.latest[core].temp,
-            busy,
-            ratio,
+impl Entry {
+    fn new(ceiling: i32) -> Self {
+        Self {
+            ceiling,
+            max: None,
+            max_at: None,
+            temp: 0.0,
+            secs: 0.0,
+            ratio: 0.0,
+            run: 0.0,
         }
     }
 
-    /// Суммы всех ядер — заново (автомодуль блоков не судил: старое не должно попасть в следующее показание).
-    pub fn forget(&mut self) {
-        self.sums.fill(Sum::default());
+    fn mean(&self) -> Option<f64> {
+        (self.secs > 0.0).then(|| self.temp / self.secs)
+    }
+
+    fn mean_ratio(&self) -> Option<f64> {
+        (self.run > 0.0).then(|| self.ratio / self.run)
     }
 }
 
-/// Столько опросов окна (по полсекунды) подряд ядро должно быть нагружено, прежде чем идти в среднюю: оно ещё греется
-/// (`AverageSkip` в Core.cs — 4 опроса, 2 с).
-const WARM: u32 = 4;
+/// Итог блока на одном потолке — для журнала событий (app/timeline.rs): потолок, секунды в средней, наибольшая и когда
+/// она достигнута, средняя.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Period {
+    pub ceiling: i32,
+    pub secs: f64,
+    pub max: Option<f64>,
+    pub max_at: Option<Stamp>,
+    pub mean: Option<f64>,
+}
 
-/// Средняя температура и средний фактический множитель ядра под его собственной нагрузкой (Core.Average в C#).
+/// Одна строка «по потолкам» блока для окна (поле byCeiling состояния).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AtCeiling {
+    pub ceiling: i32,
+    pub max: Option<f64>,
+    pub mean: Option<f64>,
+    pub secs: f64,
+}
+
+/// Наибольшие и средние под нагрузкой плиток — по блоку и по каждому потолку, который у него стоял с последнего сброса
+/// (владелец 16.10). Копятся из каждого показания, которое читает программа (`app/sense.rs`, `record`): опроса срезов,
+/// пока включён автомодуль или журнал, и опроса окна, — открыто окно или нет (владелец играет без окна). У блока
+/// копит его первое ядро: у кластера E-ядер датчик температуры общий, P-блок — само ядро; один владелец у каждого числа,
+/// и показание, которое приходит один раз, считается один раз. Оба выключателя выключены и окна нет — ничего не
+/// читается и ничего не копится.
 ///
-/// Правило C#: считается, только пока само ядро нагружено, и относится к одной комбинации — отсчёт заново, когда
-/// меняется набор нагруженных ядер, сила нагрузки или потолки; первые 2 с после этого не в счёт. Нагрузку тогда давали
-/// кнопки программы, и набор нагруженных ядер стоял минутами. Теперь нагружает игра (владелец 15.10), и «нагружено» —
-/// доля работы ядра не меньше `BUSY` (как у автомодуля); набор таких ядер в игре меняется каждые полсекунды, и отсчёт
-/// заново по нему не накопил бы ничего. Поэтому:
-/// - отсчёт заново — когда меняются потолки (средняя относится к одним потолкам) и по сбросу владельца;
-/// - каждое ядро идёт в среднюю, только пока само нагружено, и только после `WARM` опросов нагрузки подряд;
-/// - у ядра без нагрузки значение остаётся то, что было под его последней нагрузкой (как в C#).
+/// Поля плитки (`max`, `avg`, `avg_ratio`, по ядрам — всем ядрам блока одно) — значения потолка, который стоит сейчас (с
+/// поправкой автомодуля); прежние — списком `by_ceiling`. Срез и возврат автомодуля только переключают, какой потолок
+/// нынешний. Список блока сбрасывается, когда владелец меняет его потолок (профиль, плитка; `align`), и весь — кнопкой
+/// сброса. Средняя — правило Core.Average в C#: считается, только пока блок нагружен (доля работы не меньше `BUSY`), и
+/// только после `WARM_SECS` нагрузки подряд.
+///
+/// Всё это переживает перезапуск программы (владелец 16.10: «сохранять их пока я не нажму reset вручную»): data\maxima.json
+/// (`to_json`, `restore`; когда — app/serve.rs).
 #[derive(Debug, Clone)]
-struct Means {
-    key: Vec<i32>,
-    streak: Vec<u32>,
-    temp: Vec<(f64, u32)>,
-    ratio: Vec<(f64, u32)>,
+pub struct Kept {
+    /// По ядрам: номер блока, если ядро — первое ядро блока; его показания копятся.
+    first_of: Vec<Option<usize>>,
+    /// По блокам: первое ядро и все ядра (поля плитки — всем им).
+    firsts: Vec<usize>,
+    members: Vec<Vec<usize>>,
+    /// По блокам: потолок владельца, при котором копится список; None — ещё не известен.
+    owner: Vec<Option<i32>>,
+    /// По блокам: потолок, который стоит сейчас (с поправкой автомодуля); None — не известен, показания не копятся.
+    current: Vec<Option<i32>>,
+    /// По блокам: значения по потолкам, по убыванию потолка.
+    entries: Vec<Vec<Entry>>,
+    /// По блокам: сколько секунд подряд блок нагружен.
+    loaded_for: Vec<f64>,
+    pub pkg_max: Option<f64>,
+    /// Поля плитки по ядрам — значения нынешнего потолка их блока (обновляются при каждом изменении).
+    pub max: Vec<Option<f64>>,
     avg: Vec<Option<f64>>,
     avg_ratio: Vec<Option<f64>>,
+    /// С какого времени считаются (мировое время: переживает перезапуск).
+    since: Stamp,
+    /// Наибольшая выросла или блок сброшен: файл надо переписать.
+    changed: bool,
 }
 
-impl Means {
-    fn new(cores: usize) -> Self {
+impl Kept {
+    #[must_use]
+    pub fn new(blocks: &[Block], cores: usize) -> Self {
+        let mut first_of = vec![None; cores];
+        for (b, block) in blocks.iter().enumerate() {
+            if let Some(slot) = first_of.get_mut(block.first) {
+                *slot = Some(b);
+            }
+        }
         Self {
-            key: Vec::new(),
-            streak: vec![0; cores],
-            temp: vec![(0.0, 0); cores],
-            ratio: vec![(0.0, 0); cores],
+            first_of,
+            firsts: blocks.iter().map(|b| b.first).collect(),
+            members: blocks.iter().map(|b| b.members.clone()).collect(),
+            owner: vec![None; blocks.len()],
+            current: vec![None; blocks.len()],
+            entries: vec![Vec::new(); blocks.len()],
+            loaded_for: vec![0.0; blocks.len()],
+            pkg_max: None,
+            max: vec![None; cores],
             avg: vec![None; cores],
             avg_ratio: vec![None; cores],
+            since: Stamp::now(),
+            changed: false,
         }
     }
 
-    /// Отсчёт заново: суммы и счёт нагрузки подряд — с нуля; у нагруженных сейчас ядер прежней средней больше нет.
-    fn restart(&mut self, busy: &[Option<f64>]) {
-        self.streak.fill(0);
-        self.temp.fill((0.0, 0));
-        self.ratio.fill((0.0, 0));
-        for (i, b) in busy.iter().enumerate() {
-            if b.is_some_and(|b| b >= BUSY) {
-                self.avg[i] = None;
-                self.avg_ratio[i] = None;
+    /// Значения блока `b` при потолке `ceiling` — есть или новые (список держится по убыванию потолка).
+    fn entry(&mut self, b: usize, ceiling: i32) -> &mut Entry {
+        let list = &mut self.entries[b];
+        let at = match list.iter().position(|e| e.ceiling <= ceiling) {
+            Some(at) if list[at].ceiling == ceiling => at,
+            Some(at) => {
+                list.insert(at, Entry::new(ceiling));
+                at
             }
-        }
+            None => {
+                list.push(Entry::new(ceiling));
+                list.len() - 1
+            }
+        };
+        &mut list[at]
     }
 
-    /// Опрос окна при этих потолках. В счёт — только ядра, прочитанные с прошлого опроса (`fresh`): прежнее показание
-    /// второй раз не считается.
-    fn add(
-        &mut self,
-        ceilings: &[i32],
-        cur: &[Option<f64>],
-        ratio: &[Option<f64>],
-        busy: &[Option<f64>],
-        fresh: &[bool],
-    ) {
-        if self.key != ceilings {
-            ceilings.clone_into(&mut self.key);
-            self.restart(busy);
-        }
-        for i in 0..self.streak.len() {
-            if !fresh.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            if !busy.get(i).copied().flatten().is_some_and(|b| b >= BUSY) {
-                self.streak[i] = 0;
-                continue;
-            }
-            self.streak[i] += 1;
-            if self.streak[i] <= WARM {
-                continue;
-            }
-            if let Some(t) = cur.get(i).copied().flatten() {
-                let (sum, n) = &mut self.temp[i];
-                *sum += t;
-                *n += 1;
-                self.avg[i] = Some(*sum / f64::from(*n));
-            }
-            if let Some(r) = ratio.get(i).copied().flatten() {
-                let (sum, n) = &mut self.ratio[i];
-                *sum += r;
-                *n += 1;
-                self.avg_ratio[i] = Some(*sum / f64::from(*n));
+    /// Поля плитки ядер блока `b` — заново из значений нынешнего потолка.
+    fn show(&mut self, b: usize) {
+        let now = self.current[b]
+            .and_then(|c| self.entries[b].iter().find(|e| e.ceiling == c))
+            .copied();
+        for &m in &self.members[b] {
+            if m < self.max.len() {
+                self.max[m] = now.and_then(|e| e.max);
+                self.avg[m] = now.as_ref().and_then(Entry::mean);
+                self.avg_ratio[m] = now.as_ref().and_then(Entry::mean_ratio);
             }
         }
     }
 
-    /// Сброс владельцем («сбросить максимумы»): средних нет ни у кого, отсчёт заново (Core.ResetAverage).
-    fn reset(&mut self) {
-        self.key.clear();
-        self.avg.fill(None);
-        self.avg_ratio.fill(None);
-        self.streak.fill(0);
-        self.temp.fill((0.0, 0));
-        self.ratio.fill((0.0, 0));
+    /// Потолки сейчас, по ядрам: владельца (`intended`) и стоящие в процессоре (`current`, с поправкой автомодуля).
+    /// Блок, у которого потолок владельца другой, чем при накоплении, теряет весь список — владелец сменил ему потолок
+    /// (профиль, плитка, принятая чужая правка); не был известен — запоминается. Стоящий потолок выбирает, куда копить и
+    /// что на плитке. true — что-то сброшено.
+    pub fn align(&mut self, intended: &[i32], current: &[i32]) -> bool {
+        let mut dropped = false;
+        for b in 0..self.firsts.len() {
+            let first = self.firsts[b];
+            if let Some(now) = intended.get(first).copied() {
+                let was = self.owner[b].replace(now);
+                if was.is_some_and(|w| w != now) {
+                    self.entries[b].clear();
+                    self.loaded_for[b] = 0.0;
+                    dropped = true;
+                }
+            }
+            self.current[b] = current.get(first).copied();
+            self.show(b);
+        }
+        self.changed |= dropped;
+        dropped
+    }
+
+    /// Показание ядра (`seconds` — промежуток, который оно покрывает, `Meter::record`): у первого ядра блока — в
+    /// значения нынешнего потолка блока; у остальных ядер — ничего (их блок копит первое).
+    pub fn read(&mut self, core: usize, reading: Reading, seconds: Option<f64>) {
+        let Some(b) = self.first_of.get(core).copied().flatten() else {
+            return;
+        };
+        let Some(ceiling) = self.current[b] else {
+            return;
+        };
+        if let Some(t) = reading.temp {
+            let entry = self.entry(b, ceiling);
+            if entry.max.is_none_or(|m| t > m) {
+                entry.max = Some(t);
+                entry.max_at = Some(Stamp::now().0);
+                self.changed = true;
+                self.show(b);
+            }
+        }
+        let (Some(dt), Some(busy)) = (seconds, reading.busy) else {
+            return;
+        };
+        if busy < BUSY {
+            self.loaded_for[b] = 0.0;
+            return;
+        }
+        let warmed = self.loaded_for[b] >= WARM_SECS;
+        self.loaded_for[b] += dt;
+        if !warmed {
+            return;
+        }
+        let entry = self.entry(b, ceiling);
+        if let Some(t) = reading.temp {
+            entry.temp += t * dt;
+            entry.secs += dt;
+        }
+        if let Some(r) = reading.ratio {
+            entry.ratio += r * busy * dt;
+            entry.run += busy * dt;
+        }
+        self.show(b);
+    }
+
+    /// Корпус прочитан: наибольшая корпуса.
+    pub fn package(&mut self, pkg: Option<f64>) {
+        if let Some(p) = pkg
+            && self.pkg_max.is_none_or(|m| p > m)
+        {
+            self.pkg_max = Some(p);
+            self.changed = true;
+        }
+    }
+
+    /// «Сбросить максимумы»: списки — пустые, наибольшие нынешних потолков — с последних показаний (`latest`, по первому
+    /// ядру блока), наибольшая корпуса — со следующего чтения, средние — заново (Monitor.ResetMax и Core.ResetAverage).
+    pub fn reset(&mut self, latest: impl Fn(usize) -> Option<f64>) {
+        for b in 0..self.firsts.len() {
+            self.entries[b].clear();
+            self.loaded_for[b] = 0.0;
+            if let (Some(ceiling), Some(t)) = (self.current[b], latest(self.firsts[b])) {
+                let entry = self.entry(b, ceiling);
+                entry.max = Some(t);
+                entry.max_at = Some(Stamp::now().0);
+            }
+            self.show(b);
+        }
+        self.pkg_max = None;
+        self.since = Stamp::now();
+        self.changed = true;
+    }
+
+    /// Секунд с последнего сброса (поле «since» состояния окна).
+    #[must_use]
+    pub fn since_secs(&self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "100-ns ticks of a span of days: far inside f64's exact range"
+        )]
+        let ticks = Stamp::now().0.saturating_sub(self.since.0).max(0) as f64;
+        ticks / 1e7
+    }
+
+    /// Надо ли переписать файл, — и с этого момента не надо (вызывающий его пишет).
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    #[must_use]
+    pub fn avg(&self) -> &[Option<f64>] {
+        &self.avg
+    }
+
+    #[must_use]
+    pub fn avg_ratio(&self) -> &[Option<f64>] {
+        &self.avg_ratio
+    }
+
+    /// Итог блока `block` на потолке `ceiling` — что он там накопил с последнего сброса (пусто — ничего).
+    #[must_use]
+    pub fn period(&self, block: usize, ceiling: i32) -> Period {
+        let entry = self
+            .entries
+            .get(block)
+            .and_then(|list| list.iter().find(|e| e.ceiling == ceiling));
+        Period {
+            ceiling,
+            secs: entry.map_or(0.0, |e| e.secs),
+            max: entry.and_then(|e| e.max),
+            max_at: entry.and_then(|e| e.max_at).map(Stamp),
+            mean: entry.and_then(Entry::mean),
+        }
+    }
+
+    /// Значения блока по потолкам, по убыванию потолка (подсказка плитки в окне).
+    pub fn by_ceiling(&self, block: usize) -> impl Iterator<Item = AtCeiling> + '_ {
+        self.entries.get(block).into_iter().flatten().map(|e| AtCeiling {
+            ceiling: e.ceiling,
+            max: e.max,
+            mean: e.mean(),
+            secs: e.secs,
+        })
+    }
+
+    /// Текст data\maxima.json: процессор и раскладка (чужой файл не берётся), с какого времени, наибольшая корпуса, по
+    /// блокам — первое ядро, потолок владельца, при котором копилось, и значения по потолкам: наибольшая и суммы
+    /// средних — чтобы средние копились и после перезапуска.
+    #[must_use]
+    pub fn to_json(&self, cpu: &str, lps: &[u32]) -> String {
+        let blocks: Vec<Value> = (0..self.firsts.len())
+            .map(|b| {
+                let list: Vec<Value> = self.entries[b]
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "ceiling": e.ceiling, "max": e.max, "maxAt": e.max_at, "temp": e.temp, "secs": e.secs,
+                            "ratio": e.ratio, "run": e.run,
+                        })
+                    })
+                    .collect();
+                json!({ "first": self.firsts[b], "owner": self.owner[b], "byCeiling": list })
+            })
+            .collect();
+        json!({ "cpu": cpu, "lps": lps, "since": self.since.0, "pkgMax": self.pkg_max, "blocks": blocks }).to_string()
+    }
+
+    /// Наибольшие и средние из data\maxima.json. Файл другого процессора, другой раскладки или с другими блоками не
+    /// берётся (false); негодная запись — без неё. Отбор по потолкам владельца — `align` после.
+    pub fn restore(&mut self, map: &Map<String, Value>, cpu: &str, lps: &[u32]) -> bool {
+        let same_lps = map.get("lps").and_then(Value::as_array).is_some_and(|a| {
+            a.len() == lps.len() && a.iter().zip(lps).all(|(v, &lp)| v.as_u64() == Some(u64::from(lp)))
+        });
+        let blocks = map.get("blocks").and_then(Value::as_array);
+        let same_blocks = blocks.is_some_and(|list| {
+            list.len() == self.firsts.len()
+                && list
+                    .iter()
+                    .zip(&self.firsts)
+                    .all(|(v, &first)| v.get("first").and_then(Value::as_u64) == u64::try_from(first).ok())
+        });
+        let (Some(blocks), true, true) = (blocks, same_blocks, same_lps) else {
+            return false;
+        };
+        if map.get("cpu").and_then(Value::as_str) != Some(cpu) {
+            return false;
+        }
+        if let Some(since) = map.get("since").and_then(Value::as_i64) {
+            self.since = Stamp(since);
+        }
+        self.pkg_max = map.get("pkgMax").and_then(Value::as_f64);
+        let number = |e: &Value, name: &str| e.get(name).and_then(Value::as_f64);
+        for (b, block) in blocks.iter().enumerate() {
+            let Some(owner) = block
+                .get("owner")
+                .and_then(Value::as_i64)
+                .and_then(|c| i32::try_from(c).ok())
+            else {
+                continue;
+            };
+            self.owner[b] = Some(owner);
+            for e in block.get("byCeiling").and_then(Value::as_array).into_iter().flatten() {
+                let ceiling = e
+                    .get("ceiling")
+                    .and_then(Value::as_i64)
+                    .and_then(|c| i32::try_from(c).ok());
+                let (Some(ceiling), Some(temp), Some(secs), Some(ratio), Some(run)) = (
+                    ceiling,
+                    number(e, "temp"),
+                    number(e, "secs"),
+                    number(e, "ratio"),
+                    number(e, "run"),
+                ) else {
+                    continue;
+                };
+                let entry = self.entry(b, ceiling);
+                *entry = Entry {
+                    ceiling,
+                    max: number(e, "max"),
+                    max_at: e.get("maxAt").and_then(Value::as_i64),
+                    temp,
+                    secs,
+                    ratio,
+                    run,
+                };
+            }
+            self.show(b);
+        }
+        true
     }
 }
 
-/// Что видит окно: показания ядер на прошлый опрос окна (температура — последняя, доля работы и множитель — за время
-/// от позапрошлого опроса), корпус, наибольшие с последнего сброса, средние под нагрузкой.
+/// Что видит окно из последнего опроса окна: показания ядер (температура — последняя, доля работы и множитель — за
+/// время от позапрошлого опроса) и корпус. Наибольшие и средние — не здесь, а в `Kept`: они копятся и без окна.
 #[derive(Debug, Clone)]
 pub struct Watch {
     pub cur: Vec<Option<f64>>,
-    pub max: Vec<Option<f64>>,
     pub ratio: Vec<Option<f64>>,
     pub busy: Vec<Option<f64>>,
     pub pkg: Option<f64>,
-    pub pkg_max: Option<f64>,
-    /// С какого времени считаются наибольшие и средние.
-    pub since: Instant,
-    /// Сколько опросов окна дошло до средних под нагрузкой (скрытая проверка: каждое чтение — в одном опросе).
+    /// Сколько опросов окна было (скрытая проверка: каждое чтение — в одном опросе).
     pub polls: u64,
     /// Когда был прошлый опрос окна; None — ещё не было.
     polled_at: Option<Instant>,
@@ -265,7 +502,6 @@ pub struct Watch {
     temp: Vec<Option<f64>>,
     sums: Vec<Sum>,
     fresh: Vec<bool>,
-    means: Means,
 }
 
 impl Watch {
@@ -273,29 +509,33 @@ impl Watch {
     pub fn new(cores: usize) -> Self {
         Self {
             cur: vec![None; cores],
-            max: vec![None; cores],
             ratio: vec![None; cores],
             busy: vec![None; cores],
             pkg: None,
-            pkg_max: None,
-            since: Instant::now(),
             polls: 0,
             polled_at: None,
             temp: vec![None; cores],
             sums: vec![Sum::default(); cores],
             fresh: vec![false; cores],
-            means: Means::new(cores),
         }
     }
 
-    /// Ядро прочитано (`seconds` — время с его прошлого чтения, `Meter::record`): наибольшая — сразу, остальное — в
-    /// опрос окна.
+    /// Подключилось новое окно: показаний прежнего опроса окна у него нет.
+    pub fn new_session(&mut self) {
+        self.cur.fill(None);
+        self.ratio.fill(None);
+        self.busy.fill(None);
+        self.pkg = None;
+        self.polled_at = None;
+        self.temp.fill(None);
+        self.sums.fill(Sum::default());
+        self.fresh.fill(false);
+    }
+
+    /// Ядро прочитано (`seconds` — время с его прошлого чтения, `Meter::record`): в опрос окна.
     pub fn core(&mut self, core: usize, reading: Reading, seconds: Option<f64>) {
         if core >= self.cur.len() {
             return;
-        }
-        if let Some(t) = reading.temp {
-            self.max[core] = Some(self.max[core].map_or(t, |m| m.max(t)));
         }
         self.temp[core] = reading.temp;
         if let Some(seconds) = seconds {
@@ -306,9 +546,6 @@ impl Watch {
 
     pub fn package(&mut self, pkg: Option<f64>) {
         self.pkg = pkg;
-        if let Some(p) = pkg {
-            self.pkg_max = Some(self.pkg_max.map_or(p, |m| m.max(p)));
-        }
     }
 
     /// Пора ли опросу окна: прошлый был не ближе `min` (или его не было).
@@ -317,10 +554,9 @@ impl Watch {
         self.polled_at.is_none_or(|t| now.saturating_duration_since(t) >= min)
     }
 
-    /// Опрос окна в `now` при этих потолках: у ядер, прочитанных с прошлого, — последняя температура, доля работы и
-    /// множитель за всё время с него; затем средние под нагрузкой. С прошлого опроса ничего не прочитано — ничего не
-    /// меняется.
-    pub fn polled(&mut self, ceilings: &[i32], now: Instant) {
+    /// Опрос окна в `now`: у ядер, прочитанных с прошлого, — последняя температура, доля работы и множитель за всё
+    /// время с него. С прошлого опроса ничего не прочитано — ничего не меняется.
+    pub fn polled(&mut self, now: Instant) {
         if !self.fresh.contains(&true) {
             return;
         }
@@ -333,37 +569,17 @@ impl Watch {
             self.busy[i] = busy;
             self.ratio[i] = ratio;
         }
-        self.means
-            .add(ceilings, &self.cur, &self.ratio, &self.busy, &self.fresh);
         self.fresh.fill(false);
         self.polls += 1;
         self.polled_at = Some(now);
     }
 
-    /// Датчики не читались (держит другая часть `CoreMap` или ошибка): показаний нет, наибольшие и средние остаются.
+    /// Датчики не читались (держит другая часть `CoreMap` или ошибка): показаний нет.
     pub fn blank(&mut self) {
         self.cur.fill(None);
         self.ratio.fill(None);
         self.busy.fill(None);
         self.pkg = None;
-    }
-
-    /// «Сбросить максимумы»: наибольшие — с нынешних, средние — заново (Monitor.ResetMax и Core.ResetAverage).
-    pub fn reset(&mut self) {
-        self.max.clone_from(&self.cur);
-        self.pkg_max = self.pkg;
-        self.since = Instant::now();
-        self.means.reset();
-    }
-
-    #[must_use]
-    pub fn avg(&self) -> &[Option<f64>] {
-        &self.means.avg
-    }
-
-    #[must_use]
-    pub fn avg_ratio(&self) -> &[Option<f64>] {
-        &self.means.avg_ratio
     }
 }
 
@@ -380,151 +596,51 @@ mod tests {
     }
 
     #[test]
-    fn drain_equals_one_long_read() {
-        // Four half-second reads: busy 1, 0, 1, 0 and ratio 50 / none / 40 / none. One read over the same 2 s
-        // would see busy 0.5 and the ratio averaged over the running time: (50 + 40) / 2 = 45.
+    fn a_read_covers_the_time_since_the_last_one_and_stays_as_the_latest() {
         let mut meter = Meter::new(1);
         let t0 = Instant::now();
-        meter.record(0, Reading::default(), t0);
-        meter.record(0, reading(70.0, 1.0, Some(50.0)), t0 + Duration::from_millis(500));
-        meter.record(0, reading(68.0, 0.0, None), t0 + Duration::from_millis(1000));
-        meter.record(0, reading(72.0, 1.0, Some(40.0)), t0 + Duration::from_millis(1500));
-        meter.record(0, reading(66.0, 0.0, None), t0 + Duration::from_millis(2000));
-        let r = meter.drain(0);
-        assert!((r.busy.unwrap_or(f64::NAN) - 0.5).abs() < 1e-9);
-        assert!((r.ratio.unwrap_or(f64::NAN) - 45.0).abs() < 1e-9);
-        assert_eq!(r.temp, Some(66.0), "temperature is the latest, not a mean");
-        assert!(!meter.has(0), "a drain starts the sum afresh");
-        assert_eq!(meter.drain(0).busy, None);
-    }
-
-    #[test]
-    fn the_row_takes_the_last_interval_and_the_auto_module_the_sum() {
-        // Two reads 0.25 s apart: the samples row shows the second read as it is (its own interval), the auto module's
-        // drain sums both intervals — one does not disturb the other.
-        let mut meter = Meter::new(1);
-        let t0 = Instant::now();
-        meter.record(0, Reading::default(), t0);
-        meter.record(0, reading(70.0, 1.0, Some(50.0)), t0 + Duration::from_millis(250));
-        meter.record(0, reading(72.0, 0.2, Some(44.0)), t0 + Duration::from_millis(500));
-        assert_eq!(meter.latest(0), reading(72.0, 0.2, Some(44.0)));
-        let sum = meter.drain(0);
-        assert!((sum.busy.unwrap_or(f64::NAN) - 0.6).abs() < 1e-9, "{sum:?}");
         assert_eq!(
-            meter.latest(0),
-            reading(72.0, 0.2, Some(44.0)),
-            "a drain leaves the latest read"
+            meter.record(0, Reading::default(), t0),
+            None,
+            "the first read has nothing to compare with"
         );
+        let read = reading(72.0, 0.2, Some(44.0));
+        let seconds = meter.record(0, read, t0 + Duration::from_millis(250));
+        assert!(seconds.is_some_and(|s| (s - 0.25).abs() < 1e-9));
+        assert_eq!(meter.latest(0), read);
+        assert_eq!(meter.reads, 2);
         assert_eq!(
             meter.latest(5),
             Reading::default(),
             "no such core — nothing, not a panic"
         );
+        assert_eq!(meter.record(5, read, t0), None);
     }
 
     #[test]
-    fn a_package_read_is_reused_only_while_fresh() {
-        let mut meter = Meter::new(1);
-        assert!(
-            meter.package_within(Duration::from_secs(1)).is_none(),
-            "nothing read yet"
-        );
-        meter.record_package(Some(80.0), Instant::now());
-        assert_eq!(
-            meter.package_within(Duration::from_secs(1)).map(|p| p.value),
-            Some(Some(80.0))
-        );
-        let old = Instant::now()
-            .checked_sub(Duration::from_secs(2))
-            .expect("the machine has been up for 2 s");
-        meter.record_package(None, old);
-        assert!(
-            meter.package_within(Duration::from_secs(1)).is_none(),
-            "2 s old is not fresh for a 1 s age"
-        );
-        assert_eq!(
-            meter.package_within(Duration::from_secs(3)).map(|p| p.value),
-            Some(None),
-            "an invalid reading is still a reading"
-        );
-    }
-
-    #[test]
-    fn ratio_is_weighted_by_running_time_not_by_reads() {
-        // 1.5 s at busy 1 and ratio 50, then 0.5 s at busy 0.2 and ratio 30: running time 1.5 vs 0.1 s.
-        let mut meter = Meter::new(1);
-        let t0 = Instant::now();
-        meter.record(0, Reading::default(), t0);
-        meter.record(0, reading(70.0, 1.0, Some(50.0)), t0 + Duration::from_millis(1500));
-        meter.record(0, reading(70.0, 0.2, Some(30.0)), t0 + Duration::from_millis(2000));
-        let r = meter.drain(0);
-        let expected = (50.0 * 1.5 + 30.0 * 0.1) / 1.6;
-        assert!((r.ratio.unwrap_or(f64::NAN) - expected).abs() < 1e-9);
-    }
-
-    /// One window poll: every core read once over the last half second.
-    fn poll(watch: &mut Watch, ceilings: &[i32], temps: &[f64], busy: &[f64]) {
-        for (i, (&t, &b)) in temps.iter().zip(busy).enumerate() {
-            watch.core(i, reading(t, b, (b > 0.05).then_some(45.0)), Some(0.5));
-        }
-        watch.polled(ceilings, Instant::now());
-    }
-
-    #[test]
-    fn mean_counts_only_the_core_s_own_load_after_warming() {
-        let mut watch = Watch::new(2);
-        let ceilings = [50, 46];
-        for _ in 0..WARM {
-            poll(&mut watch, &ceilings, &[80.0, 50.0], &[1.0, 0.0]);
-        }
-        assert_eq!(watch.avg(), [None, None], "the first 2 s under load do not count");
-        poll(&mut watch, &ceilings, &[90.0, 50.0], &[1.0, 0.0]);
-        poll(&mut watch, &ceilings, &[70.0, 50.0], &[1.0, 0.0]);
-        assert_eq!(watch.avg()[0], Some(80.0));
-        assert_eq!(watch.avg_ratio()[0], Some(45.0));
-        assert_eq!(watch.avg()[1], None, "an idle core has no mean under load");
-        // Idle for a while: the mean stays; loaded again: warming first, then the same sum goes on.
-        poll(&mut watch, &ceilings, &[40.0, 50.0], &[0.1, 0.0]);
-        assert_eq!(watch.avg()[0], Some(80.0));
-        for _ in 0..WARM {
-            poll(&mut watch, &ceilings, &[99.0, 50.0], &[1.0, 0.0]);
-        }
-        assert_eq!(watch.avg()[0], Some(80.0));
-        poll(&mut watch, &ceilings, &[83.0, 50.0], &[1.0, 0.0]);
-        assert_eq!(watch.avg()[0], Some(81.0));
-    }
-
-    #[test]
-    fn a_poll_without_a_new_reading_adds_nothing() {
-        // Review 15.10, finding 1: a window poll that comes before the next reading must not count the last reading
-        // a second time (it did when the samples log started between two window polls).
+    fn a_poll_without_a_new_reading_changes_nothing() {
+        // Review 15.10, finding 1: a window poll before the next reading must not take the last reading again.
         let mut watch = Watch::new(1);
-        for _ in 0..=WARM {
-            poll(&mut watch, &[50], &[80.0], &[1.0]);
-        }
-        assert_eq!(watch.avg()[0], Some(80.0));
-        watch.core(0, reading(90.0, 1.0, Some(45.0)), Some(0.5));
-        watch.polled(&[50], Instant::now());
-        assert_eq!(watch.avg()[0], Some(85.0));
-        let polls = watch.polls;
-        watch.polled(&[50], Instant::now());
-        assert_eq!(watch.avg()[0], Some(85.0), "the same reading counted twice");
-        assert_eq!(watch.polls, polls, "a poll with nothing new is no poll");
+        watch.core(0, reading(80.0, 1.0, Some(45.0)), Some(0.5));
+        watch.polled(Instant::now());
+        let (polls, cur) = (watch.polls, watch.cur.clone());
+        watch.polled(Instant::now());
+        assert_eq!(
+            (watch.polls, watch.cur.clone()),
+            (polls, cur),
+            "a poll with nothing new is no poll"
+        );
     }
 
     #[test]
     fn a_window_poll_takes_every_reading_since_the_last_one() {
-        // Review 15.10, finding 1: while the samples log runs, the first core of a block is read every 0.25 s and the
-        // window polls every 0.5 s. The window's load and multiplier must be those of its whole half second (as when it
-        // read the core itself), not of the last quarter: 0.8 then 0.3 is 0.55 — loaded; the last read alone (0.3)
-        // is not. Core 1 stands for a non-first E core, read once per window poll.
+        // Review 15.10, finding 1: the first core of a block is read every 0.25 s, the window polls every 0.5 s; the
+        // window's load and multiplier are those of its whole half second, not of the last quarter.
         let mut watch = Watch::new(2);
-        for _ in 0..=WARM {
-            watch.core(0, reading(90.0, 0.8, Some(50.0)), Some(0.25));
-            watch.core(0, reading(82.0, 0.3, Some(40.0)), Some(0.25));
-            watch.core(1, reading(60.0, 0.6, Some(30.0)), Some(0.5));
-            watch.polled(&[50, 46], Instant::now());
-        }
+        watch.core(0, reading(90.0, 0.8, Some(50.0)), Some(0.25));
+        watch.core(0, reading(82.0, 0.3, Some(40.0)), Some(0.25));
+        watch.core(1, reading(60.0, 0.6, Some(30.0)), Some(0.5));
+        watch.polled(Instant::now());
         assert!(
             (watch.busy[0].unwrap_or(f64::NAN) - 0.55).abs() < 1e-9,
             "{:?}",
@@ -541,14 +657,7 @@ mod tests {
             [Some(82.0), Some(60.0)],
             "the temperature is the latest read"
         );
-        assert_eq!(watch.max[0], Some(90.0), "a peak between window polls is kept");
-        assert_eq!(
-            watch.avg(),
-            [Some(82.0), Some(60.0)],
-            "both loaded over their half second"
-        );
-        assert!((watch.avg_ratio()[0].unwrap_or(f64::NAN) - ratio).abs() < 1e-9);
-        assert_eq!(watch.polls, u64::from(WARM) + 1);
+        assert_eq!(watch.polls, 1);
     }
 
     #[test]
@@ -557,10 +666,10 @@ mod tests {
         let t0 = Instant::now();
         let min = Duration::from_millis(375);
         assert!(watch.due(t0, min), "no poll yet");
-        watch.polled(&[50], t0);
+        watch.polled(t0);
         assert!(watch.due(t0, min), "nothing was read: that was no poll");
         watch.core(0, reading(60.0, 0.2, None), Some(0.5));
-        watch.polled(&[50], t0);
+        watch.polled(t0);
         assert!(
             !watch.due(t0 + Duration::from_millis(250), min),
             "the next quarter-second poll is not the window's"
@@ -568,18 +677,224 @@ mod tests {
         assert!(watch.due(t0 + Duration::from_millis(500), min), "the one after it is");
     }
 
-    #[test]
-    fn new_ceilings_start_afresh_and_reset_clears_everything() {
-        let mut watch = Watch::new(2);
-        for _ in 0..=WARM {
-            poll(&mut watch, &[50, 46], &[80.0, 60.0], &[1.0, 1.0]);
+    // ----- Kept: per block, per ceiling (owner 16.10) -----
+
+    /// Two blocks: P-core 0 (core 0) and an E-cluster 1 (cores 1, 2).
+    fn blocks() -> Vec<Block> {
+        let block = |members: Vec<usize>, name: &str| Block {
+            first: members[0],
+            lp: machine::Lp(u32::try_from(members[0]).unwrap_or(0)),
+            kind: if members.len() == 1 {
+                machine::topology::Kind::P
+            } else {
+                machine::topology::Kind::E
+            },
+            name: name.into(),
+            members,
+        };
+        vec![block(vec![0], "0"), block(vec![1, 2], "1–2")]
+    }
+
+    fn kept() -> Kept {
+        Kept::new(&blocks(), 3)
+    }
+
+    /// `seconds` of quarter-second readings: core 0 at `t0`, busy `b0`, running at its ceiling; cores 1 and 2 idle at
+    /// `t1`.
+    fn feed(kept: &mut Kept, current: &[i32], seconds: f64, t0: f64, b0: f64, t1: f64) {
+        let steps = (0..).take_while(|k| f64::from(*k) * 0.25 < seconds);
+        for _ in steps {
+            kept.read(0, reading(t0, b0, Some(f64::from(current[0]))), Some(0.25));
+            kept.read(1, reading(t1, 0.0, None), Some(0.25));
+            kept.read(2, reading(t1, 0.0, None), Some(0.25));
         }
-        assert_eq!(watch.avg(), [Some(80.0), Some(60.0)]);
-        // Core 1 idles, then the ceilings change: the loaded core loses its mean, the idle one keeps its last.
-        poll(&mut watch, &[49, 46], &[78.0, 45.0], &[1.0, 0.0]);
-        assert_eq!(watch.avg(), [None, Some(60.0)]);
-        watch.reset();
-        assert_eq!(watch.avg(), [None, None]);
-        assert_eq!(watch.max, watch.cur, "the maxima start from what stands now");
+    }
+
+    fn listed(kept: &Kept, block: usize) -> Vec<(i32, Option<f64>, Option<f64>)> {
+        kept.by_ceiling(block).map(|e| (e.ceiling, e.max, e.mean)).collect()
+    }
+
+    #[test]
+    fn the_mean_counts_only_the_block_s_own_load_after_two_seconds_weighted_by_time() {
+        let mut k = kept();
+        k.align(&[50, 46, 46], &[50, 46, 46]);
+        feed(&mut k, &[50, 46, 46], 2.0, 99.0, 1.0, 40.0);
+        assert_eq!(k.avg()[0], None, "the first 2 s under load do not count");
+        feed(&mut k, &[50, 46, 46], 1.0, 80.0, 1.0, 40.0);
+        feed(&mut k, &[50, 46, 46], 0.5, 70.0, 0.1, 40.0);
+        assert_eq!(
+            k.avg()[0],
+            Some(80.0),
+            "idle readings neither count nor change the mean"
+        );
+        assert_eq!(k.avg_ratio()[0], Some(50.0));
+        assert_eq!(k.max[0], Some(99.0), "the max counts every reading, warm or not");
+        assert_eq!(
+            (k.avg()[1], k.avg()[2]),
+            (None, None),
+            "an idle block has no mean under load"
+        );
+        assert_eq!(
+            (k.max[1], k.max[2]),
+            (Some(40.0), Some(40.0)),
+            "every core of the block shows the block's"
+        );
+        let secs: Vec<f64> = k.by_ceiling(0).map(|e| e.secs).collect();
+        assert_eq!(secs, [1.0], "one second counted");
+    }
+
+    #[test]
+    fn only_the_first_core_of_a_block_feeds_it() {
+        // A window poll reads every core: the other cores of a block must not count a second time.
+        let mut k = kept();
+        k.align(&[50, 46, 46], &[50, 46, 46]);
+        k.read(2, reading(95.0, 1.0, Some(46.0)), Some(0.25));
+        assert_eq!(k.max[1], None, "core 2 is not the block's first core");
+        k.read(1, reading(61.0, 0.0, None), Some(0.25));
+        assert_eq!((k.max[1], k.max[2]), (Some(61.0), Some(61.0)));
+    }
+
+    #[test]
+    fn readings_before_the_ceilings_are_known_are_not_kept() {
+        let mut k = kept();
+        k.read(0, reading(90.0, 1.0, Some(50.0)), Some(0.25));
+        assert_eq!(listed(&k, 0), []);
+    }
+
+    #[test]
+    fn an_auto_cut_switches_the_tile_to_the_new_ceiling_and_keeps_the_old_one_listed() {
+        // Owner 16.10: a max reached at ×48 is not the max at ×47. The tile shows the ceiling that stands; a return
+        // shows the old values again.
+        let mut k = kept();
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        feed(&mut k, &[48, 46, 46], 3.0, 80.0, 1.0, 50.0);
+        assert_eq!((k.max[0], k.avg()[0]), (Some(80.0), Some(80.0)));
+        assert!(!k.align(&[48, 46, 46], &[47, 46, 46]), "a cut drops nothing");
+        assert_eq!((k.max[0], k.avg()[0]), (None, None), "nothing read at ×47 yet");
+        feed(&mut k, &[47, 46, 46], 1.0, 76.0, 1.0, 50.0);
+        assert_eq!(
+            (k.max[0], k.avg()[0]),
+            (Some(76.0), Some(76.0)),
+            "still loaded through the cut: no new warm-up"
+        );
+        assert_eq!(
+            listed(&k, 0),
+            [(48, Some(80.0), Some(80.0)), (47, Some(76.0), Some(76.0))],
+            "both ceilings, highest first"
+        );
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        assert_eq!(
+            (k.max[0], k.avg()[0]),
+            (Some(80.0), Some(80.0)),
+            "a return shows ×48 again"
+        );
+    }
+
+    #[test]
+    fn the_period_of_a_ceiling_is_its_final_entry() {
+        // The event log writes only the final values of the ceiling a block leaves (owner: «максимум пишется только
+        // последний для данной конфигурации»).
+        let mut k = kept();
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        feed(&mut k, &[48, 46, 46], 2.5, 80.0, 1.0, 50.0);
+        feed(&mut k, &[48, 46, 46], 0.5, 84.0, 1.0, 50.0);
+        let p = k.period(0, 48);
+        assert_eq!((p.ceiling, p.max), (48, Some(84.0)));
+        assert!((p.secs - 1.0).abs() < 1e-9, "{p:?}");
+        assert!(p.mean.is_some_and(|m| (m - 82.0).abs() < 1e-9), "{p:?}");
+        assert!(p.max_at.is_some(), "when the max was reached");
+        let none = k.period(0, 47);
+        assert_eq!(
+            (none.ceiling, none.secs, none.max, none.mean),
+            (47, 0.0, None, None),
+            "nothing at ×47"
+        );
+    }
+
+    #[test]
+    fn the_owner_s_new_ceiling_clears_that_block_s_list_only_and_reset_clears_all() {
+        // Owner 16.10: «если я отредактировал ядро, то максимум по нему от старого множителя не нужен».
+        let mut k = kept();
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        feed(&mut k, &[48, 46, 46], 3.0, 80.0, 1.0, 60.0);
+        assert!(k.take_changed(), "the maxima rose");
+        assert!(k.align(&[45, 46, 46], &[45, 46, 46]), "the owner set ×45 for block 0");
+        assert_eq!(listed(&k, 0), [], "the whole list of block 0 is gone");
+        assert_eq!(listed(&k, 1), [(46, Some(60.0), None)], "block 1 keeps its own");
+        assert!(k.take_changed(), "a drop is written");
+        assert!(
+            !k.align(&[45, 46, 46], &[45, 46, 46]),
+            "the same ceilings again drop nothing"
+        );
+        k.reset(|core| (core == 1).then_some(55.0));
+        assert_eq!(listed(&k, 0), []);
+        assert_eq!(
+            listed(&k, 1),
+            [(46, Some(55.0), None)],
+            "the max starts from the reading that stands now"
+        );
+        assert_eq!(k.pkg_max, None);
+        assert!(k.take_changed(), "a reset is written");
+    }
+
+    #[test]
+    fn the_file_round_trips_every_ceiling_and_the_mean_goes_on_accumulating() {
+        let lps = [0, 2, 3];
+        let mut k = kept();
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        feed(&mut k, &[48, 46, 46], 3.0, 80.0, 1.0, 50.0);
+        k.align(&[48, 46, 46], &[47, 46, 46]);
+        feed(&mut k, &[47, 46, 46], 1.0, 76.0, 1.0, 50.0);
+        k.package(Some(84.0));
+        let map: Map<String, Value> = serde_json::from_str(&k.to_json("cpu", &lps)).unwrap_or_default();
+        let mut again = kept();
+        assert!(again.restore(&map, "cpu", &lps));
+        assert!(
+            !again.align(&[48, 46, 46], &[47, 46, 46]),
+            "the same owner's ceilings: everything kept"
+        );
+        assert_eq!(listed(&again, 0), listed(&k, 0));
+        assert_eq!(listed(&again, 1), listed(&k, 1));
+        assert_eq!(
+            (again.max.clone(), again.avg().to_vec()),
+            (k.max.clone(), k.avg().to_vec())
+        );
+        assert_eq!(again.avg_ratio(), k.avg_ratio());
+        assert_eq!(again.pkg_max, Some(84.0));
+        assert!(
+            (again.since_secs() - k.since_secs()).abs() < 1.0,
+            "the reset time is kept"
+        );
+        // ×47 had 1 s at 76 °C; after the restart the block warms up again for 2 s, then 1 s at 86 °C counts.
+        feed(&mut again, &[47, 46, 46], 3.0, 86.0, 1.0, 50.0);
+        assert_eq!(
+            again.avg()[0],
+            Some(81.0),
+            "(76 · 1 s + 86 · 1 s) / 2 s: the sums came back"
+        );
+    }
+
+    #[test]
+    fn at_start_a_block_of_another_owner_s_ceiling_is_dropped_and_another_file_is_not_taken() {
+        let lps = [0, 2, 3];
+        let mut k = kept();
+        k.align(&[48, 46, 46], &[48, 46, 46]);
+        feed(&mut k, &[48, 46, 46], 3.0, 80.0, 1.0, 60.0);
+        let map: Map<String, Value> = serde_json::from_str(&k.to_json("cpu", &lps)).unwrap_or_default();
+        let mut again = kept();
+        assert!(again.restore(&map, "cpu", &lps));
+        assert!(
+            again.align(&[47, 46, 46], &[47, 46, 46]),
+            "block 0's ceiling changed while the program was closed"
+        );
+        assert_eq!(listed(&again, 0), []);
+        assert_eq!(listed(&again, 1), [(46, Some(60.0), None)]);
+        // Another processor, another layout, other blocks: nothing taken.
+        let mut other = kept();
+        assert!(!other.restore(&map, "other", &lps));
+        assert!(!other.restore(&map, "cpu", &[0, 2, 4]));
+        let mut single = Kept::new(&blocks()[..1], 3);
+        assert!(!single.restore(&map, "cpu", &lps));
+        assert!(listed(&other, 0).is_empty() && listed(&single, 0).is_empty());
     }
 }
