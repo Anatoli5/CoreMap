@@ -1261,6 +1261,8 @@ component Lines inherits Flickable {
 export component AppWindow inherits Window {
     in property <string> version;  // номер версии (файл VERSION); «без номера» — собрано не скриптом tools\rust.ps1
     title: "CoreMap " + root.version;
+    // Значок окна в заголовке и на панели задач (тот же, что у CoreMapTray; PNG 256 из assets\coremap.ico).
+    icon: @image-url("../../../assets/coremap.png");
     background: Palette.bg;
     default-font-family: "Segoe UI";
     default-font-size: 14px;
