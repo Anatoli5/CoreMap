@@ -16,6 +16,11 @@
 // • по паре блоков A, B — температура A, когда он занят (доля работы ≥ BUSY), отдельно «B тоже занят» и «B свободен»,
 //   в той же корзине множителя A: так разница не смешивается с тем, что при работе соседа A чаще стоит на другом
 //   множителе. Это сравнение — как было (граница «занят» здесь остаётся).
+// • по блоку и корзине — та же сводка в двух видах (статистика окна, владелец 15.10: «кривые максимальных температур и
+//   кривые средних температур так сильно расходятся»): абсолютная температура и температура над остальным кристаллом
+//   (`above_die`; аналитик 15.10, outputs/thermal-model-2026-10-15.md: 68–96 % температуры любого блока — общий уровень
+//   кристалла, корзина множителя по абсолютной температуре говорит в основном о том, когда она набралась); у каждого
+//   вида — гистограмма по времени (`Hist`), из неё 95-й процентиль вместо наибольшей одной строки.
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -98,6 +103,150 @@ pub fn span_ms(previous: Option<i64>, at: RowTime) -> i64 {
         Some(gap) if gap > 0 && gap * 2 <= at.step * 3 => gap,
         _ => at.step,
     }
+}
+
+/// Ячейка гистограммы абсолютной температуры, °C: датчики ядер отдают целые градусы (шагом 2 °C), поэтому ячейка в
+/// 1 °C ничего не огрубляет — процентиль по ней точный.
+pub const ABS_CELL: f64 = 1.0;
+/// Ячейка гистограммы температуры над кристаллом, °C. Её шаг в данных — 2 °C / число остальных блоков (≈ 0,18 °C при
+/// одиннадцати): ячейка того же порядка не огрубляет то, что различают датчики, ошибка процентиля — не больше половины
+/// ячейки (0,125 °C: 2 px на графике высотой 700 px, меньше пикселя при 1280×800); мельче — гистограммы растут, а
+/// точности у датчика с шагом 2 °C не прибавляется. Память: ≈ 120 ячеек по 4 байта на корзину множителя.
+pub const ABOVE_CELL: f64 = 0.25;
+/// Дальше этого от нуля, °C, — не температура, а испорченная строка: ячеек под неё гистограмма не заводит (средняя и
+/// наибольшая её всё равно покажут — их не трогаем).
+const HIST_LIMIT: f64 = 200.0;
+/// 95-й процентиль: доля времени, ниже которой температура, — 95 из 100.
+pub const P95: (u64, u64) = (95, 100);
+
+/// Гистограмма температуры по времени: ячейка — `cell` °C с центром в k · cell, в ячейке — миллисекунды, которые
+/// покрывают строки с такой температурой (вес строки — её время, как у средней: строка прежнего журнала — 2 с, нового —
+/// 0,25 с). Хранятся только ячейки от наименьшей занятой до наибольшей.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hist {
+    cell: f64,
+    first: i32,
+    ms: Vec<u32>,
+}
+
+impl Hist {
+    #[must_use]
+    pub fn new(cell: f64) -> Hist {
+        Hist {
+            cell,
+            first: 0,
+            ms: Vec::new(),
+        }
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "finite and within ±HIST_LIMIT / cell (±800 cells), so the rounded value fits i32"
+    )]
+    fn cell_of(&self, value: f64) -> Option<i32> {
+        (value.is_finite() && value.abs() <= HIST_LIMIT).then(|| (value / self.cell).round() as i32)
+    }
+
+    /// Строка со значением `value` покрывает `ms` миллисекунд.
+    pub fn add(&mut self, value: f64, ms: u32) {
+        if let Some(cell) = self.cell_of(value) {
+            self.put(cell, ms);
+        }
+    }
+
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "offsets are taken only after checking cell >= first, so they are non-negative"
+    )]
+    fn put(&mut self, cell: i32, ms: u32) {
+        if self.ms.is_empty() {
+            self.first = cell;
+            self.ms.push(0);
+        } else if cell < self.first {
+            let grow = (self.first - cell) as usize;
+            self.ms.splice(0..0, std::iter::repeat_n(0, grow));
+            self.first = cell;
+        }
+        let at = (cell - self.first) as usize;
+        if at >= self.ms.len() {
+            self.ms.resize(at + 1, 0);
+        }
+        // Сутки — 86,4 млн мс, предел u32 — 4 295 млн: 49 суток в одной ячейке; насыщение — только страховка.
+        self.ms[at] = self.ms[at].saturating_add(ms);
+    }
+
+    pub fn merge(&mut self, other: &Hist) {
+        debug_assert!(
+            self.ms.is_empty() || other.ms.is_empty() || (self.cell - other.cell).abs() < f64::EPSILON,
+            "гистограммы одного вида — с одной ячейкой"
+        );
+        if self.ms.is_empty() {
+            self.cell = other.cell;
+        }
+        for (k, &ms) in other.ms.iter().enumerate() {
+            if ms > 0 {
+                self.put(other.first + i32::try_from(k).unwrap_or(i32::MAX), ms);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.first = 0;
+        self.ms.clear();
+    }
+
+    /// Миллисекунд всего.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.ms.iter().map(|&m| u64::from(m)).sum()
+    }
+
+    /// Процентиль по времени: наименьшая температура v (центр ячейки), при которой время с температурой не выше v —
+    /// не меньше доли `share` = (числитель, знаменатель) всего времени. Для значений на сетке ячеек — точно; иначе — не
+    /// дальше половины ячейки от точного. None — гистограмма пуста.
+    #[must_use]
+    pub fn quantile(&self, share: (u64, u64)) -> Option<f64> {
+        let total = self.total();
+        if total == 0 || share.1 == 0 {
+            return None;
+        }
+        let mut below = 0u64;
+        for (k, &ms) in self.ms.iter().enumerate() {
+            below += u64::from(ms);
+            if below * share.1 >= total * share.0 {
+                return Some(f64::from(self.first + i32::try_from(k).ok()?) * self.cell);
+            }
+        }
+        // Доля больше 1: всё время не выше наибольшей ячейки.
+        Some(f64::from(self.first + i32::try_from(self.ms.len() - 1).ok()?) * self.cell)
+    }
+}
+
+/// Уровень остального кристалла: средняя температура остальных блоков (`sum` — их сумма, `known` — у скольких она в
+/// строке известна, `others` — сколько их в файле). None — известна меньше чем у половины остальных (или ни у одного):
+/// по нескольким блокам «уровень кристалла» — это они сами, а не кристалл.
+#[must_use]
+pub fn die_level(sum: f64, known: usize, others: usize) -> Option<f64> {
+    #[expect(clippy::cast_precision_loss, reason = "a dozen blocks")]
+    let level = sum / known as f64;
+    (known >= 1 && known * 2 >= others).then_some(level)
+}
+
+/// Температура блока `a` над остальным кристаллом в одной строке: его температура минус средняя остальных блоков,
+/// у которых она в этой строке известна. None — у блока температуры нет или остальных известно меньше половины.
+/// Правило одной строки, как его задаёт спецификация, — для тестов: счёт строк (`Scratch::row`) применяет то же
+/// правило через `die_level`, без второго прохода по блокам.
+#[cfg(test)]
+#[must_use]
+pub fn above_die(temps: &[Option<f64>], a: usize) -> Option<f64> {
+    let own = temps.get(a).copied().flatten()?;
+    let (sum, known) = temps
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != a)
+        .filter_map(|(_, t)| *t)
+        .fold((0.0, 0), |(s, k), t| (s + t, k + 1));
+    Some(own - die_level(sum, known, temps.len().saturating_sub(1))?)
 }
 
 /// Строка в корзине: что о ней помнить.
@@ -231,11 +380,24 @@ pub struct Split {
     pub alone: Side,
 }
 
-/// Сводка по блоку: корзины по множителю и сравнение с каждым другим блоком (по названию).
+/// Сводка по блоку: корзины по множителю — по абсолютной температуре (`bins`) и над остальным кристаллом (`above`: та
+/// же корзина, температура — `above_die`; строки без уровня кристалла в неё не идут), у каждой — гистограмма по
+/// времени; и сравнение с каждым другим блоком (по названию).
 #[derive(Clone, Default, Debug)]
 pub struct BlockTally {
     pub bins: BTreeMap<i32, Bin>,
+    pub hist: BTreeMap<i32, Hist>,
+    pub above: BTreeMap<i32, Bin>,
+    pub above_hist: BTreeMap<i32, Hist>,
     pub with: BTreeMap<String, BTreeMap<i32, Split>>,
+}
+
+/// Гистограмму — в словарь корзин: новая корзина — с ячейкой `cell`.
+fn merge_hist(into: &mut BTreeMap<i32, Hist>, bin: i32, cell: f64, hist: &Hist) {
+    if hist.ms.is_empty() {
+        return;
+    }
+    into.entry(bin).or_insert_with(|| Hist::new(cell)).merge(hist);
 }
 
 /// Сводка по строкам срезов: складывается из сводок файлов (`merge`).
@@ -267,6 +429,15 @@ impl Tally {
             let mine = self.blocks.entry(name.clone()).or_default(); // a dozen names per merge
             for (bin, b) in &theirs.bins {
                 mine.bins.entry(*bin).or_default().merge(b);
+            }
+            for (bin, b) in &theirs.above {
+                mine.above.entry(*bin).or_default().merge(b);
+            }
+            for (bin, h) in &theirs.hist {
+                merge_hist(&mut mine.hist, *bin, ABS_CELL, h);
+            }
+            for (bin, h) in &theirs.above_hist {
+                merge_hist(&mut mine.above_hist, *bin, ABOVE_CELL, h);
             }
             for (other_name, splits) in &theirs.with {
                 let pair = mine.with.entry(other_name.clone()).or_default();
@@ -382,7 +553,9 @@ pub struct Scratch {
     secs: f64,
     first: Option<String>,
     last: Option<String>,
-    bins: Vec<Bin>,              // [блок × BINS]
+    bins: Vec<Bin>,              // [блок × BINS], абсолютная температура
+    above: Vec<Bin>,             // [блок × BINS], над остальным кристаллом
+    hists: Vec<Hist>,            // [(блок × BINS) × 2]: абсолютная, над кристаллом
     pairs: Vec<Split>,           // [(блок × n + другой) × BINS]
     cells: Vec<Cell>,            // по блокам, текущая строка
     fields: Vec<(usize, usize)>, // начало и конец полей текущей строки
@@ -415,12 +588,18 @@ pub fn bin_of(ratio: f64) -> Option<usize> {
 
 impl Scratch {
     fn reset(&mut self, n: usize) {
-        if self.n == n {
+        if self.n == n && self.hists.len() == 2 * n * BINS {
             self.bins.fill(Bin::default());
+            self.above.fill(Bin::default());
+            self.hists.iter_mut().for_each(Hist::clear);
             self.pairs.fill(Split::default());
         } else {
             self.n = n;
             self.bins = vec![Bin::default(); n * BINS];
+            self.above = vec![Bin::default(); n * BINS];
+            self.hists = (0..n * BINS)
+                .flat_map(|_| [Hist::new(ABS_CELL), Hist::new(ABOVE_CELL)])
+                .collect();
             self.pairs = vec![Split::default(); n * n * BINS];
             self.cells = vec![Cell::default(); n];
         }
@@ -472,11 +651,14 @@ impl Scratch {
         let time = &line[self.fields[0].0..self.fields[0].1];
         // Без времени у строки нет длительности: не в счёт.
         let at = row_time(time)?;
+        let span = span_ms(*previous, at);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a span of milliseconds between two rows, far below 2^52"
         )]
-        let secs = span_ms(*previous, at) as f64 / 1000.0;
+        let secs = span as f64 / 1000.0;
+        // Промежуток — не больше полутора шагов записи (span_ms), то есть 3 с: в u32 помещается всегда.
+        let ms = u32::try_from(span).unwrap_or(0);
         *previous = Some(at.ms);
         let field = |column: Option<usize>| column.and_then(|i| self.fields.get(i)).map(|&(s, e)| &line[s..e]);
         let fan = field(columns.fan_cpu).and_then(number);
@@ -488,6 +670,12 @@ impl Scratch {
             };
         }
         let n = self.n;
+        // Уровень кристалла в этой строке: сумма и число известных температур всех блоков (у блока — без него самого).
+        let (sum, known) = self
+            .cells
+            .iter()
+            .filter_map(|c| c.temp)
+            .fold((0.0, 0), |(s, k), t| (s + t, k + 1));
         for a in 0..n {
             let me = self.cells[a];
             let (Some(temp), Some(ratio)) = (me.temp, me.ratio) else {
@@ -495,16 +683,22 @@ impl Scratch {
             };
             let Some(bin) = bin_of(ratio) else { continue };
             // График: каждая строка, при любой нагрузке (владелец 15.10: «от 0 до 100»).
-            self.bins[a * BINS + bin].add(
-                Seen {
-                    temp,
-                    ratio,
-                    busy: me.busy,
-                    secs,
-                    at: at.ms,
-                },
-                fan,
-            );
+            let seen = Seen {
+                temp,
+                ratio,
+                busy: me.busy,
+                secs,
+                at: at.ms,
+            };
+            let at_bin = a * BINS + bin;
+            self.bins[at_bin].add(seen, fan);
+            self.hists[2 * at_bin].add(temp, ms);
+            // Над остальным кристаллом: то же правило, что `above_die`, без второго прохода по блокам.
+            if let Some(level) = die_level(sum - temp, known - 1, n - 1) {
+                let above = temp - level;
+                self.above[at_bin].add(Seen { temp: above, ..seen }, fan);
+                self.hists[2 * at_bin + 1].add(above, ms);
+            }
             // Связь соседей: только пока блок сам занят, сосед — занят или свободен (это правило не менялось).
             if me.busy.is_none_or(|busy| busy < BUSY) {
                 continue;
@@ -547,6 +741,18 @@ impl Scratch {
                 touched = true;
                 let tally = into.blocks.entry(block.name.clone()).or_default(); // one name per used bin per chunk
                 tally.bins.entry(ratio_of(bin)).or_default().merge(b);
+                let at = a * BINS + bin;
+                merge_hist(&mut tally.hist, ratio_of(bin), ABS_CELL, &self.hists[2 * at]);
+                let up = &self.above[at];
+                if up.n > 0 {
+                    tally.above.entry(ratio_of(bin)).or_default().merge(up);
+                    merge_hist(
+                        &mut tally.above_hist,
+                        ratio_of(bin),
+                        ABOVE_CELL,
+                        &self.hists[2 * at + 1],
+                    );
+                }
                 for (o, other) in columns.blocks.iter().enumerate() {
                     let s = self.pairs[(a * n + o) * BINS + bin];
                     if s.together.secs <= 0.0 && s.alone.secs <= 0.0 {
@@ -1281,5 +1487,73 @@ mod tests {
         let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(20_376 * 24 + 1);
         assert_eq!(date_before(at, 0), "2025-10-15");
         assert_eq!(date_before(at, 30), "2025-09-15");
+    }
+
+    #[test]
+    fn above_the_die_needs_half_of_the_others() {
+        // Блок 0 на 80 °C, остальные 60 и 70: над кристаллом +15.
+        assert_eq!(above_die(&[Some(80.0), Some(60.0), Some(70.0)], 0), Some(15.0));
+        // Из трёх остальных известен один — меньше половины: значения нет; известны два — есть.
+        assert_eq!(above_die(&[Some(80.0), Some(60.0), None, None], 0), None);
+        assert_eq!(above_die(&[Some(80.0), Some(60.0), Some(70.0), None], 0), Some(15.0));
+        // Своей температуры нет — нет и значения; остальных нет вовсе — тоже.
+        assert_eq!(above_die(&[None, Some(60.0), Some(70.0)], 0), None);
+        assert_eq!(above_die(&[Some(80.0)], 0), None);
+    }
+
+    #[test]
+    fn rows_count_above_the_die_only_where_the_die_level_is_known() {
+        // Две строки по 2 с: в первой кластер 60 °C — ядро 0 над ним на +20; во второй температуры кластера нет — у
+        // ядра 0 точка в абсолютной шкале есть, над кристаллом — нет.
+        let t = tally(&[
+            "2026-10-15 10:00:00,60,,,53,52.0,0.9,80,46,44.0,0.5,60",
+            "2026-10-15 10:00:02,60,,,53,52.0,0.9,84,46,44.0,0.5,",
+        ]);
+        let core = &t.blocks["0"];
+        assert_eq!(core.bins[&52].n, 2);
+        assert_eq!(core.above[&52].n, 1);
+        assert_eq!(core.above[&52].mean(), Some(20.0));
+        assert_eq!(core.hist[&52].quantile(P95), Some(84.0));
+        assert_eq!(core.above_hist[&52].quantile(P95), Some(20.0));
+        // Кластер во второй строке без температуры — его корзина только из первой: −20.
+        assert_eq!(t.blocks["2–5"].above[&44].mean(), Some(-20.0));
+    }
+
+    #[test]
+    fn the_95th_percentile_is_by_time_not_by_rows() {
+        // 19 секунд при 70 °C и 1 с при 90 °C: 95 % времени — не выше 70. По строкам (10 строк по 2 с против 4 по
+        // 0,25 с) было бы иначе: 4 из 14 строк — 90.
+        let mut h = Hist::new(ABS_CELL);
+        for _ in 0..19 {
+            h.add(70.0, 1000);
+        }
+        for _ in 0..4 {
+            h.add(90.0, 250);
+        }
+        assert_eq!(h.total(), 20_000);
+        assert_eq!(h.quantile(P95), Some(70.0));
+        // Ещё полсекунды при 90 °C — 70 °C уже меньше 95 % времени.
+        h.add(90.0, 500);
+        assert_eq!(h.quantile(P95), Some(90.0));
+        // Слияние — как одна гистограмма всех строк; пустая — нет процентиля.
+        let mut a = Hist::new(ABOVE_CELL);
+        let mut b = Hist::new(ABOVE_CELL);
+        let mut whole = Hist::new(ABOVE_CELL);
+        for (k, v) in [-3.1, 0.2, 5.0, 7.3, 12.6, -8.0].iter().enumerate() {
+            let ms = 250 * (u32::try_from(k).unwrap_or(0) + 1);
+            if k % 2 == 0 {
+                a.add(*v, ms);
+            } else {
+                b.add(*v, ms);
+            }
+            whole.add(*v, ms);
+        }
+        a.merge(&b);
+        assert_eq!(a, whole);
+        assert_eq!(Hist::new(ABS_CELL).quantile(P95), None);
+        // Значение вне сетки — центр своей ячейки: 7,3 → 7,25.
+        let mut one = Hist::new(ABOVE_CELL);
+        one.add(7.3, 250);
+        assert_eq!(one.quantile(P95), Some(7.25));
     }
 }

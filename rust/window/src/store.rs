@@ -1,9 +1,9 @@
 // Статистика читается в своём потоке, не в потоке окна (rust\AGENTS.md: поток окна не ждёт файлов).
 //
 // Поток держит сводку по каждому файлу срезов за последние 30 дней и сколько от файла прочитано; раз в SCAN он
-// смотрит размеры и времена записи (одна папка, до 31 файла и два журнала) и дочитывает только дописанное — прошлые
-// дни не перечитываются, сегодняшний — только с прочитанного места. Ничего не изменилось — окну ничего не идёт.
-// Изменилось — окно получает новую сводку целиком (Digest) и перерисовывает то, что из неё показывает.
+// смотрит размеры и времена записи (одна папка: файл на день и его продолжения «-N», и два журнала) и дочитывает только
+// дописанное — прошлые дни не перечитываются, сегодняшний — только с прочитанного места. Ничего не изменилось — окну
+// ничего не идёт. Изменилось — окно получает новую сводку целиком (Digest) и перерисовывает то, что из неё показывает.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,16 +95,13 @@ impl Worker {
         let mut parsed_bytes = 0;
         let mut parsed_rows = 0;
 
-        // Срезы: файлы «ГГГГ-ММ-ДД.csv» не старше DAYS дней.
+        // Срезы: файлы дня (`day_of`) не старше DAYS дней.
         let cutoff = samples::date_before(SystemTime::now(), DAYS);
         let names = match std::fs::read_dir(self.dir.join("samples")) {
             Ok(entries) => entries
                 .flatten()
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| {
-                    n.strip_suffix(".csv")
-                        .is_some_and(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d >= cutoff.as_str())
-                })
+                .filter(|n| day_of(n).is_some_and(|d| d >= cutoff.as_str()))
                 .collect::<Vec<_>>(),
             // Папки срезов нет — программа входа ещё ничего не писала; это не ошибка.
             Err(_) => Vec::new(),
@@ -182,6 +179,24 @@ impl Worker {
     }
 }
 
+/// День файла срезов по его имени: «ГГГГ-ММ-ДД.csv» — файл дня; «ГГГГ-ММ-ДД-N.csv» (N — цифры) — продолжение того же
+/// дня: программа входа начинает его, когда у файла дня заголовок прежнего вида (добавились столбцы). Каждый файл
+/// читается сам по себе — со своим заголовком (столбцы — по названиям, лишние пропускаются) и своей цепочкой времени
+/// строк. Другое имя — не срезы (None).
+fn day_of(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".csv")?;
+    let day = stem.get(..10)?;
+    let b = day.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let dated = digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10);
+    let rest = &stem[10..];
+    let part = rest.is_empty()
+        || rest
+            .strip_prefix('-')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
+    (dated && part).then_some(day)
+}
+
 /// Дочитывает файл срезов. Some((байт, строк)) — прочитано новое; None — файл не менялся.
 fn read_samples(path: &Path, file: &mut SampleFile, scratch: &mut Scratch) -> std::io::Result<Option<(u64, u64)>> {
     let text = match samples::read_new(path, &mut file.tail)? {
@@ -210,4 +225,98 @@ fn read_samples(path: &Path, file: &mut SampleFile, scratch: &mut Scratch) -> st
         scratch.count(columns, body, &mut file.previous, &mut file.tally);
     }
     Ok(Some((text.len() as u64, file.tally.rows - rows_before)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn day_files_and_their_continuations_are_samples_other_names_are_not() {
+        assert_eq!(day_of("2026-10-15.csv"), Some("2026-10-15"));
+        assert_eq!(day_of("2026-10-15-2.csv"), Some("2026-10-15"));
+        assert_eq!(day_of("2026-10-15-12.csv"), Some("2026-10-15"));
+        for other in [
+            "2026-10-15-x.csv",
+            "2026-10-15-.csv",
+            "2026-10-15-2a.csv",
+            "2026-10-15_2.csv",
+            "notes.csv",
+            "2026-10-15.txt",
+            "2026-1-15.csv",
+            "ab26-10-15.csv",
+        ] {
+            assert_eq!(day_of(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_continuation_file_with_new_columns_is_read_with_its_own_header() {
+        let dir = std::env::temp_dir().join(format!("coremap-window-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // остатки прошлого прогона с тем же номером процесса
+        let samples = dir.join("samples");
+        std::fs::create_dir_all(&samples).expect("папка срезов");
+        let today = samples::date_before(SystemTime::now(), 0);
+        let old =
+            "time,package,fan_cpu,fan_gpu,0.ceiling,0.ratio,0.busy,0.temp,2–5.ceiling,2–5.ratio,2–5.busy,2–5.temp";
+        // Файл дня — прежний заголовок, две строки по 2 с.
+        std::fs::write(
+            samples.join(format!("{today}.csv")),
+            format!(
+                "{old}
+{today} 10:00:00,60,3000,,53,50,1,80,46,44,0.5,60
+{today} 10:00:02,60,,,53,50,1,82,46,44,0.5,60
+"
+            ),
+        )
+        .expect("файл дня");
+        // Продолжение дня: столбцы GPU и мощности добавлены в конец, порядок блоков другой, строки по 0,25 с.
+        let new = "time,package,fan_cpu,fan_gpu,2–5.ceiling,2–5.ratio,2–5.busy,2–5.temp,0.ceiling,0.ratio,0.busy,0.temp,power_cpu,temp_gpu,power_gpu,busy_gpu";
+        std::fs::write(
+            samples.join(format!("{today}-2.csv")),
+            format!(
+                "{new}
+{today} 11:00:00.000,61,3100,,46,44,0.5,62,53,51,1,90,45.5,70,120.0,0.93
+{today} 11:00:00.250,61,,,46,44,0.5,62,53,51,1,90,45.1,70,118.2,0.91
+"
+            ),
+        )
+        .expect("продолжение дня");
+        // Не срезы: имя не по правилу.
+        std::fs::write(
+            samples.join(format!("{today}-x.csv")),
+            format!(
+                "{old}
+{today} 12:00:00,60,,,53,52,1,99,46,44,0.5,60
+"
+            ),
+        )
+        .expect("чужой файл");
+        std::fs::write(
+            samples.join("notes.csv"),
+            "time
+",
+        )
+        .expect("чужой файл");
+        let mut worker = Worker {
+            dir: dir.clone(),
+            ..Worker::default()
+        };
+        let digest = worker.scan(true).expect("первый проход");
+        let _ = std::fs::remove_dir_all(&dir); // временная папка теста; не удалилась — не беда
+        assert_eq!(digest.files, 2, "файл дня и его продолжение; чужие имена не читаются");
+        assert_eq!(digest.tally.rows, 4);
+        let core = &digest.tally.blocks["0"];
+        // Ядро 0 нашлось по названию в обоих файлах: ×50 из файла дня (2 + 2 с), ×51 из продолжения (0,25 + 0,25 с).
+        assert_eq!(core.bins[&50].n, 2);
+        assert_eq!(core.bins[&51].n, 2);
+        assert!((core.bins[&51].secs - 0.5).abs() < 1e-9, "{}", core.bins[&51].secs);
+        assert_eq!(core.bins[&51].mean(), Some(90.0));
+        assert!(
+            !core.bins.contains_key(&52),
+            "строка из файла с чужим именем не посчитана"
+        );
+        // Время — по строкам каждого файла: 2 + 2 с в файле дня и 0,25 + 0,25 с в продолжении.
+        assert!((digest.tally.secs - (4.0 + 0.5)).abs() < 1e-9, "{}", digest.tally.secs);
+    }
 }

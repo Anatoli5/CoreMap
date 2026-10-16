@@ -1,9 +1,10 @@
-// Что окно помнит о себе между запусками (DECISIONS #36): блоки в сравнении с их цветами, подсветку, размер и место.
+// Что окно помнит о себе между запусками (DECISIONS #36): блоки в сравнении, подсветку, вид графика статистики (шкала,
+// линии, оси), размер и место. Цвет у блока свой (src/chart.rs, color_of) — его помнить не нужно.
 // Это настройки только окна — ими никто, кроме окна, не пользуется, поэтому держит их оно само, в data\window.json;
 // программа у часов о них не знает (её файл data\tray.json — настройки автомодуля, которыми пользуется она: «каждая
 // настройка живёт у программы, которая ею пользуется»).
 //
-// Пишется при смене выбора блоков и подсветки (щелчок владельца — одна запись) и при закрытии окна: размер и место —
+// Пишется при смене выбора блоков, подсветки и вида графика (щелчок владельца — одна запись) и при закрытии окна: размер и место —
 // только тогда, событий о перемещении у Slint нет. Окно развёрнуто или свёрнуто — его обычные размер и место остаются
 // прежними (из файла), развёрнутость запоминается признаком.
 //
@@ -16,7 +17,7 @@ use serde_json::{Map, Value, json};
 use slint::{ComponentHandle, LogicalSize, PhysicalPosition};
 
 use crate::AppWindow;
-use crate::panels::COMPARE;
+use crate::chart::Curves;
 use crate::wire::BlockInfo;
 
 pub const FILE: &str = "window.json";
@@ -51,10 +52,16 @@ impl Rect {
 /// Что лежит в файле. None у поля — его нет или оно негодно: берётся значение по умолчанию.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Saved {
-    /// Блоки в сравнении по порядку добавления: название блока (как в знакомстве) и номер цвета.
-    pub compared: Vec<(String, usize)>,
+    /// Блоки в сравнении по порядку добавления: названия (как в знакомстве).
+    pub compared: Vec<String>,
     /// Подсветка закреплённая (true) или под курсором (false).
     pub pin: Option<bool>,
+    /// Шкала графика: над кристаллом (true) или абсолютная (false).
+    pub above: Option<bool>,
+    /// Какие линии на графике.
+    pub curves: Option<Curves>,
+    /// Оси местами: температура по горизонтали (true).
+    pub swap: Option<bool>,
     /// Обычный размер окна, логические точки (не зависят от масштаба экрана).
     pub size: Option<(f32, f32)>,
     /// Левый верхний угол окна с рамкой, физические точки экрана.
@@ -98,22 +105,29 @@ pub fn parse(text: &str) -> Result<Saved, String> {
             [x, y] => Some((i32::try_from(x.as_i64()?).ok()?, i32::try_from(y.as_i64()?).ok()?)),
             _ => None,
         });
+    // Блок — название строкой; запись вида {"block": …, "color": …} (её писали сборки 0.5.3 до цветов у блоков) —
+    // тоже: цвет из неё не нужен.
     let compared = map
         .get("compared")
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .filter_map(|e| {
-                    let name = e.get("block")?.as_str()?.to_string();
-                    let color = usize::try_from(e.get("color")?.as_u64()?).ok()?;
-                    Some((name, color))
-                })
+                .filter_map(|e| e.as_str().or_else(|| e.get("block")?.as_str()).map(str::to_string))
                 .collect()
         })
         .unwrap_or_default();
+    let curves = match map.get("curves").and_then(Value::as_str) {
+        Some("mean") => Some(Curves::Mean),
+        Some("p95") => Some(Curves::P95),
+        Some("both") => Some(Curves::Both),
+        _ => None,
+    };
     Ok(Saved {
         compared,
         pin: map.get("pin").and_then(Value::as_bool),
+        above: map.get("above").and_then(Value::as_bool),
+        curves,
+        swap: map.get("swap").and_then(Value::as_bool),
         size,
         position,
         maximized: map.get("maximized").and_then(Value::as_bool).unwrap_or(false),
@@ -123,15 +137,24 @@ pub fn parse(text: &str) -> Result<Saved, String> {
 /// Текст файла.
 #[must_use]
 pub fn text(saved: &Saved) -> String {
-    let compared: Vec<Value> = saved
-        .compared
-        .iter()
-        .map(|(name, color)| json!({ "block": name, "color": color }))
-        .collect();
     let mut map = Map::new();
-    map.insert("compared".into(), Value::Array(compared));
+    map.insert("compared".into(), json!(saved.compared));
     if let Some(pin) = saved.pin {
         map.insert("pin".into(), pin.into());
+    }
+    if let Some(above) = saved.above {
+        map.insert("above".into(), above.into());
+    }
+    if let Some(curves) = saved.curves {
+        let name = match curves {
+            Curves::Mean => "mean",
+            Curves::P95 => "p95",
+            Curves::Both => "both",
+        };
+        map.insert("curves".into(), name.into());
+    }
+    if let Some(swap) = saved.swap {
+        map.insert("swap".into(), swap.into());
     }
     if let Some((w, h)) = saved.size {
         map.insert("size".into(), json!([w.round(), h.round()]));
@@ -143,31 +166,18 @@ pub fn text(saved: &Saved) -> String {
     Value::Object(map).to_string()
 }
 
-/// Блоки из файла: только те, что есть в знакомстве, без повторов, не больше `COMPARE`; цвет вне палитры или уже
-/// занятый — первый свободный (цвета остальных не трогаются).
+/// Блоки из файла (номера), по порядку файла: только те, что есть в знакомстве, без повторов — хоть все.
 #[must_use]
-pub fn compared(saved: &[(String, usize)], blocks: &[BlockInfo]) -> Vec<(usize, usize)> {
-    let mut kept: Vec<(usize, Option<usize>)> = Vec::new();
-    for (name, color) in saved {
-        let Some(block) = blocks.iter().find(|b| &b.name == name) else {
-            continue;
-        };
-        if kept.len() >= COMPARE || kept.iter().any(|(b, _)| *b == block.index) {
-            continue;
+pub fn compared(saved: &[String], blocks: &[BlockInfo]) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::with_capacity(saved.len().min(blocks.len()));
+    for name in saved {
+        if let Some(block) = blocks.iter().find(|b| &b.name == name)
+            && !kept.contains(&block.index)
+        {
+            kept.push(block.index);
         }
-        let free = *color < COMPARE && kept.iter().all(|(_, c)| *c != Some(*color));
-        kept.push((block.index, free.then_some(*color)));
     }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(kept.len());
-    for (i, &(block, color)) in kept.iter().enumerate() {
-        let slot = color.unwrap_or_else(|| {
-            (0..COMPARE)
-                .find(|s| kept.iter().all(|(_, c)| *c != Some(*s)) && out.iter().all(|(_, used)| used != s))
-                .unwrap_or(i % COMPARE)
-        });
-        out.push((block, slot));
-    }
-    out
+    kept
 }
 
 /// Куда ставить окно. `work_area(полоса)` — рабочая область экрана, на котором больше всего этой полосы (None — она
@@ -254,14 +264,15 @@ mod tests {
         }
     }
 
+    /// Блоки 275HX: 8 P-ядер и 4 кластера E-ядер.
     fn blocks() -> Vec<BlockInfo> {
-        vec![
-            block(0, "0"),
-            block(1, "1"),
-            block(2, "2–5"),
-            block(3, "6–9"),
-            block(4, "10"),
+        [
+            "0", "1", "2–5", "6–9", "10", "11", "12", "13", "14–17", "18–21", "22", "23",
         ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| block(i, name))
+        .collect()
     }
 
     const SCREEN: Rect = Rect {
@@ -280,15 +291,29 @@ mod tests {
     #[test]
     fn what_was_written_comes_back() {
         let saved = Saved {
-            compared: vec![("2–5".into(), 0), ("0".into(), 1)],
+            compared: vec!["2–5".into(), "0".into()],
             pin: Some(true),
+            above: Some(false),
+            curves: Some(Curves::P95),
+            swap: Some(true),
             size: Some((1500.0, 900.0)),
             position: Some((120, 80)),
             maximized: false,
         };
         let back = parse(&text(&saved)).expect("свой файл читается");
         assert_eq!(back, saved);
-        assert_eq!(compared(&back.compared, &blocks()), [(2, 0), (0, 1)]);
+        assert_eq!(compared(&back.compared, &blocks()), [2, 0]);
+        // Все двенадцать блоков — все двенадцать и вернутся, по порядку файла.
+        let every: Vec<String> = blocks().iter().rev().map(|b| b.name.clone()).collect();
+        let all = Saved {
+            compared: every,
+            ..Saved::default()
+        };
+        let every_back = parse(&text(&all)).expect("свой файл читается");
+        assert_eq!(
+            compared(&every_back.compared, &blocks()),
+            (0..12).rev().collect::<Vec<_>>()
+        );
         let place = placement(&back, (900.0, 560.0), one_screen);
         assert_eq!(
             place,
@@ -302,39 +327,30 @@ mod tests {
 
     #[test]
     fn blocks_that_are_gone_drop_out_alone() {
-        // Блока «12» нет (другой процессор или раскладка), «0» записан дважды, пятый лишний, цвет 9 вне палитры,
-        // цвет 1 занят дважды.
-        let saved = vec![
-            ("12".to_string(), 0),
-            ("0".to_string(), 1),
-            ("0".to_string(), 2),
-            ("1".to_string(), 1),
-            ("2–5".to_string(), 9),
-            ("6–9".to_string(), 3),
-            ("10".to_string(), 0),
-        ];
-        let got = compared(&saved, &blocks());
-        // Порядок — как в файле; не больше четырёх; цвета без повторов, у годных — свои.
-        assert_eq!(got.iter().map(|(b, _)| *b).collect::<Vec<_>>(), [0, 1, 2, 3]);
-        assert_eq!(got[0].1, 1);
-        assert_eq!(got[3].1, 3);
-        let mut colors: Vec<usize> = got.iter().map(|(_, c)| *c).collect();
-        colors.sort_unstable();
-        colors.dedup();
-        assert_eq!(colors.len(), 4, "colours stay distinct: {got:?}");
-        assert!(got.iter().all(|(_, c)| *c < COMPARE));
+        // Блока «99» нет (другой процессор или раскладка), «0» записан дважды.
+        let saved: Vec<String> = ["99", "0", "0", "1", "2–5", "6–9", "10"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            compared(&saved, &blocks()),
+            [0, 1, 2, 3, 4],
+            "порядок — как в файле, без повторов"
+        );
         // Ни одного известного — пусто (окно возьмёт умолчание: первое P-ядро).
-        assert_eq!(compared(&[("99".into(), 0)], &blocks()), []);
+        assert_eq!(compared(&["99".into()], &blocks()), Vec::<usize>::new());
     }
 
     #[test]
     fn a_bad_part_falls_back_alone() {
-        // Размер — не пара чисел, место — дробное, сравнение — со строкой без цвета: годное рядом остаётся.
-        let saved =
-            parse(r#"{"compared":[{"block":"1"},{"block":"0","color":2}],"pin":true,"size":"big","position":[1.5,2]}"#)
-                .expect("объект");
-        assert_eq!(saved.compared, [("0".to_string(), 2)]);
-        assert_eq!(saved.pin, Some(true));
+        // Размер — не пара чисел, место — дробное, в сравнении — число и запись прежнего вида с цветом, линии — незнакомое
+        // слово: годное рядом остаётся.
+        let saved = parse(
+            r#"{"compared":[7,{"block":"0","color":2},"2–5"],"pin":true,"curves":"all","above":false,"size":"big","position":[1.5,2]}"#,
+        )
+        .expect("объект");
+        assert_eq!(saved.compared, ["0".to_string(), "2–5".to_string()]);
+        assert_eq!((saved.pin, saved.above, saved.curves), (Some(true), Some(false), None));
         assert_eq!((saved.size, saved.position), (None, None));
         for bad in [
             r#"{"size":[0,700]}"#,

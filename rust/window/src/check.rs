@@ -4,7 +4,8 @@
 // агент — как выглядит окно, проверка не судит.
 // Три прохода (`Mode`):
 // • полный — против движка на имитации, его запускает проверка движка (Tray.cs C#-части): картинки F, F-select.png,
-//   F-pin.png, F-tip.png, F-profiles.png, F-menu.png, F-1280.png, F-natural.png;
+//   F-pin.png, F-tip.png, F-abs.png, F-all.png, F-chart-tip.png, F-swap.png, F-swap-tip.png, F-profiles.png,
+//   F-menu.png, F-1280.png, F-1280-tip.png, F-1280-swap.png, F-1500.png, F-natural.png;
 // • --settings — против программы у часов, её запускает её скрытая проверка (rust/tray/src/check_window.rs): настройки
 //   автомодуля выключателями и ползунками, затем выбор блоков, подсветка, размер — и закрытие окна; картинка F;
 // • --reopened — второй запуск с той же папкой (--data): окно открылось таким, каким его закрыли; картинка F.
@@ -28,6 +29,8 @@ use slint::platform::{Platform, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, Model, PhysicalSize, Rgb8Pixel};
 
 use crate::AppWindow;
+use crate::chart::{self, Curves, E_COLORS, P_COLORS, Scale};
+use crate::panels::f;
 use crate::pipe::{Event, Link};
 use crate::samples;
 use crate::store::Digest;
@@ -287,10 +290,11 @@ impl Check {
         );
         self.idle();
         self.select(&p_block, &e_block, expected.as_ref());
+        self.chart_views(&p_block, &e_block, expected.as_ref());
         self.means_and_reset(&p_block);
         self.limit_menu(&limits, &e_block);
         self.profiles(&limits, &e_block);
-        self.sizes();
+        self.sizes(&p_block, &e_block);
     }
 
     /// Знакомство, потолки и первое состояние пришли; плиток столько, сколько в раскладке.
@@ -466,7 +470,7 @@ impl Check {
     )]
     fn select(&mut self, p_block: &BlockInfo, e_block: &BlockInfo, expected: Option<&Synthetic>) {
         let (p, e) = (p_block.index, e_block.index);
-        let compared = |v: &View| v.compared.iter().map(|(b, _)| *b).collect::<Vec<_>>();
+        let compared = |v: &View| v.compared.clone();
         let first = compared(&self.view.borrow()) == [p];
         self.check(
             first,
@@ -488,9 +492,10 @@ impl Check {
         let selected = self.pump(|v| compared(v) == [e], 2.0);
         self.check(selected, format!("щелчок выбрал блок {}", e_block.name));
         let outline = self.view.borrow().shown(e).map(|t| (t.selected, t.outline));
+        let colour = self.colour(e);
         self.check(
-            outline == Some((true, crate::panels::rgb(crate::panels::SERIES[0]))),
-            "выбранная плитка обведена цветом своей линии",
+            outline == Some((true, crate::panels::rgb(colour))) && E_COLORS.contains(&colour),
+            "выбранная плитка обведена цветом своей линии (кластер — холодным)",
         );
         self.pump(|_| false, 1.0);
         let loaded = self
@@ -612,9 +617,10 @@ impl Check {
             ),
         );
         let p_outline = self.view.borrow().shown(p).map(|t| t.outline);
+        let p_colour = self.colour(p);
         self.check(
-            p_outline == Some(crate::panels::rgb(crate::panels::SERIES[1])),
-            "у второго блока — второй цвет",
+            p_outline == Some(crate::panels::rgb(p_colour)) && P_COLORS.contains(&p_colour),
+            "у второго блока — свой цвет (P-ядро — тёплым)",
         );
         let shot = self.shot("select");
         self.check(shot, "картинка сравнения двух блоков");
@@ -647,10 +653,14 @@ impl Check {
             self.note(format!("подсказка столбца: {}", tip.1.replace('\n', " / ")));
         }
         let well_formed = |tip: &str| {
+            // Пробелы внутри чисел и единиц в подсказке неразрывные — для счёта они обычные.
+            let tip = tip.replace('\u{a0}', " ");
             let peaks = tip.matches('▲').count();
             peaks >= 1
-                && tip.matches("при нагрузке ø").count() == peaks
-                && tip.matches(", нагрузка ").count() == peaks
+                && tip.matches(", нагрузка ø ").count() == peaks
+                && tip.matches("95 % ниже").count() == peaks
+                && tip.matches(" °C: ×").count() == peaks
+                && tip.contains("над остальным кристаллом")
                 && !tip.contains("срезов")
         };
         let tip_ratios: Vec<i32> = tips.iter().map(|(r, _)| *r).collect();
@@ -658,7 +668,7 @@ impl Check {
             !tips.is_empty() && tip_ratios == point_ratios && tips.iter().all(|(_, t)| well_formed(t)),
             format!(
                 "подсказки столбцов: есть у множителей {tip_ratios:?}, точки у {point_ratios:?}; у каждого блока время, \
-                 ø нагрузка и ▲ со множителем, нагрузкой и временем"
+                 ø нагрузка, ø и 95 % над кристаллом, ▲ со множителем, нагрузкой и временем"
             ),
         );
 
@@ -729,47 +739,6 @@ impl Check {
         self.click(hover_x, hover_y, PointerEventButton::Left);
         let back = self.pump(|v| !v.pin_mode, 1.0);
         self.check(back, "щелчок по «под курсором» вернул подсветку под курсором");
-
-        // Больше четырёх блоков не сравнивается: пятый щелчок не добавляет и говорит почему.
-        let others: Vec<usize> = self
-            .view
-            .borrow()
-            .hello
-            .as_ref()
-            .map(|h| {
-                h.blocks
-                    .iter()
-                    .map(|b| b.index)
-                    .filter(|&b| b != p && b != e)
-                    .take(3)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if others.len() == 3 {
-            for &b in &others {
-                let (x, y) = self.tile_center(b);
-                self.click(x, y, PointerEventButton::Left);
-            }
-            let refused = self.pump(|v| v.compared.len() == crate::panels::COMPARE, 1.0);
-            let said = self.ui.get_problem().to_string();
-            let count = self.view.borrow().compared.len();
-            self.check(
-                refused && said.contains("до 4"),
-                format!("пятый блок не добавлен: блоков {count}, строка «{said}»"),
-            );
-            self.view.borrow_mut().problem_dismissed();
-            // Убрать лишние: сравниваются снова кластер и P-ядро, их цвета прежние.
-            for &b in others.iter().take(2) {
-                let (x, y) = self.tile_center(b);
-                self.click(x, y, PointerEventButton::Left);
-            }
-            let back = self.pump(|v| compared(v) == [e, p], 1.0);
-            let colours = self.view.borrow().compared.clone();
-            self.check(
-                back && colours == [(e, 0), (p, 1)],
-                format!("лишние убраны, цвета оставшихся прежние: {colours:?}"),
-            );
-        }
     }
 
     /// Точка ø средней линии блока на графике — координаты окна; None — у блока нет точек.
@@ -784,15 +753,393 @@ impl Check {
             .points
             .first()?
             .clone();
-        // Поле графика: Chart стоит в stats-x + pad - 4, поле — 40 px от его левого края и 8 px от верха, справа 10 px,
-        // снизу ось 34 px (ui/app.slint, Chart).
+        // Поле графика — как его кладёт окно (ui/app.slint, plot-*); места точек уже повёрнуты (оси местами).
         let ui = &self.ui;
-        let chart_x = ui.get_stats_x() + ui.get_pad() - 4.0;
-        let chart_w = ui.get_stats_w() - 2.0 * ui.get_pad() + 4.0;
-        let (plot_x, plot_y) = (chart_x + 40.0, ui.get_chart_y() + 8.0);
-        let (plot_w, plot_h) = (chart_w - 40.0 - 10.0, ui.get_chart_h() - 8.0 - 34.0);
-        Some((plot_x + point.x * plot_w, plot_y + (1.0 - point.mean) * plot_h))
+        Some((
+            ui.get_plot_x() + point.x * ui.get_plot_w(),
+            ui.get_plot_y() + (1.0 - point.y) * ui.get_plot_h(),
+        ))
     }
+
+    /// Цвет блока, как его даёт окно (src/chart.rs): у блока свой.
+    fn colour(&self, block: usize) -> u32 {
+        self.view
+            .borrow()
+            .hello
+            .as_ref()
+            .map_or(0, |h| chart::color_of(&h.blocks, block))
+    }
+
+    /// Щелчок по кнопке переключателя вида и ожидание, что окно его приняло.
+    fn chip(&mut self, at: (f32, f32), done: impl Fn(&View) -> bool, what: &str) -> bool {
+        self.click(at.0, at.1, PointerEventButton::Left);
+        let ok = self.pump(done, 1.0);
+        self.check(ok, what)
+    }
+
+    /// Курсор — в столбец множителя номер `i` по счёту на оси (при осях местами — в строку), на доле `along` поля
+    /// поперёк столбца; через полсекунды — подсказка. Она должна лечь в поле графика, рядом с курсором, не на шкалы
+    /// (подписи слева и снизу) и не на столбец под курсором (владелец 15.10: «закрывает саму скалу… не вижу, где я
+    /// стою»).
+    fn chart_tip(&mut self, i: usize, along: f32, what: &str) -> bool {
+        let ui = &self.ui;
+        let (px, py, pw, ph) = (ui.get_plot_x(), ui.get_plot_y(), ui.get_plot_w(), ui.get_plot_h());
+        let swap = ui.get_chart_swap();
+        // Столбец под курсором — по геометрии графика (chart::Frame::band, доли поля, y снизу вверх) в пиксели окна.
+        let (lo, hi) = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .map(|s| {
+                (
+                    s.columns.first().map_or(0, |c| c.ratio),
+                    s.columns.last().map_or(0, |c| c.ratio),
+                )
+            })
+            .unwrap_or_default();
+        let frame = chart::Frame {
+            lo,
+            hi,
+            t0: 0.0,
+            t1: 1.0,
+            swap,
+        };
+        let (bx, by, bw, bh) = frame.band(lo + i32::try_from(i).unwrap_or(0));
+        let column = (px + f(bx) * pw, py + (1.0 - f(by + bh)) * ph, f(bw) * pw, f(bh) * ph);
+        let cursor = if swap {
+            (px + along * pw, column.1 + column.3 / 2.0)
+        } else {
+            (column.0 + column.2 / 2.0, py + (1.0 - along) * ph)
+        };
+        self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(cursor.0, cursor.1),
+        });
+        self.pump(|_| false, 0.7);
+        let shown = self.ui.get_tip_shown();
+        let tip = (
+            self.ui.get_tip_box_x(),
+            self.ui.get_tip_box_y(),
+            self.ui.get_tip_box_w(),
+            self.ui.get_tip_box_h(),
+        );
+        let chart_x = self.ui.get_chart_x();
+        let scales = [
+            (chart_x, py, px - chart_x, ph),                 // подписи слева
+            (chart_x, py + ph, self.ui.get_chart_w(), 34.0), // подписи снизу
+        ];
+        let meets = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+            a.0 < b.0 + b.2 - 0.5 && b.0 < a.0 + a.2 - 0.5 && a.1 < b.1 + b.3 - 0.5 && b.1 < a.1 + a.3 - 0.5
+        };
+        let clear = !meets(tip, column) && scales.iter().all(|&r| !meets(tip, r));
+        let inside =
+            tip.0 >= px - 0.5 && tip.0 + tip.2 <= px + pw + 0.5 && tip.1 >= 0.0 && tip.1 + tip.3 <= py + ph + 0.5;
+        self.check(
+            shown && clear && inside,
+            format!(
+                "{what}: подсказка {:.0},{:.0} {:.0}×{:.0}; {} {:.0},{:.0} {:.0}×{:.0}; поле {px:.0},{py:.0} {pw:.0}×{ph:.0}; курсор {:.0},{:.0} — не на шкалах и не на {}, внутри поля",
+                tip.0,
+                tip.1,
+                tip.2,
+                tip.3,
+                if swap { "строка" } else { "столбец" },
+                column.0,
+                column.1,
+                column.2,
+                column.3,
+                cursor.0,
+                cursor.1,
+                if swap { "строке" } else { "столбце" },
+            ),
+        )
+    }
+
+    /// Номера столбцов (по счёту на оси) с подсказкой — где у выбранных блоков есть срезы.
+    fn tipped_columns(&self) -> Vec<usize> {
+        self.view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .map(|s| {
+                s.columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.tip.is_empty())
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Курсор уходит из окна: подсказки и подсветки нет.
+    fn leave(&mut self) {
+        self.ui.window().dispatch_event(WindowEvent::PointerExited);
+        self.pump(|_| true, 0.0);
+    }
+
+    /// Щелчки по плиткам, пока в сравнении не станут ровно `want` (по порядку: недостающие добавляются в конец).
+    fn compare_exactly(&mut self, want: &[usize]) -> bool {
+        let now = self.view.borrow().compared.clone();
+        for b in now.iter().filter(|b| !want.contains(b)) {
+            let (x, y) = self.tile_center(*b);
+            self.click(x, y, PointerEventButton::Left);
+        }
+        for b in want {
+            if !self.view.borrow().compared.contains(b) {
+                let (x, y) = self.tile_center(*b);
+                self.click(x, y, PointerEventButton::Left);
+            }
+        }
+        let want = want.to_vec();
+        self.pump(move |v| v.compared == want, 2.0)
+    }
+
+    /// Шаг 2б: вид графика (владелец 15.10). Шкала над кристаллом по умолчанию и абсолютная переключателем; линии ø /
+    /// 95 % / обе; сравнение всех блоков сразу — двенадцать цветов двумя семьями; подсказка столбца не ложится на шкалы
+    /// и на столбец под курсором; оси местами — подсветка линии и подсказка работают так же. В конце — снова кластер
+    /// и P-ядро, обычные оси, обе линии, шкала над кристаллом.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario of switches, hovers and pictures, read top to bottom"
+    )]
+    fn chart_views(&mut self, p_block: &BlockInfo, e_block: &BlockInfo, expected: Option<&Synthetic>) {
+        let (p, e) = (p_block.index, e_block.index);
+        let ticks = |c: &Check| {
+            c.ui.get_chart_ticks()
+                .iter()
+                .map(|t| t.text.to_string())
+                .collect::<Vec<_>>()
+        };
+        // Шкала над кристаллом — по умолчанию: 0 на оси, подписи со знаком.
+        let above = self.view.borrow().scale == Scale::AboveDie && self.ui.get_chart_above();
+        let first = ticks(self);
+        self.check(
+            above
+                && first.iter().any(|t| t == "0°")
+                && first.iter().any(|t| t.starts_with('+'))
+                && self.ui.get_chart_value_title().contains("над кристаллом"),
+            format!("по умолчанию шкала над кристаллом: деления {first:?}"),
+        );
+        if let Some(s) = expected {
+            let digest = self.view.borrow().digest.clone();
+            let tally = digest.as_ref().and_then(|d| d.tally.blocks.get(&e_block.name).cloned());
+            // Средние над кристаллом — как у генератора (он считает их сам, по строкам, которые пишет).
+            let got: Vec<(i32, f64)> = tally
+                .as_ref()
+                .map(|t| {
+                    t.above
+                        .iter()
+                        .map(|(r, b)| (*r, b.mean().unwrap_or(f64::NAN)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            #[expect(clippy::cast_precision_loss, reason = "milliseconds of a synthetic day")]
+            let want: Vec<(i32, f64)> = s.above.iter().map(|(r, (sum, ms))| (*r, sum / *ms as f64)).collect();
+            let same = got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-6);
+            self.check(
+                same,
+                format!(
+                    "ø над кристаллом у {} по корзинам — как у генератора: {}",
+                    e_block.name,
+                    got.iter()
+                        .map(|(r, m)| format!("×{r} {m:+.2}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+            // 95 %: процентиль гистограммы — не дальше половины ячейки от точного по строкам генератора.
+            let mut worst = 0.0f64;
+            let mut all_there = true;
+            for (ratio, rows) in &s.above_rows {
+                let exact = exact_quantile(rows, samples::P95);
+                let got = tally
+                    .as_ref()
+                    .and_then(|t| t.above_hist.get(ratio))
+                    .and_then(|h| h.quantile(samples::P95));
+                match (exact, got) {
+                    (Some(x), Some(g)) => worst = worst.max((x - g).abs()),
+                    _ => all_there = false,
+                }
+            }
+            self.check(
+                all_there && worst <= samples::ABOVE_CELL / 2.0 + 1e-9,
+                format!(
+                    "95 % над кристаллом у {} — от точного по строкам не дальше {worst:.3} °C (половина ячейки — {:.3})",
+                    e_block.name,
+                    samples::ABOVE_CELL / 2.0
+                ),
+            );
+        }
+        // Абсолютная — щелчком: 40–100 °C, отсечка снова возможна.
+        let before = self.view.borrow().shown_stats.clone();
+        let abs = (self.ui.get_abs_chip_x(), self.ui.get_abs_chip_y());
+        self.chip(
+            abs,
+            |v| v.scale == Scale::Absolute,
+            "щелчок по «абсолютная» — шкала абсолютной температуры",
+        );
+        let now = ticks(self);
+        let changed = before != self.view.borrow().shown_stats;
+        self.check(
+            now.first().is_some_and(|t| t == "40°") && now.last().is_some_and(|t| t == "100°") && changed,
+            format!("деления абсолютной шкалы {now:?}; нарисованное изменилось: {changed}"),
+        );
+        let shot = self.shot("abs");
+        self.check(shot, "картинка абсолютной шкалы");
+        let above_at = (self.ui.get_above_chip_x(), self.ui.get_above_chip_y());
+        self.chip(
+            above_at,
+            |v| v.scale == Scale::AboveDie,
+            "щелчок по «над кристаллом» вернул шкалу над кристаллом",
+        );
+
+        // Линии: только ø, только 95 %, обе.
+        let drawn = |v: &View| {
+            v.shown_stats.as_ref().map_or((false, false), |s| {
+                (
+                    s.series.iter().any(|l| !l.mean.is_empty()),
+                    s.series.iter().any(|l| !l.p95.is_empty()),
+                )
+            })
+        };
+        let at = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
+        self.chip(at, |v| v.curves == Curves::Mean, "щелчок по «ø» — только средние");
+        let mean_only = drawn(&self.view.borrow()) == (true, false) && self.ui.get_chart_curves() == 0;
+        let at = (self.ui.get_p95_chip_x(), self.ui.get_p95_chip_y());
+        self.chip(at, |v| v.curves == Curves::P95, "щелчок по «95 %» — только 95 %");
+        let p95_only = drawn(&self.view.borrow()) == (false, true) && self.ui.get_chart_curves() == 1;
+        let at = (self.ui.get_both_chip_x(), self.ui.get_both_chip_y());
+        self.chip(at, |v| v.curves == Curves::Both, "щелчок по «обе» — обе линии");
+        let both = drawn(&self.view.borrow()) == (true, true) && self.ui.get_chart_curves() == 2;
+        self.check(
+            mean_only && p95_only && both,
+            format!("нарисованы: только ø {mean_only}, только 95 % {p95_only}, обе {both}"),
+        );
+
+        // Все блоки сразу: двенадцать цветов, P — тёплые, E — холодные, обводка плитки — цвет линии.
+        let blocks: Vec<BlockInfo> = self
+            .view
+            .borrow()
+            .hello
+            .as_ref()
+            .map(|h| h.blocks.clone())
+            .unwrap_or_default();
+        let mut every: Vec<usize> = vec![e, p];
+        every.extend(blocks.iter().map(|b| b.index).filter(|&b| b != e && b != p));
+        let all = self.compare_exactly(&every);
+        let legend = self.ui.get_stats_legend().row_count();
+        let series = self.ui.get_chart_series().row_count();
+        let outlines: Vec<(bool, bool)> = blocks
+            .iter()
+            .map(|b| {
+                let colour = self.colour(b.index);
+                let family = if b.kind == "E" {
+                    E_COLORS.contains(&colour)
+                } else {
+                    P_COLORS.contains(&colour)
+                };
+                let framed = self
+                    .view
+                    .borrow()
+                    .shown(b.index)
+                    .is_some_and(|t| t.selected && t.outline == crate::panels::rgb(colour));
+                (family, framed)
+            })
+            .collect();
+        let mut colours: Vec<u32> = blocks.iter().map(|b| self.colour(b.index)).collect();
+        colours.sort_unstable();
+        colours.dedup();
+        self.check(
+            all && legend == blocks.len()
+                && series == blocks.len()
+                && colours.len() == blocks.len()
+                && outlines.iter().all(|&(f, o)| f && o),
+            format!(
+                "в сравнении все {} блоков: в легенде {legend}, линий {series}, разных цветов {}; цвет по семье и обводка плитки — у {} из {}",
+                blocks.len(),
+                colours.len(),
+                outlines.iter().filter(|&&(f, o)| f && o).count(),
+                blocks.len()
+            ),
+        );
+        let shot = self.shot("all");
+        self.check(shot, "картинка: все блоки, шкала над кристаллом, обе линии");
+
+        // Подсказка столбца с двенадцатью блоками: у левого края, в середине и у правого края оси.
+        let tipped = self.tipped_columns();
+        if let (Some(&left), Some(&right)) = (tipped.first(), tipped.last()) {
+            let middle = tipped[tipped.len() / 2];
+            self.chart_tip(left, 0.6, "подсказка левого столбца");
+            self.chart_tip(middle, 0.3, "подсказка среднего столбца");
+            self.chart_tip(right, 0.8, "подсказка правого столбца");
+            let shot = self.shot("chart-tip");
+            self.check(shot, "картинка с подсказкой столбца у правого края");
+            self.leave();
+        } else {
+            self.check(false, "у столбцов нет подсказок");
+        }
+
+        // Оси местами: множитель по вертикали; подсветка линии и подсказка — так же.
+        let swap_at = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+        self.chip(swap_at, |v| v.swap, "щелчок по «°C» — температура по горизонтали");
+        let point = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.series.iter().find(|l| l.block == e))
+            .and_then(|l| l.points.first().cloned());
+        let turned = point.as_ref().is_some_and(|q| {
+            let frame_ok = self.ui.get_chart_swap();
+            // Точка ø у кластера при осях местами: по вертикали — множитель (доля оси множителя), по горизонтали —
+            // температура.
+            let columns = self
+                .view
+                .borrow()
+                .shown_stats
+                .as_ref()
+                .and_then(|s| s.columns.iter().find(|c| c.ratio == q.ratio).map(|c| c.at));
+            frame_ok && columns.is_some_and(|at| (at - q.y).abs() < 1e-6)
+        });
+        self.check(
+            turned,
+            "оси местами: точка кластера по вертикали стоит на своём множителе",
+        );
+        let shot = self.shot("swap");
+        self.check(shot, "картинка: оси местами, все блоки");
+        let tipped = self.tipped_columns();
+        if let (Some(&low), Some(&high)) = (tipped.first(), tipped.last()) {
+            self.chart_tip(low, 0.5, "оси местами: подсказка нижней строки");
+            self.chart_tip(high, 0.5, "оси местами: подсказка верхней строки");
+            let shot = self.shot("swap-tip");
+            self.check(shot, "картинка: оси местами, подсказка строки");
+            self.leave();
+        }
+        // Подсветка линии при осях местами — на двух блоках, как при обычных осях: среди двенадцати линии лежат
+        // друг на друге, и ближайшей к курсору может честно оказаться чужая.
+        let back = self.compare_exactly(&[e, p]);
+        self.check(back, "в сравнении снова кластер и P-ядро");
+        if let Some((x, y)) = self.chart_point(e) {
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x + 3.0, y + 2.0),
+            });
+            let near = self.pump(|v| v.hovered == Some(e), 1.0);
+            self.check(
+                near,
+                format!("оси местами: курсор у линии {} — подсвечена она", e_block.name),
+            );
+            self.leave();
+        } else {
+            self.check(false, "у линии кластера нет точки на графике");
+        }
+        let plain_at = (self.ui.get_plain_chip_x(), self.ui.get_plain_chip_y());
+        self.chip(plain_at, |v| !v.swap, "щелчок по «×» — множитель снова по горизонтали");
+    }
+
     /// Шаг 3: ø под нагрузкой на плитке; кнопка «▲ ø» сбрасывает наибольшую и средние. Нагрузку даёт команда
     /// движку напрямую (не жест окна: у окна нагрузки нет) — только чтобы движок на имитации посчитал средние.
     fn means_and_reset(&mut self, p_block: &BlockInfo) {
@@ -1071,9 +1418,40 @@ impl Check {
         self.check(deleted, format!("«удалить» убрал «{NAME}»"));
     }
 
-    /// 6. Окно 1280×800 и по содержимому: разделы не налезают друг на друга и не выходят за окно.
-    fn sizes(&mut self) {
-        for (name, size) in [("1280", Some((1280, 800))), ("natural", None)] {
+    /// Шаг 6: окно 1280×800, 1500×900 и по содержимому — разделы не налезают друг на друга и не выходят за окно;
+    /// кнопки вида графика — в панели статистики, между легендой и графиком. При 1280 — несколько P- и E-блоков,
+    /// подсказка и оси местами на картинках.
+    fn sizes(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
+        // Несколько блоков: два P-ядра и два кластера, если есть.
+        let blocks: Vec<BlockInfo> = self
+            .view
+            .borrow()
+            .hello
+            .as_ref()
+            .map(|h| h.blocks.clone())
+            .unwrap_or_default();
+        let mut some = vec![e_block.index, p_block.index];
+        some.extend(
+            blocks
+                .iter()
+                .filter(|b| b.kind == "P" && b.index != p_block.index)
+                .take(2)
+                .map(|b| b.index),
+        );
+        some.extend(
+            blocks
+                .iter()
+                .filter(|b| b.kind == "E" && b.index != e_block.index)
+                .take(1)
+                .map(|b| b.index),
+        );
+        let several = self.compare_exactly(&some);
+        self.check(several, format!("для картинок размеров в сравнении блоки {some:?}"));
+        for (name, size) in [
+            ("1280", Some((1280, 800))),
+            ("1500", Some((1500, 900))),
+            ("natural", None),
+        ] {
             let size = size.unwrap_or_else(|| {
                 let (w, h) = (self.ui.get_natural_w(), self.ui.get_natural_h());
                 (rounded(w), rounded(h))
@@ -1100,9 +1478,86 @@ impl Check {
                 ui.get_chart_h()
             );
             self.check(fits, line);
+            self.header_fits(name);
             let shot = self.shot(name);
             self.check(shot, format!("картинка {name}"));
+            if name == "1280" {
+                let tipped = self.tipped_columns();
+                if let Some(&middle) = tipped.get(tipped.len() / 2) {
+                    self.chart_tip(middle, 0.5, "1280×800: подсказка столбца");
+                    let shot = self.shot("1280-tip");
+                    self.check(shot, "картинка 1280 с подсказкой столбца");
+                    self.leave();
+                }
+                let swap_at = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+                self.chip(swap_at, |v| v.swap, "1280×800: оси местами");
+                let shot = self.shot("1280-swap");
+                self.check(shot, "картинка 1280, оси местами");
+                let plain_at = (self.ui.get_plain_chip_x(), self.ui.get_plain_chip_y());
+                self.chip(plain_at, |v| !v.swap, "1280×800: оси обратно");
+            }
         }
+        let back = self.compare_exactly(&[e_block.index, p_block.index]);
+        self.check(back, "в сравнении снова кластер и P-ядро");
+    }
+
+    /// Шапка статистики помещается (владелец 15.10 видел при 1280 подпись линий поверх переключателя подсветки): группы
+    /// кнопок вида — внутри панели, ниже легенды блоков и выше графика, друг на друга не налезают.
+    fn header_fits(&mut self, name: &str) {
+        let ui = &self.ui;
+        let groups = [
+            (
+                "шкала",
+                ui.get_scale_group_x(),
+                ui.get_scale_group_y(),
+                ui.get_scale_group_w(),
+            ),
+            (
+                "линии",
+                ui.get_curve_group_x(),
+                ui.get_curve_group_y(),
+                ui.get_curve_group_w(),
+            ),
+            (
+                "оси",
+                ui.get_axes_group_x(),
+                ui.get_axes_group_y(),
+                ui.get_axes_group_w(),
+            ),
+            (
+                "подсветка",
+                ui.get_mode_group_x(),
+                ui.get_mode_group_y(),
+                ui.get_mode_group_w(),
+            ),
+        ];
+        let height = 22.0;
+        let (left, right) = (ui.get_stats_x(), ui.get_stats_x() + ui.get_stats_w());
+        let (top, bottom) = (ui.get_key_bottom(), ui.get_chart_y());
+        let outside: Vec<&str> = groups
+            .iter()
+            .filter(|&&(_, x, y, w)| x < left || x + w > right || y < top - 0.5 || y + height > bottom + 0.5)
+            .map(|&(n, ..)| n)
+            .collect();
+        let mut crowded = Vec::new();
+        for (i, a) in groups.iter().enumerate() {
+            for b in &groups[i + 1..] {
+                let meet = a.1 < b.1 + b.3 && b.1 < a.1 + a.3 && a.2 < b.2 + height && b.2 < a.2 + height;
+                if meet {
+                    crowded.push(format!("{}/{}", a.0, b.0));
+                }
+            }
+        }
+        let mut rows: Vec<f32> = groups.iter().map(|g| g.2).collect();
+        rows.sort_by(f32::total_cmp);
+        rows.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        self.check(
+            outside.is_empty() && crowded.is_empty(),
+            format!(
+                "{name}: кнопки вида графика — {} строк(и) в панели статистики между легендой ({top:.0}) и графиком ({bottom:.0}); вне места: {outside:?}, налезли: {crowded:?}",
+                rows.len()
+            ),
+        );
     }
 }
 
@@ -1231,6 +1686,13 @@ impl Check {
             );
             return;
         }
+        // Отсечка — абсолютная температура: её линия — на абсолютной шкале (на шкале над кристаллом её места нет).
+        let abs = (self.ui.get_abs_chip_x(), self.ui.get_abs_chip_y());
+        self.chip(
+            abs,
+            |v| v.scale == Scale::Absolute,
+            "щелчок по «абсолютная» — шкала, на которой рисуется отсечка",
+        );
         let sent = self.view.borrow().sent;
         let start_limit = i32::try_from(start.limit).unwrap_or(LIMIT_TO);
         let start_depth = i32::try_from(start.depth).unwrap_or(DEPTH_TO);
@@ -1252,6 +1714,16 @@ impl Check {
             format!(
                 "щелчок по выключателю включил автомодуль: линия отсечки на графике, «{text_on}» на {line_on:.3} высоты"
             ),
+        );
+        // На шкале над кристаллом места абсолютной отсечке нет — линии нет; на абсолютной она снова там же.
+        let above = (self.ui.get_above_chip_x(), self.ui.get_above_chip_y());
+        self.chip(above, |v| v.scale == Scale::AboveDie, "щелчок по «над кристаллом»");
+        let hidden = self.ui.get_chart_cutoff() < 0.0;
+        self.chip(abs, |v| v.scale == Scale::Absolute, "щелчок по «абсолютная»");
+        let again = self.ui.get_chart_cutoff().to_bits() == line_on.to_bits();
+        self.check(
+            hidden && again,
+            format!("линия отсечки: над кристаллом нет ({hidden}), на абсолютной снова на месте ({again})"),
         );
 
         // 2. Ползунок отсечки — до LIMIT_TO: пока тянут, команды нет, а ручка и линия идут за мышью.
@@ -1336,14 +1808,19 @@ impl Check {
         let names = |v: &View| {
             v.compared
                 .iter()
-                .filter_map(|(b, slot)| Some((v.hello.as_ref()?.blocks.get(*b)?.name.clone(), *slot)))
+                .filter_map(|&b| Some(v.hello.as_ref()?.blocks.get(b)?.name.clone()))
                 .collect::<Vec<_>>()
         };
-        let wanted = vec![(p.name.clone(), 0), (e.name.clone(), 1)];
+        let wanted = vec![p.name.clone(), e.name.clone()];
         let first = names(&self.view.borrow());
         let (x, y) = self.tile_center(e.index);
         self.click(x, y, PointerEventButton::Left);
         let (x, y) = (self.ui.get_pin_chip_x(), self.ui.get_pin_chip_y());
+        self.click(x, y, PointerEventButton::Left);
+        // Вид графика тоже запоминается: оси местами и только 95 % (шкала — абсолютная с настроек автомодуля).
+        let (x, y) = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+        self.click(x, y, PointerEventButton::Left);
+        let (x, y) = (self.ui.get_p95_chip_x(), self.ui.get_p95_chip_y());
         self.click(x, y, PointerEventButton::Left);
         let file = self.data.join(crate::saved::FILE);
         let read = || {
@@ -1357,10 +1834,13 @@ impl Check {
             first == wanted[..1]
                 && names(&self.view.borrow()) == wanted
                 && clicked.compared == wanted
-                && clicked.pin == Some(true),
+                && clicked.pin == Some(true)
+                && clicked.swap == Some(true)
+                && clicked.curves == Some(Curves::P95)
+                && clicked.above == Some(false),
             format!(
-                "щелчки по плитке {} и по «закреплённая» сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}",
-                e.name, clicked.compared, clicked.pin
+                "щелчки по плитке {}, «закреплённая», «°C» и «95 %» сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}, оси местами {:?}, линии {:?}, над кристаллом {:?}",
+                e.name, clicked.compared, clicked.pin, clicked.swap, clicked.curves, clicked.above
             ),
         );
         self.resize(CLOSED_SIZE);
@@ -1396,14 +1876,23 @@ impl Check {
         );
         let compared = self.view.borrow().compared.clone();
         self.check(
-            compared == [(p.index, 0), (e.index, 1)],
-            format!(
-                "в сравнении — те же блоки {} и {} с теми же цветами: {compared:?}",
-                p.name, e.name
-            ),
+            compared == [p.index, e.index],
+            format!("в сравнении — те же блоки {} и {}: {compared:?}", p.name, e.name),
         );
         let pinned = self.ui.get_pin_mode() && self.view.borrow().pin_mode;
         self.check(pinned, "подсветка — закреплённая, как была");
+        let (scale, curves, swap) = {
+            let v = self.view.borrow();
+            (v.scale, v.curves, v.swap)
+        };
+        self.check(
+            scale == Scale::Absolute
+                && curves == Curves::P95
+                && swap
+                && self.ui.get_chart_swap()
+                && self.ui.get_chart_curves() == 1,
+            format!("вид графика — как оставили: шкала {scale:?}, линии {curves:?}, оси местами {swap}"),
+        );
         let came = self.pump(|v| v.auto.is_some(), 5.0);
         let auto = self.view.borrow().auto.clone();
         self.check(
@@ -1455,6 +1944,12 @@ struct Synthetic {
     /// По блоку: множитель → (строк, мс), посчитанное генератором: каждая строка с температурой и множителем, при любой
     /// нагрузке; мс — её шаг (строки идут без пропусков, кроме перерыва перед первой новой — та тоже покрывает шаг).
     bins: HashMap<String, BTreeMap<i32, (u32, u64)>>,
+    /// Блок, у которого генератор считает и шкалу над кристаллом (кластер проверки).
+    focus: String,
+    /// У него: множитель → (сумма «над кристаллом» × мс, мс) — средняя над кристаллом по строкам.
+    above: BTreeMap<i32, (f64, u64)>,
+    /// У него: множитель → (над кристаллом, мс) каждой строки — для точного процентиля.
+    above_rows: BTreeMap<i32, Vec<(f64, u64)>>,
     rows: u64,
     /// Сколько мс покрывают все строки.
     ms: u64,
@@ -1488,6 +1983,8 @@ fn rows(
 ) {
     let n = hello.blocks.len();
     let mut busy = vec![false; n];
+    // Значения блоков текущей строки: (заводской, корзина множителя, доля работы, записанная температура).
+    let mut cells: Vec<(i64, i64, &str, Option<f64>)> = Vec::with_capacity(n);
     let mut counted = s;
     let old = stretch.step_ms == samples::OLD_STEP_MS.unsigned_abs();
     for k in 0..stretch.count {
@@ -1521,11 +2018,12 @@ fn rows(
             String::new()
         };
         let _ = write!(text, ",{package},{fan},"); // into a String
+        // Сначала значения всех блоков (уровень кристалла строки — по ним всем), потом запись и счёт.
+        cells.clear();
         for (j, b) in hello.blocks.iter().enumerate() {
             let fused = limits.fused.get(b.first).copied().unwrap_or(40);
             let step = i64::try_from((i / (11 + j as u64)) % 4).unwrap_or(0);
             let ratio = fused - step;
-            let ratio_text = format!("{}.7", ratio - 1); // ×(ratio−0.3): корзина ratio
             // Доля работы: 0.9 / 0.1, изредка ровно на границе — 0.5 (занят) и 0.49 (свободен).
             let share = if i.is_multiple_of(97) {
                 "0.5"
@@ -1543,15 +2041,22 @@ fn rows(
             } else {
                 45.0
             };
-            // Изредка пустая температура: неизвестно, не ноль — такой срез не считается.
-            let temp_text = if (i + j as u64).is_multiple_of(53) {
-                String::new()
-            } else {
-                format!("{temp:.0}")
-            };
+            // Изредка пустая температура: неизвестно, не ноль — такой срез не считается. Записывается целым, как
+            // у датчиков; дальше считается то, что записано.
+            let known = !(i + j as u64).is_multiple_of(53);
+            let written = known.then(|| format!("{temp:.0}").parse::<f64>().unwrap_or(temp));
+            cells.push((fused, ratio, share, written));
+        }
+        let (sum, count) = cells
+            .iter()
+            .filter_map(|c| c.3)
+            .fold((0.0, 0usize), |(s, k), t| (s + t, k + 1));
+        for (b, &(fused, ratio, share, written)) in hello.blocks.iter().zip(cells.iter()) {
+            let ratio_text = format!("{}.7", ratio - 1); // ×(ratio−0.3): корзина ratio
+            let temp_text = written.map(|t| format!("{t}")).unwrap_or_default();
             let _ = write!(text, ",{fused},{ratio_text},{share},{temp_text}"); // into a String
             // В график идёт каждая строка с температурой и множителем — при любой нагрузке (владелец 15.10).
-            if !temp_text.is_empty()
+            if let Some(temp) = written
                 && let Some(s) = counted.as_deref_mut()
             {
                 let bin = s
@@ -1562,6 +2067,16 @@ fn rows(
                     .or_default();
                 bin.0 += 1;
                 bin.1 += stretch.step_ms;
+                // Над кристаллом: минус средняя остальных известных, если их не меньше половины остальных.
+                let others = count - 1;
+                if b.name == s.focus && others >= 1 && others * 2 >= n - 1 {
+                    let up = temp - (sum - temp) / others as f64;
+                    let key = i32::try_from(ratio).unwrap_or(0);
+                    let at = s.above.entry(key).or_default();
+                    at.0 += up * stretch.step_ms as f64;
+                    at.1 += stretch.step_ms;
+                    s.above_rows.entry(key).or_default().push((up, stretch.step_ms));
+                }
             }
         }
         text.push('\n');
@@ -1570,6 +2085,22 @@ fn rows(
             s.ms += stretch.step_ms;
         }
     }
+}
+
+/// Процентиль по времени точно, по строкам (значение, мс): наименьшее значение, у которого время не выше него — не
+/// меньше доли `share` всего времени (то же определение, что у гистограммы окна, без ячеек).
+fn exact_quantile(rows: &[(f64, u64)], share: (u64, u64)) -> Option<f64> {
+    let mut sorted = rows.to_vec(); // a few thousand rows of one bin, once per check
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: u64 = sorted.iter().map(|r| r.1).sum();
+    let mut below = 0;
+    for (v, ms) in sorted {
+        below += ms;
+        if below * share.1 >= total * share.0 {
+            return Some(v);
+        }
+    }
+    None
 }
 
 #[expect(
@@ -1604,7 +2135,10 @@ fn synthesize(
         let _ = write!(header, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String
     }
     header.push('\n');
-    let mut s = Synthetic::default();
+    let mut s = Synthetic {
+        focus: e_block.name.clone(),
+        ..Synthetic::default()
+    };
     let now = SystemTime::now();
     let day = |back| samples::date_before(now, back);
     let (old, new) = (samples::OLD_STEP_MS.unsigned_abs(), samples::STEP_MS.unsigned_abs());

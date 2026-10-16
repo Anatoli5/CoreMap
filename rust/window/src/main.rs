@@ -28,8 +28,11 @@ mod ui {
     )]
     slint::include_modules!();
 }
-use ui::{AppWindow, CellData, Column, LegendItem, LineRow, LinkData, Mark, MenuEntry, Series, SetRow, Tick, TileData};
+use ui::{
+    AppWindow, CellData, Column, LegendItem, LineRow, LinkData, Mark, MenuEntry, Run, Series, SetRow, Tick, TileData,
+};
 
+mod chart;
 mod check;
 mod die;
 mod panels;
@@ -40,6 +43,10 @@ mod screen;
 // Тесты модуля samples по спецификации, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
 #[cfg(test)]
 mod samples_spec;
+// Тесты графика статистики (шкала над кристаллом, 95-й процентиль, оси местами, цвета) по спецификации, написанные
+// отдельно от реализации.
+#[cfg(test)]
+mod chart_spec;
 mod store;
 mod view;
 mod wire;
@@ -70,6 +77,12 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_chart_click(move |x, y, w, h| v.borrow_mut().chart_click(x, y, w, h));
     let v = Rc::clone(view);
     ui.on_mode_changed(move |pin| v.borrow_mut().mode_changed(pin));
+    let v = Rc::clone(view);
+    ui.on_scale_changed(move |above| v.borrow_mut().scale_changed(above));
+    let v = Rc::clone(view);
+    ui.on_curves_changed(move |code| v.borrow_mut().curves_changed(code));
+    let v = Rc::clone(view);
+    ui.on_axes_changed(move |swap| v.borrow_mut().axes_changed(swap));
     let v = Rc::clone(view);
     ui.on_tile_menu(move |block| v.borrow_mut().menu(block));
     let v = Rc::clone(view);

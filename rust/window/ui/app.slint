@@ -81,27 +81,37 @@ export struct LineRow {
     mark: color,    // цвет блока (действия автомодуля при сравнении)
 }
 
-// Точка линии блока: место по оси множителя и высоты ø средней и ▲ наибольшей — доли поля графика; ø доля работы
-// (0…1; < 0 — не известна) — заливка точки.
+// Точка линии блока: места ø средней (x, y) и 95 % (qx, qy) — доли поля графика, y снизу вверх (оси уже повёрнуты в
+// Rust, src/chart.rs Frame); ø доля работы (0…1; < 0 — не известна) — заливка точки; a — густота краски: меньше времени
+// за точкой — бледнее.
 export struct Mark {
     x: float,
-    mean: float,
-    peak: float,
+    y: float,
+    qx: float,
+    qy: float,
     load: float,
+    a: float,
 }
 
-// Линия блока на графике статистики: пути в рамке 1000 × 1000, цвет блока, бледная — подсвечен другой.
+// Кусок линии одной густоты: путь в рамке 1000 × 1000 и густота краски.
+export struct Run {
+    d: string,
+    a: float,
+}
+
+// Линия блока на графике статистики: куски ø средней и 95 %, цвет блока, бледная — подсвечен другой.
 export struct Series {
-    mean: string,
-    peak: string,
+    mean: [Run],
+    p95: [Run],
     color: color,
     faded: bool,
     marks: [Mark],
 }
 
-// Столбец множителя на оси: место, множитель, подсказка (что у каждого выбранного блока на нём; "" — ничего).
+// Столбец множителя на оси: середина — доля оси множителя, множитель, подсказка (что у каждого выбранного блока на нём;
+// "" — ничего).
 export struct Column {
-    x: float,
+    f: float,
     v: int,
     tip: string,
 }
@@ -135,15 +145,14 @@ export global Palette {
 }
 
 // Подсказка: обычный текст со строками (у встроенной подсказки Slint 1.18 текст — разметка, где перевод строки
-// склеивается с соседней строкой); длинная строка переносится по словам.
+// склеивается с соседней строкой); длинная строка переносится по словам. Размер и место считает окно (AppWindow,
+// tip-box-*): ему нужно знать их заранее, чтобы подсказка графика не легла на шкалу и столбец под курсором.
 component TipBox inherits Rectangle {
     in property <string> text;
     background: #262a31;
     border-radius: 5px;
     border-width: 1px;
     border-color: #3d4350;
-    width: min(label.preferred-width, 460px) + 20px;
-    height: label.preferred-height + 14px;
     label := Text {
         x: 10px;
         y: 7px;
@@ -207,6 +216,69 @@ component Switch inherits Rectangle {
         enabled: root.enabled;
         mouse-cursor: root.enabled ? pointer : default;
         clicked => { root.toggled(); }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
+// Кнопка выбора вида графика: выбранная — на подложке, остальные — прозрачные. Одинаковое дело — одинаковый элемент:
+// все переключатели вида (шкала, линии, оси, подсветка) — такие кнопки. glyph: 1 — образец толстой линии с кольцом
+// (ø средняя), 2 — тонкой с точкой (95 %).
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> on;
+    in property <int> glyph;
+    callback clicked();
+    callback hover(bool);
+    property <length> mark-w: root.glyph != 0 ? 20px : 0px;
+    width: label.preferred-width + root.mark-w + 14px;
+    height: 22px;
+    border-radius: 4px;
+    background: root.on ? Palette.line : touch.has-hover ? Palette.cell : transparent;
+    border-width: 1px;
+    border-color: Palette.cell;
+    if root.glyph == 1: Rectangle {
+        x: 6px;
+        y: (root.height - 3px) / 2;
+        width: 14px;
+        height: 3px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 1: Rectangle {
+        x: 9px;
+        y: (root.height - 8px) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: Palette.panel;
+        border-width: 1.5px;
+        border-color: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 2: Rectangle {
+        x: 6px;
+        y: (root.height - 1.5px) / 2;
+        width: 14px;
+        height: 1.5px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 2: Rectangle {
+        x: 11px;
+        y: (root.height - 5px) / 2;
+        width: 5px;
+        height: 5px;
+        border-radius: 2.5px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    label := Text {
+        x: 7px + root.mark-w;
+        text: root.text;
+        color: root.on ? Palette.text : Palette.dim;
+        font-size: 11px;
+        vertical-alignment: center;
+        height: root.height;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
         changed has-hover => { root.hover(self.has-hover); }
     }
 }
@@ -423,19 +495,28 @@ component TileView inherits Rectangle {
     }
 }
 
-// График «температура от фактического множителя» выбранных блоков: у каждого блока своя линия своего цвета —
-// толстая ø средняя, тонкая ▲ наибольшая. Оси общие для всех блоков (владелец 15.10): множитель — числовая ось с
-// подписью через 1, 2 или 5 ступеней, сколько помещается; температура — 40–100 °C. Отсечка автомодуля — красной
-// линией. Подсвеченная линия рисуется последней (Rust ставит её в конец), остальные тогда бледнее.
+// График «температура от фактического множителя» выбранных блоков (src/chart.rs): у каждого блока своя линия своего
+// цвета — толстая ø средняя и тонкая 95 % (температура, ниже которой блок был 95 % времени на этом множителе). Оси общие
+// для всех блоков (владелец 15.10): множитель — столбец на каждый, подпись через 1, 2 или 5 ступеней, сколько
+// помещается; температура — над остальным кристаллом (по умолчанию) или абсолютная. swap — оси меняются местами:
+// множитель по вертикали, температура по горизонтали; места точек Rust уже повернул, здесь поворачиваются только оси,
+// подписи и столбец под курсором. Отсечка автомодуля — красной линией (только на абсолютной шкале). Подсвеченная
+// линия рисуется последней (Rust ставит её в конец), остальные тогда бледнее.
 component Chart inherits Rectangle {
     in property <[Series]> series;
     in property <[Column]> cols;
-    in property <[Tick]> yticks;
+    in property <[Tick]> ticks;     // ось температуры
     in property <string> empty;     // вместо графика, когда точек нет
     in property <float> columns: 1; // сколько множителей на оси
-    in property <float> cutoff: -1; // отсечка автомодуля — доля высоты поля; < 0 — нет
+    in property <float> cutoff: -1; // отсечка автомодуля — доля оси температуры; < 0 — нет
     in property <string> cutoff-text;
-    callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
+    in property <float> zero: -1;   // уровень кристалла (0 °C над ним) — доля оси температуры; < 0 — нет
+    in property <bool> swap;
+    in property <bool> show-mean: true;
+    in property <bool> show-p95: true;
+    in property <string> value-title;
+    // Подсказка столбца (AppWindow.chart-tip): столбец, поле и курсор — в координатах окна.
+    callback tip(bool, string, string, length, length, length, length, length, length, length, length, length, length);
     // Курсор над полем (от его левого верхнего угла) и размер поля: Rust ищет ближайшую линию.
     callback pointer(length, length, length, length);
     callback exited();
@@ -444,13 +525,17 @@ component Chart inherits Rectangle {
     property <length> left: 40px;
     property <length> axis-h: 34px;
     out property <length> plot-x: root.left;
-    out property <length> plot-y: 8px;
+    out property <length> plot-y: 16px;
     out property <length> plot-w: root.width - root.left - 10px;
     out property <length> plot-h: root.height - root.plot-y - root.axis-h;
-    property <length> col-w: root.plot-w / max(1, root.columns);
-    // Подпись каждого множителя, каждого второго или каждого пятого — по ширине столбца.
-    property <int> step: root.col-w >= 20px ? 1 : root.col-w >= 10px ? 2 : 5;
+    // Столбец множителя: по горизонтали — ширина, по вертикали (swap) — высота.
+    out property <length> band: (root.swap ? root.plot-h : root.plot-w) / max(1, root.columns);
+    // Подпись каждого множителя, каждого второго или каждого пятого — по размеру столбца.
+    property <int> step: root.swap
+        ? (root.band >= 14px ? 1 : root.band >= 7px ? 2 : 5)
+        : (root.band >= 20px ? 1 : root.band >= 10px ? 2 : 5);
     property <bool> drawn: root.empty == "" && root.cols.length > 0;
+    property <string> ratio-title: "множитель, ×";
 
     if root.empty != "": Text {
         x: 0;
@@ -464,60 +549,69 @@ component Chart inherits Rectangle {
         wrap: word-wrap;
     }
 
-    for t in root.yticks: Rectangle {
-        x: root.plot-x;
-        y: root.plot-y + (1 - t.f) * root.plot-h;
-        width: root.plot-w;
-        height: 1px;
+    // Деления температуры: сетка через поле, подписи — слева (обычно) или снизу (swap).
+    for t in root.ticks: Rectangle {
+        x: root.swap ? root.plot-x + t.f * root.plot-w : root.plot-x;
+        y: root.swap ? root.plot-y : root.plot-y + (1 - t.f) * root.plot-h;
+        width: root.swap ? 1px : root.plot-w;
+        height: root.swap ? root.plot-h : 1px;
         background: Palette.line;
     }
-    for t in root.yticks: Text {
-        x: 0;
-        width: root.left - 6px;
-        y: root.plot-y + (1 - t.f) * root.plot-h - 8px;
+    for t in root.ticks: Text {
+        x: root.swap ? root.plot-x + t.f * root.plot-w - 20px : 0;
+        width: root.swap ? 40px : root.left - 6px;
+        y: root.swap ? root.plot-y + root.plot-h + 6px : root.plot-y + (1 - t.f) * root.plot-h - 8px;
         height: 16px;
         text: t.text;
         color: Palette.dim;
         font-size: 11px;
-        horizontal-alignment: right;
-        vertical-alignment: center;
+        horizontal-alignment: root.swap ? TextHorizontalAlignment.center : TextHorizontalAlignment.right;
+        vertical-alignment: root.swap ? TextVerticalAlignment.top : TextVerticalAlignment.center;
+    }
+    // Уровень кристалла: 0 °C над ним — линия ярче сетки.
+    if root.drawn && root.zero >= 0: Rectangle {
+        x: root.swap ? root.plot-x + root.zero * root.plot-w : root.plot-x;
+        y: root.swap ? root.plot-y : root.plot-y + (1 - root.zero) * root.plot-h;
+        width: root.swap ? 1px : root.plot-w;
+        height: root.swap ? root.plot-h : 1px;
+        background: Palette.dim;
     }
 
     // Столбец под курсором — подсветка (подсказка с числами — у окна).
     if plot-touch.has-hover && root.cols[plot-touch.at-col].tip != "": Rectangle {
-        x: root.plot-x + plot-touch.at-col * root.col-w;
-        y: root.plot-y;
-        width: root.col-w;
-        height: root.plot-h;
+        x: root.swap ? root.plot-x : root.plot-x + plot-touch.at-col * root.band;
+        y: root.swap ? root.plot-y + root.plot-h - (plot-touch.at-col + 1) * root.band : root.plot-y;
+        width: root.swap ? root.plot-w : root.band;
+        height: root.swap ? root.band : root.plot-h;
         background: #ffffff0c;
     }
 
     // Отсечка автомодуля.
     if root.drawn && root.cutoff >= 0: Rectangle {
-        x: root.plot-x;
-        y: root.plot-y + (1 - root.cutoff) * root.plot-h;
-        width: root.plot-w;
-        height: 1px;
+        x: root.swap ? root.plot-x + root.cutoff * root.plot-w : root.plot-x;
+        y: root.swap ? root.plot-y : root.plot-y + (1 - root.cutoff) * root.plot-h;
+        width: root.swap ? 1px : root.plot-w;
+        height: root.swap ? root.plot-h : 1px;
         background: Palette.bad.transparentize(0.25);
     }
     if root.drawn && root.cutoff >= 0: Text {
-        x: root.plot-x;
-        width: root.plot-w - 4px;
-        y: root.plot-y + (1 - root.cutoff) * root.plot-h - 15px;
+        x: root.swap ? root.plot-x + root.cutoff * root.plot-w - 104px : root.plot-x;
+        width: root.swap ? 100px : root.plot-w - 4px;
+        y: root.swap ? root.plot-y + 2px : root.plot-y + (1 - root.cutoff) * root.plot-h - 15px;
         text: "отсечка " + root.cutoff-text;
         color: Palette.bad;
         font-size: 10px;
         horizontal-alignment: right;
     }
 
-    // Линии блоков: пути в рамке 1000 × 1000 растягиваются на поле (толщина линии — снаружи поля).
+    // Линии блоков: куски путей в рамке 1000 × 1000 растягиваются на поле (толщина линии — снаружи поля).
     for s in root.series: Rectangle {
         x: root.plot-x;
         y: root.plot-y;
         width: root.plot-w;
         height: root.plot-h;
         opacity: s.faded ? 0.3 : 1;
-        Path {
+        for r in s.p95: Path {
             x: -1px;
             y: -1px;
             width: parent.width + 2px;
@@ -525,11 +619,12 @@ component Chart inherits Rectangle {
             viewbox-width: 1000;
             viewbox-height: 1000;
             fit: fill;
-            commands: s.peak;
-            stroke: s.color.transparentize(0.45);
+            commands: r.d;
+            stroke: s.color.transparentize(0.35);
             stroke-width: 1.5px;
+            opacity: r.a;
         }
-        Path {
+        for r in s.mean: Path {
             x: -1.5px;
             y: -1.5px;
             width: parent.width + 3px;
@@ -537,33 +632,36 @@ component Chart inherits Rectangle {
             viewbox-width: 1000;
             viewbox-height: 1000;
             fit: fill;
-            commands: s.mean;
+            commands: r.d;
             stroke: s.color;
             stroke-width: 3px;
             stroke-line-join: round;
+            opacity: r.a;
         }
-        for m in s.marks: Text {
-            x: m.x * parent.width - 6px;
-            y: (1 - m.peak) * parent.height - 8px;
-            width: 12px;
-            height: 14px;
-            text: "▲";
-            color: s.color.transparentize(0.2);
-            font-size: 9px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        // Точка 95 % — маленькая сплошная.
+        for m in s.marks: Rectangle {
+            visible: root.show-p95;
+            x: m.qx * parent.width - 2.5px;
+            y: (1 - m.qy) * parent.height - 2.5px;
+            width: 5px;
+            height: 5px;
+            border-radius: 2.5px;
+            background: s.color;
+            opacity: m.a;
         }
         // Точка ø средней — кольцо цвета блока, залитое по ø нагрузке: площадь заливки — её доля (пустое — 0 %,
         // полное — 100 %; владелец 15.10 о нагрузке: «от 0 до 100»).
         for m in s.marks: Rectangle {
+            visible: root.show-mean;
             x: m.x * parent.width - 5px;
-            y: (1 - m.mean) * parent.height - 5px;
+            y: (1 - m.y) * parent.height - 5px;
             width: 10px;
             height: 10px;
             border-radius: 5px;
             background: Palette.panel;
             border-width: 1.5px;
             border-color: s.color;
+            opacity: m.a;
             Rectangle {
                 property <length> d: 10px * Math.sqrt(max(0, m.load));
                 x: (parent.width - self.d) / 2;
@@ -576,39 +674,54 @@ component Chart inherits Rectangle {
         }
     }
 
-    // Ось множителя: черта на каждый, подпись — через шаг; название оси справа.
+    // Ось множителя: черта на каждый, подпись — через шаг; снизу (обычно) или слева (swap).
     if root.drawn: Rectangle {
         x: root.plot-x;
-        y: root.plot-y + root.plot-h;
-        width: root.plot-w;
-        height: 1px;
+        y: root.swap ? root.plot-y : root.plot-y + root.plot-h;
+        width: root.swap ? 1px : root.plot-w;
+        height: root.swap ? root.plot-h : 1px;
         background: Palette.dim;
     }
     for c in root.cols: Rectangle {
-        x: root.plot-x + c.x * root.plot-w;
-        y: root.plot-y + root.plot-h;
-        width: 1px;
-        height: Math.mod(c.v, root.step) == 0 ? 5px : 3px;
+        property <length> long: Math.mod(c.v, root.step) == 0 ? 5px : 3px;
+        x: root.swap ? root.plot-x - self.long : root.plot-x + c.f * root.plot-w;
+        y: root.swap ? root.plot-y + (1 - c.f) * root.plot-h : root.plot-y + root.plot-h;
+        width: root.swap ? self.long : 1px;
+        height: root.swap ? 1px : self.long;
         background: Palette.dim;
     }
     for c in root.cols: Text {
         visible: Math.mod(c.v, root.step) == 0;
-        x: root.plot-x + c.x * root.plot-w - 15px;
-        width: 30px;
-        y: root.plot-y + root.plot-h + 6px;
+        x: root.swap ? 0 : root.plot-x + c.f * root.plot-w - 15px;
+        width: root.swap ? root.left - 8px : 30px;
+        y: root.swap ? root.plot-y + (1 - c.f) * root.plot-h - 8px : root.plot-y + root.plot-h + 6px;
+        height: 16px;
         text: "\{c.v}";
         color: Palette.text;
         font-size: 11px;
-        horizontal-alignment: center;
+        horizontal-alignment: root.swap ? TextHorizontalAlignment.right : TextHorizontalAlignment.center;
+        vertical-alignment: root.swap ? TextVerticalAlignment.center : TextVerticalAlignment.top;
     }
+    // Названия осей: горизонтальной — снизу справа, вертикальной — над полем слева.
     if root.drawn: Text {
         x: root.plot-x;
         width: root.plot-w;
         y: root.plot-y + root.plot-h + 20px;
-        text: "множитель, ×";
+        text: root.swap ? root.value-title : root.ratio-title;
         color: Palette.dim;
         font-size: 10px;
         horizontal-alignment: right;
+    }
+    // Над полем, не над подписями делений слева: верхняя подпись стоит у самого края поля.
+    if root.drawn: Text {
+        x: root.plot-x;
+        y: 0;
+        width: root.plot-w;
+        height: root.plot-y - 2px;
+        text: root.swap ? root.ratio-title : root.value-title;
+        color: Palette.dim;
+        font-size: 10px;
+        vertical-alignment: center;
     }
 
     // Одна область касания на всё поле: столбец под курсором (подсказка), ближайшая линия (Rust), щелчок.
@@ -618,9 +731,16 @@ component Chart inherits Rectangle {
         width: root.plot-w;
         height: root.plot-h;
         enabled: root.drawn;
-        out property <int> at-col: max(0, min(root.cols.length - 1, floor(self.mouse-x / root.col-w)));
+        out property <int> at-col: max(0, min(root.cols.length - 1,
+            floor((root.swap ? root.plot-h - self.mouse-y : self.mouse-x) / root.band)));
         function show() {
-            root.tip(true, "col" + self.at-col, root.cols[self.at-col].tip, self.absolute-position.x + self.at-col * root.col-w, self.absolute-position.y, root.col-w, root.plot-h);
+            root.tip(true, "col" + self.at-col, root.cols[self.at-col].tip,
+                self.absolute-position.x + (root.swap ? 0 : self.at-col * root.band),
+                self.absolute-position.y + (root.swap ? root.plot-h - (self.at-col + 1) * root.band : 0),
+                root.swap ? root.plot-w : root.band,
+                root.swap ? root.band : root.plot-h,
+                self.absolute-position.x, self.absolute-position.y, root.plot-w, root.plot-h,
+                self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
         }
         changed at-col => {
             if (self.has-hover) {
@@ -631,17 +751,19 @@ component Chart inherits Rectangle {
             if (self.has-hover) {
                 self.show();
             } else {
-                root.tip(false, "col" + self.at-col, "", 0, 0, 0, 0);
+                root.tip(false, "col" + self.at-col, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
                 root.exited();
             }
         }
         changed mouse-x => {
             if (self.has-hover) {
+                self.show();
                 root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
             }
         }
         changed mouse-y => {
             if (self.has-hover) {
+                self.show();
                 root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
             }
         }
@@ -736,11 +858,18 @@ export component AppWindow inherits Window {
     in property <[LegendItem]> stats-legend;   // выбранные блоки: цвет линии и название
     in property <[Series]> chart-series;
     in property <[Column]> chart-cols;
-    in property <[Tick]> chart-yticks;
+    in property <[Tick]> chart-ticks;
     in property <string> chart-empty;
     in property <float> chart-columns: 1;
     in property <float> chart-cutoff: -1;
     in property <string> chart-cutoff-text;
+    in property <float> chart-zero: -1;
+    in property <string> chart-value-title;
+    // Вид графика (выбор владельца, src/chart.rs): шкала над кристаллом / абсолютная, линии (0 — ø, 1 — 95 %,
+    // 2 — обе), оси местами.
+    in property <bool> chart-above: true;
+    in property <int> chart-curves: 2;
+    in property <bool> chart-swap;
     in property <[LineRow]> actions;
     in property <string> actions-empty;
     // Подсветка линий: false — под курсором, true — закреплённая (владелец 15.10: попробовать обе).
@@ -782,6 +911,44 @@ export component AppWindow inherits Window {
     out property <length> hover-chip-y: hover-chip.absolute-position.y + hover-chip.height / 2;
     out property <length> pin-chip-x: pin-chip.absolute-position.x + pin-chip.width / 2;
     out property <length> pin-chip-y: pin-chip.absolute-position.y + pin-chip.height / 2;
+    out property <length> above-chip-x: above-chip.absolute-position.x + above-chip.width / 2;
+    out property <length> above-chip-y: above-chip.absolute-position.y + above-chip.height / 2;
+    out property <length> abs-chip-x: abs-chip.absolute-position.x + abs-chip.width / 2;
+    out property <length> abs-chip-y: abs-chip.absolute-position.y + abs-chip.height / 2;
+    out property <length> mean-chip-x: mean-chip.absolute-position.x + mean-chip.width / 2;
+    out property <length> mean-chip-y: mean-chip.absolute-position.y + mean-chip.height / 2;
+    out property <length> p95-chip-x: p95-chip.absolute-position.x + p95-chip.width / 2;
+    out property <length> p95-chip-y: p95-chip.absolute-position.y + p95-chip.height / 2;
+    out property <length> both-chip-x: both-chip.absolute-position.x + both-chip.width / 2;
+    out property <length> both-chip-y: both-chip.absolute-position.y + both-chip.height / 2;
+    out property <length> plain-chip-x: plain-chip.absolute-position.x + plain-chip.width / 2;
+    out property <length> plain-chip-y: plain-chip.absolute-position.y + plain-chip.height / 2;
+    out property <length> swap-chip-x: swap-chip.absolute-position.x + swap-chip.width / 2;
+    out property <length> swap-chip-y: swap-chip.absolute-position.y + swap-chip.height / 2;
+    // Поле графика в координатах окна и размер столбца множителя — по ним скрытая проверка ведёт мышь и проверяет, где
+    // легла подсказка.
+    out property <length> plot-x: chart.x + chart.plot-x;
+    out property <length> plot-y: chart.y + chart.plot-y;
+    out property <length> plot-w: chart.plot-w;
+    out property <length> plot-h: chart.plot-h;
+    out property <length> plot-band: chart.band;
+    out property <length> chart-x: chart.x;
+    out property <length> chart-w: chart.width;
+    // Шапка статистики в координатах окна: низ легенды блоков и группы кнопок вида (x, y, ширина) — скрытая проверка
+    // смотрит, что они не налезают друг на друга при любой ширине.
+    out property <length> key-bottom: root.body-y + root.head-h - 4px + root.key-h;
+    out property <length> scale-group-x: root.stats-x + root.pad;
+    out property <length> scale-group-y: root.body-y + root.controls-top;
+    out property <length> scale-group-w: scale-group.preferred-width;
+    out property <length> curve-group-x: root.stats-x + root.pad + root.g2-x;
+    out property <length> curve-group-y: root.body-y + root.controls-top + root.g2-y;
+    out property <length> curve-group-w: curve-group.preferred-width;
+    out property <length> axes-group-x: root.stats-x + root.pad + root.g3-x;
+    out property <length> axes-group-y: root.body-y + root.controls-top + root.g3-y;
+    out property <length> axes-group-w: axes-group.preferred-width;
+    out property <length> mode-group-x: root.stats-x + root.pad + root.g4-x;
+    out property <length> mode-group-y: root.body-y + root.controls-top + root.g4-y;
+    out property <length> mode-group-w: mode-group.preferred-width;
 
     callback tile-clicked(int);
     callback tile-hover(int, bool);
@@ -789,6 +956,9 @@ export component AppWindow inherits Window {
     callback chart-left();
     callback chart-click(length, length, length, length);
     callback mode-changed(bool);
+    callback scale-changed(bool);   // true — над кристаллом
+    callback curves-changed(int);
+    callback axes-changed(bool);    // true — температура по горизонтали
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
     callback limit-chosen(int);
     callback problem-dismissed();
@@ -814,6 +984,7 @@ export component AppWindow inherits Window {
     out property <bool> tip-shown;
     function tip(on: bool, key: string, text: string, x: length, y: length, w: length, h: length) {
         if (on) {
+            root.tip-chart = false;
             root.tip-key = key;
             root.tip-text = text;
             root.tip-x = x;
@@ -827,11 +998,71 @@ export component AppWindow inherits Window {
             root.tip-shown = false;
         }
     }
+    // Подсказка столбца графика: рядом с курсором внутри поля, не на шкалах и не на столбце под курсором (владелец
+    // 15.10: «подсказка вылезает, и она мне закрывает саму скалу… не вижу, где я стою»). Столбец (x, y, w, h), поле
+    // (ax…ah) и курсор (cx, cy) — в координатах окна. Курсор движется по тому же столбцу — подсказка идёт за ним, не
+    // гаснет.
+    property <bool> tip-chart;
+    property <length> tip-ax;
+    property <length> tip-ay;
+    property <length> tip-aw;
+    property <length> tip-ah;
+    property <length> tip-cx;
+    property <length> tip-cy;
+    function chart-tip(on: bool, key: string, text: string, x: length, y: length, w: length, h: length, ax: length, ay: length, aw: length, ah: length, cx: length, cy: length) {
+        if (on) {
+            if (root.tip-key != key || !root.tip-chart) {
+                root.tip-shown = false;
+            }
+            root.tip-chart = true;
+            root.tip-key = key;
+            root.tip-text = text;
+            root.tip-x = x;
+            root.tip-y = y;
+            root.tip-w = w;
+            root.tip-h = h;
+            root.tip-ax = ax;
+            root.tip-ay = ay;
+            root.tip-aw = aw;
+            root.tip-ah = ah;
+            root.tip-cx = cx;
+            root.tip-cy = cy;
+            root.tip-wanted = text != "";
+        } else if (root.tip-key == key) {
+            root.tip-wanted = false;
+            root.tip-shown = false;
+        }
+    }
     Timer {
         interval: 450ms;
         running: root.tip-wanted && !root.tip-shown;
         triggered() => { root.tip-shown = true; }
     }
+    // Размер подсказки: ширина по самой длинной строке (не шире 460 px и — у графика — места сбоку от столбца), высота —
+    // по тексту, перенесённому на эту ширину. Невидимые тексты только меряют.
+    tip-natural := Text { visible: false; text: root.tip-text; font-size: 12px; }
+    tip-wrapped := Text { visible: false; width: root.tip-box-w - 20px; text: root.tip-text; font-size: 12px; wrap: word-wrap; }
+    property <length> tip-want-w: min(tip-natural.preferred-width, 460px) + 20px;
+    // Столбец по вертикали: подсказка справа от него или слева — где места больше (или где она помещается).
+    property <length> tip-room-r: root.tip-ax + root.tip-aw - (root.tip-x + root.tip-w) - 6px;
+    property <length> tip-room-l: root.tip-x - root.tip-ax - 6px;
+    property <bool> tip-right: root.tip-room-r >= root.tip-want-w || root.tip-room-r >= root.tip-room-l;
+    // Строка по горизонтали (оси местами): подсказка над ней или под ней.
+    property <length> tip-room-a: root.tip-y - root.tip-ay - 6px;
+    property <length> tip-room-b: root.tip-ay + root.tip-ah - (root.tip-y + root.tip-h) - 6px;
+    property <bool> tip-above: root.tip-room-a >= root.tip-box-h || root.tip-room-a >= root.tip-room-b;
+    out property <length> tip-box-w: !root.tip-chart ? root.tip-want-w
+        : root.chart-swap ? min(root.tip-want-w, root.tip-aw)
+        : max(40px, min(root.tip-want-w, root.tip-right ? root.tip-room-r : root.tip-room-l));
+    out property <length> tip-box-h: tip-wrapped.preferred-height + 14px;
+    out property <length> tip-box-x: !root.tip-chart ? max(4px, min(root.tip-x, root.width - root.tip-box-w - 4px))
+        : root.chart-swap ? max(root.tip-ax, min(root.tip-cx + 14px, root.tip-ax + root.tip-aw - root.tip-box-w))
+        : root.tip-right ? root.tip-x + root.tip-w + 6px : root.tip-x - 6px - root.tip-box-w;
+    out property <length> tip-box-y: !root.tip-chart
+        ? (root.tip-y + root.tip-h + 6px + root.tip-box-h <= root.height - 4px ? root.tip-y + root.tip-h + 6px : max(4px, root.tip-y - root.tip-box-h - 6px))
+        : root.chart-swap
+            ? (root.tip-above ? max(4px, root.tip-y - 6px - root.tip-box-h) : root.tip-y + root.tip-h + 6px)
+            : max(4px, min(root.tip-cy + 16px, root.tip-ay + root.tip-ah - root.tip-box-h));
 
     out property <length> top-h: 36px;
     property <length> problem-h: root.problem != "" ? 30px : 0px;
@@ -890,11 +1121,34 @@ export component AppWindow inherits Window {
     property <length> note-y: root.row-c-y + root.btn-h + 4px;
     property <length> hist-y: root.note-y + 18px + 8px;
 
-    // Статистика: график, под ним настройки автомодуля (три строки), под ними — его действия.
+    // Статистика: заголовок, легенда блоков (сетка — блоков до двенадцати), переключатели вида (в строку или в две —
+    // по ширине панели), график, под ним настройки автомодуля (три строки), под ними — его действия.
+    property <length> key-cell: 50px;
+    property <length> key-row: 18px;
+    property <int> key-cols: max(1, floor((root.stats-w - 2 * root.pad) / root.key-cell));
+    property <length> key-h: ceil(root.stats-legend.length / root.key-cols) * root.key-row;
+    property <length> controls-top: root.head-h - 4px + root.key-h + (root.key-h > 0 ? 4px : 0px);
+    // Переключатели вида — четыре группы слева направо; не помещается — с новой строки.
+    property <length> ctl-w: root.stats-w - 2 * root.pad;
+    property <length> ctl-gap: 14px;
+    property <length> ctl-row: 26px;
+    property <length> g2-at: scale-group.preferred-width + root.ctl-gap;
+    property <bool> g2-fits: root.g2-at + curve-group.preferred-width <= root.ctl-w;
+    property <length> g2-x: root.g2-fits ? root.g2-at : 0;
+    property <length> g2-y: root.g2-fits ? 0 : root.ctl-row;
+    property <length> g3-at: root.g2-x + curve-group.preferred-width + root.ctl-gap;
+    property <bool> g3-fits: root.g3-at + axes-group.preferred-width <= root.ctl-w;
+    property <length> g3-x: root.g3-fits ? root.g3-at : 0;
+    property <length> g3-y: root.g3-fits ? root.g2-y : root.g2-y + root.ctl-row;
+    property <length> g4-at: root.g3-x + axes-group.preferred-width + root.ctl-gap;
+    property <bool> g4-fits: root.g4-at + mode-group.preferred-width <= root.ctl-w;
+    property <length> g4-x: root.g4-fits ? root.g4-at : 0;
+    property <length> g4-y: root.g4-fits ? root.g3-y : root.g3-y + root.ctl-row;
+    property <length> controls-h: root.g4-y + root.ctl-row;
     property <length> actions-h: min(6, max(1, root.actions.length)) * 18px;
     out property <length> auto-h: root.has-auto ? 92px : 0px;
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.auto-h;
-    out property <length> chart-y: root.body-y + root.head-h + 22px;
+    out property <length> chart-y: root.body-y + root.controls-top + root.controls-h;
     out property <length> chart-h: root.auto-y - root.chart-y;
 
     out property <length> menu-x;
@@ -1300,33 +1554,10 @@ export component AppWindow inherits Window {
         height: root.body-h;
         background: Palette.panel;
         border-radius: 8px;
-        // Заголовок и выбранные блоки — квадратик цвета их линии и название; справа — сколько срезов и за какое время.
-        stats-head := HorizontalLayout {
-            x: root.pad;
-            y: 4px;
-            height: 24px;
-            spacing: 10px;
-            alignment: start;
-            Text { text: "Статистика"; color: Palette.dim; font-weight: 600; vertical-alignment: center; }
-            for l[i] in root.stats-legend: Rectangle {
-                width: item.preferred-width;
-                item := HorizontalLayout {
-                    spacing: 4px;
-                    Rectangle {
-                        width: 10px;
-                        Rectangle { y: (parent.height - 10px) / 2; width: 10px; height: 10px; border-radius: 2px; background: l.color; }
-                    }
-                    Text { text: l.name; color: Palette.text; font-size: 12px; vertical-alignment: center; }
-                }
-                TouchArea {
-                    changed has-hover => {
-                        root.tip(self.has-hover, "legend" + i, l.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                    }
-                }
-            }
-        }
+        // Заголовок; справа — сколько срезов и за какое время.
+        Text { x: root.pad; y: 4px; height: 24px; text: "Статистика"; color: Palette.dim; font-weight: 600; vertical-alignment: center; }
         Text {
-            x: root.pad + stats-head.preferred-width + 12px;
+            x: root.pad + 90px;
             y: 4px;
             height: 24px;
             width: parent.width - root.pad - self.x;
@@ -1337,84 +1568,126 @@ export component AppWindow inherits Window {
             vertical-alignment: center;
             overflow: elide;
         }
-        // Что значат линии; справа — какая линия подсвечивается.
-        HorizontalLayout {
-            x: root.pad;
-            y: root.head-h;
-            height: 18px;
-            spacing: 5px;
-            alignment: start;
-            Rectangle {
-                width: 16px;
-                Rectangle { y: (parent.height - 3px) / 2; width: 16px; height: 3px; background: Palette.dim; }
-            }
-            Text { text: "ø средняя"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 4px; }
-            Text { text: "▲ наибольшая, °C"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            Rectangle { width: 4px; }
-            Rectangle {
-                width: 10px;
-                Rectangle {
-                    y: (parent.height - 10px) / 2;
-                    width: 10px;
-                    height: 10px;
-                    border-radius: 5px;
-                    background: Palette.panel;
-                    border-width: 1.5px;
-                    border-color: Palette.dim;
-                    Rectangle { x: 2.5px; y: 2.5px; width: 5px; height: 5px; border-radius: 2.5px; background: Palette.dim; }
+        // Выбранные блоки — сеткой: квадратик цвета линии и номер блока, как на схеме (полное название — в подсказке).
+        for l[i] in root.stats-legend: Rectangle {
+            x: root.pad + Math.mod(i, root.key-cols) * root.key-cell;
+            y: root.head-h - 4px + floor(i / root.key-cols) * root.key-row;
+            width: root.key-cell;
+            height: root.key-row;
+            Rectangle { x: 0; y: (parent.height - 10px) / 2; width: 10px; height: 10px; border-radius: 2px; background: l.color; }
+            Text { x: 14px; width: parent.width - 16px; height: parent.height; text: l.name; color: Palette.text; font-size: 12px; vertical-alignment: center; overflow: elide; }
+            TouchArea {
+                changed has-hover => {
+                    root.tip(self.has-hover, "legend" + i, l.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
-            Text { text: "заливка — ø нагрузка"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
         }
-        TouchArea {
+        // Шкала температуры.
+        scale-group := HorizontalLayout {
             x: root.pad;
-            y: root.head-h;
-            width: 330px;
-            height: 18px;
-            changed has-hover => {
-                root.tip(self.has-hover, "lines", "Линии выбранных блоков\nПо всем срезам, при любой нагрузке: на каждом фактическом множителе — ø средняя температура (толстая линия) и ▲ наибольшая (тонкая).\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• оси общие для всех блоков — графики можно сравнивать\n• красная линия — отсечка автомодуля\n• числа — в подсказке столбца множителя: сколько времени, ø нагрузка, при каком множителе, нагрузке и когда была ▲", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            y: root.controls-top;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            above-chip := Chip {
+                text: "над кристаллом";
+                on: root.chart-above;
+                clicked => { root.scale-changed(true); }
+                hover(on) => {
+                    root.tip(on, "scale-above", "Над остальным кристаллом\nТемпература блока минус средняя остальных блоков в тот же момент: общий нагрев кристалла (игра, видеокарта, комната) вычитается, остаётся то, чем блок горячее других.\n• 0 — блок как кристалл в среднем, выше — горячее остальных\n• срез, где температура известна меньше чем у половины остальных блоков, сюда не идёт\n• отсечка автомодуля — абсолютная, её линия — на «абсолютной»", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            abs-chip := Chip {
+                text: "абсолютная";
+                on: !root.chart-above;
+                clicked => { root.scale-changed(false); }
+                hover(on) => {
+                    root.tip(on, "scale-abs", "Абсолютная температура\nКак её показывает датчик.\n• почти вся она — общий уровень кристалла: столбец множителя показывает больше то, когда набралось время, чем сам множитель\n• красная линия — отсечка автомодуля", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Какие линии.
+        curve-group := HorizontalLayout {
+            x: root.pad + root.g2-x;
+            y: root.controls-top + root.g2-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            mean-chip := Chip {
+                text: "ø";
+                glyph: 1;
+                on: root.chart-curves == 0;
+                clicked => { root.curves-changed(0); }
+                hover(on) => {
+                    root.tip(on, "curve-mean", "ø средняя\nТолстая линия: средняя температура по времени на каждом фактическом множителе.\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• бледнее — меньше времени за точкой: от одной строки (0,25 с) до самой полной корзины, по логарифму\n• щелчок — только эта линия", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            p95-chip := Chip {
+                text: "95 %";
+                glyph: 2;
+                on: root.chart-curves == 1;
+                clicked => { root.curves-changed(1); }
+                hover(on) => {
+                    root.tip(on, "curve-p95", "95 % времени ниже\nТонкая линия: температура, выше которой блок был только 5 % времени на этом множителе.\n• в отличие от наибольшей не зависит от одной строки и от того, сколько строк в корзине\n• наибольшая — в подсказке столбца: ▲ со множителем, нагрузкой и временем\n• щелчок — только эта линия", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            both-chip := Chip {
+                text: "обе";
+                on: root.chart-curves == 2;
+                clicked => { root.curves-changed(2); }
+                hover(on) => {
+                    root.tip(on, "curve-both", "Обе линии\nø средняя — толстая, 95 % — тонкая, у каждого блока своего цвета.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Какая ось по горизонтали.
+        axes-group := HorizontalLayout {
+            x: root.pad + root.g3-x;
+            y: root.controls-top + root.g3-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            Text { text: "по горизонтали:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            plain-chip := Chip {
+                text: "×";
+                on: !root.chart-swap;
+                clicked => { root.axes-changed(false); }
+                hover(on) => {
+                    root.tip(on, "axes-plain", "Множитель — по горизонтали\nСтолбец на каждый множитель, температура — по вертикали.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            swap-chip := Chip {
+                text: "°C";
+                on: root.chart-swap;
+                clicked => { root.axes-changed(true); }
+                hover(on) => {
+                    root.tip(on, "axes-swap", "Температура — по горизонтали\nМножитель — по вертикали: строка на каждый множитель, подсказка — у строки.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
             }
         }
         // Переключатель подсветки: «курсор» — линия под курсором (или плитки под курсором) поверх остальных;
         // «закреплённая» — последний добавленный блок или линия, по которой щёлкнули.
-        HorizontalLayout {
-            // Ширина — по содержимому: без неё раскладка шириной в панель растягивает надпись и уводит кнопки за край.
-            x: parent.width - root.pad - self.width;
-            y: root.head-h - 2px;
+        mode-group := HorizontalLayout {
+            x: root.pad + root.g4-x;
+            y: root.controls-top + root.g4-y;
             width: self.preferred-width;
             height: 22px;
             spacing: 4px;
-            alignment: end;
             Text { text: "подсветка:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            hover-chip := Rectangle {
-                width: hover-text.preferred-width + 14px;
-                border-radius: 4px;
-                background: !root.pin-mode ? Palette.line : hover-touch.has-hover ? Palette.cell : transparent;
-                border-width: 1px;
-                border-color: Palette.cell;
-                hover-text := Text { text: "под курсором"; color: !root.pin-mode ? Palette.text : Palette.dim; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-                hover-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.mode-changed(false); }
-                    changed has-hover => {
-                        root.tip(self.has-hover, "mode-hover", "Подсветка под курсором\nНаведи на линию или на плитку выбранного блока — его линия поверх остальных, остальные бледнее; курсор ушёл — все одинаковы.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                    }
+            hover-chip := Chip {
+                text: "под курсором";
+                on: !root.pin-mode;
+                clicked => { root.mode-changed(false); }
+                hover(on) => {
+                    root.tip(on, "mode-hover", "Подсветка под курсором\nНаведи на линию или на плитку выбранного блока — его линия поверх остальных, остальные бледнее; курсор ушёл — все одинаковы.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
-            pin-chip := Rectangle {
-                width: pin-text.preferred-width + 14px;
-                border-radius: 4px;
-                background: root.pin-mode ? Palette.line : pin-touch.has-hover ? Palette.cell : transparent;
-                border-width: 1px;
-                border-color: Palette.cell;
-                pin-text := Text { text: "закреплённая"; color: root.pin-mode ? Palette.text : Palette.dim; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-                pin-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.mode-changed(true); }
-                    changed has-hover => {
-                        root.tip(self.has-hover, "mode-pin", "Закреплённая подсветка\nПоверх остальных всегда одна линия: последнего добавленного блока или та, по которой щёлкнули на графике; остальные бледнее.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                    }
+            pin-chip := Chip {
+                text: "закреплённая";
+                on: root.pin-mode;
+                clicked => { root.mode-changed(true); }
+                hover(on) => {
+                    root.tip(on, "mode-pin", "Закреплённая подсветка\nПоверх остальных всегда одна линия: последнего добавленного блока или та, по которой щёлкнули на графике; остальные бледнее.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
@@ -1429,19 +1702,24 @@ export component AppWindow inherits Window {
             font-size: 12px;
         }
     }
-    Chart {
+    chart := Chart {
         x: root.stats-x + root.pad - 4px;
         y: root.chart-y;
         width: root.stats-w - 2 * root.pad + 4px;
         height: root.chart-h;
         series: root.chart-series;
         cols: root.chart-cols;
-        yticks: root.chart-yticks;
+        ticks: root.chart-ticks;
         empty: root.chart-empty;
         columns: root.chart-columns;
         cutoff: root.chart-cutoff;
         cutoff-text: root.chart-cutoff-text;
-        tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
+        zero: root.chart-zero;
+        swap: root.chart-swap;
+        show-mean: root.chart-curves != 1;
+        show-p95: root.chart-curves != 0;
+        value-title: root.chart-value-title;
+        tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy) => { root.chart-tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy); }
         pointer(x, y, w, h) => { root.chart-pointer(x, y, w, h); }
         exited() => { root.chart-left(); }
         clicked-at(x, y, w, h) => { root.chart-click(x, y, w, h); }
@@ -1523,7 +1801,7 @@ export component AppWindow inherits Window {
             moved(v) => { root.limit-moved(v); }
             released(v) => { root.limit-released(v); }
             hover(on) => {
-                root.tip(on, "limit", "Отсечка, °C\nСредняя температура блока, выше которой автомодуль снижает его потолок; на графике — красная линия.\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• при смене опущенные блоки возвращаются к принятым потолкам, автомодуль судит их заново", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "limit", "Отсечка, °C\nСредняя температура блока, выше которой автомодуль снижает его потолок; на графике «абсолютная» — красная линия.\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• при смене опущенные блоки возвращаются к принятым потолкам, автомодуль судит их заново", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -1667,7 +1945,9 @@ export component AppWindow inherits Window {
     // Подсказка поверх всего.
     if root.tip-shown: TipBox {
         text: root.tip-text;
-        x: max(4px, min(root.tip-x, root.width - self.width - 4px));
-        y: root.tip-y + root.tip-h + 6px + self.height <= root.height - 4px ? root.tip-y + root.tip-h + 6px : max(4px, root.tip-y - self.height - 6px);
+        x: root.tip-box-x;
+        y: root.tip-box-y;
+        width: root.tip-box-w;
+        height: root.tip-box-h;
     }
 }

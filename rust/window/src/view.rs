@@ -7,13 +7,14 @@
 // свойства окна ставятся, только если значение другое.
 //
 // Жесты (владелец 15.10: «по две функции на одно действие… так не делается»): щелчок по плитке — добавить блок в
-// статистику или убрать его оттуда (сравнение до четырёх блоков, владелец 15.10), и только; правая кнопка — меню
-// потолка. Нагрузки у окна нет.
+// статистику или убрать его оттуда (сравнить можно любые блоки, хоть все, владелец 15.10: «почему только 4 ядра можно
+// выбирать»), и только; правая кнопка — меню потолка. Нагрузки у окна нет.
 //
 // Настройки автомодуля (DECISIONS #36) — выбор программы у часов: окно показывает тему settings и шлёт изменения
 // командой auto.set; ползунок — одной командой, когда его отпустили. Пока его тянут и пока программа не подтвердила
 // новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад.
-// Что окно помнит о себе (сравниваемые блоки, подсветка, размер и место) — его собственный файл (src/saved.rs).
+// Что окно помнит о себе (сравниваемые блоки, подсветка, вид графика, размер и место) — его собственный файл
+// (src/saved.rs).
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -22,8 +23,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
+use crate::chart::{self, Curves, Scale, StatsShown};
 use crate::die::{self, Geometry};
-use crate::panels::{self, ProfileInput, ProfileShown, StatsShown};
+use crate::panels::{self, ProfileInput, ProfileShown};
 use crate::pipe::{Event, Link};
 use crate::saved::{self, Remembered};
 use crate::store::Digest;
@@ -135,6 +137,10 @@ impl Pending {
     missing_debug_implementations,
     reason = "holds Slint handles that have no Debug; nothing prints a View"
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts of the window (link up, highlight mode, axes swapped, slider held), not one state machine"
+)]
 pub struct View {
     ui: slint::Weak<AppWindow>,
     link: Arc<Link>,
@@ -148,8 +154,12 @@ pub struct View {
     geometry: Geometry,
     tiles: Rc<VecModel<TileData>>,
     sets: Rc<VecModel<SetRow>>,
-    /// Блоки в статистике по порядку добавления: (номер блока, номер цвета в `panels::SERIES`).
-    pub compared: Vec<(usize, usize)>,
+    /// Блоки в статистике (номера) по порядку добавления; цвет — у блока (`chart::color_of`).
+    pub compared: Vec<usize>,
+    /// Вид графика (src/chart.rs): шкала, линии, оси местами.
+    pub scale: Scale,
+    pub curves: Curves,
+    pub swap: bool,
     /// Подсветка линий (владелец 15.10 не решил, какая удобнее, — переключатель в окне): false — под курсором (плитка
     /// или линия графика), true — закреплённая: последний добавленный блок или линия, по которой щёлкнули.
     pub pin_mode: bool,
@@ -183,7 +193,7 @@ pub struct View {
     /// Файл окна: что оно помнит о себе; запоминается при смене выбора и подсветки и при закрытии.
     memory: Remembered,
     /// Сравниваемые блоки из файла окна ждут первого знакомства: только тогда известно, какие блоки есть.
-    restore: Option<Vec<(String, usize)>>,
+    restore: Option<Vec<String>>,
 }
 
 impl View {
@@ -194,6 +204,13 @@ impl View {
         let sets = Rc::new(VecModel::default());
         ui.set_sets(ModelRc::from(Rc::clone(&sets)));
         let pin_mode = memory.saved.pin.unwrap_or(false);
+        let scale = match memory.saved.above {
+            Some(false) => Scale::Absolute,
+            Some(true) => Scale::AboveDie,
+            None => Scale::default(),
+        };
+        let curves = memory.saved.curves.unwrap_or_default();
+        let swap = memory.saved.swap.unwrap_or(false);
         let restore = (!memory.saved.compared.is_empty()).then(|| memory.saved.compared.clone()); // a few names, once
         let problem = memory.trouble.clone(); // one line, once
         let view = View {
@@ -209,6 +226,9 @@ impl View {
             tiles,
             sets,
             compared: Vec::new(),
+            scale,
+            curves,
+            swap,
             pin_mode,
             pinned: None,
             hovered: None,
@@ -394,14 +414,14 @@ impl View {
         ui.set_die_nat_h(self.geometry.height);
         // Выбор переживает новое знакомство, пока такие блоки есть; при первом — выбор из файла окна (его блоки,
         // которых больше нет, выпадают); пусто — первое P-ядро.
-        self.compared.retain(|&(b, _)| b < hello.blocks.len());
+        self.compared.retain(|&b| b < hello.blocks.len());
         self.pinned = self.pinned.filter(|&b| b < hello.blocks.len());
         self.hovered = None;
         if let Some(restore) = self.restore.take()
             && self.compared.is_empty()
         {
             self.compared = saved::compared(&restore, &hello.blocks);
-            self.pinned = self.compared.last().map(|(b, _)| *b);
+            self.pinned = self.compared.last().copied();
         }
         if self.compared.is_empty()
             && let Some(first) = hello
@@ -410,7 +430,7 @@ impl View {
                 .find(|b| b.kind == "P")
                 .or_else(|| hello.blocks.first())
         {
-            self.compared.push((first.index, 0));
+            self.compared.push(first.index);
             self.pinned = Some(first.index);
         }
         self.hello = Some(hello);
@@ -520,9 +540,9 @@ impl View {
             strip: rgb(NO_PEAK),
             ..Default::default()
         };
-        if let Some(&(_, slot)) = self.compared.iter().find(|(b, _)| *b == block.index) {
+        if self.compared.contains(&block.index) {
             data.selected = true;
-            data.outline = panels::rgb(panels::SERIES[slot % panels::COMPARE]);
+            data.outline = panels::rgb(chart::color_of(&hello.blocks, block.index));
         }
         if cluster {
             let cells: Vec<CellData> = t
@@ -677,13 +697,16 @@ impl View {
     fn refresh_stats(&mut self) {
         let cutoff = self.cutoff();
         let Some(hello) = self.hello.as_ref() else { return };
-        let shown = panels::stats_panel(&panels::StatsInput {
+        let shown = chart::stats_panel(&chart::StatsInput {
             blocks: &hello.blocks,
             compared: &self.compared,
             highlight: self.highlight(),
             fused: self.limits.as_ref().map(|l| l.fused.as_slice()),
             cutoff,
             digest: self.digest.as_deref(),
+            scale: self.scale,
+            curves: self.curves,
+            swap: self.swap,
         });
         if self.shown_stats.as_ref() == Some(&shown) {
             return;
@@ -697,9 +720,25 @@ impl View {
         set_text(&ui.get_actions_empty(), &shown.actions_empty, |t| {
             ui.set_actions_empty(t);
         });
+        set_text(&ui.get_chart_value_title(), &shown.value_title, |t| {
+            ui.set_chart_value_title(t);
+        });
         // Та же величина из того же расчёта — те же биты.
         if ui.get_chart_cutoff().to_bits() != shown.cutoff.to_bits() {
             ui.set_chart_cutoff(shown.cutoff);
+        }
+        if ui.get_chart_zero().to_bits() != shown.zero.to_bits() {
+            ui.set_chart_zero(shown.zero);
+        }
+        let above = self.scale == Scale::AboveDie;
+        if ui.get_chart_above() != above {
+            ui.set_chart_above(above);
+        }
+        if ui.get_chart_curves() != self.curves.code() {
+            ui.set_chart_curves(self.curves.code());
+        }
+        if ui.get_chart_swap() != self.swap {
+            ui.set_chart_swap(self.swap);
         }
         #[expect(clippy::cast_precision_loss, reason = "a few dozen columns: exact in f32")]
         let width = shown.columns.len().max(1) as f32;
@@ -714,8 +753,8 @@ impl View {
         if old.is_none_or(|o| o.columns != shown.columns) {
             ui.set_chart_cols(ModelRc::new(VecModel::from(shown.column_rows())));
         }
-        if old.is_none_or(|o| o.yticks != shown.yticks) {
-            ui.set_chart_yticks(ModelRc::new(VecModel::from(shown.ticks())));
+        if old.is_none_or(|o| o.ticks != shown.ticks) {
+            ui.set_chart_ticks(ModelRc::new(VecModel::from(shown.tick_rows())));
         }
         if old.is_none_or(|o| o.legend != shown.legend) {
             ui.set_stats_legend(ModelRc::new(VecModel::from(shown.legend_rows())));
@@ -993,10 +1032,13 @@ impl View {
             saved.compared = self
                 .compared
                 .iter()
-                .filter_map(|&(b, slot)| Some((hello.blocks.get(b)?.name.clone(), slot)))
+                .filter_map(|&b| Some(hello.blocks.get(b)?.name.clone()))
                 .collect();
         }
         saved.pin = Some(self.pin_mode);
+        saved.above = Some(self.scale == Scale::AboveDie);
+        saved.curves = Some(self.curves);
+        saved.swap = Some(self.swap);
         saved.maximized = window.is_maximized();
         if !window.is_maximized() && !window.is_minimized() {
             let size = window.size().to_logical(window.scale_factor());
@@ -1021,31 +1063,20 @@ impl View {
         self.remember();
     }
 
-    /// Щелчок по плитке: блока нет в статистике — добавить (до `COMPARE` блоков, у каждого свой цвет), есть — убрать.
-    /// Больше щелчок ничего не делает.
+    /// Щелчок по плитке: блока нет в статистике — добавить (сколько угодно блоков, у каждого свой цвет), есть —
+    /// убрать. Больше щелчок ничего не делает.
     pub fn clicked(&mut self, block: i32) {
         let Ok(block) = usize::try_from(block) else { return };
-        if let Some(at) = self.compared.iter().position(|(b, _)| *b == block) {
+        if let Some(at) = self.compared.iter().position(|&b| b == block) {
             self.compared.remove(at);
             if self.pinned == Some(block) {
-                self.pinned = self.compared.last().map(|(b, _)| *b);
+                self.pinned = self.compared.last().copied();
             }
             if self.hovered == Some(block) {
                 self.hovered = None;
             }
-        } else if self.compared.len() >= panels::COMPARE {
-            self.problem = Some(format!(
-                "Сравнить можно до {} блоков — сначала убери один щелчком по его плитке",
-                panels::COMPARE
-            ));
-            self.show_problem();
-            return;
         } else {
-            // Цвет — первый свободный: у оставшихся блоков цвета не меняются.
-            let slot = (0..panels::COMPARE)
-                .find(|s| self.compared.iter().all(|(_, used)| used != s))
-                .unwrap_or(0);
-            self.compared.push((block, slot));
+            self.compared.push(block);
             self.pinned = Some(block);
         }
         self.refresh(false);
@@ -1057,7 +1088,7 @@ impl View {
     pub fn tile_hover(&mut self, block: i32, on: bool) {
         let Ok(block) = usize::try_from(block) else { return };
         let hovered = if on {
-            self.compared.iter().any(|(b, _)| *b == block).then_some(block)
+            self.compared.contains(&block).then_some(block)
         } else if self.hovered == Some(block) {
             None
         } else {
@@ -1096,9 +1127,44 @@ impl View {
         }
     }
 
+    /// Шкала графика: над кристаллом (true) или абсолютная.
+    pub fn scale_changed(&mut self, above: bool) {
+        let scale = if above { Scale::AboveDie } else { Scale::Absolute };
+        if self.scale != scale {
+            self.scale = scale;
+            self.refresh_stats();
+            self.remember();
+        }
+    }
+
+    /// Линии графика: 0 — ø средние, 1 — 95 %, 2 — обе.
+    pub fn curves_changed(&mut self, code: i32) {
+        if let Some(curves) = Curves::from_code(i64::from(code))
+            && self.curves != curves
+        {
+            self.curves = curves;
+            self.refresh_stats();
+            self.remember();
+        }
+    }
+
+    /// Оси местами: температура по горизонтали (true).
+    pub fn axes_changed(&mut self, swap: bool) {
+        if self.swap != swap {
+            self.swap = swap;
+            self.refresh_stats();
+            self.remember();
+        }
+    }
+
     fn near(&self, x: f32, y: f32, w: f32, h: f32) -> Option<usize> {
         let series = self.shown_stats.as_ref().map(|s| s.series.as_slice())?;
-        panels::nearest(series, (f64::from(x), f64::from(y)), (f64::from(w), f64::from(h)))
+        chart::nearest(
+            series,
+            (f64::from(x), f64::from(y)),
+            (f64::from(w), f64::from(h)),
+            self.curves,
+        )
     }
 
     fn hover(&mut self, block: Option<usize>) {
