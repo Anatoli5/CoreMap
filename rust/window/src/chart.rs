@@ -42,44 +42,50 @@ pub enum Scale {
     Absolute,
 }
 
-/// Какие линии показаны (владелец 15.10: «друг друга там… мусорят… избыточное количество информации»).
+/// Какие линии показаны (владелец 15.10: «друг друга там… мусорят… избыточное количество информации»). Два
+/// независимых выключателя — «ø» и «95 %» (владелец 16.10: «зачем эта кнопка оба… сделать два независимых
+/// выключателя»); оба выключены — пустой график с осями (`Neither`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Curves {
     Mean,
     P95,
     #[default]
     Both,
+    Neither,
 }
 
 impl Curves {
+    /// Линии по двум выключателям.
+    #[must_use]
+    pub fn of(mean: bool, p95: bool) -> Curves {
+        match (mean, p95) {
+            (true, true) => Curves::Both,
+            (true, false) => Curves::Mean,
+            (false, true) => Curves::P95,
+            (false, false) => Curves::Neither,
+        }
+    }
+
     #[must_use]
     pub fn mean(self) -> bool {
-        self != Curves::P95
+        matches!(self, Curves::Mean | Curves::Both)
     }
 
     #[must_use]
     pub fn p95(self) -> bool {
-        self != Curves::Mean
+        matches!(self, Curves::P95 | Curves::Both)
     }
 
-    /// Номер для окна и файла окна: 0 — средние, 1 — 95 %, 2 — обе.
+    /// Щелчок по «ø»: средние показаны или скрыты, 95 % — как были.
     #[must_use]
-    pub fn code(self) -> i32 {
-        match self {
-            Curves::Mean => 0,
-            Curves::P95 => 1,
-            Curves::Both => 2,
-        }
+    pub fn toggled_mean(self) -> Curves {
+        Curves::of(!self.mean(), self.p95())
     }
 
+    /// Щелчок по «95 %»: 95 % показаны или скрыты, средние — как были.
     #[must_use]
-    pub fn from_code(code: i64) -> Option<Curves> {
-        match code {
-            0 => Some(Curves::Mean),
-            1 => Some(Curves::P95),
-            2 => Some(Curves::Both),
-            _ => None,
-        }
+    pub fn toggled_p95(self) -> Curves {
+        Curves::of(self.mean(), !self.p95())
     }
 }
 
@@ -306,6 +312,9 @@ pub struct SeriesShown {
     /// пусто.
     pub model: String,
     pub model_dash: String,
+    /// Та же кривая модели ломаными в долях поля (x, y снизу вверх, оси уже повёрнуты) — для подсветки под курсором
+    /// (`nearest`); скрыта или нет кривой — пусто.
+    pub model_line: Vec<Vec<(f32, f32)>>,
     pub points: Vec<PointShown>,
 }
 
@@ -681,9 +690,9 @@ fn dashed_path(run: &[(f64, f64)], frame: &Frame, out: &mut String) {
 }
 
 /// Пути кривой модели блока: сплошная над наблюдёнными множителями, пунктир от края оси до них и от них до края.
-fn model_paths(m: &BlockModel, scale: Scale, frame: &Frame) -> (String, String) {
+fn model_paths(m: &BlockModel, scale: Scale, frame: &Frame) -> (String, String, Vec<Vec<(f32, f32)>>) {
     let Some(r) = m.reference.as_ref().filter(|_| m.drawn()) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), Vec::new());
     };
     let (from, to) = (f64::from(frame.lo) - 0.5, f64::from(frame.hi) + 0.5);
     let piece = |a: f64, b: f64| -> Vec<(f64, f64)> {
@@ -695,15 +704,27 @@ fn model_paths(m: &BlockModel, scale: Scale, frame: &Frame) -> (String, String) 
             .collect()
     };
     let (lo, hi) = (r.lo.clamp(from, to), r.hi.clamp(from, to));
+    // Те же куски — ломаными в долях поля для подсветки под курсором (`nearest`).
+    let turned = |run: &[(f64, f64)]| -> Vec<(f32, f32)> {
+        run.iter()
+            .map(|&(along, value)| {
+                let (x, y) = frame.turn(along, value);
+                (f(x), f(y))
+            })
+            .collect()
+    };
+    let mut line = Vec::new();
     let mut solid = String::new();
     for run in clipped(&piece(lo, hi)) {
         solid_path(&run, frame, &mut solid);
+        line.push(turned(&run));
     }
     let mut dash = String::new();
     for run in clipped(&piece(from, lo)).iter().chain(&clipped(&piece(hi, to))) {
         dashed_path(run, frame, &mut dash);
+        line.push(turned(run));
     }
-    (solid, dash)
+    (solid, dash, line)
 }
 
 /// Часть подсказки блока в легенде о модели нагрева: «°C на ватт» (тепловое сопротивление) или почему его нет, вид
@@ -1058,9 +1079,9 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             .map(|s| frame.place(s.ratio, s.bin.mean().unwrap_or(s.p95)))
             .collect();
         let highs: Vec<(f64, f64)> = stats.iter().map(|s| frame.place(s.ratio, s.p95)).collect();
-        let (model, model_dash) = match fitted.and_then(|m| model_of(m, b)) {
+        let (model, model_dash, model_line) = match fitted.and_then(|m| model_of(m, b)) {
             Some(m) if input.model => model_paths(m, input.scale, &frame),
-            _ => (String::new(), String::new()),
+            _ => (String::new(), String::new(), Vec::new()),
         };
         shown.series.push(SeriesShown {
             block: b.index,
@@ -1078,6 +1099,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             },
             model,
             model_dash,
+            model_line,
             points: stats
                 .iter()
                 .zip(means.iter().zip(&highs))
@@ -1110,7 +1132,8 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
 type PlaceOf = fn(&PointShown) -> (f32, f32);
 
 /// Линия какого блока ближе всего к курсору: поле графика w × h пикселей, курсор (x, y) от его левого верхнего угла;
-/// None — ни одна не ближе `NEAR_PX`. Считаются показанные кривые блока — ø средняя и 95 %; места точек уже повёрнуты
+/// None — ни одна не ближе `NEAR_PX`. Считаются показанные кривые блока — ø средняя и 95 % (по `curves`) и кривая модели
+/// (её ломаные пусты, когда она скрыта): подсветка работает с тем, что видно. Места точек уже повёрнуты
 /// (`Frame::place`), поэтому одинаково при любой раскладке осей.
 #[must_use]
 pub fn nearest(series: &[SeriesShown], cursor: (f64, f64), field: (f64, f64), curves: Curves) -> Option<usize> {
@@ -1140,6 +1163,15 @@ pub fn nearest(series: &[SeriesShown], cursor: (f64, f64), field: (f64, f64), cu
                     best = Some((gap, s.block));
                 }
                 previous = Some(p);
+            }
+        }
+        for run in &s.model_line {
+            let at = |p: (f32, f32)| (f64::from(p.0) * width, (1.0 - f64::from(p.1)) * height);
+            for w in run.windows(2) {
+                let gap = segment_distance(at(w[0]), at(w[1]), cursor);
+                if gap <= NEAR_PX && best.is_none_or(|(closest, _)| gap < closest) {
+                    best = Some((gap, s.block));
+                }
             }
         }
     }
@@ -1410,9 +1442,29 @@ mod tests {
         let p95 = with(Curves::P95);
         assert!(p95.series[0].mean.is_empty() && !p95.series[0].p95.is_empty());
         assert_eq!(both.ticks, mean.ticks, "ось температуры от выбора линий не зависит");
-        for c in [Curves::Mean, Curves::P95, Curves::Both] {
-            assert_eq!(Curves::from_code(i64::from(c.code())), Some(c));
+        // Оба выключены — пустой график с осями: ни одной линии, оси и столбцы те же, надписи «нет данных» нет.
+        let neither = with(Curves::Neither);
+        assert!(neither.series[0].mean.is_empty() && neither.series[0].p95.is_empty());
+        assert_eq!(
+            (&neither.ticks, neither.columns.len(), &neither.empty),
+            (&both.ticks, both.columns.len(), &both.empty)
+        );
+    }
+
+    // Два независимых выключателя (владелец 16.10): щелчок по одному меняет только свою линию; все четыре сочетания
+    // достижимы и обратимы.
+    #[test]
+    fn each_curve_switch_flips_only_its_own_line() {
+        for c in [Curves::Mean, Curves::P95, Curves::Both, Curves::Neither] {
+            let m = c.toggled_mean();
+            assert_eq!((m.mean(), m.p95()), (!c.mean(), c.p95()), "{c:?}");
+            let q = c.toggled_p95();
+            assert_eq!((q.mean(), q.p95()), (c.mean(), !c.p95()), "{c:?}");
+            assert_eq!(m.toggled_mean(), c);
+            assert_eq!(q.toggled_p95(), c);
+            assert_eq!(Curves::of(c.mean(), c.p95()), c);
         }
+        assert_eq!(Curves::default(), Curves::Both);
     }
 
     #[test]

@@ -116,14 +116,10 @@ impl Thermal for SimCpu {
     fn block(&mut self, core: usize) -> Result<Reading, HwError> {
         let load = self.load[core];
         let ceiling = self.current[core];
-        let ratio = (load >= 0.05).then_some(f64::from(ceiling));
         Ok(Reading {
             temp: Some(heat(load, ceiling)),
             busy: Some(load),
-            ratio,
-            // Напряжение имитации растёт с множителем (0,6 В + 12,5 мВ на ступень: ×45 — 1,16 В); есть, когда есть
-            // множитель.
-            volts: ratio.map(|r| 0.6 + 0.0125 * r),
+            ratio: (load >= 0.05).then_some(f64::from(ceiling)),
         })
     }
 

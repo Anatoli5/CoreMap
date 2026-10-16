@@ -205,7 +205,6 @@ impl Controller {
                 temp: Some(temp),
                 busy,
                 ratio,
-                ..
             }) = *reading
             else {
                 track.cool_at = None;
@@ -364,7 +363,6 @@ mod tests {
             temp: Some(temp),
             busy: Some(busy),
             ratio: Some(ratio),
-            volts: None,
         })
     }
 

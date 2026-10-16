@@ -19,11 +19,8 @@
 // тепловая эффективность ядра): тепло ядра — это ватты его работы, а не доля времени, которую оно не спит; ватты ядер
 // модель окна делит между блоками, чистые от кольца и памяти они делятся точнее, чем мощность корпуса.
 //
-// Напряжение ядра — биты 47:32 регистра 0x198 (IA32_PERF_STATUS) этого ядра, в единицах 1/2^13 В (Intel SDM том 4,
-// MSR_PERF_STATUS, начиная со 2-го поколения Core), показание в момент чтения. Модуль IntelMSR регистр читать пускает
-// (KNOWLEDGE.md: 0x198 доступен, измерено); что поле напряжения на 275HX заполнено — не проверено, покажет журнал.
-// Зачем (владелец 16.10): мощность ядра ≈ нагрузка × множитель × напряжение², напряжение — часть фактического состояния
-// ядра для тепловой модели.
+// Напряжения ядра (0x198) здесь нет: его задаёт процессор от множителя и условий, независимым входом модели оно не
+// служит (владелец 16.10, DECISIONS #32, подзапись 16.10; в 0.5.4 оно было).
 
 use std::time::Instant;
 
@@ -36,7 +33,6 @@ const PACKAGE_THERM_STATUS: u32 = 0x1B1;
 const MPERF: u32 = 0xE7;
 const APERF: u32 = 0xE8;
 const PLATFORM_INFO: u32 = 0xCE;
-const PERF_STATUS: u32 = 0x198;
 const RAPL_POWER_UNIT: u32 = 0x606;
 const PKG_ENERGY_STATUS: u32 = 0x611;
 const PP0_ENERGY_STATUS: u32 = 0x639;
@@ -47,9 +43,6 @@ const GAP: std::time::Duration = std::time::Duration::from_secs(10);
 /// Больше этого корпус ноутбука не берёт (у 275HX наибольшая мощность турбо — 160 Вт по спецификации): такое число —
 /// не мощность, а сброс счётчика (после гибернации процессор обнуляет его) между чтениями.
 const MOST_WATTS: f64 = 1000.0;
-/// Напряжение ядра вне этих пределов — не напряжение (поле пустое или не то): у процессоров Intel этих лет рабочее
-/// напряжение ядра — десятые доли вольта до полутора.
-const VOLTS: std::ops::RangeInclusive<f64> = 0.3..=2.0;
 
 /// Показание блока за последний промежуток между опросами.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -60,8 +53,6 @@ pub struct Reading {
     pub busy: Option<f64>,
     /// Средний фактический множитель, пока блок работал; None — первый опрос или блок почти спал.
     pub ratio: Option<f64>,
-    /// Напряжение ядра, В, в момент чтения; None — регистр не прочитался или поле не похоже на напряжение.
-    pub volts: Option<f64>,
 }
 
 /// Средняя мощность с прошлого чтения, Вт: корпуса и одних ядер. None — первый вызов, перерыв дольше 10 с, счётчик за
@@ -109,12 +100,6 @@ impl Counters {
             cores_energy: None,
         }
     }
-}
-
-/// Напряжение ядра по регистру 0x198: биты 47:32 × 1/2^13 В; None — вне `VOLTS`.
-fn core_volts(value: u64) -> Option<f64> {
-    let volts = f64::from(u32::try_from(value >> 32 & 0xFFFF).unwrap_or(0)) / 8192.0;
-    VOLTS.contains(&volts).then_some(volts)
 }
 
 fn temperature(value: u64, tjmax: i32) -> Option<f64> {
@@ -174,9 +159,6 @@ impl Thermal for MailboxCpu {
         let status = self.msr.read(THERM_STATUS)?;
         let aperf = self.msr.read(APERF)?;
         let mperf = self.msr.read(MPERF)?;
-        // Напряжение — лишний столбец журнала: его отказ не должен останавливать температуру и множитель, он виден
-        // пустым столбцом.
-        let volts = self.msr.read(PERF_STATUS).ok().and_then(core_volts);
         let now = Instant::now();
         let previous = self.sensors.last[core].replace((aperf, mperf, now));
         // Счётчик пошёл назад (после гибернации процессор их обнуляет) или перерыв долгий — как первый опрос
@@ -207,7 +189,6 @@ impl Thermal for MailboxCpu {
             temp: temperature(status, tjmax),
             busy,
             ratio,
-            volts,
         })
     }
 
@@ -251,14 +232,6 @@ mod tests {
         // 105 °C TjMax (measured on the 275HX), readout 30 -> 75 °C; bit 31 = valid.
         assert_eq!(temperature(1 << 31 | 30 << 16, 105), Some(75.0));
         assert_eq!(temperature(30 << 16, 105), None, "an invalid reading is no reading");
-    }
-
-    #[test]
-    fn core_voltage_is_bits_47_to_32_in_units_of_2_to_minus_13() {
-        // 1.25 V = 10240 / 8192; the low 32 bits (ratio fields) do not matter.
-        assert_eq!(core_volts(10240 << 32 | 0x2D00), Some(1.25));
-        assert_eq!(core_volts(0x2D00), None, "an empty field is no voltage");
-        assert_eq!(core_volts(0xFFFF << 32), None, "8 V is not a core voltage");
     }
 
     // Счётчик энергии по Intel SDM (том 4, MSR 606H и 611H): единица 1/2^ESU Дж, ESU — биты 12:8; счётчик 32-битный,

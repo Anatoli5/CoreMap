@@ -40,7 +40,7 @@ mod meter;
 mod sense;
 mod serve;
 use crate::shell::{Event, Item, Loop, Menu, Shell};
-pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, STEP_UP_ID};
+pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, LOG_ID, STEP_UP_ID};
 pub use sense::LogCount;
 pub use serve::{Confirm, LEAVE_WITHIN, WINDOW_EXE};
 
@@ -204,6 +204,8 @@ pub struct App {
     logging: sense::Logging,
     serving: serve::Serving,
     auto: auto::Autopilot,
+    /// Скрытая проверка: сколько раз драйвер отпущен, потому что стал не нужен (`release_idle`).
+    releases: u64,
     lease: Rc<named::Mutex>,
     watched: Vec<Watched>,
     balloons: VecDeque<String>,
@@ -255,6 +257,7 @@ impl App {
             logging: sense::Logging::default(),
             serving,
             auto: auto::Autopilot::new(blocks),
+            releases: 0,
             lease: Rc::new(lease),
             watched: Vec::new(),
             balloons: VecDeque::new(),
@@ -323,10 +326,22 @@ impl App {
         &mut self.serving
     }
 
-    /// Сколько ядер прочитано всего (скрытая проверка: без окна и автомодуля не растёт).
+    /// Сколько ядер прочитано всего (скрытая проверка: без окна, журнала срезов и автомодуля не растёт).
     #[must_use]
     pub fn reads(&self) -> u64 {
         self.meter.reads
+    }
+
+    /// Скрытая проверка: сколько раз драйвер отпущен, потому что стал не нужен.
+    #[must_use]
+    pub fn releases(&self) -> u64 {
+        self.releases
+    }
+
+    /// Скрытая проверка: сколько сообщений таймера опроса раз в 2 с пришло (таймера нет — не растёт).
+    #[must_use]
+    pub fn auto_ticks(&self) -> u64 {
+        self.auto.ticks
     }
 
     /// Скрытая проверка: пишется ли журнал срезов, сколько было его опросов (из них опросов окна), сколько раз он
@@ -361,8 +376,11 @@ impl App {
         let was = std::mem::replace(&mut self.config.auto, timing);
         self.stop_logging(shell);
         self.restart_costs();
-        if self.auto.choice.on {
+        let choice = self.auto.choice;
+        if choice.on {
             self.auto.controller = Some(self.controller_for());
+        }
+        if choice.on || choice.log {
             shell.set_timer(auto::AUTO, timing.tick);
         }
         was
@@ -426,15 +444,25 @@ impl App {
             return Err(format!("потолки множителей недоступны: {}", e.0));
         }
         let result = act(self);
-        // Автомодуль опрашивает раз в 2 с (а его журнал срезов — 4 раза в секунду), окно — раз в полсекунды: пока
-        // работает кто-то из них, драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
-        if !self.auto.choice.on
-            && !self.serving.attached()
+        self.release_idle();
+        Ok(result)
+    }
+
+    /// Нужен ли драйвер между действиями: автомодуль опрашивает раз в 2 с, журнал срезов — 4 раза в секунду, окно — раз в
+    /// полсекунды; пока работает кто-то из них, драйвер остаётся открытым, иначе каждый опрос заново грузил бы модуль.
+    fn driver_needed(&self) -> bool {
+        self.auto.choice.on || self.logging.on || self.serving.attached()
+    }
+
+    /// Отпустить драйвер, если он больше никому не нужен (`driver_needed`): после действия, когда кончился журнал срезов,
+    /// ушло окно или выключен автомодуль. Следующее обращение откроет его заново.
+    fn release_idle(&mut self) {
+        if !self.driver_needed()
             && let Some(device) = &mut self.device
         {
             device.cpu().release();
+            self.releases += 1;
         }
-        Ok(result)
     }
 
     fn connect(&mut self) -> Result<(), HwError> {
@@ -777,6 +805,8 @@ impl App {
             }
             items.push(separator());
         }
+        // Два независимых выключателя (владелец 16.10): журнал срезов — свой пункт, не в подменю автомодуля.
+        items.push(self.log_menu());
         items.push(self.auto_menu());
         items.push(separator());
         items.push(Item {

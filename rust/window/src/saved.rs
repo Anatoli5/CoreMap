@@ -118,10 +118,13 @@ pub fn parse(text: &str) -> Result<Saved, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // Линии: «mean», «p95», «both» — как писали сборки с переключателем «ø / 95 % / обе» (только ø, только 95 %, обе);
+    // «none» — оба выключателя выключены (владелец 16.10: два независимых выключателя).
     let curves = match map.get("curves").and_then(Value::as_str) {
         Some("mean") => Some(Curves::Mean),
         Some("p95") => Some(Curves::P95),
         Some("both") => Some(Curves::Both),
+        Some("none") => Some(Curves::Neither),
         _ => None,
     };
     Ok(Saved {
@@ -153,6 +156,7 @@ pub fn text(saved: &Saved) -> String {
             Curves::Mean => "mean",
             Curves::P95 => "p95",
             Curves::Both => "both",
+            Curves::Neither => "none",
         };
         map.insert("curves".into(), name.into());
     }
@@ -346,6 +350,22 @@ mod tests {
         );
         // Ни одного известного — пусто (окно возьмёт умолчание: первое P-ядро).
         assert_eq!(compared(&["99".into()], &blocks()), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn lines_of_the_three_way_switch_map_onto_the_two_switches() {
+        // Файл сборки с «ø / 95 % / обе»: только ø, только 95 %, обе; и новое «обе выключены» — туда и обратно.
+        for (word, mean, p95) in [
+            ("mean", true, false),
+            ("p95", false, true),
+            ("both", true, true),
+            ("none", false, false),
+        ] {
+            let saved = parse(&format!(r#"{{"curves":"{word}"}}"#)).expect("объект");
+            let curves = saved.curves.expect(word);
+            assert_eq!((curves.mean(), curves.p95()), (mean, p95), "{word}");
+            assert_eq!(parse(&text(&saved)).expect("свой файл").curves, Some(curves));
+        }
     }
 
     #[test]

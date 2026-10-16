@@ -17,7 +17,8 @@
 //
 // Настройки автомодуля (DECISIONS #36) — выбор программы у часов: окно показывает тему settings и шлёт изменения
 // командой auto.set; ползунок — одной командой, когда его отпустили. Пока его тянут и пока программа не подтвердила
-// новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад.
+// новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад. Журнал срезов — свой
+// выключатель той же программы (владелец 16.10): «запись» в шапке статистики, команда log.set.
 // Что окно помнит о себе (сравниваемые блоки, подсветка, вид графика, размер и место) — его собственный файл
 // (src/saved.rs).
 use std::cmp::Ordering;
@@ -182,6 +183,9 @@ pub struct View {
     pub changes: Changes,
     /// Выбор автомодуля из темы settings программы у часов; None — его нет (движок C# такой темы не шлёт).
     pub auto: Option<AutoSettings>,
+    /// Журнал срезов пишется (тема settings, поле log); None — программа его не сообщает (движок C#, `CoreMapTray` до
+    /// 0.5.5): выключателя «запись» в окне нет.
+    pub log: Option<bool>,
     /// Отсечка под ручкой ползунка: пока его тянут и после отпускания, пока программа не подтвердила её (темой и
     /// состоянием); None — ручка и линия стоят на выборе программы.
     limit_held: Option<i32>,
@@ -247,6 +251,7 @@ impl View {
             menu_block: None,
             changes: Changes::default(),
             auto: None,
+            log: None,
             limit_held: None,
             limit_dragging: false,
             sent: 0,
@@ -340,6 +345,7 @@ impl View {
             }
             Event::Message(Message::Settings(settings)) => {
                 self.auto = settings.auto;
+                self.log = settings.log.map(|l| l.on);
                 let cutoff = self.cutoff();
                 self.settle_holds();
                 self.show_auto();
@@ -764,8 +770,11 @@ impl View {
         if ui.get_chart_above() != above {
             ui.set_chart_above(above);
         }
-        if ui.get_chart_curves() != self.curves.code() {
-            ui.set_chart_curves(self.curves.code());
+        if ui.get_chart_mean() != self.curves.mean() {
+            ui.set_chart_mean(self.curves.mean());
+        }
+        if ui.get_chart_p95() != self.curves.p95() {
+            ui.set_chart_p95(self.curves.p95());
         }
         if ui.get_chart_model() != self.model {
             ui.set_chart_model(self.model);
@@ -913,6 +922,13 @@ impl View {
         if ui.get_auto_ready() != ready {
             ui.set_auto_ready(ready);
         }
+        if ui.get_has_log() != self.log.is_some() {
+            ui.set_has_log(self.log.is_some());
+        }
+        let logging = self.log.unwrap_or(false);
+        if ui.get_log_on() != logging {
+            ui.set_log_on(logging);
+        }
         let Some(a) = &self.auto else { return };
         let ints = [
             (
@@ -982,6 +998,16 @@ impl View {
     pub fn auto_toggled(&mut self) {
         if let Some(on) = self.auto.as_ref().map(|a| a.on) {
             self.set_auto("on", (!on).into(), "Автомодуль не переключён", false);
+        }
+    }
+
+    /// «запись»: журнал срезов включить или выключить — команда log.set; выключатель встаёт, когда программа подтвердит
+    /// темой settings.
+    pub fn log_toggled(&mut self) {
+        if let Some(on) = self.log {
+            let mut args = Map::new();
+            args.insert("on".into(), (!on).into());
+            self.order_then("log.set", args, Pending::failing("Журнал срезов не переключён"));
         }
     }
 
@@ -1131,15 +1157,18 @@ impl View {
         }
     }
 
-    /// Линии графика: 0 — ø средние, 1 — 95 %, 2 — обе.
-    pub fn curves_changed(&mut self, code: i32) {
-        if let Some(curves) = Curves::from_code(i64::from(code))
-            && self.curves != curves
-        {
-            self.curves = curves;
-            self.refresh_stats();
-            self.remember();
-        }
+    /// «ø»: линии средних показать или скрыть; 95 % — как были (владелец 16.10: два независимых выключателя).
+    pub fn mean_toggled(&mut self) {
+        self.curves = self.curves.toggled_mean();
+        self.refresh_stats();
+        self.remember();
+    }
+
+    /// «95 %»: линии 95 % показать или скрыть; средние — как были.
+    pub fn p95_toggled(&mut self) {
+        self.curves = self.curves.toggled_p95();
+        self.refresh_stats();
+        self.remember();
     }
 
     /// Кривые модели нагрева: показать или скрыть (свой выключатель, вместе с линиями ø и 95 %).

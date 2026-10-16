@@ -192,11 +192,21 @@ pub struct AutoSettings {
     pub limit_range: [i64; 2],
 }
 
-/// Тема «settings»: выбор автомодуля; поле неожиданной формы — как будто темы нет (настройки в окне не показываются).
+/// Журнал срезов (тема «settings», поле «log»): свой выключатель, независимый от автомодуля (владелец 16.10). Хозяин —
+/// программа входа (data\tray.json); окно показывает его «записью» в шапке статистики и шлёт команду log.set.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LogSettings {
+    pub on: bool,
+}
+
+/// Тема «settings»: выбор автомодуля и журнал срезов; поле неожиданной формы — как будто его нет (этот выключатель в
+/// окне не показывается). Программа входа до 0.5.5 поля «log» не шлёт.
 #[derive(Deserialize, Clone, Debug)]
 pub struct Settings {
     #[serde(default, deserialize_with = "lenient")]
     pub auto: Option<AutoSettings>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub log: Option<LogSettings>,
 }
 
 /// Сообщение владельцу (то, что программа сказала бы всплывающим окошком); прочитано — команда notices.seen {seq}.
@@ -416,9 +426,23 @@ mod tests {
     fn settings_topic_as_the_logon_program_writes_it() {
         // Тема в том виде, в каком её пишет программа входа (rust/tray/src/app/auto.rs, Choice::topic); и в виде до
         // 0.5.4 — с глубиной, которую окно больше не читает.
-        for text in [
-            r#"{"t":"settings","auto":{"on":true,"limit":82,"stepUp":false,"limitRange":[60,95]}}"#,
-            r#"{"t":"settings","auto":{"on":true,"limit":82,"depth":4,"stepUp":false,"limitRange":[60,95],"depthRange":[1,8]}}"#,
+        for (text, log) in [
+            (
+                r#"{"t":"settings","auto":{"on":true,"limit":82,"stepUp":false,"limitRange":[60,95]},"log":{"on":false}}"#,
+                Some(false),
+            ),
+            (
+                r#"{"t":"settings","auto":{"on":true,"limit":82,"stepUp":false,"limitRange":[60,95]}}"#,
+                None,
+            ),
+            (
+                r#"{"t":"settings","auto":{"on":true,"limit":82,"depth":4,"stepUp":false,"limitRange":[60,95],"depthRange":[1,8]}}"#,
+                None,
+            ),
+            (
+                r#"{"t":"settings","auto":{"on":true,"limit":82,"stepUp":false,"limitRange":[60,95]},"log":{"on":"да"}}"#,
+                None,
+            ),
         ] {
             let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(text) else {
                 panic!("тема settings не разобралась: {text}");
@@ -426,6 +450,7 @@ mod tests {
             let auto = s.auto.expect("выбор автомодуля");
             assert_eq!((auto.on, auto.limit, auto.step_up), (true, 82, false));
             assert_eq!(auto.limit_range, [60, 95]);
+            assert_eq!(s.log.map(|l| l.on), log, "{text}");
         }
         // Поле другой формы не ломает сообщение: настроек просто нет.
         let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(r#"{"t":"settings","auto":{"on":"да"}}"#)

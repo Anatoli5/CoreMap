@@ -46,6 +46,7 @@ mod model_report;
 mod model_spec;
 mod panels;
 mod pipe;
+mod restore;
 mod samples;
 mod saved;
 mod screen;
@@ -89,7 +90,9 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_scale_changed(move |above| v.borrow_mut().scale_changed(above));
     let v = Rc::clone(view);
-    ui.on_curves_changed(move |code| v.borrow_mut().curves_changed(code));
+    ui.on_mean_toggled(move || v.borrow_mut().mean_toggled());
+    let v = Rc::clone(view);
+    ui.on_p95_toggled(move || v.borrow_mut().p95_toggled());
     let v = Rc::clone(view);
     ui.on_model_toggled(move || v.borrow_mut().model_toggled());
     let v = Rc::clone(view);
@@ -120,6 +123,8 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_auto_toggled(move || v.borrow_mut().auto_toggled());
     let v = Rc::clone(view);
     ui.on_step_up_toggled(move || v.borrow_mut().step_up_toggled());
+    let v = Rc::clone(view);
+    ui.on_log_toggled(move || v.borrow_mut().log_toggled());
     let v = Rc::clone(view);
     ui.on_limit_moved(move |value| v.borrow_mut().limit_moved(value));
     let v = Rc::clone(view);
@@ -214,6 +219,8 @@ fn main() {
     // по умолчанию, который AppWindow::new возьмёт сам; окно от этого не теряется.
     let _ = slint::BackendSelector::new().renderer_name("software".into()).select();
     let ui = AppWindow::new().expect("окно");
+    // Окно после сворачивания — целиком (обход ошибки Slint 1.18.1, src/restore.rs).
+    restore::watch(&ui);
     // Номер версии (файл VERSION, tools\rust.ps1); метка сборки в заголовок не идёт — она только делает файл другим.
     ui.set_version(env!("COREMAP_VERSION").into());
     let data = data_dir(&args);

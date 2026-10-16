@@ -366,6 +366,13 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
             && auto.get("depthRange").is_none(),
         &format!("settings при знакомстве (глубины нет): {auto}"),
     );
+    r.check(
+        settings["log"] == json!({ "on": true }),
+        &format!(
+            "settings при знакомстве: журнал срезов — своим полем, включён ({})",
+            settings["log"]
+        ),
+    );
     let file = data.join("tray.json");
     let before = fs::read_to_string(&file).unwrap_or_default();
     let mut refused = Vec::new();
@@ -424,10 +431,57 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
     );
 }
 
+/// 12b'. Журнал срезов по каналу — свой выключатель и своя команда log.set (владелец 16.10: два независимых
+/// выключателя): меняет только себя, тема settings и tray.json следом; негодное — отказ без записи.
+fn log_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client, data: &Path) {
+    let file = data.join("tray.json");
+    // Журнал срезов — свой выключатель и своя команда log.set (владелец 16.10: два независимых выключателя): меняет
+    // только себя; негодное — отказ без записи.
+    let auto = app.auto_choice();
+    let (id, ok, why) = order(shell, app, client, "log.set", &json!({ "on": false }));
+    let topic = client.last("settings").cloned().unwrap_or(Value::Null);
+    let written = fs::read_to_string(&file).unwrap_or_default();
+    let after = app.auto_choice();
+    r.check(
+        ok && client.state_after(id).is_some()
+            && topic["log"] == json!({ "on": false })
+            && !after.log
+            && after.same_auto(auto)
+            && written.contains("\"log\":false"),
+        &format!(
+            "log.set {{on: false}}: принято {why}, тема settings {}, автомодуль не тронут, tray.json {written}",
+            topic["log"]
+        ),
+    );
+    let mut refused = Vec::new();
+    for bad in [json!({ "on": "нет" }), json!({ "limit": 80 }), json!({})] {
+        let (_, ok, why) = order(shell, app, client, "log.set", &bad);
+        refused.push((bad, ok, why));
+    }
+    r.check(
+        refused.iter().all(|(_, ok, why)| !ok && !why.is_empty()) && !app.auto_choice().log,
+        &format!(
+            "log.set с негодным — отказ с причиной: {}",
+            refused
+                .iter()
+                .map(|(bad, _, why)| format!("{bad} — {why}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
+    let (_, ok, _) = order(shell, app, client, "log.set", &json!({ "on": true }));
+    r.check(
+        ok && app.auto_choice().log && app.auto_choice().same_auto(auto) && logged(app, "журнал срезов (окно)") >= 2,
+        "log.set {on: true}: журнал снова включён, в tray.log — по строке на смену",
+    );
+}
+
 /// Что настоящее окно делает в своей проверке настроек (rust/window/src/check.rs, `settings`): включает автомодуль,
 /// тянет ползунок отсечки до 88 °C, включает подтягивание, выключает автомодуль — четыре жеста (глубины нет, #38).
 const WINDOW_LIMIT: i32 = 88;
 const WINDOW_GESTURES: usize = 4;
+/// Щелчков по «запись» в той же проверке окна: выключить и включить журнал срезов.
+const WINDOW_LOG_GESTURES: usize = 2;
 /// Название профиля, который окно в той же проверке сохраняет, применяет, перезаписывает и удаляет щелчками.
 const WINDOW_PROFILE: &str = "проверка окна";
 
@@ -528,6 +582,7 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     let folder_arg = folder.display().to_string();
     let before = app.auto_choice();
     let lines = logged(app, "автомодуль (окно)");
+    let log_lines = logged(app, "журнал срезов (окно)");
     let ceilings = ceilings_now(app);
     let history = profile_log(data).len();
     let logon = app.store().read_profile().ok().flatten().map(|p| p.name);
@@ -549,6 +604,7 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
         on: false,
         limit: WINDOW_LIMIT,
         step_up: true,
+        log: true,
     };
     r.check(
         after == want && written == want.file_text(),
@@ -559,6 +615,15 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
         gestures == WINDOW_GESTURES,
         &format!(
             "строк журнала «автомодуль (окно)»: {gestures} — по одной на жест ({WINDOW_GESTURES}), не на каждый шаг ползунка"
+        ),
+    );
+    // «запись» в шапке статистики — журнал срезов, свой выключатель (владелец 16.10): окно выключает и включает его
+    // щелчками, команда log.set на каждый; выключатель автомодуля от этого не меняется (он проверен выше).
+    let log_gestures = logged(app, "журнал срезов (окно)") - log_lines;
+    r.check(
+        log_gestures == WINDOW_LOG_GESTURES && app.auto_choice().log,
+        &format!(
+            "строк журнала «журнал срезов (окно)»: {log_gestures} — по одной на щелчок по «запись» ({WINDOW_LOG_GESTURES}); журнал снова включён"
         ),
     );
     // Профили щелчками окна: что окно оставило программе входа.
@@ -636,7 +701,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     pump(shell, app, Duration::from_millis(1100));
     r.check(
         app.reads() == reads_before,
-        "без окна и автомодуля датчики не читаются (канал ждёт окно, таймера нет)",
+        "без окна датчики не читаются: автомодуль выключен, процессор не занят — опрос раз в 2 с их не трогает (канал ждёт окно)",
     );
 
     // 12a. Знакомство: ответ, hello, limits, profiles, потом состояния.
@@ -711,6 +776,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
         &format!("обороты вентиляторов в состоянии ({})", state["fans"]["rpm"]),
     );
     auto_settings(r, app, shell, &mut client, data, &state);
+    log_settings(r, app, shell, &mut client, data);
 
     // 12c. Средняя под нагрузкой: нагруженный блок получает среднюю после 2 с прогрева, ненагруженный — нет;
     //      «сбросить максимумы» обнуляет и наибольшие, и средние.
@@ -1243,9 +1309,12 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     drop(again);
     drop(silent);
     pump(shell, app, Duration::from_millis(300));
+    // Покой — на настоящих сроках опроса раз в 2 с: у проверки он раз в 50 мс (шаг 10 в check.rs).
+    let was = app.retime(shell, AutoTiming::REAL);
     let from = shell::usage();
     pump(shell, app, Duration::from_secs(3));
     let to = shell::usage();
+    app.retime(shell, was);
     r.note(&format!(
         "после окна: память выделенная {:.1} МБ (с сообщениями клиента проверки в том же процессе), процессор в покое {} мс за 3 с",
         f64::from(u32::try_from(to.private / 1024).unwrap_or(u32::MAX)) / 1024.0,

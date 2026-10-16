@@ -308,13 +308,48 @@ impl Check {
             "картинка окна (выбран первый P-блок, статистика из придуманных срезов)",
         );
         self.idle();
+        self.restore_repaint();
         self.select(&p_block, &e_block, expected.as_ref());
         self.chart_views(&p_block, &e_block, expected.as_ref());
         self.model_curves(&p_block, &e_block);
+        self.curve_switches(&e_block);
         self.means_and_reset(&p_block);
         self.limit_menu(&limits, &e_block);
         self.profiles(&limits, &e_block);
         self.sizes(&p_block, &e_block);
+    }
+
+    /// Обход ошибки Slint 1.18.1 (src/restore.rs): путь восстановления из свёрнутого меняет прозрачный слой во всё окно —
+    /// следующий кадр рисует окно целиком; цвет слоя остаётся полностью прозрачным. Настоящего сворачивания здесь нет
+    /// (окно проверки не на winit, `on_winit_window_event` для него ничего не делает) — тот же путь проходят события,
+    /// которые дал бы winit; что настоящий winit их шлёт и что окно после этого рисуется целиком, видно только на экране.
+    fn restore_repaint(&mut self) {
+        use crate::restore::{Restore, Seen};
+        let mut restore = Restore::default();
+        let state = |c: &Check| (c.ui.get_repaint_epoch(), c.ui.get_repaint_veil());
+        let before = state(self);
+        restore.on(&self.ui, Seen::Resized(0, 0));
+        let minimized = state(self) == before;
+        restore.on(&self.ui, Seen::Resized(self.size.0, self.size.1));
+        let restored = state(self);
+        restore.on(&self.ui, Seen::Resized(self.size.0 + 10, self.size.1));
+        let resized = state(self) == restored;
+        restore.on(&self.ui, Seen::Visible);
+        let visible = state(self);
+        let drawn = self.draw();
+        self.check(
+            minimized
+                && restored.0 != before.0
+                && restored.1 != before.1
+                && resized
+                && visible.1 != restored.1
+                && [before.1, restored.1, visible.1].iter().all(|c| c.alpha() == 0)
+                && drawn,
+            format!(
+                "после сворачивания слой во всё окно меняется ({:?} → {:?} → {:?}), всегда прозрачный; свернуть и просто сменить размер — не меняют",
+                before.1, restored.1, visible.1
+            ),
+        );
     }
 
     /// Знакомство, потолки и первое состояние пришли; плиток столько, сколько в раскладке.
@@ -1040,7 +1075,7 @@ impl Check {
             "щелчок по «над кристаллом» вернул шкалу над кристаллом",
         );
 
-        // Линии: только ø, только 95 %, обе.
+        // Линии ø и 95 % — два независимых выключателя (подробно — шаг 2г, `curve_switches`): скрыть одну и вернуть.
         let drawn = |v: &View| {
             v.shown_stats.as_ref().map_or((false, false), |s| {
                 (
@@ -1049,18 +1084,23 @@ impl Check {
                 )
             })
         };
-        let at = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
-        self.chip(at, |v| v.curves == Curves::Mean, "щелчок по «ø» — только средние");
-        let mean_only = drawn(&self.view.borrow()) == (true, false) && self.ui.get_chart_curves() == 0;
         let at = (self.ui.get_p95_chip_x(), self.ui.get_p95_chip_y());
-        self.chip(at, |v| v.curves == Curves::P95, "щелчок по «95 %» — только 95 %");
-        let p95_only = drawn(&self.view.borrow()) == (false, true) && self.ui.get_chart_curves() == 1;
-        let at = (self.ui.get_both_chip_x(), self.ui.get_both_chip_y());
-        self.chip(at, |v| v.curves == Curves::Both, "щелчок по «обе» — обе линии");
-        let both = drawn(&self.view.borrow()) == (true, true) && self.ui.get_chart_curves() == 2;
+        self.chip(
+            at,
+            |v| v.curves == Curves::Mean,
+            "щелчок по «95 %» — 95 % скрыты, ø остались",
+        );
+        let mean_only =
+            drawn(&self.view.borrow()) == (true, false) && self.ui.get_chart_mean() && !self.ui.get_chart_p95();
+        self.chip(
+            at,
+            |v| v.curves == Curves::Both,
+            "второй щелчок по «95 %» — снова обе линии",
+        );
+        let both = drawn(&self.view.borrow()) == (true, true) && self.ui.get_chart_mean() && self.ui.get_chart_p95();
         self.check(
-            mean_only && p95_only && both,
-            format!("нарисованы: только ø {mean_only}, только 95 % {p95_only}, обе {both}"),
+            mean_only && both,
+            format!("нарисованы: только ø {mean_only}, обе {both}"),
         );
 
         // Все блоки сразу: двенадцать цветов, P — тёплые, E — холодные, обводка плитки — цвет линии.
@@ -1255,6 +1295,113 @@ impl Check {
         self.chip(at, |v| v.model, "второй щелчок по «модель» — кривые снова видны");
         let back = shown(&self.view.borrow());
         self.check(back, "кривые модели вернулись");
+    }
+
+    /// Шаг 2г: линии «ø», «95 %» и «модель» — три независимых выключателя (владелец 16.10: «зачем эта кнопка оба…
+    /// сделать два независимых выключателя»; «модель» и была своим). Каждый щелчок настоящим событием мыши показывает
+    /// или скрывает только свою линию; все выключены — пустой график с осями; подсветка под курсором работает с тем, что
+    /// видно: при одной модели — по её кривой. Картинки F-curves-model.png и F-curves-none.png.
+    fn curve_switches(&mut self, e_block: &BlockInfo) {
+        let e = e_block.index;
+        let lines = |v: &View| {
+            v.shown_stats.as_ref().map_or((false, false, false), |s| {
+                (
+                    s.series.iter().any(|l| !l.mean.is_empty()),
+                    s.series.iter().any(|l| !l.p95.is_empty()),
+                    s.series.iter().any(|l| !l.model.is_empty()),
+                )
+            })
+        };
+        let switches = |c: &Check| (c.ui.get_chart_mean(), c.ui.get_chart_p95(), c.ui.get_chart_model());
+        let start = lines(&self.view.borrow());
+        self.check(
+            start == (true, true, true) && switches(self) == (true, true, true),
+            format!("перед шагом видны все три линии и включены их выключатели: {start:?}"),
+        );
+        let places = [
+            ("ø", (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y())),
+            ("95 %", (self.ui.get_p95_chip_x(), self.ui.get_p95_chip_y())),
+            ("модель", (self.ui.get_model_chip_x(), self.ui.get_model_chip_y())),
+        ];
+        let flip = |state: (bool, bool, bool), k: usize| match k {
+            0 => (!state.0, state.1, state.2),
+            1 => (state.0, !state.1, state.2),
+            _ => (state.0, state.1, !state.2),
+        };
+        // ø, 95 % — осталась одна модель; модель — пусто; потом в том же порядке обратно.
+        let mut state = start;
+        for (step, k) in [0, 1, 2, 0, 1, 2].into_iter().enumerate() {
+            let (name, at) = places[k];
+            let want = flip(state, k);
+            self.click(at.0, at.1, PointerEventButton::Left);
+            let took = self.pump(|v| (v.curves.mean(), v.curves.p95(), v.model) == want, 1.0);
+            let (got, ui) = (lines(&self.view.borrow()), switches(self));
+            self.check(
+                took && got == want && ui == want,
+                format!("щелчок по «{name}»: линии (ø, 95 %, модель) {state:?} → {got:?}, выключатели {ui:?} — изменилась только своя"),
+            );
+            state = got;
+            if step == 1 {
+                // Видна одна модель: курсор на кривой модели кластера — подсвечена она.
+                let aim = {
+                    let view = self.view.borrow();
+                    view.shown_stats
+                        .as_ref()
+                        .and_then(|s| s.series.iter().find(|l| l.block == e))
+                        .and_then(|l| l.model_line.iter().max_by_key(|run| run.len()).cloned())
+                        .and_then(|run| run.get(run.len() / 2).copied())
+                };
+                if let Some((x, y)) = aim {
+                    let ui = &self.ui;
+                    let at = LogicalPosition::new(
+                        ui.get_plot_x() + x * ui.get_plot_w(),
+                        ui.get_plot_y() + (1.0 - y) * ui.get_plot_h(),
+                    );
+                    self.ui
+                        .window()
+                        .dispatch_event(WindowEvent::PointerMoved { position: at });
+                    let lit = self.pump(|v| v.hovered == Some(e), 1.0);
+                    self.check(
+                        lit,
+                        format!(
+                            "ø и 95 % скрыты: курсор на кривой модели {} — подсвечена она",
+                            e_block.name
+                        ),
+                    );
+                    let shot = self.shot("curves-model");
+                    self.check(shot, "картинка: видна одна модель, кривая кластера подсвечена");
+                    self.ui.window().dispatch_event(WindowEvent::PointerExited);
+                    self.pump(|_| true, 0.0);
+                } else {
+                    self.check(
+                        false,
+                        format!("у кластера {} нет кривой модели на графике", e_block.name),
+                    );
+                }
+            }
+            if step == 2 {
+                // Всё выключено: пустой график с осями — деления и столбцы те же, надписи «нет данных» нет.
+                let ui = &self.ui;
+                let empty = ui.get_chart_empty().is_empty()
+                    && ui.get_chart_ticks().row_count() > 0
+                    && ui.get_chart_cols().row_count() > 0
+                    && ui
+                        .get_chart_series()
+                        .iter()
+                        .all(|s| s.mean.row_count() == 0 && s.p95.row_count() == 0);
+                self.check(
+                    empty,
+                    format!(
+                        "все выключены: пустой график с осями — делений {}, столбцов {}",
+                        ui.get_chart_ticks().row_count(),
+                        ui.get_chart_cols().row_count()
+                    ),
+                );
+                let shot = self.shot("curves-none");
+                self.check(shot, "картинка: все линии выключены — пустой график с осями");
+            }
+        }
+        self.check(state == start, format!("после шага — снова все три линии: {state:?}"));
     }
 
     /// Шаг 3: ø под нагрузкой на плитке; кнопка «▲ ø» сбрасывает наибольшую и средние. Нагрузку даёт команда
@@ -2061,6 +2208,24 @@ impl Check {
             off && self.ui.get_chart_cutoff() < 0.0 && sent_total == GESTURES,
             format!("щелчок выключил автомодуль — линии отсечки нет; команд за {GESTURES} жестов: {sent_total}"),
         );
+
+        // 5. «запись» — журнал срезов, свой выключатель (владелец 16.10): выключить и включить; автомодуль не меняется.
+        let came = self.pump(|v| v.log.is_some(), 1.0);
+        let shown = came && self.ui.get_has_log() && self.ui.get_log_on();
+        let (x, y) = (self.ui.get_log_switch_x(), self.ui.get_log_switch_y());
+        let auto = self.view.borrow().auto.clone();
+        self.click(x, y, PointerEventButton::Left);
+        let off = self.pump(|v| v.log == Some(false), 5.0) && !self.ui.get_log_on();
+        let shot = self.shot("log-off");
+        self.click(x, y, PointerEventButton::Left);
+        let on = self.pump(|v| v.log == Some(true), 5.0) && self.ui.get_log_on();
+        let untouched = self.view.borrow().auto == auto;
+        self.check(
+            shown && off && on && untouched && shot,
+            format!(
+                "«запись» в шапке статистики: был включён ({shown}), щелчок выключил ({off}), второй включил ({on}) — по команде log.set на щелчок, CoreMapTray подтвердил; автомодуль не тронут ({untouched}); картинка F-log-off.png"
+            ),
+        );
     }
 
     /// Память окна до закрытия: щелчки по плитке и подсветке сразу пишутся в файл окна, закрытие дописывает размер.
@@ -2077,10 +2242,11 @@ impl Check {
         self.click(x, y, PointerEventButton::Left);
         let (x, y) = (self.ui.get_pin_chip_x(), self.ui.get_pin_chip_y());
         self.click(x, y, PointerEventButton::Left);
-        // Вид графика тоже запоминается: оси местами и только 95 % (шкала — абсолютная с настроек автомодуля).
+        // Вид графика тоже запоминается: оси местами и только 95 % — щелчком по «ø» (шкала — абсолютная с настроек
+        // автомодуля).
         let (x, y) = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
         self.click(x, y, PointerEventButton::Left);
-        let (x, y) = (self.ui.get_p95_chip_x(), self.ui.get_p95_chip_y());
+        let (x, y) = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
         self.click(x, y, PointerEventButton::Left);
         let file = self.data.join(crate::saved::FILE);
         let read = || {
@@ -2099,7 +2265,7 @@ impl Check {
                 && clicked.curves == Some(Curves::P95)
                 && clicked.above == Some(false),
             format!(
-                "щелчки по плитке {}, «закреплённая», «°C» и «95 %» сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}, оси местами {:?}, линии {:?}, над кристаллом {:?}",
+                "щелчки по плитке {}, «закреплённая», «°C» и «ø» (ø скрыты — остались 95 %) сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}, оси местами {:?}, линии {:?}, над кристаллом {:?}",
                 e.name, clicked.compared, clicked.pin, clicked.swap, clicked.curves, clicked.above
             ),
         );
@@ -2150,7 +2316,8 @@ impl Check {
                 && curves == Curves::P95
                 && swap
                 && self.ui.get_chart_swap()
-                && self.ui.get_chart_curves() == 1,
+                && !self.ui.get_chart_mean()
+                && self.ui.get_chart_p95(),
             format!("вид графика — как оставили: шкала {scale:?}, линии {curves:?}, оси местами {swap}"),
         );
         let came = self.pump(|v| v.auto.is_some(), 5.0);

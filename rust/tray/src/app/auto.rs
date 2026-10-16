@@ -1,7 +1,12 @@
-// Автомодуль в программе входа (DECISIONS #31, «Auto module» и его подзапись; #32): раз в 2 с — температура корпуса;
-// близко к пределу, пока какой-то блок не на принятом или пока процессор нагружен (доля работы по Windows) —
-// показания всех блоков и решение регулятора (machine::auto). Выключен — таймера нет, ничего не читается, драйвер
-// закрыт между действиями.
+// Опрос раз в 2 с и автомодуль в программе входа (DECISIONS #31, «Auto module» и его подзапись; #32). Два независимых
+// выключателя (владелец 16.10, DECISIONS #32, подзапись 16.10: «отдельно какой-то выключатель для логирования и отдельно
+// выключатель для автоподстройки… это независимый процесс»): автомодуль — меняет ли он потолки, журнал срезов —
+// пишется ли он. Опрос идёт, пока включён хоть один из них и потолки у этой программы (не у C#-части, не в ожидании
+// возврата права или сверки после сна): процессор нагружен (доля работы по Windows) — показания блоков, сверка потолков
+// и (если включён) журнал срезов; включённый автомодуль читает ещё корпус в каждом опросе и, когда корпус близко к
+// пределу или блок не на принятом, тоже судит блоки — решение регулятора (machine::auto). Автомодуль выключен —
+// регулятора нет, потолков он не меняет; выключен и процессор не занят — ничего не читается. Оба выключены — опроса нет,
+// драйвер закрыт между действиями.
 //
 // Память перегрева (machine::memory) не пускает блок обратно на ступень, где он перегрелся, пока не выйдет запрет; она
 // восстанавливается при запуске из журнала действий data\auto-log.jsonl — там каждое решение с условиями: средняя и
@@ -44,6 +49,8 @@ pub const AUTO: usize = 4;
 pub const AUTO_ON: u32 = 10;
 pub const STEP_UP_ID: u32 = 11;
 pub const AUTO_WINDOW_ID: u32 = 12;
+/// Пункт меню верхнего уровня «Журнал срезов» — свой выключатель, не в подменю автомодуля (владелец 16.10).
+pub const LOG_ID: u32 = 13;
 /// Отсечка, °C, — ползунок в окне с шагом 1 °C (план DECISIONS #32, шаг 2; вместо пресетов 75–95 в меню).
 pub const LIMIT_RANGE: RangeInclusive<i32> = 60..=95;
 /// Как часто писать в журнал цену опроса — так она измеряется на машине владельца.
@@ -51,8 +58,9 @@ pub(super) const COST_EVERY: Duration = Duration::from_secs(60);
 /// Столько чтений подряд потолок блока должен расходиться с ожидаемым, чтобы считаться чужой правкой: одно чтение
 /// бывает и запоздалым ответом на собственную запись, и чужим запросом в ящике (`ThrottleStop` не берёт наш замок).
 const FOREIGN_READS: u8 = 2;
-/// С такой доли работы всего процессора (по Windows) блоки читаются, даже если корпус далеко от предела: для журнала
-/// срезов и для подтягивания нужны блоки под нагрузкой. Простой Windows — 1–5 %; число — выбор агента, не мерено.
+/// С такой доли работы всего процессора (по Windows) блоки читаются и пишется журнал срезов, даже если корпус далеко от
+/// предела и автомодуль выключен: для журнала срезов и для подтягивания нужны блоки под нагрузкой. Простой Windows —
+/// 1–5 %; число — выбор агента, не мерено.
 const LOADED: f64 = 0.10;
 /// Обороты для окна, пока журнал срезов не пишется, и после отказа прошивки — не чаще: каждый раз — вызов прошивки
 /// (около 30 мс, замер на машине владельца 15.10), а отказавший может держать цикл программы до 4 с (fans.rs,
@@ -93,13 +101,18 @@ impl AutoTiming {
 
 /// Выбор владельца, как он лежит в data\tray.json. Глубины больше нет (владелец 15.10, DECISIONS #38): регулятор
 /// опускает блок сколько нужно, но не ниже нижней границы допустимого потолка; ключ «depth» файла прежней сборки
-/// читается молча и больше не пишется.
+/// читается молча и больше не пишется. Два выключателя независимы (владелец 16.10: «отдельно какой-то выключатель для
+/// логирования и отдельно выключатель для автоподстройки… это независимый процесс»): `on` — меняет ли автомодуль
+/// потолки, `log` — пишется ли журнал срезов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Choice {
+    /// Автомодуль меняет потолки (по умолчанию выключен).
     pub on: bool,
     pub limit: i32,
     /// Подтягивать прохладные блоки выше принятого, до заводского (DECISIONS #32; по умолчанию выключено).
     pub step_up: bool,
+    /// Журнал срезов data\samples (по умолчанию включён: файл прежней сборки без ключа «log» — тоже включён).
+    pub log: bool,
 }
 
 impl Default for Choice {
@@ -108,6 +121,7 @@ impl Default for Choice {
             on: false,
             limit: 85,
             step_up: false,
+            log: true,
         }
     }
 }
@@ -133,7 +147,29 @@ impl Choice {
                 .and_then(|v| whole(v, &LIMIT_RANGE))
                 .unwrap_or(default.limit),
             step_up: map.get("stepUp").and_then(Value::as_bool).unwrap_or(default.step_up),
+            log: map.get("log").and_then(Value::as_bool).unwrap_or(default.log),
         }
+    }
+
+    /// Те же настройки автомодуля (выключатель, отсечка, подтягивание): смена журнала срезов их не касается.
+    #[must_use]
+    pub fn same_auto(self, other: Self) -> bool {
+        (self.on, self.limit, self.step_up) == (other.on, other.limit, other.step_up)
+    }
+
+    /// Команда окна «log.set» {on}: журнал срезов включён или нет. Отказ, если «on» нет, оно не да/нет или есть
+    /// незнакомое поле (настройки автомодуля этой командой не меняются — у них своя, «auto.set»).
+    pub fn log_changed(self, fields: &Map<String, Value>) -> Result<Self, String> {
+        let mut next = None;
+        for (key, value) in fields {
+            match key.as_str() {
+                "id" | "c" => {}
+                "on" => next = Some(value.as_bool().ok_or("«on» — да или нет")?),
+                other => return Err(format!("незнакомая настройка журнала срезов «{other}»")),
+            }
+        }
+        next.map(|log| Self { log, ..self })
+            .ok_or_else(|| "в команде нет «on»".into())
     }
 
     /// Команда окна «auto.set»: какие поля пришли — те и меняются, остальные прежние. Отказ, если хоть одно поле
@@ -171,10 +207,11 @@ impl Choice {
     /// Как выбор лежит в data\tray.json.
     #[must_use]
     pub fn file_text(self) -> String {
-        json!({ "auto": self.on, "limit": self.limit, "stepUp": self.step_up }).to_string()
+        json!({ "auto": self.on, "limit": self.limit, "stepUp": self.step_up, "log": self.log }).to_string()
     }
 
-    /// Тема окну «settings»: выбор и допустимая отсечка — её держит эта программа, окно по ней строит ползунок.
+    /// Тема окну «settings»: выбор и допустимая отсечка — её держит эта программа, окно по ней строит ползунок;
+    /// журнал срезов — отдельным полем, со своей командой «log.set».
     #[must_use]
     pub fn topic(self) -> String {
         json!({
@@ -183,6 +220,7 @@ impl Choice {
                 "on": self.on, "limit": self.limit, "stepUp": self.step_up,
                 "limitRange": [LIMIT_RANGE.start(), LIMIT_RANGE.end()],
             },
+            "log": { "on": self.log },
         })
         .to_string()
     }
@@ -212,6 +250,8 @@ pub struct Autopilot {
     fans_cost: Option<Duration>,
     /// Скрытая проверка: сколько раз обороты спрошены.
     pub(super) fan_calls: u64,
+    /// Скрытая проверка: сколько сообщений таймера опроса пришло.
+    pub(super) ticks: u64,
     /// По блокам: чужая правка принята — автомодуль этот блок не трогает до смены набора.
     aside: Vec<bool>,
     /// По блокам: сколько чтений подряд потолок расходится с ожидаемым.
@@ -243,6 +283,7 @@ impl Autopilot {
             fans_said: None,
             fans_cost: None,
             fan_calls: 0,
+            ticks: 0,
             aside: vec![false; blocks],
             mismatch: vec![0; blocks],
             holding: false,
@@ -293,6 +334,8 @@ enum Polled {
 /// Докуда дошёл опрос: от этого — пишется ли журнал срезов и что сказать в строке цены.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
+    /// Ничего: автомодуль выключен и процессор не занят — датчики не нужны ни регулятору, ни журналу срезов.
+    Nothing,
     /// Только корпус: блоки не нужны, не прочитаны или опроса не было.
     Package,
     /// Блоки прочитаны, потолки — нет.
@@ -353,7 +396,8 @@ impl App {
         )
     }
 
-    /// Запуск программы: метка автомодуля от прошлого запуска — вернуть принятые опущенным блокам; включён — опрос.
+    /// Запуск программы: метка автомодуля от прошлого запуска — вернуть принятые опущенным блокам; опрос раз в 2 с —
+    /// если включён автомодуль или журнал срезов (выключатели независимы), регулятор — если включён автомодуль.
     pub(super) fn start_auto(&mut self, shell: &Shell) {
         self.load_choice();
         self.replay_memory();
@@ -363,10 +407,16 @@ impl App {
                 self.queue(&said);
             }
         }
-        if self.auto.choice.on {
-            self.auto.controller = Some(self.controller_for());
+        let choice = self.auto.choice;
+        if choice.on || choice.log {
             self.meter.forget();
             shell.set_timer(AUTO, self.config.auto.tick);
+        }
+        if !choice.log {
+            self.journal.note("журнал срезов выключен");
+        }
+        if choice.on {
+            self.auto.controller = Some(self.controller_for());
             self.journal.note(&format!(
                 "автомодуль включён: до {} °C{}",
                 self.auto.choice.limit,
@@ -557,12 +607,26 @@ impl App {
         }
     }
 
-    /// Пункт подменю. true — пункт автомодуля (разобран здесь).
+    /// Пункт меню верхнего уровня «Журнал срезов» с отметкой: свой выключатель, не в подменю автомодуля (владелец 16.10:
+    /// «это разные процессы»).
+    pub(super) fn log_menu(&self) -> Item {
+        Item {
+            id: LOG_ID,
+            text: Some("Журнал срезов".into()),
+            checked: self.auto.choice.log,
+            enabled: true,
+            default: false,
+            children: Vec::new(),
+        }
+    }
+
+    /// Пункт подменю автомодуля или «Журнал срезов». true — пункт разобран здесь.
     pub(super) fn auto_command(&mut self, shell: &mut Shell, id: u32) -> bool {
         let mut next = self.auto.choice;
         match id {
             STEP_UP_ID => next.step_up = !next.step_up,
             AUTO_ON => next.on = !next.on,
+            LOG_ID => next.log = !next.log,
             AUTO_WINDOW_ID => {
                 self.open_window(shell);
                 return true;
@@ -582,7 +646,18 @@ impl App {
     /// Команда окна «auto.set» (app/serve.rs) — тот же путь, что пункты меню: проверка, применение, файл, журнал.
     /// Возвращает отказ; None — принято (или ничего не изменилось — тогда ни записи, ни возврата потолков).
     pub fn set_auto(&mut self, shell: &Shell, fields: &Map<String, Value>) -> Option<String> {
-        match self.auto.choice.changed(fields) {
+        let next = self.auto.choice.changed(fields);
+        self.set_choice(shell, next)
+    }
+
+    /// Команда окна «log.set» {on} (app/serve.rs, выключатель «запись» в окне) — тот же путь, что пункт меню.
+    pub fn set_log(&mut self, shell: &Shell, fields: &Map<String, Value>) -> Option<String> {
+        let next = self.auto.choice.log_changed(fields);
+        self.set_choice(shell, next)
+    }
+
+    fn set_choice(&mut self, shell: &Shell, next: Result<Choice, String>) -> Option<String> {
+        match next {
             Err(why) => Some(why),
             Ok(next) => {
                 if next != self.auto.choice {
@@ -593,41 +668,54 @@ impl App {
         }
     }
 
-    /// Новый выбор владельца — единственный путь его смены (меню и окно): включение и выключение опроса, возврат
-    /// опущенных блоков, новый регулятор, data\tray.json, строка журнала. Окно узнаёт о нём темой «settings»
-    /// (app/serve.rs, по изменению) и полем autoLimit состояния.
+    /// Новый выбор владельца — единственный путь его смены (меню и окно): регулятор есть или нет, возврат опущенных
+    /// блоков, журнал срезов, опрос раз в 2 с, data\tray.json, строка журнала. Выключатели независимы (владелец 16.10):
+    /// автомодуль — только про изменение множителей, журнал срезов — только про запись; смена одного другой не трогает.
+    /// Окно узнаёт о выборе темой «settings» (app/serve.rs, по изменению) и полем autoLimit состояния.
     fn apply_choice(&mut self, shell: &Shell, next: Choice, by: &str) {
         let was = std::mem::replace(&mut self.auto.choice, next);
         if next.on && !was.on {
-            // Суммы показаний, набранные окном до включения, — не для первого решения регулятора.
+            // Суммы показаний, набранные журналом или окном до включения, — не для первого решения регулятора.
             self.meter.forget();
-            shell.set_timer(AUTO, self.config.auto.tick);
         } else if !next.on && was.on {
-            shell.kill_timer(AUTO);
-            self.stop_logging(shell);
             self.put_back("автомодуль выключен");
             self.auto.controller = None;
-            // Драйвер нужен ещё окну, если оно открыто (его опрос раз в полсекунду).
-            if !self.serving.attached()
-                && let Some(device) = &mut self.device
-            {
-                device.cpu().release();
-            }
         }
-        if next.on {
+        if next.on && !next.same_auto(was) {
             // Новый выбор — опущенные возвращаются, регулятор начинает заново (прежние окна — при другой отсечке).
             // Сохранить надстройку через смену отсечки мог бы только сам регулятор (machine::auto) — не здесь.
             self.put_back("новые настройки автомодуля");
             self.auto.controller = Some(self.controller_for());
             self.auto.aside.fill(false);
         }
+        if !next.log {
+            // Журнал выключен — опрос раз в 0,25 с и файл дня кончаются сразу, а не со следующим опросом раз в 2 с.
+            self.stop_logging(shell);
+        }
+        // Опрос раз в 2 с нужен регулятору или журналу срезов; ни тому ни другому — его нет.
+        let polled = |c: Choice| c.on || c.log;
+        if polled(next) && !polled(was) {
+            shell.set_timer(AUTO, self.config.auto.tick);
+        } else if !polled(next) && polled(was) {
+            shell.kill_timer(AUTO);
+        }
+        // Драйвер нужен ещё журналу срезов и окну, если они идут; иначе — отпустить.
+        self.release_idle();
         self.save_choice();
-        self.journal.note(&format!(
-            "автомодуль ({by}): {}, до {} °C, подтягивание {}",
-            if next.on { "включён" } else { "выключен" },
-            next.limit,
-            if next.step_up { "вкл" } else { "выкл" }
-        ));
+        if !next.same_auto(was) {
+            self.journal.note(&format!(
+                "автомодуль ({by}): {}, до {} °C, подтягивание {}",
+                if next.on { "включён" } else { "выключен" },
+                next.limit,
+                if next.step_up { "вкл" } else { "выкл" }
+            ));
+        }
+        if next.log != was.log {
+            self.journal.note(&format!(
+                "журнал срезов ({by}): {}",
+                if next.log { "включён" } else { "выключен" }
+            ));
+        }
     }
 
     /// Владелец поставил блоку потолок сам (окно): регулятор судит этот блок заново, отставленный из-за чужой правки —
@@ -684,9 +772,16 @@ impl App {
         Some(text)
     }
 
-    /// Опрос по таймеру.
+    /// Опрос по таймеру. Таймер есть, пока включён автомодуль или журнал срезов (`apply_choice`):
+    /// - автомодуль включён — как всегда: корпус, при нужде блоки, сверка, решение регулятора; журнал срезов, если он
+    ///   включён и блоки с потолками прочитаны;
+    /// - автомодуль выключен, журнал включён — процессор занят (≥ `LOADED`): блоки, сверка потолков (чужая правка
+    ///   принимается) и журнал; регулятора нет, потолки не меняются; не занят — ничего не читается, журнал стоит.
     pub(super) fn auto_tick(&mut self, shell: &mut Shell) {
-        if !self.auto.choice.on {
+        self.auto.ticks += 1;
+        let choice = self.auto.choice;
+        if !choice.on && !choice.log {
+            shell.kill_timer(AUTO); // сообщение таймера, пришедшее после его снятия
             return;
         }
         // Сообщения таймера, накопившиеся, пока было открыто меню, приходят разом: один опрос, а не несколько в одну
@@ -707,39 +802,58 @@ impl App {
             return; // потолки ставит на место возврат права или сверка после пробуждения
         }
         let started = Instant::now();
-        let mut reach = Reach::Package;
+        let share = self.system_share();
+        let mut reach = Reach::Nothing;
         let polled = self.logging.on;
-        let outcome = self.with_ceilings(|app| app.poll(&mut reach));
-        // Журнал срезов пишется, пока блоки судятся и потолки прочитаны (то же условие, что и раньше для строки раз в
-        // 2 с): опрос раз в 0,25 с — с этого решения до того, которое скажет «не нужно». Потолки не прочитаны — журнал
-        // стоит: его опрос открывал бы драйвер, который здесь после ошибки отпускается.
-        if reach == Reach::Ceilings {
-            self.start_logging(shell);
+        // Журнал срезов пишется, пока он включён, а блоки и потолки прочитаны (то же условие, что и раньше для строки
+        // раз в 2 с): опрос раз в 0,25 с — с этого решения до того, которое скажет «не нужно». Потолки не прочитаны —
+        // журнал стоит: его опрос открывал бы драйвер, который здесь после ошибки отпускается. Начинается журнал под
+        // той же арендой: иначе `with_ceilings` отпустил бы драйвер, который через 0,25 с снова нужен журналу.
+        let outcome = if choice.on || share >= LOADED {
+            reach = Reach::Package;
+            Some(self.with_ceilings(|app| {
+                let polled = app.poll(share, &mut reach);
+                if reach == Reach::Ceilings && choice.log {
+                    app.start_logging(shell);
+                }
+                polled
+            }))
         } else {
+            // Автомодуль выключен, процессор не занят: ни регулятору, ни журналу датчики не нужны — драйвер не
+            // трогается. Набранное окном — не для следующего раза (как в `sample`, когда блоки не судятся).
+            self.meter.forget();
+            None
+        };
+        if !(reach == Reach::Ceilings && choice.log) {
             self.stop_logging(shell);
         }
         let said = match outcome {
-            Ok(Polled::Quiet) => None,
-            Ok(Polled::Said(said)) => Some(said),
-            Ok(Polled::Reset) => {
+            None => None,
+            Some(Ok(Polled::Quiet)) => Some(None),
+            Some(Ok(Polled::Said(said))) => Some(Some(said)),
+            Some(Ok(Polled::Reset)) => {
                 // Сброс сном, пробуждения программа не заметила (бывает при современном сне): сверка — сейчас.
                 self.auto.wake_pending = true;
                 shell.set_timer(super::WAKE, self.config.wake_delay);
-                None
+                Some(None)
             }
-            Err(reason) => Some(format!("Автомодуль ждёт: {reason}")),
+            Some(Err(reason)) => Some(Some(format!("{} ждёт: {reason}", self.poller()))),
         };
-        if let Some(said) = said {
-            // Одна и та же беда — одно сообщение, а не каждые 2 с (ревизия M5); драйвер — переоткрыть.
-            if self.auto.last_said.as_deref() != Some(said.as_str()) {
-                self.notify(shell, &said);
-                self.auto.last_said = Some(said);
+        // Опроса датчиков не было (автомодуль выключен, процессор не занят) — сказанное прежде остаётся сказанным:
+        // иначе одна и та же беда повторялась бы с каждым новым «процессор занят».
+        match said {
+            Some(Some(said)) => {
+                // Одна и та же беда — одно сообщение, а не каждые 2 с (ревизия M5); драйвер — переоткрыть.
+                if self.auto.last_said.as_deref() != Some(said.as_str()) {
+                    self.notify(shell, &said);
+                    self.auto.last_said = Some(said);
+                }
+                if let Some(device) = &mut self.device {
+                    device.cpu().release();
+                }
             }
-            if let Some(device) = &mut self.device {
-                device.cpu().release();
-            }
-        } else {
-            self.auto.last_said = None;
+            Some(None) => self.auto.last_said = None,
+            None => {}
         }
         if self.auto.last_cost.is_none_or(|t| t.elapsed() >= COST_EVERY) {
             self.auto.last_cost = Some(Instant::now());
@@ -750,9 +864,15 @@ impl App {
                 .map(|cost| format!(", из них обороты {} мкс", cost.as_micros()))
                 .unwrap_or_default();
             self.journal.note(&format!(
-                "автомодуль: опрос {} мкс{}{fans}",
+                "{}: опрос {} мкс{}{fans}",
+                match (choice.on, choice.log) {
+                    (true, true) => "автомодуль",
+                    (true, false) => "автомодуль (журнал срезов выключен)",
+                    (false, _) => "автомодуль выключен, журнал срезов",
+                },
                 started.elapsed().as_micros(),
                 match (reach, polled) {
+                    (Reach::Nothing, _) => ", процессор не занят — датчики не читаются",
                     (Reach::Package, _) => ", только корпус",
                     (_, true) => ", с блоками (показания опроса срезов)",
                     (_, false) => ", с блоками",
@@ -766,9 +886,18 @@ impl App {
         }
     }
 
-    /// Один опрос под арендой: показания, сверка потолков, решение регулятора, запись.
-    fn poll(&mut self, reach: &mut Reach) -> Polled {
-        let (package, readings) = match self.sample() {
+    /// Кто опрашивает — для сообщений владельцу: включённый автомодуль или, когда он выключен, журнал срезов.
+    fn poller(&self) -> &'static str {
+        if self.auto.choice.on {
+            "Автомодуль"
+        } else {
+            "Журнал срезов"
+        }
+    }
+
+    /// Один опрос под арендой: показания, сверка потолков, решение регулятора (если он есть), запись.
+    fn poll(&mut self, share: f64, reach: &mut Reach) -> Polled {
+        let (package, readings) = match self.sample(share) {
             Ok(Some(sampled)) => sampled,
             Ok(None) => {
                 // Блоки не читались: прежние показания больше не окно подряд.
@@ -786,14 +915,20 @@ impl App {
             Err(said) => return Polled::Said(said),
         };
         *reach = Reach::Ceilings;
-        // Обороты для условий решения в журнале действий: пока пишется журнал срезов, их читает его опрос.
-        if !self.logging.on {
+        // Обороты для условий решения в журнале действий: пока пишется журнал срезов, их читает его опрос; выключенному
+        // автомодулю решать нечего — и читать их незачем (вызов прошивки — около 30 мс).
+        if self.auto.choice.on && !self.logging.on {
             self.read_fans();
         }
         let mut said = (!foreign.is_empty()).then(|| {
             format!(
-                "Потолки блоков {} изменила другая программа — автомодуль их больше не трогает",
-                foreign.join(", ")
+                "Потолки блоков {} изменила другая программа — {}",
+                foreign.join(", "),
+                if self.auto.choice.on {
+                    "автомодуль их больше не трогает"
+                } else {
+                    "оставляю их как есть"
+                }
             )
         });
         if let Some(refused) = self.act(&readings, package) {
@@ -806,8 +941,19 @@ impl App {
         said.map_or(Polled::Quiet, Polled::Said)
     }
 
-    /// Доля работы всего процессора с прошлого опроса по Windows; первый опрос — 0.
+    /// Доля работы всего процессора с прошлого опроса по Windows; первый опрос — 0. На имитации — доля работы её ядер
+    /// (их нагрузку задаёт скрытая проверка), а не Windows компьютера, где идёт проверка: шаги проверки не должны
+    /// зависеть от того, чем он занят (игра владельца, соседние проверки).
     fn system_share(&mut self) -> f64 {
+        if self.config.simulate {
+            return match &self.device {
+                Some(Device::Sim(sim)) if !sim.load.is_empty() => {
+                    let cores = f64::from(u32::try_from(sim.load.len()).unwrap_or(u32::MAX));
+                    (sim.load.iter().sum::<f64>() / cores).clamp(0.0, 1.0)
+                }
+                _ => 0.0,
+            };
+        }
         let now = crate::shell::system_times();
         let share = match (self.auto.system, now) {
             (Some((idle0, total0)), Some((idle1, total1))) if total1 > total0 => {
@@ -824,14 +970,14 @@ impl App {
         share
     }
 
-    /// Показания: корпус и, если нужны, блоки — корпус близко к пределу, надстройка есть или процессор нагружен.
-    /// Ok(None) — блоки не нужны.
+    /// Показания: корпус и, если нужны, блоки — включённому автомодулю, когда корпус близко к пределу или надстройка
+    /// есть; ему и журналу срезов — когда процессор нагружен (`share`). Ok(None) — блоки не нужны.
     ///
     /// Пока ядра читает кто-то другой — опрос срезов раз в 0,25 с или окно раз в полсекунды, — у ядра счётчики одни:
     /// показание блока — сумма их чтений с прошлого решения (app/meter.rs), своего чтения нет; корпус — их последнее
     /// чтение, если оно свежее половины опроса. Никто не читает — корпус и блоки читаются здесь, как раньше.
-    fn sample(&mut self) -> Result<Option<Sampled>, String> {
-        let share = self.system_share();
+    fn sample(&mut self, share: f64) -> Result<Option<Sampled>, String> {
+        let poller = self.poller();
         let Some(device) = self.device.as_mut() else {
             return Ok(None);
         };
@@ -840,13 +986,16 @@ impl App {
             None => device
                 .thermal()
                 .package()
-                .map_err(|e| format!("Автомодуль: температура не прочитана — {e}"))?,
+                .map_err(|e| format!("{poller}: температура не прочитана — {e}"))?,
         };
         let overlay = self.auto.active();
-        let Some(controller) = self.auto.controller.as_ref() else {
-            return Ok(None);
-        };
-        if !controller.watch_blocks(package, overlay) && share < LOADED {
+        // Выключенный автомодуль регулятора не держит: блоки — только по занятости процессора (журналу срезов).
+        let watch = self
+            .auto
+            .controller
+            .as_ref()
+            .is_some_and(|c| c.watch_blocks(package, overlay));
+        if !watch && share < LOADED {
             // Блоки не судятся: набранное окном — не для следующего решения (оно должно быть по свежему времени).
             self.meter.forget();
             return Ok(None);
@@ -959,12 +1108,13 @@ impl App {
     /// Сверка: стоит ли у каждого блока то, что должно (опущенное или принятое). Возвращает блоки с принятой чужой
     /// правкой; Ok(None) — потолки сброшены сном (их ставит сверка после пробуждения, ревизия H3).
     fn reconcile(&mut self) -> Result<Option<Vec<String>>, String> {
+        let poller = self.poller();
         let topology = &self.topology;
         let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) else {
             return Ok(Some(Vec::new()));
         };
         if let Some(unread) = limits.refresh_blocks(cpu, topology) {
-            return Err(format!("Автомодуль: потолки не прочитаны — {unread}"));
+            return Err(format!("{poller}: потолки не прочитаны — {unread}"));
         }
         let intended = self.intended.get_or_insert_with(|| limits.current().to_vec());
         let mut foreign = Vec::new();
@@ -1009,8 +1159,10 @@ impl App {
     }
 
     /// Решение регулятора и запись; снижение ставит запрет в памяти перегрева. Каждое решение — строка журнала
-    /// действий с условиями. Возвращает отказ, если он был.
+    /// действий с условиями. Возвращает отказ, если он был. Автомодуль выключен — регулятора нет: решать нечего, потолки
+    /// не меняются (владелец 16.10: выключатель — про изменение множителей).
     fn act(&mut self, readings: &[Option<Reading>], package: Option<f64>) -> Option<String> {
+        self.auto.controller.as_ref()?;
         let topology = &self.topology;
         let limits = self.limits.as_ref()?;
         let intended = self.intended.as_deref()?;
@@ -1302,9 +1454,10 @@ mod tests {
                 Choice {
                     on: true,
                     limit: 75,
-                    step_up: true
+                    step_up: true,
+                    log: true,
                 },
-                "{text}"
+                "{text}: a file without «log» (0.5.4 and earlier) keeps the samples log on"
             );
         }
     }
@@ -1315,10 +1468,66 @@ mod tests {
             on: true,
             limit: 77,
             step_up: false,
+            log: false,
         }
         .file_text();
         assert!(!text.contains("depth"), "{text}");
-        assert_eq!(text, r#"{"auto":true,"limit":77,"stepUp":false}"#);
+        assert_eq!(text, r#"{"auto":true,"limit":77,"log":false,"stepUp":false}"#);
+    }
+
+    // Два независимых выключателя (владелец 16.10): журнал срезов и автомодуль. Файл без «log» — журнал включён; каждая
+    // команда меняет только своё.
+    #[test]
+    fn the_log_switch_reads_on_by_default_and_round_trips() {
+        assert!(Choice::default().log, "a fresh install logs");
+        assert!(
+            Choice::read(&map(r#"{"auto":false,"limit":80}"#)).log,
+            "old file without «log»"
+        );
+        assert!(!Choice::read(&map(r#"{"auto":true,"log":false}"#)).log);
+        // негодное значение — по умолчанию, соседи остаются
+        let c = Choice::read(&map(r#"{"auto":true,"log":"нет"}"#));
+        assert!(c.log && c.on, "{c:?}");
+        for log in [true, false] {
+            let c = Choice {
+                log,
+                ..Choice::default()
+            };
+            assert_eq!(Choice::read(&map(&c.file_text())), c);
+        }
+    }
+
+    #[test]
+    fn log_set_changes_only_the_log_and_auto_set_never_the_log() {
+        let was = Choice {
+            on: true,
+            limit: 81,
+            step_up: true,
+            log: true,
+        };
+        let next = was.log_changed(&map(r#"{"id":4,"c":"log.set","on":false}"#));
+        assert_eq!(next, Ok(Choice { log: false, ..was }));
+        assert!(
+            next.is_ok_and(|n| n.same_auto(was)),
+            "log.set leaves the auto settings alone"
+        );
+        for bad in [
+            r#"{"on":"нет"}"#,
+            r#"{"on":1}"#,
+            r"{}",
+            r#"{"id":1,"c":"log.set"}"#,
+            r#"{"on":true,"limit":80}"#,
+        ] {
+            assert!(was.log_changed(&map(bad)).is_err(), "{bad} must be refused");
+        }
+        // auto.set не знает «log»: опечатка или чужое поле не меняют журнал молча.
+        assert!(was.changed(&map(r#"{"log":false}"#)).is_err());
+        let next = was.changed(&map(r#"{"on":false}"#));
+        assert_eq!(
+            next,
+            Ok(Choice { on: false, ..was }),
+            "auto off keeps the log as it was"
+        );
     }
 
     #[test]
@@ -1348,6 +1557,7 @@ mod tests {
             on: true,
             limit: 80,
             step_up: false,
+            log: true,
         };
         let next = was.changed(&map(r#"{"id":7,"c":"auto.set","limit":82}"#));
         assert_eq!(next, Ok(Choice { limit: 82, ..was }));
@@ -1395,6 +1605,7 @@ mod tests {
             on: true,
             limit: 77,
             step_up: true,
+            log: false,
         };
         let topic: Value = serde_json::from_str(&choice.topic()).unwrap_or(Value::Null);
         assert_eq!(topic["t"], "settings");
@@ -1402,6 +1613,7 @@ mod tests {
             topic["auto"],
             json!({ "on": true, "limit": 77, "stepUp": true, "limitRange": [60, 95] })
         );
+        assert_eq!(topic["log"], json!({ "on": false }), "the log switch has its own field");
         // Файл и команда говорят одними именами: записанное читается обратно тем же.
         assert_eq!(Choice::read(&map(&choice.file_text())), choice);
     }

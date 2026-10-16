@@ -958,10 +958,11 @@ export component AppWindow inherits Window {
     in property <string> chart-cutoff-text;
     in property <float> chart-zero: -1;
     in property <string> chart-value-title;
-    // Вид графика (выбор владельца, src/chart.rs): шкала над кристаллом / абсолютная, линии (0 — ø, 1 — 95 %,
-    // 2 — обе), оси местами.
+    // Вид графика (выбор владельца, src/chart.rs): шкала над кристаллом / абсолютная; линии ø и 95 % — два
+    // независимых выключателя (владелец 16.10); оси местами.
     in property <bool> chart-above: true;
-    in property <int> chart-curves: 2;
+    in property <bool> chart-mean: true;
+    in property <bool> chart-p95: true;
     in property <bool> chart-model: true;   // кривые модели нагрева
     in property <bool> chart-swap;
     in property <[LineRow]> actions;
@@ -983,6 +984,13 @@ export component AppWindow inherits Window {
     callback step-up-toggled();
     callback limit-moved(int);
     callback limit-released(int);
+    // Журнал срезов: выбор программы у часов из темы settings (поле log), свой выключатель — «запись» в шапке
+    // статистики (владелец 16.10: «отдельно какой-то выключатель для логирования»).
+    in property <bool> has-log;
+    in property <bool> log-on;
+    callback log-toggled();
+    out property <length> log-switch-x: log-switch.absolute-position.x + log-switch.width / 2;
+    out property <length> log-switch-y: log-switch.absolute-position.y + log-switch.height / 2;
     // Куда целится скрытая проверка: середины выключателей, дорожка ползунка.
     out property <length> auto-switch-x: auto-switch.absolute-position.x + auto-switch.width / 2;
     out property <length> auto-switch-y: auto-switch.absolute-position.y + auto-switch.height / 2;
@@ -1005,8 +1013,6 @@ export component AppWindow inherits Window {
     out property <length> mean-chip-y: mean-chip.absolute-position.y + mean-chip.height / 2;
     out property <length> p95-chip-x: p95-chip.absolute-position.x + p95-chip.width / 2;
     out property <length> p95-chip-y: p95-chip.absolute-position.y + p95-chip.height / 2;
-    out property <length> both-chip-x: both-chip.absolute-position.x + both-chip.width / 2;
-    out property <length> both-chip-y: both-chip.absolute-position.y + both-chip.height / 2;
     out property <length> model-chip-x: model-chip.absolute-position.x + model-chip.width / 2;
     out property <length> model-chip-y: model-chip.absolute-position.y + model-chip.height / 2;
     out property <length> plain-chip-x: plain-chip.absolute-position.x + plain-chip.width / 2;
@@ -1045,7 +1051,8 @@ export component AppWindow inherits Window {
     callback chart-click(length, length, length, length);
     callback mode-changed(bool);
     callback scale-changed(bool);   // true — над кристаллом
-    callback curves-changed(int);
+    callback mean-toggled();        // линии ø — показать или скрыть
+    callback p95-toggled();         // линии 95 % — показать или скрыть
     callback model-toggled();       // кривые модели — показать или скрыть
     callback axes-changed(bool);    // true — температура по горизонтали
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
@@ -1615,8 +1622,29 @@ export component AppWindow inherits Window {
         border-radius: 8px;
         // Заголовок; справа — сколько срезов и за какое время.
         Text { x: root.pad; y: 4px; height: 24px; text: "Статистика"; color: Palette.dim; font-weight: 600; vertical-alignment: center; }
-        Text {
+        // Журнал срезов — здесь, где видно, что он даёт: выключатель и подпись.
+        log-switch := Switch {
+            visible: root.has-log;
             x: root.pad + 90px;
+            y: 7px;
+            on: root.log-on;
+            enabled: root.auto-ready;
+            toggled => { root.log-toggled(); }
+            hover(on) => {
+                root.tip(on, "log-on", "Запись журнала срезов\nCoreMapTray пишет показания ядер раз в 0,25 с, пока процессор занят, — из них строятся эта статистика и модель нагрева.\n• независим от автомодуля: запись без подстройки и подстройка без записи\n• выключено — новых срезов нет, график и модель стоят на записанном\n• то же — «Журнал срезов» в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        if root.has-log: Text {
+            x: root.pad + 128px;
+            y: 4px;
+            height: 24px;
+            text: "запись";
+            color: root.log-on ? Palette.text : Palette.dim;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        Text {
+            x: root.pad + (root.has-log ? 180px : 90px);
             y: 4px;
             height: 24px;
             width: parent.width - root.pad - self.x;
@@ -1672,41 +1700,33 @@ export component AppWindow inherits Window {
             width: self.preferred-width;
             height: 22px;
             spacing: 4px;
+            // Три независимых выключателя (владелец 16.10: «два независимых выключателя» вместо «ø / 95 % / обе»): каждый
+            // показывает или скрывает свою линию; выключены все — пустой график с осями.
             mean-chip := Chip {
                 text: "ø";
                 glyph: 1;
-                on: root.chart-curves == 0;
-                clicked => { root.curves-changed(0); }
+                on: root.chart-mean;
+                clicked => { root.mean-toggled(); }
                 hover(on) => {
-                    root.tip(on, "curve-mean", "ø средняя\nТолстая линия: средняя температура по времени на каждом фактическом множителе.\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• бледнее — меньше времени за точкой: от одной строки (0,25 с) до самой полной корзины, по логарифму\n• щелчок — только эта линия", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "curve-mean", "ø средняя\nТолстая линия: средняя температура по времени на каждом фактическом множителе.\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• бледнее — меньше времени за точкой: от одной строки (0,25 с) до самой полной корзины, по логарифму\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
             p95-chip := Chip {
                 text: "95 %";
                 glyph: 2;
-                on: root.chart-curves == 1;
-                clicked => { root.curves-changed(1); }
+                on: root.chart-p95;
+                clicked => { root.p95-toggled(); }
                 hover(on) => {
-                    root.tip(on, "curve-p95", "95 % времени ниже\nТонкая линия: температура, выше которой блок был только 5 % времени на этом множителе.\n• в отличие от наибольшей не зависит от одной строки и от того, сколько строк в корзине\n• наибольшая — в подсказке столбца: ▲ со множителем, нагрузкой и временем\n• щелчок — только эта линия", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "curve-p95", "95 % времени ниже\nТонкая линия: температура, выше которой блок был только 5 % времени на этом множителе.\n• в отличие от наибольшей не зависит от одной строки и от того, сколько строк в корзине\n• наибольшая — в подсказке столбца: ▲ со множителем, нагрузкой и временем\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
-            both-chip := Chip {
-                text: "обе";
-                on: root.chart-curves == 2;
-                clicked => { root.curves-changed(2); }
-                hover(on) => {
-                    root.tip(on, "curve-both", "Обе линии\nø средняя — толстая, 95 % — тонкая, у каждого блока своего цвета.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                }
-            }
-            // Свой выключатель, не третья из линий: модель идёт вместе с ø и 95 %.
-            Rectangle { width: 4px; }
             model-chip := Chip {
                 text: "модель";
                 glyph: 3;
                 on: root.chart-model;
                 clicked => { root.model-toggled(); }
                 hover(on) => {
-                    root.tip(on, "curve-model", "Модель нагрева\nСредняя линия без точек: температура блока от фактического множителя при его полной нагрузке, соседях и кристалле на их медианах — по регрессии из журнала срезов.\n• есть в журнале мощность процессора — кривая для одинаковой работы на всех ядрах одного рода, их можно сравнивать; нет — для нагрузки этого ядра в этой игре\n• сплошная — множители, на которых блок работал под нагрузкой (без редких крайних: по 5 % времени с каждой стороны); пунктир — за ними\n• модель — по последним 8 часам журнала, пересчёт не чаще раза в минуту\n• «°C на ватт», условия и ошибка модели — в подсказке блока над графиком\n• кривой нет, пока у блока меньше 10 минут годных срезов\n• щелчок — показать или скрыть, вместе с линиями ø и 95 %", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "curve-model", "Модель нагрева\nСредняя линия без точек: температура блока от фактического множителя при его полной нагрузке, соседях и кристалле на их медианах — по регрессии из журнала срезов.\n• есть в журнале мощность процессора — кривая для одинаковой работы на всех ядрах одного рода, их можно сравнивать; нет — для нагрузки этого ядра в этой игре\n• сплошная — множители, на которых блок работал под нагрузкой (без редких крайних: по 5 % времени с каждой стороны); пунктир — за ними\n• модель — по последним 8 часам журнала, пересчёт не чаще раза в минуту\n• «°C на ватт», условия и ошибка модели — в подсказке блока над графиком\n• кривой нет, пока у блока меньше 10 минут годных срезов\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
@@ -1786,8 +1806,8 @@ export component AppWindow inherits Window {
         cutoff-text: root.chart-cutoff-text;
         zero: root.chart-zero;
         swap: root.chart-swap;
-        show-mean: root.chart-curves != 1;
-        show-p95: root.chart-curves != 0;
+        show-mean: root.chart-mean;
+        show-p95: root.chart-p95;
         value-title: root.chart-value-title;
         tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy) => { root.chart-tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy); }
         pointer(x, y, w, h) => { root.chart-pointer(x, y, w, h); }
@@ -1983,5 +2003,20 @@ export component AppWindow inherits Window {
         y: root.tip-box-y;
         width: root.tip-box-w;
         height: root.tip-box-h;
+    }
+
+    // Обход ошибки Slint 1.18.1 (src/restore.rs): после сворачивания Windows выбрасывает содержимое окна, а рисование
+    // процессором считает его на месте и рисует только изменившееся — окно остаётся прозрачным. Каждое
+    // восстановление меняет этот прозрачный слой во всё окно: изменилось всё окно, и оно рисуется целиком. Цвет — всегда
+    // полностью прозрачный, щелчков слой не ловит. Убрать вместе с src/restore.rs, когда Slint выпустит исправление
+    // (github.com/slint-ui/slint/pull/13566 и /pull/13568).
+    in property <int> repaint-epoch;
+    out property <color> repaint-veil: veil.background;
+    veil := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(Math.mod(root.repaint-epoch, 256), 0, 0, 0);
     }
 }
