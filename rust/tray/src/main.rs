@@ -17,6 +17,7 @@ mod app;
 mod check;
 mod check_window;
 mod fans;
+mod gpu;
 mod journal;
 mod launch;
 mod layout;

@@ -73,6 +73,8 @@ pub struct AutoTiming {
     pub sample: Duration,
     /// Обороты, пока пишется журнал: в строку того опроса, где прочитаны.
     pub fans: Duration,
+    /// Видеокарта, пока пишется журнал: в строку того опроса, где прочитана (app/sense.rs, DECISIONS #37).
+    pub gpu: Duration,
     pub control: Timing,
     pub bans: Spans,
 }
@@ -82,6 +84,11 @@ impl AutoTiming {
         tick: Duration::from_secs(2),
         sample: Duration::from_millis(250),
         fans: Duration::from_secs(2),
+        // 2 с — по замеру 15.10 во время его игры (DECISIONS #37): температура видеокарты обновляется раз в секунду и
+        // за 2 с меняется на 1 °C (медиана; 90 % — до 2 °C, наибольшее 4); мощность и занятость — средние за
+        // промежуток при любом шаге; путь её тепла к ядрам — общий охладитель, отклик 15–30 с (KNOWLEDGE): 2 с дают
+        // на нём 8–15 точек.
+        gpu: Duration::from_secs(2),
         control: Timing::REAL,
         bans: Spans::REAL,
     };

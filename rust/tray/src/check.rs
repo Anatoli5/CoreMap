@@ -204,11 +204,13 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
         wake_gap: Duration::from_millis(500),
         // Сроки автомодуля в проверке укорочены: опрос 50 мс, окно 0,4 с, пауза 0,3 с, прохлада 1 с; запрет памяти
         // перегрева 2 с (вдвое за повтор, не дольше 8 с, прощение через минуту). Опрос срезов — тоже 50 мс, обороты
-        // при нём — каждый восьмой (как 2 с при 0,25 с); настоящий шаг журнала — отдельным шагом проверки (12m).
+        // при нём — каждый восьмой (как 2 с при 0,25 с), видеокарта — так же; настоящий шаг журнала — отдельным шагом
+        // проверки (12m).
         auto: crate::app::AutoTiming {
             tick: Duration::from_millis(50),
             sample: Duration::from_millis(50),
             fans: Duration::from_millis(400),
+            gpu: Duration::from_millis(400),
             control: machine::auto::Timing {
                 window: Duration::from_millis(400),
                 settle: Duration::from_millis(300),
@@ -843,9 +845,161 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     //     полученные сообщения, и память после него — уже не память программы входа.
     crate::check_window::run(r, app, shell, names, places);
 
+    // 12b. Входы общего теплового пакета (DECISIONS #37): файл дня, начатый сборкой с другими столбцами, не трогается —
+    //      день продолжается в «<день>-2.csv» со своим заголовком; видеокарта или мощность корпуса не прочитались —
+    //      пусто, одна строка в error.log, журнал идёт, повтор — не в каждом опросе.
+    package_inputs(r, app, shell, data);
+
     // 13. Журнал срезов, когда что-то не так: файл дня удалён, перемещён, не открывается; обороты отказывают; потолки
     //     не читаются. Последним шагом: файл дня после него может не открываться ещё 10 с.
     logging_failures(r, app, shell, data);
+}
+
+/// Строк в error.log с этим текстом.
+fn errors(data: &Path, needle: &str) -> usize {
+    fs::read_to_string(data.join("error.log"))
+        .unwrap_or_default()
+        .matches(needle)
+        .count()
+}
+
+/// Строки файла после первых `skip` (дописанные после того, как в нём было `skip` строк).
+fn lines_after(path: &Path, skip: usize) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .skip(skip)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Шаг 12b — входы общего теплового пакета (DECISIONS #37). Сроки — как у шага 13: опрос срезов 50 мс, видеокарта и
+/// обороты — раз в 0,4 с; окна нет.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario, step after step, reads best as one piece"
+)]
+fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path) {
+    let was = app.retime(
+        shell,
+        AutoTiming {
+            tick: Duration::from_millis(200),
+            sample: Duration::from_millis(50),
+            fans: Duration::from_millis(400),
+            gpu: Duration::from_millis(400),
+            control: machine::auto::Timing::REAL,
+            bans: machine::memory::Spans::REAL,
+        },
+    );
+    let blocks = app.topology().blocks.clone(); // a dozen names, once
+    let now = ceilings_now(app);
+    let Some(hot) = blocks
+        .iter()
+        .max_by_key(|b| now.get(b.first).copied().unwrap_or(0))
+        .cloned()
+    else {
+        r.check(false, "входы теплового пакета: блоков нет");
+        return;
+    };
+    let load = |app: &mut App, value: f64| {
+        if let Some(sim) = app.sim() {
+            for &m in &hot.members {
+                sim.load[m] = value;
+            }
+        }
+    };
+    let file = today(data);
+    let day = Stamp::now().local(Pattern::Date);
+    let part2 = file.with_file_name(format!("{day}-2.csv"));
+
+    // Файл дня, начатый 0.5.3: её заголовок (без столбцов теплового пакета) и одна строка. Журнал стоит (автомодуль
+    // выключен после шага 12), файл закрыт.
+    let mut old = String::from("time,package,fan_cpu,fan_gpu");
+    for b in &blocks {
+        let n = &b.name;
+        let _ = write!(old, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String: cannot fail
+    }
+    let old_header = old.clone(); // compared with the new header below
+    old.push_str("\n2026-10-15 10:00:00.000,70,,");
+    for _ in &blocks {
+        old.push_str(",53,45.00,0.50,70");
+    }
+    old.push('\n');
+    let idle = !app.logging().on;
+    let _ = fs::remove_file(&part2); // the scratch folder may hold none; a leftover would be ours anyway
+    let planted = fs::write(&file, &old).is_ok();
+    load(app, 1.0);
+    app.command(shell, AUTO_ON);
+    pump_until(shell, app, Duration::from_secs(3), |_| lines_in(&part2) >= 4);
+    let kept = fs::read_to_string(&file).unwrap_or_default() == old;
+    let text = fs::read_to_string(&part2).unwrap_or_default();
+    let first = text.lines().next().unwrap_or_default();
+    let width = first.split(',').count();
+    let told = logged(app, &format!("пишу в {day}-2.csv"));
+    r.check(
+        idle && planted
+            && kept
+            && first.starts_with(&format!("{old_header},"))
+            && first.ends_with(",power_cpu,temp_gpu,power_gpu,busy_gpu")
+            && text.lines().count() >= 4
+            && text.lines().skip(1).all(|l| l.split(',').count() == width)
+            && told == 1,
+        &format!(
+            "файл дня со столбцами прежней сборки не тронут ({}), день продолжен в {day}-2.csv со своим заголовком ({width} столбцов, строк {}), в tray.log — {told} строка",
+            if kept { "как был" } else { "ИЗМЕНЁН" },
+            text.lines().count().saturating_sub(1)
+        ),
+    );
+
+    // Видеокарта не прочиталась: в этой и следующих строках её столбцы пусты, одна строка в error.log, новый читатель —
+    // через 10 с (не в каждом опросе), журнал идёт.
+    app.sim_gpu(true);
+    let calls = app.gpu_calls();
+    pump_until(shell, app, Duration::from_secs(2), |a| a.gpu_calls() > calls);
+    let failed = app.gpu_calls();
+    let at = lines_in(&part2);
+    pump(shell, app, Duration::from_secs(2));
+    let again = app.gpu_calls() - failed;
+    let after = lines_after(&part2, at);
+    let blank = after.iter().all(|l| l.ends_with(",,,"));
+    let going = app.logging().on;
+    let gpu_told = errors(data, "видеокарта не прочитана (проверка)");
+    app.sim_gpu(false);
+    r.check(
+        failed == calls + 1 && again == 0 && !after.is_empty() && blank && going && gpu_told == 1,
+        &format!(
+            "видеокарта не прочиталась — её столбцы пусты в {} строках после, попыток за 2 с {again} (шаг 0,4 с; повтор — через 10 с), строк в error.log {gpu_told}, журнал идёт",
+            after.len()
+        ),
+    );
+
+    // Мощность корпуса не прочиталась: пусто в строках, одна строка в error.log, журнал идёт.
+    if let Some(sim) = app.sim() {
+        sim.power_refused = true;
+    }
+    let at = lines_in(&part2);
+    pump(shell, app, Duration::from_secs(1));
+    let after = lines_after(&part2, at);
+    let no_power = after.iter().all(|l| field(l, width - 4).is_empty());
+    let going = app.logging().on;
+    let power_told = errors(data, "мощность корпуса не прочитана");
+    if let Some(sim) = app.sim() {
+        sim.power_refused = false;
+    }
+    r.check(
+        !after.is_empty() && no_power && going && power_told == 1,
+        &format!(
+            "мощность корпуса не прочиталась — пусто в {} строках, строк в error.log {power_told}, журнал идёт",
+            after.len()
+        ),
+    );
+
+    app.command(shell, AUTO_ON); // выключить: журнал стоит, файл закрыт
+    // Шаг 13 начинает файл дня заново: оба файла — прочь (временная папка проверки; не удалились — удалятся с ней).
+    let _ = fs::remove_file(&file);
+    let _ = fs::remove_file(&part2);
+    load(app, 0.0);
+    app.retime(shell, was);
 }
 
 /// Журналы автомодуля после снижений: строки действий с условиями и запретом, срезы с заголовком по всем блокам.
@@ -874,11 +1028,16 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
     );
     let samples = fs::read_to_string(today(data)).unwrap_or_default();
     let mut lines = samples.lines();
-    let width = 4 + 4 * blocks;
-    let header = lines.next().map_or(0, |h| h.split(',').count());
+    // Время, корпус, два вентилятора; по 4 на блок; в конце — мощность корпуса и видеокарта (DECISIONS #37).
+    let width = 4 + 4 * blocks + 4;
+    let head = lines.next().unwrap_or_default();
+    let header = head.split(',').count();
     let rows: Vec<&str> = lines.collect();
     r.check(
-        header == width && !rows.is_empty() && rows.iter().all(|l| l.split(',').count() == width),
+        header == width
+            && head.ends_with(",power_cpu,temp_gpu,power_gpu,busy_gpu")
+            && !rows.is_empty()
+            && rows.iter().all(|l| l.split(',').count() == width),
         &format!("срезы: заголовок {header} столбцов из {width}, строк {}", rows.len()),
     );
     let timed = rows.iter().filter(|l| ms_of_day(field(l, 0)).is_some()).count();
@@ -890,7 +1049,26 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             rows.len()
         ),
     );
+    // Мощность корпуса — в каждой строке (у имитации она есть всегда); видеокарта — только где прочитана, и тогда все
+    // три числа имитации.
+    let power = rows.iter().filter(|l| !field(l, width - 4).is_empty()).count();
+    let cards: Vec<String> = rows
+        .iter()
+        .map(|l| l.split(',').skip(width - 3).collect::<Vec<_>>().join(","))
+        .collect();
+    let read = cards.iter().filter(|c| *c == SIM_GPU).count();
+    let empty = cards.iter().filter(|c| *c == ",,").count();
+    r.check(
+        power == rows.len() && read > 0 && read < rows.len() && read + empty == rows.len(),
+        &format!(
+            "срезы: мощность корпуса — в {power} строках из {}; видеокарта ({SIM_GPU}) — в {read} (где прочитана), пусто — в {empty}",
+            rows.len()
+        ),
+    );
 }
+
+/// Видеокарта имитации в строке среза: температура, мощность, занятость (app/sense.rs, `sim_gpu`).
+const SIM_GPU: &str = "61,95.5,0.72";
 
 /// Поле строки среза по номеру ("" — нет такого).
 fn field(line: &str, k: usize) -> &str {
@@ -995,9 +1173,35 @@ fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, h
             rows.len()
         ),
     );
+    // Видеокарта — раз в 2 с, как обороты: в одной из первых восьми строк и дальше в каждой восьмой.
+    let card_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.ends_with(SIM_GPU))
+        .map(|(i, _)| i)
+        .collect();
+    let card_gaps: Vec<usize> = card_rows.windows(2).map(|w| w[1] - w[0]).collect();
     r.check(
-        cost.is_some(),
-        &format!("цена опроса срезов в tray.log (имитация): {}", cost.unwrap_or_default()),
+        card_rows.first().is_some_and(|&first| first < 8)
+            && card_rows.len() >= 2
+            && card_gaps.iter().all(|&g| g == 8)
+            && rows.iter().all(|l| l.ends_with(SIM_GPU) || l.ends_with(",,,")),
+        &format!(
+            "видеокарта — в одной из первых восьми строк и дальше в каждой восьмой (строки {card_rows:?} из {}), в остальных пусто",
+            rows.len()
+        ),
+    );
+    let line = cost.unwrap_or_default();
+    let parts = |what: &str| {
+        line.split(what)
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    r.check(
+        parts("мощность корпуса — ") > 0 && parts("видеокарта — ") > 0,
+        &format!("цена опроса срезов в tray.log (имитация), с мощностью корпуса и видеокартой: {line}"),
     );
 }
 
@@ -1027,6 +1231,7 @@ fn logging_failures(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Pat
             tick: Duration::from_millis(200),
             sample: Duration::from_millis(50),
             fans: Duration::from_millis(400),
+            gpu: Duration::from_millis(400),
             control: machine::auto::Timing::REAL,
             bans: machine::memory::Spans::REAL,
         },
