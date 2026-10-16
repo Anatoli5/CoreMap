@@ -1,15 +1,22 @@
 // Статистика читается в своём потоке, не в потоке окна (rust\AGENTS.md: поток окна не ждёт файлов).
 //
 // Поток держит сводку по каждому файлу срезов за последние 30 дней и сколько от файла прочитано; раз в SCAN он
-// смотрит размеры и времена записи (одна папка: файл на день и его продолжения «-N», и журнал автомодуля) и дочитывает только
+// смотрит размеры и времена записи (папка срезов: файл на день и его продолжения «-N»; папка событий: файл на день; журнал
+// автомодуля) и дочитывает только
 // дописанное — прошлые дни не перечитываются, сегодняшний — только с прочитанного места. Ничего не изменилось — окну
 // ничего не идёт. Изменилось — окно получает новую сводку целиком (Digest) и перерисовывает то, что из неё показывает.
 //
+// Окну поток начинает читать, когда знает блоки и их соседей (`Order::Die`, после знакомства): строка наибольшей
+// температуры корзины («макс») помнит температуры соседей. Сменились блоки — файлы читаются заново.
+//
 // Модель нагрева (model.rs, DECISIONS #39) — здесь же, после прохода: строки по 0,25 с каждого файла оставляет тот же
-// разбор (`Scratch::count_keeping`), второго чтения файлов нет; в модель идут только последние 8 ч строк
-// (`model::KEEP_MS`, через все файлы). Соседей блоков поток знает из знакомства окна (`Order::Die`); пока их нет — модели
-// нет. Подгонка — заново по всем оставленным строкам: сразу после знакомства (или смены соседей), а пока срезы
-// дописываются — не чаще раза в `REFIT`. Окно её не ждёт: она приходит в той же сводке.
+// разбор (`Scratch::count_keeping`), второго чтения файлов нет. Подгонка — заново по всем оставленным строкам: сразу после
+// знакомства (или смены соседей), а пока срезы дописываются — не чаще раза в `REFIT`. После подгонки — хранение
+// (`model::retain`, бриф W 16.10, вместо границы 8 ч): у насыщенных клеток (блок, множитель) старые строки выбрасываются.
+// Окно подгонку не ждёт: она приходит в той же сводке.
+//
+// День журнала для вида «по времени» (timeline.rs) поток читает по просьбе окна (`Order::Day`) — весь день заново, не из
+// сводки; пока этот день дописывается, перечитывает его не чаще раза в `DAY_REFRESH`.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,34 +24,60 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::events::{self, AutoEntry, Event, EventEntry};
 use crate::model::{self, Die, Log, Model};
-use crate::samples::{self, AutoEntry, Columns, Fresh, Scratch, Tail, Tally};
+use crate::samples::{self, Carry, Columns, Fresh, Scratch, Tail, Tally};
+use crate::timeline::{self, Day, Quantity};
 
 /// Как часто смотреть, не дописаны ли журналы. Программа входа пишет срез раз в 0,25 с (до 0.5.2 — раз в 2 с); график
 /// в окне отстаёт от неё не больше чем на 5 с, а проверка — несколько вызовов Windows и разбор только дописанного.
 pub const SCAN: Duration = Duration::from_secs(5);
 /// Срезы за сколько дней (программа входа хранит 30 и удаляет старые сама).
 pub const DAYS: i64 = 30;
-/// Подгонка модели, пока срезы дописываются, — не чаще раза в минуту: на 8 ч строк она стоит ~0,2 с, а минута новых
-/// строк — 1/480 данных модели, кривые от неё почти не меняются. Последние строки входят не позже чем через минуту.
+/// Подгонка модели, пока срезы дописываются, — не чаще раза в минуту: минута новых строк почти не меняет кривые, а
+/// подгонка с хранением — проход по всем оставленным строкам. Цена — настройка, не правило управления (бриф W).
 pub const REFIT: Duration = Duration::from_secs(60);
+/// Показанный день дописывается — перечитать его не чаще раза в столько (день строк по 0,25 с — десятки МБ текста).
+pub const DAY_REFRESH: Duration = Duration::from_secs(30);
 
 /// Что окно получает из потока статистики.
 #[derive(Debug, Default)]
 pub struct Digest {
     pub tally: Tally,
     pub files: usize,
-    pub auto: Vec<AutoEntry>,
+    /// События, новые первыми: файлы data\events\<день>.jsonl (с 0.5.6) и прежний журнал автомодуля
+    /// (data\auto-log.jsonl) за дни до них — `events::merged`. Пересобираются, только когда журналы дописаны.
+    pub events: Arc<Vec<Event>>,
+    /// Дни, за которые есть срезы («ГГГГ-ММ-ДД», по возрастанию) — выбор дня вида «по времени».
+    pub days: Vec<String>,
     /// Сколько байт срезов прочитано и разобрано этим проходом и за сколько: цена статистики.
     pub parsed_bytes: u64,
     pub parsed_rows: u64,
     pub parse_time: Duration,
     /// Что не прочиталось (строка для владельца); None — всё прочиталось.
     pub trouble: Option<String>,
-    /// Модель нагрева по всем строкам срезов; None — соседи блоков ещё не известны (знакомства не было).
+    /// Модель нагрева по строкам срезов; None — соседи блоков ещё не известны (знакомства не было).
     pub model: Option<Arc<Model>>,
+    /// Что сделало хранение строк после последней подгонки.
+    pub retained: Option<model::Retained>,
     /// Сколько памяти держат строки для модели, байт.
     pub kept_bytes: usize,
+}
+
+/// Что поток статистики отдаёт окну.
+#[derive(Debug)]
+pub enum Delivery {
+    Digest(Arc<Digest>),
+    Day(Arc<Day>),
+}
+
+/// Какой день показать в виде «по времени» и чьи ряды.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayOrder {
+    pub date: String,
+    pub blocks: Vec<String>,
+    /// Какие ряды блоков читать (раскладка «блоки» — одну величину, «параметры» — все).
+    pub quantities: Vec<Quantity>,
 }
 
 /// Что окно говорит потоку статистики.
@@ -54,6 +87,8 @@ pub enum Order {
     Scan,
     /// Блоки и их соседи из знакомства: модель считается по ним.
     Die(Arc<Die>),
+    /// День для вида «по времени»; None — вид закрыт, день не нужен.
+    Day(Option<DayOrder>),
 }
 
 #[derive(Debug, Default)]
@@ -63,23 +98,33 @@ struct SampleFile {
     headed: bool,
     columns: Option<Columns>,
     tally: Tally,
-    /// Время последней посчитанной строки (мс, `samples::row_time`): следующая порция считает промежуток от неё.
-    previous: Option<i64>,
+    /// Что передаёт следующей порции файла прошлая: время последней строки, последние чтения, ждущие наибольшие.
+    carry: Carry,
     /// Строки по 0,25 с — для модели.
     log: Log,
 }
 
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts of the reading thread (waits for blocks, refit due, rows stale, day stale), not one state machine"
+)]
 struct Worker {
     dir: PathBuf,
     /// Папка срезов: у окна — samples в папке данных, у отчёта — та, что ему дали.
     samples: PathBuf,
     /// Срезы за сколько дней; None — все файлы папки (скрытый отчёт модели).
     days: Option<i64>,
+    /// Читать, только когда известны блоки (окно); отчёт и тесты читают и без них.
+    wait_die: bool,
     files: BTreeMap<String, SampleFile>,
     scratch: Scratch,
     auto_tail: Tail,
     auto: Vec<AutoEntry>,
+    /// Файлы событий по дням: сколько прочитано и строки.
+    event_files: BTreeMap<String, (Tail, Vec<EventEntry>)>,
+    /// События для окна (`events::merged`) — пересобираются, когда журналы дописаны.
+    events: Arc<Vec<Event>>,
     die: Option<Arc<Die>>,
     /// Соседи сменились — модель пересчитать при следующем проходе сразу, даже если файлы не менялись.
     refit: bool,
@@ -88,17 +133,23 @@ struct Worker {
     /// Когда была последняя подгонка.
     fitted: Option<Instant>,
     model: Option<Arc<Model>>,
+    retained: Option<model::Retained>,
+    /// День вида «по времени», когда он прочитан и дописан ли с тех пор.
+    day: Option<DayOrder>,
+    day_read: Option<Instant>,
+    day_stale: bool,
 }
 
 /// Запускает поток статистики над папкой данных `dir`. `deliver` получает сводку, когда она изменилась (первую —
-/// сразу после первого прохода). Отправитель — чтобы попросить проход сейчас или дать блоки и соседей для модели;
-/// когда все отправители брошены, поток кончается.
-pub fn start(dir: PathBuf, deliver: impl Fn(Arc<Digest>) + Send + 'static) -> mpsc::Sender<Order> {
+/// после первого прохода, когда известны блоки), и день вида «по времени», когда его попросили. Отправитель — чтобы
+/// попросить проход сейчас, дать блоки и соседей, попросить день; когда все отправители брошены, поток кончается.
+pub fn start(dir: PathBuf, deliver: impl Fn(Delivery) + Send + 'static) -> mpsc::Sender<Order> {
     let (wake, woken) = mpsc::channel::<Order>();
     let mut worker = Worker {
         samples: dir.join("samples"),
         dir,
         days: Some(DAYS),
+        wait_die: true,
         ..Worker::default()
     };
     thread::Builder::new()
@@ -106,15 +157,21 @@ pub fn start(dir: PathBuf, deliver: impl Fn(Arc<Digest>) + Send + 'static) -> mp
         .spawn(move || {
             let mut first = true;
             loop {
-                if let Some(digest) = worker.scan(first) {
-                    deliver(Arc::new(digest));
+                if !(worker.wait_die && worker.die.is_none()) {
+                    if let Some(digest) = worker.scan(first) {
+                        deliver(Delivery::Digest(Arc::new(digest)));
+                    }
+                    first = false;
+                    if let Some(day) = worker.day_due(Instant::now()) {
+                        deliver(Delivery::Day(Arc::new(day)));
+                    }
                 }
-                first = false;
                 match woken.recv_timeout(SCAN) {
                     Ok(Order::Scan) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Ok(Order::Die(die)) => {
-                        worker.refit = worker.die.as_deref() != Some(&*die);
-                        worker.die = Some(die);
+                    Ok(Order::Die(die)) => worker.set_die(die),
+                    Ok(Order::Day(day)) => {
+                        worker.day_read = None;
+                        worker.day = day;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
@@ -125,11 +182,45 @@ pub fn start(dir: PathBuf, deliver: impl Fn(Arc<Digest>) + Send + 'static) -> mp
 }
 
 impl Worker {
+    /// Блоки и соседи из знакомства. Другие — модель заново, и файлы читаются заново: условия строк наибольшей
+    /// температуры («макс») берут соседей из них.
+    fn set_die(&mut self, die: Arc<Die>) {
+        if self.die.as_deref() == Some(&*die) {
+            return;
+        }
+        self.refit = true;
+        self.files.clear();
+        self.die = Some(die);
+    }
+
     /// Пора ли подгонять модель в момент `now`: соседи известны и либо сменились (первая подгонка после знакомства —
     /// сразу), либо строки дописаны и с прошлой подгонки прошло не меньше `REFIT` (или её не было).
     fn due(&self, now: Instant) -> bool {
         self.die.is_some()
             && (self.refit || (self.stale && self.fitted.is_none_or(|at| now.saturating_duration_since(at) >= REFIT)))
+    }
+
+    /// День вида «по времени», если его пора прочитать: попросили и ещё не читали, или он дописан и прошло
+    /// `DAY_REFRESH`.
+    fn day_due(&mut self, now: Instant) -> Option<Day> {
+        let order = self.day.as_ref()?;
+        let due = self
+            .day_read
+            .is_none_or(|at| self.day_stale && now.saturating_duration_since(at) >= DAY_REFRESH);
+        if !due {
+            return None;
+        }
+        let mut names: Vec<String> = self
+            .files
+            .keys()
+            .filter(|n| day_of(n) == Some(order.date.as_str()))
+            .cloned()
+            .collect(); // a few file names of one day
+        names.sort_by(|a, b| order_of(a).cmp(&order_of(b)));
+        let day = timeline::read_day(&self.samples, &order.date, &names, &order.blocks, &order.quantities);
+        self.day_read = Some(now);
+        self.day_stale = false;
+        Some(day)
     }
 
     /// Один проход; Some — что-то изменилось (или это первый проход).
@@ -154,20 +245,18 @@ impl Worker {
         let before = self.files.len();
         self.files.retain(|name, _| names.contains(name));
         let mut fresh = self.files.len() != before;
-        // Новые файлы — первыми: граница 8 ч (`model::KEEP_MS`) известна по самому новому, и разбор старых дней не берёт
-        // строк, которые выбросит подгонка (иначе первый проход держал бы строки всех 30 дней).
-        let mut names = names;
-        names.sort_by(|a, b| order_of(b).cmp(&order_of(a)));
-        let mut newest = self.files.values().filter_map(|f| f.log.newest()).max();
+        let die = self.die.as_deref();
         for name in names {
             let path = self.samples.join(&name);
+            let of_day = self
+                .day
+                .as_ref()
+                .is_some_and(|d| day_of(&name) == Some(d.date.as_str()));
             let file = self.files.entry(name).or_default();
-            let from = newest.map(|n| n - model::KEEP_MS);
-            let read = read_samples(&path, file, &mut self.scratch, from);
-            newest = newest.max(file.log.newest());
-            match read {
+            match read_samples(&path, file, &mut self.scratch, die) {
                 Ok(Some((bytes, rows))) => {
                     fresh = true;
+                    self.day_stale |= of_day;
                     parsed_bytes += bytes;
                     parsed_rows += rows;
                 }
@@ -177,35 +266,21 @@ impl Worker {
         }
         changed |= fresh;
         self.stale |= fresh;
-        // Модель — по последним 8 ч строк заново (цена — `Model::time`, в отчёте модели).
+        // Модель — по оставленным строкам заново (цена — `Model::time`), затем хранение.
         if self.due(Instant::now())
             && let Some(die) = &self.die
         {
             let mut logs: Vec<&mut Log> = self.files.values_mut().map(|f| &mut f.log).collect();
-            model::trim(&mut logs);
-            let logs: Vec<&Log> = logs.into_iter().map(|l| &*l).collect();
-            self.model = Some(Arc::new(model::fit(&logs, die)));
+            let model = model::fit(&logs.iter().map(|l| &**l).collect::<Vec<_>>(), die);
+            self.retained = Some(model::retain(&mut logs, die, &model));
+            self.model = Some(Arc::new(model));
             self.fitted = Some(Instant::now());
             self.refit = false;
             self.stale = false;
             changed = true;
         }
 
-        // Журнал автомодуля: только дописывается.
-        match samples::read_new(&self.dir.join("auto-log.jsonl"), &mut self.auto_tail) {
-            Ok(Fresh::Same) => {}
-            Ok(Fresh::More(text)) => {
-                samples::auto_entries(&text, &mut self.auto);
-                changed = true;
-            }
-            Ok(Fresh::Again(text)) => {
-                self.auto.clear();
-                samples::auto_entries(&text, &mut self.auto);
-                changed = true;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => trouble = Some(format!("журнал автомодуля не прочитан: {e}")),
-        }
+        changed |= self.read_events(cutoff.as_deref(), &mut trouble);
 
         if !changed {
             return None;
@@ -214,24 +289,72 @@ impl Worker {
         for file in self.files.values() {
             tally.merge(&file.tally);
         }
+        let mut days: Vec<String> = self
+            .files
+            .keys()
+            .filter_map(|n| day_of(n))
+            .map(str::to_string)
+            .collect();
+        days.dedup();
         Some(Digest {
             tally,
             model: self.model.as_ref().map(Arc::clone),
+            retained: self.retained,
             kept_bytes: self.files.values().map(|f| f.log.bytes()).sum(),
             files: self.files.len(),
-            // Копия журнала — на каждое изменение, не на каждый проход: действий автомодуля единицы в час.
-            auto: self.auto.clone(),
+            days,
+            events: Arc::clone(&self.events),
             parsed_bytes,
             parsed_rows,
             parse_time: started.elapsed(),
             trouble,
         })
     }
+
+    /// Журнал автомодуля и файлы событий не старше `cutoff`: только дописываются. Что-то дописано — события для окна
+    /// заново (`events::merged`), true.
+    fn read_events(&mut self, cutoff: Option<&str>, trouble: &mut Option<String>) -> bool {
+        let mut logged = false;
+        match read_log(&self.dir.join("auto-log.jsonl"), &mut self.auto_tail, &mut self.auto) {
+            Ok(fresh) => logged |= fresh,
+            Err(e) => *trouble = Some(format!("журнал автомодуля не прочитан: {e}")),
+        }
+        let folder = self.dir.join("events");
+        let names = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| {
+                    n.strip_suffix(".jsonl")
+                        .filter(|stem| stem.len() == 10)
+                        .and_then(dated)
+                        .is_some_and(|d| cutoff.is_none_or(|c| d >= c))
+                })
+                .collect::<Vec<_>>(),
+            // Папки событий нет — программа входа их ещё не писала (до 0.5.6); это не ошибка.
+            Err(_) => Vec::new(),
+        };
+        let before = self.event_files.len();
+        self.event_files.retain(|name, _| names.contains(name));
+        logged |= self.event_files.len() != before;
+        for name in names {
+            let path = folder.join(&name);
+            let (tail, lines) = self.event_files.entry(name).or_default();
+            match read_log(&path, tail, lines) {
+                Ok(fresh) => logged |= fresh,
+                Err(e) => *trouble = Some(format!("события {} не прочитаны: {e}", path.display())),
+            }
+        }
+        if logged {
+            let all: Vec<EventEntry> = self.event_files.values().flat_map(|(_, l)| l.iter().cloned()).collect(); // a few hundred lines, when a log grew
+            self.events = Arc::new(events::merged(&all, &self.auto));
+        }
+        logged
+    }
 }
 
-/// Все файлы срезов папки `samples` (без границы в 30 дней) — для скрытого отчёта модели: тот же разбор, что у окна, и
-/// те же последние 8 ч строк (`model::trim`), что идут в модель окна. Строки для модели по файлам и что не прочиталось.
-/// Журнала автомодуля рядом нет — он не нужен.
+/// Все файлы срезов папки `samples` (без границы в 30 дней) — для скрытого отчёта модели: тот же разбор, что у окна.
+/// Строки для модели по файлам и что не прочиталось. Журнала автомодуля рядом нет — он не нужен.
 pub fn read_all(samples: PathBuf) -> (Vec<Log>, Option<String>) {
     let mut worker = Worker {
         dir: samples.clone(), // one path, once per report
@@ -240,9 +363,27 @@ pub fn read_all(samples: PathBuf) -> (Vec<Log>, Option<String>) {
         ..Worker::default()
     };
     let trouble = worker.scan(true).and_then(|d| d.trouble);
-    let mut logs: Vec<Log> = std::mem::take(&mut worker.files).into_values().map(|f| f.log).collect();
-    model::trim(&mut logs.iter_mut().collect::<Vec<_>>());
+    let logs: Vec<Log> = std::mem::take(&mut worker.files).into_values().map(|f| f.log).collect();
     (logs, trouble)
+}
+
+/// Дочитывает журнал строк JSON (`events::read_lines`); true — что-то прочитано. Файла нет — не ошибка: программа
+/// входа его ещё не писала (файлы событий — с 0.5.6).
+fn read_log<T: serde::de::DeserializeOwned>(path: &Path, tail: &mut Tail, into: &mut Vec<T>) -> std::io::Result<bool> {
+    match samples::read_new(path, tail) {
+        Ok(Fresh::Same) => Ok(false),
+        Ok(Fresh::More(text)) => {
+            events::read_lines(&text, into);
+            Ok(true)
+        }
+        Ok(Fresh::Again(text)) => {
+            into.clear();
+            events::read_lines(&text, into);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// День файла срезов по его имени: «ГГГГ-ММ-ДД.csv» — файл дня; «ГГГГ-ММ-ДД-N.csv» (N — цифры) — продолжение того же
@@ -251,16 +392,21 @@ pub fn read_all(samples: PathBuf) -> (Vec<Log>, Option<String>) {
 /// строк. Другое имя — не срезы (None).
 fn day_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".csv")?;
-    let day = stem.get(..10)?;
-    let b = day.as_bytes();
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
-    let dated = digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10);
+    let day = dated(stem)?;
     let rest = &stem[10..];
     let part = rest.is_empty()
         || rest
             .strip_prefix('-')
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
-    (dated && part).then_some(day)
+    part.then_some(day)
+}
+
+/// Начало имени — дата «ГГГГ-ММ-ДД»; иначе None.
+fn dated(stem: &str) -> Option<&str> {
+    let day = stem.get(..10)?;
+    let b = day.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    (digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10)).then_some(day)
 }
 
 /// Порядок файлов срезов по времени: день, затем номер продолжения (у файла дня — 0). По имени «-2» шло бы раньше
@@ -276,13 +422,13 @@ fn order_of(name: &str) -> (&str, u32) {
     (day, part)
 }
 
-/// Дочитывает файл срезов. Some((байт, строк)) — прочитано новое; None — файл не менялся. `from` — строки раньше в
-/// модель не берутся (граница 8 ч от самой новой строки уже прочитанных файлов).
+/// Дочитывает файл срезов. Some((байт, строк)) — прочитано новое; None — файл не менялся. `die` — блоки и соседи:
+/// столбцы файла узнают по ним соседей блоков (`Columns::link`).
 fn read_samples(
     path: &Path,
     file: &mut SampleFile,
     scratch: &mut Scratch,
-    from: Option<i64>,
+    die: Option<&Die>,
 ) -> std::io::Result<Option<(u64, u64)>> {
     let text = match samples::read_new(path, &mut file.tail)? {
         Fresh::Same => return Ok(None),
@@ -291,7 +437,7 @@ fn read_samples(
             file.headed = false;
             file.columns = None;
             file.tally = Tally::default();
-            file.previous = None;
+            file.carry = Carry::default();
             file.log = Log::default();
             text
         }
@@ -304,17 +450,17 @@ fn read_samples(
         };
         file.headed = true;
         file.columns = Columns::parse(header);
-        if let Some(columns) = &file.columns {
+        if let Some(columns) = &mut file.columns {
+            if let Some(die) = die {
+                columns.link(&die.names, &die.neighbours);
+            }
             file.log = Log::new(columns.names().map(str::to_string).collect());
         }
         body = rest;
     }
     let rows_before = file.tally.rows;
-    if let Some(at) = from {
-        file.log.admit_from(at);
-    }
     if let Some(columns) = &file.columns {
-        scratch.count_keeping(columns, body, &mut file.previous, &mut file.tally, Some(&mut file.log));
+        scratch.count_keeping(columns, body, &mut file.carry, &mut file.tally, Some(&mut file.log));
     }
     Ok(Some((text.len() as u64, file.tally.rows - rows_before)))
 }
@@ -358,83 +504,65 @@ mod tests {
     }
 
     #[test]
-    fn the_model_keeps_only_rows_within_8_hours_of_the_newest_across_files() {
-        // Вчера 20:00–20:01 (за 10 ч до самой новой) и 23:00–23:01 (за 7 ч) в одном файле, сегодня 06:00–06:01 — в
-        // файле дня и его продолжении. Ловит: границу по своему файлу, а не по самому новому всех файлов; старые дни,
-        // прочитанные целиком (порядок по имени ставит «-2» раньше файла дня, а вчера — раньше сегодня).
-        let (dir, samples) = temp_samples("keep");
-        let mut old = quarter_rows("2026-10-14", 20 * 3600, 20 * 3600 + 60);
-        old.push_str(
-            quarter_rows("2026-10-14", 23 * 3600, 23 * 3600 + 60)
-                .split_once('\n')
-                .map_or("", |x| x.1),
-        );
-        std::fs::write(samples.join("2026-10-14.csv"), old).expect("вчера");
+    fn the_model_takes_every_row_of_the_period_not_only_the_last_8_hours() {
+        // Вчера 20:00–20:01 (за 10 ч до самой новой строки) и сегодня 06:00–06:01: обе минуты — в модели (границы 8 ч
+        // больше нет, бриф W). Ловит: прежнюю границу.
+        let (dir, samples) = temp_samples("all");
+        std::fs::write(
+            samples.join("2026-10-14.csv"),
+            quarter_rows("2026-10-14", 20 * 3600, 20 * 3600 + 60),
+        )
+        .expect("вчера");
         std::fs::write(
             samples.join("2026-10-15.csv"),
-            quarter_rows("2026-10-15", 6 * 3600 - 60, 6 * 3600),
-        )
-        .expect("сегодня");
-        std::fs::write(
-            samples.join("2026-10-15-2.csv"),
             quarter_rows("2026-10-15", 6 * 3600, 6 * 3600 + 60),
         )
-        .expect("продолжение");
+        .expect("сегодня");
         let mut worker = Worker {
             dir: dir.clone(),
             samples: samples.clone(),
             days: None,
+            die: Some(one_block()),
+            refit: true,
             ..Worker::default()
         };
-        // Без знакомства подгонки нет: граница держится уже разбором (новые файлы первыми).
-        worker.scan(true).expect("первый проход");
-        let rows = |w: &Worker, name: &str| w.files.get(name).map_or(0, |f| f.log.rows());
-        assert_eq!(rows(&worker, "2026-10-14.csv"), 240, "вчера — только 23:00–23:01");
-        assert_eq!(rows(&worker, "2026-10-15.csv") + rows(&worker, "2026-10-15-2.csv"), 480);
-        let newest = worker
-            .files
-            .values()
-            .filter_map(|f| f.log.newest())
-            .max()
-            .expect("строки есть");
-        // Подгонка: та же граница; отчёт (read_all) — тоже.
-        worker.die = Some(one_block());
-        worker.refit = true;
-        worker.scan(false).expect("подгонка");
-        assert!(
-            worker.model.as_ref().is_some_and(|m| m.rows == 720),
-            "в модели 720 строк"
-        );
+        worker.scan(true).expect("проход");
         let (logs, trouble) = read_all(samples);
         let _ = std::fs::remove_dir_all(&dir); // временная папка теста; не удалилась — не беда
-        assert!(trouble.is_none(), "{trouble:?}");
-        assert_eq!(logs.iter().map(Log::rows).sum::<usize>(), 720, "отчёт — те же 8 ч");
         assert!(
-            logs.iter()
-                .all(|l| l.rows() == 0 || l.newest().is_some_and(|n| n >= newest - model::KEEP_MS))
+            worker.model.as_ref().is_some_and(|m| m.rows == 480),
+            "в модели обе минуты"
         );
+        assert!(trouble.is_none(), "{trouble:?}");
+        assert_eq!(logs.iter().map(Log::rows).sum::<usize>(), 480, "отчёт — те же строки");
     }
 
     #[test]
-    fn rows_aged_out_while_logging_are_dropped_before_the_next_fit() {
-        // Файл пишется: самая новая строка ушла на 8 ч вперёд — ранние строки того же файла выбрасываются перед
-        // подгонкой. Ловит: границу только при разборе (взятые строки остались бы навсегда).
-        let mut log = model::Log::new(vec!["0".into()]);
-        let row = |log: &mut model::Log, at: i64| {
-            log.push(at, [[Some(45.0), Some(0.8), Some(70.0), None]].into_iter(), [None; 3]);
+    fn the_window_reads_only_after_hello_and_reads_again_for_new_blocks() {
+        // Окно: без блоков прохода нет (условиям «макс» нужны соседи); блоки пришли — проход; другие блоки — файлы
+        // читаются заново. Ловит: проход до знакомства, прежние сводки файлов после смены блоков.
+        let (dir, samples) = temp_samples("die");
+        std::fs::write(samples.join("2026-10-15.csv"), quarter_rows("2026-10-15", 3600, 3610)).expect("файл дня");
+        let mut worker = Worker {
+            dir: dir.clone(),
+            samples,
+            days: None,
+            wait_die: true,
+            ..Worker::default()
         };
-        for k in 0..10 {
-            row(&mut log, k * 250);
-        }
-        row(&mut log, model::KEEP_MS + 1000);
-        assert_eq!(model::trim(&mut [&mut log]), Some(1000));
-        assert_eq!(
-            log.rows(),
-            7,
-            "строки 0–750 мс ушли, 1000 мс (ровно на границе) и дальше — остались"
-        );
-        row(&mut log, 500);
-        assert_eq!(log.rows(), 7, "строка раньше границы после неё не берётся");
+        worker.set_die(one_block());
+        assert!(worker.refit);
+        let first = worker.scan(true).expect("проход");
+        assert_eq!(first.tally.rows, 40);
+        worker.set_die(Arc::new(Die {
+            names: vec!["0".into(), "1".into()],
+            e: vec![false, false],
+            neighbours: vec![vec![1], vec![0]],
+        }));
+        assert!(worker.files.is_empty() && worker.refit, "файлы — заново");
+        let again = worker.scan(false).expect("проход");
+        let _ = std::fs::remove_dir_all(&dir); // временная папка теста; не удалилась — не беда
+        assert_eq!(again.tally.rows, 40, "те же строки, не вдвое");
     }
 
     #[test]
@@ -476,6 +604,52 @@ mod tests {
         let quiet = worker.scan(false);
         let _ = std::fs::remove_dir_all(&dir); // временная папка теста; не удалилась — не беда
         assert!(quiet.is_none(), "ничего не дописано — ни подгонки, ни сводки");
+    }
+
+    #[test]
+    fn a_day_is_read_on_request_from_its_files_and_again_only_after_new_rows() {
+        // День 15.10 — файл дня и продолжение, 14.10 — другой день. Просьба — день читается целиком (обе части по
+        // порядку); без новых строк — не перечитывается; дописан — перечитывается не раньше `DAY_REFRESH`.
+        let (dir, samples) = temp_samples("day");
+        std::fs::write(samples.join("2026-10-14.csv"), quarter_rows("2026-10-14", 3600, 3610)).expect("вчера");
+        std::fs::write(samples.join("2026-10-15.csv"), quarter_rows("2026-10-15", 3600, 3610)).expect("файл дня");
+        let part = samples.join("2026-10-15-2.csv");
+        std::fs::write(&part, quarter_rows("2026-10-15", 7200, 7205)).expect("продолжение");
+        let mut worker = Worker {
+            dir: dir.clone(),
+            samples,
+            days: None,
+            ..Worker::default()
+        };
+        let digest = worker.scan(true).expect("проход");
+        assert_eq!(digest.days, ["2026-10-14", "2026-10-15"]);
+        let now = Instant::now();
+        assert!(worker.day_due(now).is_none(), "не просили — не читается");
+        worker.day = Some(DayOrder {
+            date: "2026-10-15".into(),
+            blocks: vec!["0".into()],
+            quantities: vec![Quantity::Temp, Quantity::Ceiling],
+        });
+        let day = worker.day_due(now).expect("день");
+        assert_eq!(day.t.len(), 60, "обе части дня");
+        assert_eq!(day.gaps().len(), 1, "между частями — час без строк, одним перерывом");
+        assert!(day.blocks[0].ratio.is_empty(), "о множителе не просили");
+        assert!(day.t.windows(2).all(|w| w[0] < w[1]));
+        assert!((day.blocks[0].temp[0] - 70.0).abs() < 1e-6 && (day.blocks[0].ceiling[59] - 53.0).abs() < 1e-6);
+        assert!(worker.day_due(now).is_none(), "уже прочитан, новых строк нет");
+        let mut text = std::fs::read_to_string(&part).expect("продолжение");
+        text.push_str(
+            quarter_rows("2026-10-15", 7205, 7206)
+                .split_once('\n')
+                .map_or("", |x| x.1),
+        );
+        std::fs::write(&part, text).expect("дописано");
+        worker.scan(false);
+        assert!(worker.day_due(now).is_none(), "дописан, но `DAY_REFRESH` не прошло");
+        let later = now + DAY_REFRESH;
+        let again = worker.day_due(later).expect("перечитан");
+        let _ = std::fs::remove_dir_all(&dir); // временная папка теста; не удалилась — не беда
+        assert_eq!(again.t.len(), 64);
     }
 
     #[test]

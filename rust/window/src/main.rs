@@ -33,12 +33,14 @@ mod ui {
     slint::include_modules!();
 }
 use ui::{
-    AppWindow, CellData, Column, LegendItem, LineRow, LinkData, Mark, MenuEntry, Run, Series, SetRow, Tick, TileData,
+    AppWindow, CellData, Column, Cut, LegendItem, LineRow, LinkData, Mark, MenuEntry, Run, Series, SetRow, Tick,
+    TileData, TimeDot, TimeMark, TimeRef, TimeStrip,
 };
 
 mod chart;
 mod check;
 mod die;
+mod events;
 mod model;
 mod model_report;
 // Тесты модели нагрева по брифу, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
@@ -58,6 +60,7 @@ mod samples_spec;
 #[cfg(test)]
 mod chart_spec;
 mod store;
+mod timeline;
 mod view;
 mod wire;
 
@@ -88,11 +91,37 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_mode_changed(move |pin| v.borrow_mut().mode_changed(pin));
     let v = Rc::clone(view);
-    ui.on_scale_changed(move |above| v.borrow_mut().scale_changed(above));
+    ui.on_view_changed(move |index| v.borrow_mut().view_changed(index));
     let v = Rc::clone(view);
     ui.on_mean_toggled(move || v.borrow_mut().mean_toggled());
     let v = Rc::clone(view);
     ui.on_p95_toggled(move || v.borrow_mut().p95_toggled());
+    let v = Rc::clone(view);
+    ui.on_max_toggled(move || v.borrow_mut().max_toggled());
+    let v = Rc::clone(view);
+    ui.on_time_changed(move |on| v.borrow_mut().time_changed(on));
+    let v = Rc::clone(view);
+    ui.on_day_step(move |step| v.borrow_mut().day_step(step));
+    let v = Rc::clone(view);
+    ui.on_day_whole(move || v.borrow_mut().day_whole());
+    let v = Rc::clone(view);
+    ui.on_time_wheel(move |x, w, delta| v.borrow_mut().time_wheel(x, w, delta));
+    let v = Rc::clone(view);
+    ui.on_time_press(move |x| v.borrow_mut().time_press(x));
+    let v = Rc::clone(view);
+    ui.on_time_drag(move |x, w| v.borrow_mut().time_drag(x, w));
+    let v = Rc::clone(view);
+    ui.on_time_release(move || v.borrow_mut().time_release());
+    let v = Rc::clone(view);
+    ui.on_time_hover(move |x, _y, w, _h| v.borrow().time_hover(x, w).into());
+    let v = Rc::clone(view);
+    ui.on_layout_changed(move |layout| v.borrow_mut().layout_changed(layout));
+    let v = Rc::clone(view);
+    ui.on_quantity_changed(move |quantity| v.borrow_mut().quantity_changed(quantity));
+    let v = Rc::clone(view);
+    ui.on_events_filter(move |all| v.borrow_mut().events_filter(all));
+    let v = Rc::clone(view);
+    ui.on_event_clicked(move |row| v.borrow_mut().event_clicked(row));
     let v = Rc::clone(view);
     ui.on_model_toggled(move || v.borrow_mut().model_toggled());
     let v = Rc::clone(view);
@@ -122,13 +151,15 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_auto_toggled(move || v.borrow_mut().auto_toggled());
     let v = Rc::clone(view);
-    ui.on_step_up_toggled(move || v.borrow_mut().step_up_toggled());
-    let v = Rc::clone(view);
     ui.on_log_toggled(move || v.borrow_mut().log_toggled());
     let v = Rc::clone(view);
     ui.on_limit_moved(move |value| v.borrow_mut().limit_moved(value));
     let v = Rc::clone(view);
     ui.on_limit_released(move |value| v.borrow_mut().limit_released(value));
+    let v = Rc::clone(view);
+    ui.on_emergency_moved(move |value| v.borrow_mut().emergency_moved(value));
+    let v = Rc::clone(view);
+    ui.on_emergency_released(move |value| v.borrow_mut().emergency_released(value));
     // Закрытие: размер и место — в файл окна; окно прячется, его цикл кончается.
     let v = Rc::clone(view);
     ui.window().on_close_requested(move || {
@@ -232,7 +263,12 @@ fn main() {
     VIEW.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&view)));
     connect(&ui, &view);
     // Поток статистики живёт, пока жив его отправитель, — до конца окна; окно шлёт ему блоки и соседей для модели.
-    let stats = store::start(data, |digest| to_view(move |view| view.on_digest(digest)));
+    let stats = store::start(data, |delivery| {
+        to_view(move |view| match delivery {
+            store::Delivery::Digest(digest) => view.on_digest(digest),
+            store::Delivery::Day(day) => view.on_day(day),
+        });
+    });
     view.borrow_mut().stats_to(stats);
     ui.run().expect("окно");
 }

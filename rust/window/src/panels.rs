@@ -596,6 +596,50 @@ pub struct TileFacts<'a> {
     pub fused: Option<i64>,
     /// Выбранный профиль: «csmart2» или «заводские»; None — ничего не выбрано.
     pub profile: Option<&'a str>,
+    /// ▲ и ø по потолкам с последнего сброса (`ceilings_of`); пусто — программа их не шлёт (до 0.5.6).
+    pub by_ceiling: &'a [crate::wire::ByCeiling],
+}
+
+/// ▲ и ø блока по потолкам из состояния: список блока (поле byCeiling — по блокам, как их знакомство), по убыванию
+/// потолка (программа шлёт так же; порядок здесь — чтобы подсказка от него не зависела).
+#[must_use]
+pub fn ceilings_of(
+    block: &BlockInfo,
+    row: Option<&[Option<Vec<crate::wire::ByCeiling>>]>,
+) -> Vec<crate::wire::ByCeiling> {
+    let mut out = row
+        .and_then(|r| r.get(block.index))
+        .and_then(Option::as_ref)
+        .cloned() // a few ceilings of one block, per tile refresh
+        .unwrap_or_default();
+    out.sort_by_key(|e| std::cmp::Reverse(e.ceiling));
+    out
+}
+
+/// «по потолкам с последнего сброса» в подсказке плитки (дополнение брифа W): строка на потолок — ▲, ø и время под
+/// нагрузкой, нынешний помечен. Программа до 0.5.6 их не шлёт — части нет.
+fn ceiling_lines(t: &TileFacts, tip: &mut String) {
+    if t.by_ceiling.is_empty() {
+        return;
+    }
+    tip.push_str(
+        "\nпо потолкам с последнего сброса (копятся, пока включён автомодуль или журнал, либо открыто окно; сбрасываются кнопкой или когда ты меняешь потолок блока):",
+    );
+    for e in t.by_ceiling {
+        let _ = write!(
+            tip,
+            "\n• ×{}{}: ▲ {}, ø {}, под нагрузкой {}",
+            e.ceiling,
+            if t.ceiling.now == Some(e.ceiling) {
+                " (сейчас)"
+            } else {
+                ""
+            },
+            e.max.map_or_else(|| "–".to_string(), |v| format!("{v:.0} °C")),
+            e.mean.map_or_else(|| "–".to_string(), |v| format!("{v:.1} °C")),
+            e.secs.map_or_else(|| "–".to_string(), span_of)
+        ); // into a String
+    }
 }
 
 pub fn tile_tip(t: &TileFacts) -> String {
@@ -649,6 +693,7 @@ pub fn tile_tip(t: &TileFacts) -> String {
             ); // into a String
         }
     }
+    ceiling_lines(t, &mut tip);
     tip.push_str("\n• ▲ и ø обнуляет кнопка над схемой");
     if t.throttled {
         tip.push_str("\n• сейчас сбрасывает частоту из-за перегрева");
@@ -1098,5 +1143,70 @@ mod tests {
         assert_eq!(grouped(0), "0");
         assert_eq!(grouped(43_200), "43 200");
         assert_eq!(grouped(1_234_567), "1 234 567");
+    }
+
+    #[test]
+    fn tile_tooltip_lists_maxima_and_means_by_ceiling_since_the_reset() {
+        // Дополнение брифа W: «по потолкам с последнего сброса», строка на потолок — ▲, ø, время под нагрузкой; нынешний
+        // помечен; как они копятся и сбрасываются — в заголовке части. Поле — по блокам. Программа 0.5.5 его не шлёт —
+        // части нет. Ловит: список не того блока, нынешний не помечен, часть без данных.
+        use crate::wire::ByCeiling;
+        let e = |ceiling, max, mean, secs| ByCeiling {
+            ceiling,
+            max: Some(max),
+            mean: Some(mean),
+            secs: Some(secs),
+        };
+        let cluster = block(1, "2–5", vec![1, 2, 3, 4]);
+        let by_block: Vec<Option<Vec<ByCeiling>>> = vec![
+            Some(vec![e(50, 90.0, 80.0, 600.0)]),
+            Some(vec![e(44, 72.0, 61.5, 300.0), e(45, 75.0, 62.3, 120.0)]),
+        ];
+        let merged = ceilings_of(&cluster, Some(&by_block));
+        assert_eq!(
+            merged.iter().map(|x| x.ceiling).collect::<Vec<_>>(),
+            [45, 44],
+            "список своего блока, по убыванию потолка"
+        );
+        assert_eq!(ceilings_of(&cluster, None), Vec::<ByCeiling>::new());
+        assert_eq!(
+            ceilings_of(&cluster, Some(&by_block[..1])),
+            Vec::<ByCeiling>::new(),
+            "ряд короче — части нет"
+        );
+        let facts = |by: &[ByCeiling]| {
+            tile_tip(&TileFacts {
+                block: &cluster,
+                cores: &[],
+                cur: &[],
+                temp: None,
+                peak: None,
+                mean: None,
+                ratio: None,
+                mean_ratio: None,
+                throttled: false,
+                ceiling: Ceiling {
+                    now: Some(44),
+                    ..Ceiling::default()
+                },
+                fused: None,
+                profile: None,
+                by_ceiling: by,
+            })
+        };
+        let tip = facts(&merged);
+        assert!(
+            tip.contains("по потолкам с последнего сброса (копятся, пока включён автомодуль"),
+            "{tip}"
+        );
+        assert!(
+            tip.contains("• ×44 (сейчас): ▲ 72 °C, ø 61.5 °C, под нагрузкой 5 мин 0 с"),
+            "{tip}"
+        );
+        assert!(
+            tip.contains("• ×45: ▲ 75 °C, ø 62.3 °C, под нагрузкой 2 мин 0 с"),
+            "{tip}"
+        );
+        assert!(!facts(&[]).contains("по потолкам"), "без поля (0.5.5) — части нет");
     }
 }

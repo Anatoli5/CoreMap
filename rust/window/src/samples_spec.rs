@@ -681,7 +681,7 @@ fn spans_are(t: &Tally, expected: &[f64]) {
 }
 
 // Пик: температура, точный множитель строки, её нагрузка (или «неизвестна») и время строки.
-fn peak_is(p: Peak, temp: f64, ratio: f64, busy: Option<f64>, when: i64) {
+fn peak_is(p: &Peak, temp: f64, ratio: f64, busy: Option<f64>, when: i64) {
     let same_busy = match (p.busy, busy) {
         (Some(x), Some(y)) => close(x, y),
         (None, None) => true,
@@ -1061,7 +1061,7 @@ fn bins_take_rows_at_any_load_and_weight_temp_and_load_by_time() {
     assert!(near(b45.mean(), 600.0 / 9.0), "среднее по времени: {:?}", b45.mean());
     // (0·2 + 1·1 + 0,25·2 + 0,5·1) / 6 — только строки, где нагрузка известна; по строкам было бы 0,4375
     assert!(near(b45.load(), 2.0 / 6.0), "нагрузка по времени: {:?}", b45.load());
-    peak_is(b45.peak, 90.0, 45.3, None, OCT15 + (base + 3) * 1000);
+    peak_is(&b45.peak, 90.0, 45.3, None, OCT15 + (base + 3) * 1000);
 }
 
 #[test]
@@ -1071,7 +1071,7 @@ fn peak_is_the_hottest_row_ties_go_to_the_later_time_in_any_merge_order() {
         (new_at(base), "45.20", "0.80", "80"),
         (new_at(base + 250), "44.70", "", "70"),
     ]);
-    peak_is(bin(&x, "0", 45).peak, 80.0, 45.2, Some(0.8), OCT15 + base);
+    peak_is(&bin(&x, "0", 45).peak, 80.0, 45.2, Some(0.8), OCT15 + base);
     // другой файл с той же наибольшей температурой позже — пик из него; раньше — пик остаётся из x
     let later = block0(&[
         (new_at(base + 5000), "44.90", "", "80"),
@@ -1091,7 +1091,7 @@ fn peak_is_the_hottest_row_ties_go_to_the_later_time_in_any_merge_order() {
         yx.merge(&x);
         for m in [&xy, &yx] {
             let b45 = bin(m, "0", 45);
-            peak_is(b45.peak, 80.0, ratio, busy, when);
+            peak_is(&b45.peak, 80.0, ratio, busy, when);
             assert_eq!((m.rows, b45.n), (4, 4));
             assert!(close(m.secs, 1.0) && close(b45.secs, 1.0), "{b45:?}");
             assert!(near(b45.mean(), 76.25), "{:?}", b45.mean());
@@ -1105,7 +1105,7 @@ fn peak_is_the_hottest_row_ties_go_to_the_later_time_in_any_merge_order() {
         (new_at(base + 10_000), "45.10", "0.90", "85"),
         (new_at(base + 9_000), "44.80", "0.60", "85"),
     ]);
-    peak_is(bin(&back, "0", 45).peak, 85.0, 45.1, Some(0.9), OCT15 + base + 10_000);
+    peak_is(&bin(&back, "0", 45).peak, 85.0, 45.1, Some(0.9), OCT15 + base + 10_000);
 }
 
 #[test]

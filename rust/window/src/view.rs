@@ -15,10 +15,16 @@
 // ничего не шлёт. «Применить» ставит выбранный, «сохранить» пишет в него текущее, «загружать при старте Windows» —
 // отдельный выбор (команда profile.startup), видимый только знаком в списке.
 //
-// Настройки автомодуля (DECISIONS #36) — выбор программы у часов: окно показывает тему settings и шлёт изменения
-// командой auto.set; ползунок — одной командой, когда его отпустили. Пока его тянут и пока программа не подтвердила
-// новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад. Журнал срезов — свой
-// выключатель той же программы (владелец 16.10): «запись» в шапке статистики, команда log.set.
+// Настройки автомодуля (DECISIONS #36, бриф T) — выбор программы у часов: окно показывает тему settings и шлёт изменения
+// командой auto.set; ползунок (цель или аварийная) — одной командой, когда его отпустили. Пока его тянут и пока
+// программа не подтвердила новое число, ручка и линия стоят на числе под рукой (`limit_held`, `emergency_held`), а не
+// прыгают назад. Журнал срезов — свой выключатель той же программы (владелец 16.10): «запись» в шапке статистики,
+// команда log.set.
+//
+// Ось x — время (бриф W с поправкой 16.10, timeline.rs): день журнала поток статистики читает по просьбе окна
+// (`Order::Day`) — блоки и ряды раскладки; окно держит показанный отрезок, колесо и перетаскивание меняют его, полосы
+// пересчитываются из дня в памяти. События (events.rs) — списком под графиком; щелчок по строке — ось x время, день
+// события, момент посередине.
 // Что окно помнит о себе (сравниваемые блоки, подсветка, вид графика, размер и место) — его собственный файл
 // (src/saved.rs).
 use std::cmp::Ordering;
@@ -27,17 +33,21 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use serde_json::{Map, Value};
-use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use slint::{Color, ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 use crate::chart::{self, Curves, Scale, StatsShown};
 use crate::die::{self, Geometry};
+use crate::events::{self, Event as Happened};
 use crate::model::Die;
 use crate::panels::{self, ProfileInput, ProfileShown};
 use crate::pipe::{Event, Link};
 use crate::saved::{self, Remembered};
-use crate::store::{Digest, Order};
+use crate::store::{DayOrder, Digest, Order};
+use crate::timeline::{self, Act, Day, Layout, Quantity, TimeInput, TimeShown, Under};
 use crate::wire::{AutoSettings, Hello, Limits, Message, Profiles, State};
-use crate::{AppWindow, CellData, LinkData, MenuEntry, SetRow, TileData};
+use crate::{
+    AppWindow, CellData, LineRow, LinkData, MenuEntry, SetRow, Tick, TileData, TimeDot, TimeMark, TimeRef, TimeStrip,
+};
 
 const TEXT: [u8; 3] = [0xe6, 0xe8, 0xec];
 const ACCENT: [u8; 3] = [0xff, 0xd1, 0x66];
@@ -45,6 +55,53 @@ const BAD: [u8; 3] = [0xff, 0x5d, 0x5d];
 const CELL: [u8; 3] = [0x2a, 0x2e, 0x36];
 /// Полоска плитки, пока ▲ наибольшей ещё нет.
 const NO_PEAK: [u8; 3] = [0x35, 0x3a, 0x44];
+/// Строк в списке событий не больше: каждая — несколько элементов Slint, а событий за 30 дней — сотни; старшие видны
+/// отметками на графиках.
+const EVENT_ROWS: usize = 500;
+/// Ширина показа вокруг события по щелчку, когда узкого показа того же дня не было: 10 мин.
+const CENTRE_SPAN: i64 = 600_000;
+
+/// Прочитанный день — ответ на эту просьбу: тот же день, те же блоки по порядку и те же ряды.
+fn answers(asked: &DayOrder, day: &Day) -> bool {
+    asked.date == day.date
+        && asked.quantities == day.quantities
+        && asked.blocks.iter().eq(day.blocks.iter().map(|b| &b.name))
+}
+
+/// Блоки показа для timeline.rs: подпись и цвет.
+fn shown_blocks<'a>(labels: &'a [String], colours: &[u32]) -> Vec<timeline::Shown<'a>> {
+    labels
+        .iter()
+        .zip(colours)
+        .map(|(label, &color)| timeline::Shown { label, color })
+        .collect()
+}
+
+fn tick_rows(ticks: &[(f32, String)]) -> Vec<Tick> {
+    ticks
+        .iter()
+        .map(|(f, t)| Tick {
+            f: *f,
+            text: t.as_str().into(),
+        })
+        .collect()
+}
+
+/// Событие одной строкой для подсказки графика по времени: время, блок, изменение, что и почему; подробности — второй.
+fn event_line(e: &Happened) -> String {
+    let mut line = format!(
+        "{} {}{}: {}",
+        e.time,
+        e.block.as_deref().map(|b| format!("{b} ")).unwrap_or_default(),
+        e.change,
+        e.why
+    );
+    if !e.details.is_empty() {
+        line.push_str("\n    ");
+        line.push_str(&e.details);
+    }
+    line
+}
 
 fn rgb([r, g, b]: [u8; 3]) -> Color {
     Color::from_rgb_u8(r, g, b)
@@ -154,12 +211,38 @@ pub struct View {
     sets: Rc<VecModel<SetRow>>,
     /// Блоки в статистике (номера) по порядку добавления; цвет — у блока (`chart::color_of`).
     pub compared: Vec<usize>,
-    /// Вид графика (src/chart.rs): шкала, линии, оси местами.
+    /// Вид графика (src/chart.rs): нагрев ядра, над кристаллом или абсолютная; линии, оси местами.
     pub scale: Scale,
     pub curves: Curves,
+    /// Линия наибольших (переключатель «макс»).
+    pub max: bool,
     /// Кривые модели нагрева (переключатель «модель»).
     pub model: bool,
     pub swap: bool,
+    /// Ось x — время (иначе множитель).
+    pub timeline: bool,
+    /// Раскладка по времени и величина раскладки «блоки».
+    pub layout: Layout,
+    pub quantity: Quantity,
+    /// Список событий: все блоки или выбранные.
+    pub events_all: bool,
+    /// Что список событий показывает: события (указатель сводки), выбранные блоки, переключатель — не пересобирать
+    /// тот же; номера показанных событий по строкам.
+    events_key: Option<(usize, Vec<usize>, bool)>,
+    listed: Vec<usize>,
+    /// Событие, которое показать посередине, когда его день прочитан: день и время, мс.
+    centre: Option<(String, i64)>,
+    /// Выбранный день («ГГГГ-ММ-ДД»); None — самый новый.
+    pub day: Option<String>,
+    /// Показанный отрезок дня, мс; None — весь день.
+    pub span: Option<(i64, i64)>,
+    /// День, который поток статистики прочитал по последней просьбе.
+    pub day_data: Option<Arc<Day>>,
+    /// О чём окно попросило поток статистики (не просить дважды).
+    asked: Option<DayOrder>,
+    pub shown_time: Option<TimeShown>,
+    /// Перетаскивание по полю «по времени»: где мышь была в прошлом событии.
+    drag_x: Option<f32>,
     /// Поток статистики: ему уходят блоки и соседи из знакомства — по ним считается модель.
     stats: Option<mpsc::Sender<Order>>,
     /// Подсветка линий (владелец 15.10 не решил, какая удобнее, — переключатель в окне): false — под курсором (плитка
@@ -190,6 +273,9 @@ pub struct View {
     /// состоянием); None — ручка и линия стоят на выборе программы.
     limit_held: Option<i32>,
     limit_dragging: bool,
+    /// То же у аварийной отсечки (подтверждение — тема settings).
+    emergency_held: Option<i32>,
+    emergency_dragging: bool,
     /// Сколько команд окно послало (скрытой проверке: движение ползунка — одна команда).
     pub sent: u32,
     /// Файл окна: что оно помнит о себе; запоминается при смене выбора и подсветки и при закрытии.
@@ -208,14 +294,15 @@ impl View {
         let sets = Rc::new(VecModel::default());
         ui.set_sets(ModelRc::from(Rc::clone(&sets)));
         let pin_mode = memory.saved.pin.unwrap_or(false);
-        let scale = match memory.saved.above {
-            Some(false) => Scale::Absolute,
-            Some(true) => Scale::AboveDie,
-            None => Scale::default(),
-        };
+        let scale = memory.saved.view.unwrap_or_default();
         let curves = memory.saved.curves.unwrap_or_default();
+        let max = memory.saved.max.unwrap_or(false);
         let model = memory.saved.model.unwrap_or(true);
         let swap = memory.saved.swap.unwrap_or(false);
+        let timeline = memory.saved.timeline.unwrap_or(false);
+        let layout = memory.saved.layout.unwrap_or_default();
+        let quantity = memory.saved.quantity.unwrap_or_default();
+        let events_all = memory.saved.events_all.unwrap_or(false);
         let restore = (!memory.saved.compared.is_empty()).then(|| memory.saved.compared.clone()); // a few names, once
         let problem = memory.trouble.clone(); // one line, once
         let view = View {
@@ -232,8 +319,22 @@ impl View {
             compared: Vec::new(),
             scale,
             curves,
+            max,
             model,
             swap,
+            timeline,
+            layout,
+            quantity,
+            events_all,
+            events_key: None,
+            listed: Vec::new(),
+            centre: None,
+            day: None,
+            span: None,
+            day_data: None,
+            asked: None,
+            shown_time: None,
+            drag_x: None,
             stats: None,
             pin_mode,
             pinned: None,
@@ -254,6 +355,8 @@ impl View {
             log: None,
             limit_held: None,
             limit_dragging: false,
+            emergency_held: None,
+            emergency_dragging: false,
             sent: 0,
             memory,
             restore,
@@ -261,6 +364,7 @@ impl View {
         };
         view.show_link();
         view.show_problem();
+        view.show_mode();
         if ui.get_pin_mode() != pin_mode {
             ui.set_pin_mode(pin_mode);
         }
@@ -282,6 +386,8 @@ impl View {
                 // Ответов на посланное уже не будет: ручки — на последнем известном выборе программы.
                 self.limit_held = None;
                 self.limit_dragging = false;
+                self.emergency_held = None;
+                self.emergency_dragging = false;
                 self.show_link();
                 self.show_auto();
                 self.refresh_stats();
@@ -323,8 +429,10 @@ impl View {
                     };
                     if !reply.ok && pending.held {
                         self.limit_held = None;
+                        self.emergency_held = None;
                         self.show_auto();
                         self.refresh_stats();
+                        self.refresh_time();
                     }
                     if reply.ok
                         && let Some(name) = pending.saved_as
@@ -344,13 +452,14 @@ impl View {
                 }
             }
             Event::Message(Message::Settings(settings)) => {
+                let lines = (self.cutoff(), self.emergency());
                 self.auto = settings.auto;
                 self.log = settings.log.map(|l| l.on);
-                let cutoff = self.cutoff();
                 self.settle_holds();
                 self.show_auto();
-                if self.cutoff() != cutoff {
+                if (self.cutoff(), self.emergency()) != lines {
                     self.refresh_stats();
+                    self.refresh_time();
                 }
             }
             Event::Message(Message::Bye) => self.leave(),
@@ -392,6 +501,30 @@ impl View {
         self.digest = Some(digest);
         self.refresh_stats();
         self.refresh_links();
+        // Дни могли появиться (полночь), события — дописаться.
+        self.ask_day();
+        self.refresh_time();
+    }
+
+    /// День оси времени прочитан (поток store.rs). Ответ не на последнюю просьбу — не нужен. Тот же день перечитан
+    /// (дописан или с другими рядами): показ, который был весь день, растёт с ним; иначе остаётся. Ждёт центр
+    /// события — показ вокруг него.
+    pub fn on_day(&mut self, day: Arc<Day>) {
+        if self.asked.as_ref().is_none_or(|a| !answers(a, &day)) {
+            return;
+        }
+        let was_whole = match (&self.day_data, self.span) {
+            (Some(old), Some(span)) => old.date == day.date && old.bounds() == Some(span),
+            _ => true,
+        };
+        let same_day = self.day_data.as_ref().is_some_and(|old| old.date == day.date);
+        self.span = match (day.bounds(), self.span) {
+            (Some(bounds), Some(span)) if same_day && !was_whole => Some(timeline::pan(span, bounds, 0.0)),
+            (bounds, _) => bounds,
+        };
+        self.day_data = Some(day);
+        self.apply_centre();
+        self.refresh_time();
     }
 
     fn ui(&self) -> AppWindow {
@@ -663,6 +796,7 @@ impl View {
             data.auto = format!("авто {}", panels::signed(c.auto)).into();
         }
         data.ban = c.ban.is_some();
+        let by_ceiling = panels::ceilings_of(block, s.by_ceiling.as_deref());
         data.tip = panels::tile_tip(&panels::TileFacts {
             block,
             cores: &hello.cores,
@@ -676,6 +810,7 @@ impl View {
             ceiling: c,
             fused,
             profile: chosen_title.as_deref(),
+            by_ceiling: &by_ceiling,
         })
         .into();
         Some(data)
@@ -729,8 +864,17 @@ impl View {
         Some(self.limit_held.map_or(on, f64::from))
     }
 
+    /// Аварийная отсечка на графике: так же — пока автомодуль включён; число — из темы settings или под ручкой.
+    fn emergency(&self) -> Option<f64> {
+        self.state.as_ref().and_then(|s| s.auto_limit)?;
+        let set = self.auto.as_ref().and_then(|a| a.emergency)?;
+        Some(f64::from(self.emergency_held.unwrap_or_else(|| slint_int(set))))
+    }
+
     fn refresh_stats(&mut self) {
+        self.refresh_events();
         let cutoff = self.cutoff();
+        let emergency = self.emergency();
         let Some(hello) = self.hello.as_ref() else { return };
         let shown = chart::stats_panel(&chart::StatsInput {
             blocks: &hello.blocks,
@@ -738,9 +882,11 @@ impl View {
             highlight: self.highlight(),
             fused: self.limits.as_ref().map(|l| l.fused.as_slice()),
             cutoff,
+            emergency,
             digest: self.digest.as_deref(),
             scale: self.scale,
             curves: self.curves,
+            max: self.max,
             model: self.model,
             swap: self.swap,
         });
@@ -753,9 +899,12 @@ impl View {
         set_text(&ui.get_chart_cutoff_text(), &shown.cutoff_text, |t| {
             ui.set_chart_cutoff_text(t);
         });
-        set_text(&ui.get_actions_empty(), &shown.actions_empty, |t| {
-            ui.set_actions_empty(t);
+        set_text(&ui.get_chart_emergency_text(), &shown.emergency_text, |t| {
+            ui.set_chart_emergency_text(t);
         });
+        if ui.get_chart_emergency().to_bits() != shown.emergency.to_bits() {
+            ui.set_chart_emergency(shown.emergency);
+        }
         set_text(&ui.get_chart_value_title(), &shown.value_title, |t| {
             ui.set_chart_value_title(t);
         });
@@ -766,15 +915,17 @@ impl View {
         if ui.get_chart_zero().to_bits() != shown.zero.to_bits() {
             ui.set_chart_zero(shown.zero);
         }
-        let above = self.scale == Scale::AboveDie;
-        if ui.get_chart_above() != above {
-            ui.set_chart_above(above);
+        if ui.get_chart_view() != self.scale.index() {
+            ui.set_chart_view(self.scale.index());
         }
         if ui.get_chart_mean() != self.curves.mean() {
             ui.set_chart_mean(self.curves.mean());
         }
         if ui.get_chart_p95() != self.curves.p95() {
             ui.set_chart_p95(self.curves.p95());
+        }
+        if ui.get_chart_max() != self.max {
+            ui.set_chart_max(self.max);
         }
         if ui.get_chart_model() != self.model {
             ui.set_chart_model(self.model);
@@ -800,9 +951,6 @@ impl View {
         }
         if old.is_none_or(|o| o.legend != shown.legend) {
             ui.set_stats_legend(ModelRc::new(VecModel::from(shown.legend_rows())));
-        }
-        if old.is_none_or(|o| o.actions != shown.actions) {
-            ui.set_actions(ModelRc::new(VecModel::from(shown.action_rows())));
         }
         self.shown_stats = Some(shown);
     }
@@ -955,8 +1103,38 @@ impl View {
         if ui.get_auto_on() != a.on {
             ui.set_auto_on(a.on);
         }
-        if ui.get_auto_step_up() != a.step_up {
-            ui.set_auto_step_up(a.step_up);
+        // Аварийная (с 0.5.6): её промежуток — от цели под ручкой + 1, пока цель тянут (бриф T: цель + 1 … 100).
+        let has = a.emergency.is_some();
+        if ui.get_has_emergency() != has {
+            ui.set_has_emergency(has);
+        }
+        if let Some(set) = a.emergency {
+            let [low, high] = match self.limit_held {
+                Some(limit) if a.emergency_range.is_none() => [i64::from(limit) + 1, 100],
+                _ => a.emergency_span(),
+            };
+            let ints = [
+                (
+                    ui.get_auto_emergency(),
+                    self.emergency_held.unwrap_or_else(|| slint_int(set)),
+                    AppWindow::set_auto_emergency as fn(&AppWindow, i32),
+                ),
+                (
+                    ui.get_auto_emergency_min(),
+                    slint_int(low),
+                    AppWindow::set_auto_emergency_min,
+                ),
+                (
+                    ui.get_auto_emergency_max(),
+                    slint_int(high),
+                    AppWindow::set_auto_emergency_max,
+                ),
+            ];
+            for (now, want, set) in ints {
+                if now != want {
+                    set(&ui, want);
+                }
+            }
         }
     }
 
@@ -968,6 +1146,12 @@ impl View {
     )]
     fn settle_holds(&mut self) {
         let Some(a) = &self.auto else { return };
+        if !self.emergency_dragging
+            && let Some(held) = self.emergency_held
+            && a.emergency == Some(i64::from(held))
+        {
+            self.emergency_held = None;
+        }
         if !self.limit_dragging
             && let Some(held) = self.limit_held
             && i64::from(held) == a.limit
@@ -1011,19 +1195,16 @@ impl View {
         }
     }
 
-    pub fn step_up_toggled(&mut self) {
-        if let Some(up) = self.auto.as_ref().map(|a| a.step_up) {
-            self.set_auto("stepUp", (!up).into(), "Подтягивание не переключено", false);
-        }
-    }
-
     /// Ползунок отсечки тянут: число под ручкой — линией на графике (если автомодуль включён). Команды нет.
     pub fn limit_moved(&mut self, value: i32) {
         let cutoff = self.cutoff();
         self.limit_dragging = true;
         self.limit_held = Some(value);
+        // Нижний край аварийной идёт за целью.
+        self.show_auto();
         if self.cutoff() != cutoff {
             self.refresh_stats();
+            self.refresh_time();
         }
     }
 
@@ -1036,6 +1217,32 @@ impl View {
         self.show_auto();
         if self.cutoff() != cutoff {
             self.refresh_stats();
+            self.refresh_time();
+        }
+    }
+
+    /// Ползунок аварийной отсечки тянут: число под ручкой — линией на графике. Команды нет.
+    pub fn emergency_moved(&mut self, value: i32) {
+        let line = self.emergency();
+        self.emergency_dragging = true;
+        self.emergency_held = Some(value);
+        if self.emergency() != line {
+            self.refresh_stats();
+            self.refresh_time();
+        }
+    }
+
+    /// Ползунок аварийной отсечки отпустили: одна команда auto.set {emergency}, если число другое.
+    pub fn emergency_released(&mut self, value: i32) {
+        let line = self.emergency();
+        self.emergency_dragging = false;
+        let same = self.auto.as_ref().is_none_or(|a| a.emergency == Some(i64::from(value)));
+        self.emergency_held =
+            (!same && self.set_auto("emergency", value.into(), "Аварийная отсечка не изменена", true)).then_some(value);
+        self.show_auto();
+        if self.emergency() != line {
+            self.refresh_stats();
+            self.refresh_time();
         }
     }
 
@@ -1055,10 +1262,15 @@ impl View {
                 .collect();
         }
         saved.pin = Some(self.pin_mode);
-        saved.above = Some(self.scale == Scale::AboveDie);
+        saved.view = Some(self.scale);
         saved.curves = Some(self.curves);
+        saved.max = Some(self.max);
         saved.model = Some(self.model);
         saved.swap = Some(self.swap);
+        saved.timeline = Some(self.timeline);
+        saved.layout = Some(self.layout);
+        saved.quantity = Some(self.quantity);
+        saved.events_all = Some(self.events_all);
         saved.maximized = window.is_maximized();
         if !window.is_maximized() && !window.is_minimized() {
             let size = window.size().to_logical(window.scale_factor());
@@ -1101,6 +1313,9 @@ impl View {
         }
         self.refresh(false);
         self.refresh_stats();
+        // Ось x — время: блоки раскладки из выбранных.
+        self.ask_day();
+        self.refresh_time();
         self.remember();
     }
 
@@ -1147,14 +1362,21 @@ impl View {
         }
     }
 
-    /// Шкала графика: над кристаллом (true) или абсолютная.
-    pub fn scale_changed(&mut self, above: bool) {
-        let scale = if above { Scale::AboveDie } else { Scale::Absolute };
+    /// Вид графика: 0 — нагрев ядра, 1 — над кристаллом, 2 — абсолютная (`Scale::of`).
+    pub fn view_changed(&mut self, index: i32) {
+        let scale = Scale::of(index);
         if self.scale != scale {
             self.scale = scale;
             self.refresh_stats();
             self.remember();
         }
+    }
+
+    /// «макс»: линию наибольших показать или скрыть; остальные — как были.
+    pub fn max_toggled(&mut self) {
+        self.max = !self.max;
+        self.refresh_stats();
+        self.remember();
     }
 
     /// «ø»: линии средних показать или скрыть; 95 % — как были (владелец 16.10: два независимых выключателя).
@@ -1187,14 +1409,536 @@ impl View {
         }
     }
 
+    /// Линия под курсором: в «нагреве ядра» — точки частных остатков и кривая модели, в остальных видах — показанные
+    /// линии (ø, 95 %, наибольшие) и кривая модели.
     fn near(&self, x: f32, y: f32, w: f32, h: f32) -> Option<usize> {
         let series = self.shown_stats.as_ref().map(|s| s.series.as_slice())?;
-        chart::nearest(
+        let own = self.scale == Scale::OwnHeat;
+        chart::nearest_with(
             series,
             (f64::from(x), f64::from(y)),
             (f64::from(w), f64::from(h)),
-            self.curves,
+            if own { Curves::Mean } else { self.curves },
+            self.max && !own,
         )
+    }
+
+    // ----- ось x — время -----
+
+    /// Ось x: множитель (false) или время (true).
+    pub fn time_changed(&mut self, on: bool) {
+        if self.timeline == on {
+            return;
+        }
+        self.timeline = on;
+        self.show_mode();
+        self.ask_day();
+        self.refresh_stats();
+        self.refresh_time();
+        self.remember();
+    }
+
+    /// Раскладка по времени: 0 — «блоки», 1 — «параметры».
+    pub fn layout_changed(&mut self, layout: i32) {
+        let layout = if layout == 1 { Layout::Params } else { Layout::Blocks };
+        if self.layout == layout {
+            return;
+        }
+        self.layout = layout;
+        self.show_mode();
+        self.ask_day();
+        self.refresh_time();
+        self.remember();
+    }
+
+    /// Величина раскладки «блоки» (`Quantity::index`).
+    pub fn quantity_changed(&mut self, quantity: i32) {
+        let quantity = Quantity::of(quantity);
+        if self.quantity == quantity {
+            return;
+        }
+        self.quantity = quantity;
+        self.show_mode();
+        self.ask_day();
+        self.refresh_time();
+        self.remember();
+    }
+
+    /// Ось x, раскладка и величина — в окно (панель статистики от них не зависит, `refresh_stats` их не ставит).
+    fn show_mode(&self) {
+        let ui = self.ui();
+        if ui.get_chart_time() != self.timeline {
+            ui.set_chart_time(self.timeline);
+        }
+        let layout = i32::from(self.layout == Layout::Params);
+        if ui.get_time_layout() != layout {
+            ui.set_time_layout(layout);
+        }
+        if ui.get_time_quantity() != self.quantity.index() {
+            ui.set_time_quantity(self.quantity.index());
+        }
+        if ui.get_events_all() != self.events_all {
+            ui.set_events_all(self.events_all);
+        }
+    }
+
+    /// Дни со срезами (по возрастанию) и показанный: выбранный, если он ещё есть, иначе самый новый.
+    fn days(&self) -> (&[String], Option<&str>) {
+        let days = self.digest.as_ref().map_or(&[][..], |d| d.days.as_slice());
+        let chosen = self
+            .day
+            .as_deref()
+            .filter(|d| days.iter().any(|x| x == d))
+            .or_else(|| days.last().map(String::as_str));
+        (days, chosen)
+    }
+
+    /// Блоки по времени (номера): «блоки» — все выбранные, «параметры» — первые два.
+    fn time_indices(&self) -> Vec<usize> {
+        let take = match self.layout {
+            Layout::Blocks => self.compared.len(),
+            Layout::Params => 2,
+        };
+        self.compared.iter().take(take).copied().collect()
+    }
+
+    /// Просьба к потоку статистики: день, блоки и их ряды, пока ось x — время; иначе день не нужен. Та же просьба
+    /// дважды не идёт; другой день — показ заново (весь день), те же день и другие ряды — показ остаётся.
+    fn ask_day(&mut self) {
+        let wanted = if self.timeline {
+            let (_, chosen) = self.days();
+            let blocks: Vec<String> = self
+                .time_indices()
+                .iter()
+                .filter_map(|&b| Some(self.hello.as_ref()?.blocks.get(b)?.name.clone()))
+                .collect(); // up to twelve names per request
+            let quantities = match self.layout {
+                Layout::Blocks => vec![self.quantity],
+                Layout::Params => Quantity::ALL.to_vec(),
+            };
+            chosen.map(|date| DayOrder {
+                date: date.to_string(),
+                blocks,
+                quantities,
+            })
+        } else {
+            None
+        };
+        if wanted == self.asked {
+            return;
+        }
+        if wanted
+            .as_ref()
+            .is_none_or(|w| self.asked.as_ref().is_none_or(|a| a.date != w.date))
+        {
+            self.span = None;
+            self.day_data = None;
+        }
+        self.asked.clone_from(&wanted);
+        if let Some(stats) = &self.stats {
+            // Поток кончился — дня не будет, вид скажет, что он читается.
+            let _ = stats.send(Order::Day(wanted));
+        }
+    }
+
+    /// ◀ / ▶: день раньше или позже среди дней со срезами; показ — весь день.
+    pub fn day_step(&mut self, step: i32) {
+        let (days, chosen) = self.days();
+        let Some(at) = chosen.and_then(|c| days.iter().position(|d| d == c)) else {
+            return;
+        };
+        let next = if step < 0 { at.checked_sub(1) } else { Some(at + 1) };
+        let Some(date) = next.and_then(|k| days.get(k)).cloned() else {
+            return;
+        };
+        self.choose_day(date);
+        self.ask_day();
+        self.refresh_time();
+    }
+
+    /// Выбор дня: самый новый — «самый новый» (растёт с полуночью), не закреплённая дата.
+    fn choose_day(&mut self, date: String) {
+        let newest = self.digest.as_ref().and_then(|d| d.days.last());
+        self.day = (Some(&date) != newest).then_some(date);
+    }
+
+    /// «весь день»: показ — от первого среза дня до последнего.
+    pub fn day_whole(&mut self) {
+        self.span = self.day_data.as_ref().and_then(|d| d.bounds());
+        self.refresh_time();
+    }
+
+    /// Колесо над полем «по времени»: масштаб вокруг курсора (`timeline::zoom`).
+    pub fn time_wheel(&mut self, x: f32, width: f32, delta: f32) {
+        let (Some(day), Some(span)) = (self.day_data.as_ref(), self.span) else {
+            return;
+        };
+        let Some(bounds) = day.bounds() else { return };
+        self.span = Some(timeline::zoom(
+            span,
+            bounds,
+            f64::from(x) / f64::from(width.max(1.0)),
+            f64::from(delta),
+        ));
+        self.refresh_time();
+    }
+
+    pub fn time_press(&mut self, x: f32) {
+        self.drag_x = Some(x);
+    }
+
+    /// Перетаскивание по полю «по времени»: показ сдвигается вслед за мышью (`timeline::pan`).
+    pub fn time_drag(&mut self, x: f32, width: f32) {
+        let (Some(last), Some(day), Some(span)) = (self.drag_x, self.day_data.as_ref(), self.span) else {
+            return;
+        };
+        let Some(bounds) = day.bounds() else { return };
+        self.span = Some(timeline::pan(
+            span,
+            bounds,
+            f64::from(x - last) / f64::from(width.max(1.0)),
+        ));
+        self.drag_x = Some(x);
+        self.refresh_time();
+    }
+
+    pub fn time_release(&mut self) {
+        self.drag_x = None;
+    }
+
+    /// Подсказка под курсором поля «по времени» (курсор и ширина поля — точки).
+    pub fn time_hover(&self, x: f32, width: f32) -> String {
+        let (Some(day), Some((from, to))) = (self.day_data.as_ref(), self.span) else {
+            return String::new();
+        };
+        let share = f64::from(x) / f64::from(width.max(1.0));
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "milliseconds of a day"
+        )]
+        let at = from + (share * (to - from) as f64).round() as i64;
+        // «Рядом» — 6 точек поля: отметка события или перерыва под курсором.
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "milliseconds of a day"
+        )]
+        let near = (6.0 / f64::from(width.max(1.0)) * (to - from) as f64).round() as i64;
+        let (labels, colours) = self.time_blocks();
+        let shown = shown_blocks(&labels, &colours);
+        timeline::hover(
+            day,
+            &Under {
+                x: at,
+                near,
+                layout: self.layout,
+                quantity: self.quantity,
+                blocks: &shown,
+                events: &self.time_acts(),
+            },
+        )
+    }
+
+    /// Блоки по времени: подписи и цвета.
+    fn time_blocks(&self) -> (Vec<String>, Vec<u32>) {
+        let Some(hello) = self.hello.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        self.time_indices()
+            .iter()
+            .filter_map(|&b| {
+                let block = hello.blocks.get(b)?;
+                Some((panels::capital(&panels::whom(block)), chart::color_of(&hello.blocks, b)))
+            })
+            .unzip()
+    }
+
+    /// События показанного дня для оси времени: блоков на графике (с номером среди них — отметкой на линии блока) и без
+    /// блока (сброс, пробуждение — отметкой под полосами).
+    fn time_acts(&self) -> Vec<Act> {
+        let (Some(digest), Some(hello), Some(day)) =
+            (self.digest.as_ref(), self.hello.as_ref(), self.day_data.as_ref())
+        else {
+            return Vec::new();
+        };
+        let (Some(&first), Some(&last)) = (day.t.first(), day.t.last()) else {
+            return Vec::new();
+        };
+        let indices = self.time_indices();
+        let names: Vec<&str> = indices
+            .iter()
+            .filter_map(|&b| Some(hello.blocks.get(b)?.name.as_str()))
+            .collect();
+        events::listed(&digest.events, &names, false)
+            .into_iter()
+            .filter_map(|(i, which)| {
+                let e = &digest.events[i];
+                let at = e.at.filter(|t| (first..=last).contains(t))?;
+                Some(Act {
+                    at,
+                    color: e.kind.color(),
+                    cut: e.kind.cuts(),
+                    block: which,
+                    tip: event_line(e),
+                })
+            })
+            .collect()
+    }
+
+    /// Полосы оси времени заново (день, показ, раскладка, блоки, отсечки, события); в окно — только изменившееся.
+    #[expect(clippy::too_many_lines, reason = "the time view's properties, one after another")]
+    pub fn refresh_time(&mut self) {
+        if !self.timeline {
+            return;
+        }
+        let ui = self.ui();
+        let (days, chosen) = self.days();
+        let at = chosen.and_then(|c| days.iter().position(|d| d == c));
+        let day_text = chosen.map(timeline::short_date).unwrap_or_default();
+        set_text(&ui.get_day_text(), &day_text, |t| ui.set_day_text(t));
+        let (prev, next) = (at.is_some_and(|k| k > 0), at.is_some_and(|k| k + 1 < days.len()));
+        if ui.get_can_day_prev() != prev {
+            ui.set_can_day_prev(prev);
+        }
+        if ui.get_can_day_next() != next {
+            ui.set_can_day_next(next);
+        }
+        let shown = match (self.day_data.as_ref(), self.span) {
+            _ if self.compared.is_empty() => TimeShown {
+                empty: "Щёлкни по плитке — её день появится здесь.".into(),
+                ..TimeShown::default()
+            },
+            _ if chosen.is_none() => TimeShown {
+                empty: "Срезов пока нет — их пишет CoreMapTray, пока включена запись.".into(),
+                ..TimeShown::default()
+            },
+            // Прочитан ли день, о котором просили (тот же день, те же блоки и ряды) — иначе он ещё читается.
+            (Some(day), Some(span)) if self.asked.as_ref().is_some_and(|a| answers(a, day)) => {
+                let (labels, colours) = self.time_blocks();
+                let blocks = shown_blocks(&labels, &colours);
+                // Картинки полос — в пикселях экрана: столько столбцов прореживания, сколько их видно.
+                let scale = f64::from(ui.window().scale_factor());
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a plot size in pixels, a few thousand"
+                )]
+                let (columns, height) = (
+                    (f64::from(ui.get_time_plot_w().max(100.0)) * scale).round() as usize,
+                    (f64::from(ui.get_time_plot_h().max(40.0)) * scale).round() as usize,
+                );
+                timeline::time_panel(&TimeInput {
+                    day,
+                    view: span,
+                    layout: self.layout,
+                    quantity: self.quantity,
+                    columns,
+                    height,
+                    scale,
+                    blocks: &blocks,
+                    limit: self.cutoff(),
+                    emergency: self.emergency(),
+                    events: &self.time_acts(),
+                })
+            }
+            _ => TimeShown {
+                empty: "День читается…".into(),
+                ..TimeShown::default()
+            },
+        };
+        if self.shown_time.as_ref() == Some(&shown) {
+            return;
+        }
+        set_text(&ui.get_time_head(), &shown.head, |t| ui.set_time_head(t));
+        set_text(&ui.get_time_empty(), &shown.empty, |t| ui.set_time_empty(t));
+        let old = self.shown_time.as_ref();
+        if old.is_none_or(|o| o.strips != shown.strips) {
+            let strips: Vec<TimeStrip> = shown
+                .strips
+                .iter()
+                .map(|s| TimeStrip {
+                    title: s.title.as_str().into(),
+                    ticks: ModelRc::new(VecModel::from(tick_rows(&s.ticks))),
+                    picture: Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                        &s.picture.rgba,
+                        s.picture.width,
+                        s.picture.height,
+                    )),
+                    refs: ModelRc::new(VecModel::from(
+                        s.refs
+                            .iter()
+                            .map(|r| TimeRef {
+                                f: r.f,
+                                color: panels::rgb(r.color),
+                                text: r.text.as_str().into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                })
+                .collect(); // up to seven strips, per zoom or pan
+            ui.set_time_strips(ModelRc::new(VecModel::from(strips)));
+        }
+        if old.is_none_or(|o| o.ticks != shown.ticks) {
+            ui.set_time_ticks(ModelRc::new(VecModel::from(tick_rows(&shown.ticks))));
+        }
+        if old.is_none_or(|o| o.marks != shown.marks) {
+            ui.set_time_marks(ModelRc::new(VecModel::from(
+                shown
+                    .marks
+                    .iter()
+                    .map(|m| TimeMark {
+                        f: m.f,
+                        color: panels::rgb(m.color),
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+        }
+        if old.is_none_or(|o| o.dots != shown.dots) {
+            ui.set_time_dots(ModelRc::new(VecModel::from(
+                shown
+                    .dots
+                    .iter()
+                    .map(|d| TimeDot {
+                        x: d.x,
+                        y: d.y,
+                        color: panels::rgb(d.color),
+                        kind: d.kind,
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+        }
+        if old.is_none_or(|o| o.gaps != shown.gaps) {
+            ui.set_time_gaps(ModelRc::new(VecModel::from(shown.gaps.clone()))); // a few gap marks
+        }
+        self.shown_time = Some(shown);
+    }
+
+    // ----- события -----
+
+    /// «все блоки» (true) или «выбранные блоки» в списке событий.
+    pub fn events_filter(&mut self, all: bool) {
+        if self.events_all == all {
+            return;
+        }
+        self.events_all = all;
+        self.show_mode();
+        self.refresh_events();
+        self.remember();
+    }
+
+    /// Список событий под графиком: новые первыми, все блоки или выбранные; в окно — только когда он другой.
+    fn refresh_events(&mut self) {
+        let (Some(hello), Some(digest)) = (self.hello.as_ref(), self.digest.as_ref()) else {
+            return;
+        };
+        let key = (
+            Arc::as_ptr(&digest.events) as usize,
+            self.compared.clone(),
+            self.events_all,
+        ); // a dozen numbers
+        if self.events_key.as_ref() == Some(&key) {
+            return;
+        }
+        let names: Vec<&str> = self
+            .compared
+            .iter()
+            .filter_map(|&b| Some(hello.blocks.get(b)?.name.as_str()))
+            .collect();
+        let listed = events::listed(&digest.events, &names, self.events_all);
+        // Строк в окне — не больше `EVENT_ROWS` (каждая — несколько элементов Slint); старше — только на графике.
+        let rows: Vec<LineRow> = listed
+            .iter()
+            .take(EVENT_ROWS)
+            .map(|&(i, which)| {
+                let e = &digest.events[i];
+                let mark = which
+                    .and_then(|w| self.compared.get(w))
+                    .map_or(0x0035_3a44, |&b| chart::color_of(&hello.blocks, b));
+                LineRow {
+                    time: e.time.as_str().into(),
+                    head: match &e.block {
+                        Some(b) => format!("{b} {}", e.change).trim_end().into(),
+                        None => e.change.as_str().into(),
+                    },
+                    text: e.why.as_str().into(),
+                    more: e.details.as_str().into(),
+                    color: panels::rgb(e.kind.color()),
+                    mark: panels::rgb(mark),
+                }
+            })
+            .collect();
+        let empty = if digest.events.is_empty() {
+            "событий пока нет: их пишет CoreMapTray с 0.5.6 (отсечки, профили, правки потолков, сбросы)"
+        } else if self.events_all {
+            "событий нет"
+        } else {
+            "с выбранными блоками событий не было — «все блоки» покажет остальные"
+        };
+        let ui = self.ui();
+        set_text(&ui.get_events_empty(), empty, |t| ui.set_events_empty(t));
+        ui.set_events(ModelRc::new(VecModel::from(rows)));
+        self.listed = listed.into_iter().map(|(i, _)| i).take(EVENT_ROWS).collect();
+        self.events_key = Some(key);
+    }
+
+    /// Щелчок по строке списка событий: ось x — время, день события, показ с моментом события посередине (уже был
+    /// узкий показ того же дня — той же ширины, иначе `CENTRE_SPAN`).
+    pub fn event_clicked(&mut self, row: i32) {
+        let Some(&i) = usize::try_from(row).ok().and_then(|r| self.listed.get(r)) else {
+            return;
+        };
+        let Some(e) = self.digest.as_ref().and_then(|d| d.events.get(i)) else {
+            return;
+        };
+        let (Some(at), Some(date)) = (e.at, e.date.clone()) else {
+            return;
+        };
+        let has_samples = self.digest.as_ref().is_some_and(|d| d.days.contains(&date));
+        if !self.timeline {
+            self.timeline = true;
+            self.show_mode();
+        }
+        if has_samples {
+            self.choose_day(date.clone()); // one date
+            self.centre = Some((date, at));
+        }
+        self.ask_day();
+        self.apply_centre();
+        self.refresh_stats();
+        self.refresh_time();
+        self.remember();
+    }
+
+    /// Время события первой строки списка (скрытой проверке).
+    pub fn first_event_time(&self) -> Option<i64> {
+        let i = *self.listed.first()?;
+        self.digest.as_ref()?.events.get(i)?.at
+    }
+
+    /// Ждущий центр события — на показ, когда его день прочитан.
+    fn apply_centre(&mut self) {
+        let (Some((date, at)), Some(day)) = (self.centre.as_ref(), self.day_data.as_ref()) else {
+            return;
+        };
+        if self.asked.as_ref().is_none_or(|a| &a.date != date) {
+            // Просят уже другой день: центр не нужен.
+            self.centre = None;
+            return;
+        }
+        if &day.date != date || !self.asked.as_ref().is_some_and(|a| answers(a, day)) {
+            return;
+        }
+        let (Some(bounds), Some(x)) = (day.bounds(), day.place(*at)) else {
+            self.centre = None;
+            return;
+        };
+        let width = match self.span {
+            Some(s) if s != bounds => s.1 - s.0,
+            _ => CENTRE_SPAN,
+        };
+        self.span = Some(timeline::centred(x, width, bounds));
+        self.centre = None;
     }
 
     fn hover(&mut self, block: Option<usize>) {

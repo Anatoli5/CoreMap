@@ -128,7 +128,8 @@ $procs += Start-Process -FilePath (Join-Path $build 'CoreMapTray.exe') -Argument
 $hover = Join-Path $dir 'hover.txt'
 $procs += Start-Process -FilePath $out -ArgumentList "--simulate --saved --hover --snapshot $hover --size 1920x1040" -PassThru
 
-$procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
+# 300 s, not 120: the logon check runs the window five times and the auto module's cutoff rules; it outgrew 120 s on 16.10 (0.5.6)
+$procs | Wait-Process -Timeout 300 -ErrorAction SilentlyContinue
 $failed = 0
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.Kill(); $failed++; Write-Host 'a snapshot run did not finish' } }
 

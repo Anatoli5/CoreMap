@@ -21,25 +21,48 @@ use std::fmt::Write as _;
 
 use slint::{ModelRc, VecModel};
 
-use crate::model::{BlockModel, Model};
+use crate::events::{Event, Kind};
+use crate::model::{BlockModel, Model, OwnBin};
 use crate::panels::{capital, f, grouped, percent, rgb, span_of, whom};
 use crate::samples::{self, Bin, P95};
 use crate::store::Digest;
 use crate::wire::BlockInfo;
-use crate::{Column, LegendItem, LineRow, Mark, Run, Series, Tick};
-
-const PEAK: u32 = 0x00ff_8a7a;
-const E_TEXT: u32 = 0x006f_d0c8;
+use crate::{Column, Cut, LegendItem, Mark, Run, Series, Tick};
 
 // ----- выбор владельца -----
 
-/// Какая температура на графике.
+/// Вид графика (бриф 16.10, «нагрев ядра»): один из трёх.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scale {
-    /// Блок минус средняя остальных блоков в той же строке (`samples::above_die`).
+    /// Нагрев ядра: свой нагрев блока при полной нагрузке от множителя, всё прочее (кристалл, соседи, ранг) вынесено —
+    /// кривая модели и частные остатки журнала (model.rs). Владелец 16.10: «кривая должна воспроизводить относительную
+    /// эффективность относительно других ядер… при всех прочих равных».
     #[default]
+    OwnHeat,
+    /// Блок минус средняя остальных блоков в той же строке (`samples::above_die`).
     AboveDie,
     Absolute,
+}
+
+impl Scale {
+    /// Номер вида для окна (app.slint: 0 — нагрев ядра, 1 — над кристаллом, 2 — абсолютная).
+    #[must_use]
+    pub fn index(self) -> i32 {
+        match self {
+            Scale::OwnHeat => 0,
+            Scale::AboveDie => 1,
+            Scale::Absolute => 2,
+        }
+    }
+
+    #[must_use]
+    pub fn of(index: i32) -> Scale {
+        match index {
+            1 => Scale::AboveDie,
+            2 => Scale::Absolute,
+            _ => Scale::OwnHeat,
+        }
+    }
 }
 
 /// Какие линии показаны (владелец 15.10: «друг друга там… мусорят… избыточное количество информации»). Два
@@ -249,7 +272,7 @@ const DASH: f64 = 18.0;
 const DASH_GAP: f64 = 12.0;
 
 /// Что нужно панели статистики.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StatsInput<'a> {
     pub blocks: &'a [BlockInfo],
     /// Блоки в сравнении (номера) по порядку добавления.
@@ -263,9 +286,13 @@ pub struct StatsInput<'a> {
     pub digest: Option<&'a Digest>,
     pub scale: Scale,
     pub curves: Curves,
+    /// Линия наибольших (переключатель «макс»).
+    pub max: bool,
     /// Кривые модели нагрева (переключатель «модель»).
     pub model: bool,
     pub swap: bool,
+    /// Аварийная отсечка автомодуля, °C — второй линией на «абсолютной».
+    pub emergency: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -283,13 +310,15 @@ pub struct StatsShown {
     /// Отсечка автомодуля — доля оси температуры; < 0 — линии нет.
     pub cutoff: f32,
     pub cutoff_text: String,
+    /// Аварийная отсечка — так же.
+    pub emergency: f32,
+    pub emergency_text: String,
+    pub max: bool,
     pub value_title: String,
     pub swap: bool,
     pub curves: Curves,
     pub model: bool,
     pub empty: String,
-    pub actions: Vec<ActionShown>,
-    pub actions_empty: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -305,9 +334,12 @@ pub struct SeriesShown {
     pub block: usize,
     pub color: u32,
     pub faded: bool,
-    /// Пути ø средней и 95 % в рамке 1000 × 1000 (y вниз) с густотой краски; скрытая кривая — пусто.
+    /// Пути ø средней, 95 % и наибольших в рамке 1000 × 1000 (y вниз) с густотой краски; скрытая кривая — пусто.
     pub mean: Vec<(f32, String)>,
     pub p95: Vec<(f32, String)>,
+    pub max: Vec<(f32, String)>,
+    /// Отметки отсечек автомодуля на линии блока.
+    pub cuts: Vec<CutShown>,
     /// Кривая модели в той же рамке: сплошная (наблюдённые множители, 5–95 % по времени) и пунктир (за ними); нет кривой —
     /// пусто.
     pub model: String,
@@ -318,8 +350,9 @@ pub struct SeriesShown {
     pub points: Vec<PointShown>,
 }
 
-/// Точка линии: множитель, места ø средней (x, y) и 95 % (qx, qy) — доли поля, y снизу вверх; строк в корзине; ø доля
-/// работы (0…1; < 0 — не известна); густота краски (`ink`).
+/// Точка линии: множитель, места ø средней (x, y), 95 % (qx, qy) и наибольшей (mx, my) — доли поля, y снизу вверх;
+/// строк в корзине; ø доля работы (0…1; < 0 — не известна); густота краски (`ink`). В виде «нагрев ядра» (x, y) —
+/// частный остаток, остальных мест нет.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PointShown {
     pub ratio: i32,
@@ -327,9 +360,19 @@ pub struct PointShown {
     pub y: f32,
     pub qx: f32,
     pub qy: f32,
+    pub mx: f32,
+    pub my: f32,
     pub samples: u32,
     pub load: f32,
     pub ink: f32,
+}
+
+/// Отметка отсечки на линии блока: место (доли поля, y снизу вверх) и вид: 1 — аварийная, 2 — по цели.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CutShown {
+    pub x: f32,
+    pub y: f32,
+    pub kind: i32,
 }
 
 /// Столбец множителя: множитель, середина — доля оси множителя, подсказка.
@@ -338,15 +381,6 @@ pub struct ColumnShown {
     pub ratio: i32,
     pub at: f32,
     pub tip: String,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct ActionShown {
-    pub time: String,
-    pub change: String,
-    pub why: String,
-    pub lower: bool,
-    pub color: u32,
 }
 
 impl StatsShown {
@@ -377,6 +411,7 @@ impl StatsShown {
             .map(|s| Series {
                 mean: runs(&s.mean),
                 p95: runs(&s.p95),
+                max: runs(&s.max),
                 model: s.model.as_str().into(),
                 model_dash: s.model_dash.as_str().into(),
                 color: rgb(s.color),
@@ -389,11 +424,23 @@ impl StatsShown {
                             y: p.y,
                             qx: p.qx,
                             qy: p.qy,
+                            mx: p.mx,
+                            my: p.my,
                             load: p.load,
                             a: p.ink,
                         })
                         .collect::<Vec<_>>(),
                 )), // a few dozen points per changed series
+                cuts: ModelRc::new(VecModel::from(
+                    s.cuts
+                        .iter()
+                        .map(|c| Cut {
+                            x: c.x,
+                            y: c.y,
+                            kind: c.kind,
+                        })
+                        .collect::<Vec<_>>(),
+                )), // a few cut marks per changed series
             })
             .collect()
     }
@@ -419,19 +466,6 @@ impl StatsShown {
             })
             .collect()
     }
-
-    pub fn action_rows(&self) -> Vec<LineRow> {
-        self.actions
-            .iter()
-            .map(|a| LineRow {
-                time: a.time.as_str().into(),
-                head: a.change.as_str().into(),
-                text: a.why.as_str().into(),
-                color: rgb(if a.lower { PEAK } else { E_TEXT }),
-                mark: rgb(a.color),
-            })
-            .collect()
-    }
 }
 
 // ----- счёт -----
@@ -444,7 +478,8 @@ struct Stat {
     p95: f64,
 }
 
-/// Корзины блока на шкале `scale`, где были срезы (при любой нагрузке), по возрастанию множителя.
+/// Корзины блока на шкале `scale`, где были срезы (при любой нагрузке), по возрастанию множителя; в виде «нагрев
+/// ядра» сырых корзин нет.
 fn stats_of(digest: &Digest, block: &BlockInfo, scale: Scale) -> Vec<Stat> {
     let Some(t) = digest.tally.blocks.get(&block.name) else {
         return Vec::new();
@@ -452,6 +487,7 @@ fn stats_of(digest: &Digest, block: &BlockInfo, scale: Scale) -> Vec<Stat> {
     let (bins, hists) = match scale {
         Scale::Absolute => (&t.bins, &t.hist),
         Scale::AboveDie => (&t.above, &t.above_hist),
+        Scale::OwnHeat => return Vec::new(),
     };
     bins.iter()
         .filter(|(_, b)| b.n > 0 && b.secs > 0.0)
@@ -500,14 +536,18 @@ fn value_range(scale: Scale, every: &[Vec<Stat>], models: &[f64]) -> (f64, f64, 
         .chain(models.iter().copied());
     let (mut lo, mut hi) = match scale {
         Scale::Absolute => (ABS_LOW, ABS_HIGH),
-        Scale::AboveDie => (0.0, 0.0),
+        Scale::AboveDie | Scale::OwnHeat => (0.0, 0.0),
     };
     for v in values.filter(|v| v.is_finite()) {
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    if scale == Scale::AboveDie && hi - lo < ABOVE_SPAN {
+    if scale != Scale::Absolute && hi - lo < ABOVE_SPAN {
         hi = lo + ABOVE_SPAN;
+    }
+    // Нагрев ядра — с запасом сверху (бриф: «0 to the largest… with a margin»).
+    if scale == Scale::OwnHeat {
+        hi += (hi - lo) * 0.08;
     }
     let step = STEPS
         .iter()
@@ -536,17 +576,17 @@ fn signed_temp(v: f64, decimals: usize) -> String {
     }
 }
 
-/// Температура для подписи: абсолютная — как есть, над кристаллом — со знаком.
+/// Температура для подписи: абсолютная — как есть, над кристаллом и нагрев ядра — со знаком.
 fn temp_text(scale: Scale, v: f64, decimals: usize) -> String {
     match scale {
         Scale::Absolute => format!("{v:.decimals$}"),
-        Scale::AboveDie => signed_temp(v, decimals),
+        Scale::AboveDie | Scale::OwnHeat => signed_temp(v, decimals),
     }
 }
 
 /// Подпись блока в легенде: короткое название (номер ядра или кластера, как на схеме), полное — в подсказке; там же
 /// «°C на ватт» по модели нагрева.
-fn legend(blocks: &[BlockInfo], compared: &[&BlockInfo], digest: Option<&Digest>) -> Vec<LegendShown> {
+fn legend(blocks: &[BlockInfo], compared: &[&BlockInfo], digest: Option<&Digest>, scale: Scale) -> Vec<LegendShown> {
     compared
         .iter()
         .map(|&b| {
@@ -563,11 +603,16 @@ fn legend(blocks: &[BlockInfo], compared: &[&BlockInfo], digest: Option<&Digest>
                 name: b.name.clone(),
                 color: color_of(blocks, b.index),
                 tip: format!(
-                    "{}{counted}\nЩелчок по плитке убирает блок из сравнения, щелчок по другой — добавляет.\n• цвет у блока свой: P-ядра — тёплые, кластеры E-ядер — холодные; обводка плитки — того же цвета{}",
+                    "{}{counted}\nЩелчок по плитке убирает блок из сравнения, щелчок по другой — добавляет.\n• цвет у блока свой: P-ядра — тёплые, кластеры E-ядер — холодные; обводка плитки — того же цвета{}{}",
                     capital(&whom(b)),
                     digest
                         .and_then(|d| d.model.as_deref())
-                        .map(|m| model_tip(m, b))
+                        .map(|m| model_tip(m, b, scale))
+                        .unwrap_or_default(),
+                    digest
+                        .and_then(|d| d.model.as_deref())
+                        .and_then(|m| model_of(m, b))
+                        .map(influence_tip)
                         .unwrap_or_default()
                 ),
             }
@@ -582,12 +627,16 @@ fn model_of<'a>(model: &'a Model, block: &BlockInfo) -> Option<&'a BlockModel> {
     model.blocks.iter().find(|m| m.name == block.name)
 }
 
-/// Кривая модели на шкале графика: абсолютная — как есть, над кристаллом — минус опорный уровень кристалла.
+/// Кривая модели на шкале графика: абсолютная — как есть, над кристаллом — минус опорный уровень кристалла, нагрев
+/// ядра — свой нагрев без всего прочего (`BlockModel::own_heat`).
 fn model_value(m: &BlockModel, scale: Scale, ratio: f64) -> Option<f64> {
+    if scale == Scale::OwnHeat {
+        return m.own_heat(ratio);
+    }
     let t = m.shown_curve(ratio)?;
     Some(match scale {
-        Scale::Absolute => t,
         Scale::AboveDie => t - m.reference.as_ref()?.die,
+        _ => t,
     })
 }
 
@@ -731,7 +780,11 @@ fn model_paths(m: &BlockModel, scale: Scale, frame: &Frame) -> (String, String, 
 /// кривой (одинаковая работа или нагрузка этого ядра), условия, ошибка, сколько данных. «°C на ступень» по своей
 /// нагрузке здесь больше не показывается: занятость — это время бодрствования, а не тепло работы, и Windows даёт тяжёлые
 /// потоки верхним по рангу ядрам — число мерило тяжесть потока, а не ядро (DECISIONS #39).
-fn model_tip(model: &Model, block: &BlockInfo) -> String {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one tooltip section after another: figure, power, conditions, error, data"
+)]
+fn model_tip(model: &Model, block: &BlockInfo, scale: Scale) -> String {
     let Some(m) = model_of(model, block) else {
         return String::new();
     };
@@ -814,10 +867,55 @@ fn model_tip(model: &Model, block: &BlockInfo) -> String {
     } else {
         String::new()
     };
+    let conditions = if scale == Scale::OwnHeat {
+        format!(
+            "\n• нагрев ядра: все прочие равны: соседи, кристалл, видеокарта, история вынесены; {}",
+            if m.work_factor().1 {
+                "одинаковая работа на всех ядрах рода"
+            } else {
+                "нагрузка этого ядра в этой игре, не одинаковая работа"
+            }
+        )
+    } else {
+        format!(
+            "\n• условия кривой: своя нагрузка 100 %, кристалл {:.1} °C{near} (медианы, пока блок под нагрузкой)",
+            r.die
+        )
+    };
     format!(
-        "{head}\n• условия кривой: своя нагрузка 100 %, кристалл {:.1} °C{near} (медианы, пока блок под нагрузкой){error}\n• данных {}{fallback}{e_note}",
-        r.die,
+        "{head}{conditions}{error}\n• данных {}{fallback}{e_note}",
         glued(&span_of(m.minutes * 60.0)),
+    )
+}
+
+/// «Что влияет на температуру ядра» (бриф W): по группе входов — изменчивость её вклада (°C) и насколько хуже ошибка
+/// модели без неё; «не определено», где разброс по частям данных доходит до нуля. Ранг — только в скрытом отчёте.
+fn influence_tip(m: &BlockModel) -> String {
+    let Some(inf) = m.influence else {
+        return String::new();
+    };
+    let groups = [
+        (crate::model::DIE_GROUP, "кристалл"),
+        (crate::model::OWN_GROUP, "своя работа"),
+        (crate::model::NEAR_GROUP, "соседи"),
+        (crate::model::HISTORY_GROUP, "предыдущие секунды"),
+    ];
+    let lines: Vec<String> = groups
+        .iter()
+        .map(|&(g, name)| {
+            if inf.determined(g) {
+                let without = inf.ablation[g]
+                    .map(|a| format!("; без него ошибка {}{GLUE}°C", glued(&signed_temp(a, 2))))
+                    .unwrap_or_default();
+                format!("• {name}: {:.1}{GLUE}°C{without}", inf.size[g])
+            } else {
+                format!("• {name}: не определено")
+            }
+        })
+        .collect();
+    format!(
+        "\nЧто влияет на температуру ядра\nРазброс вклада каждой группы по журналу, °C, и насколько хуже модель на отложенных данных без неё.\n{}\n• видеокарта, вентиляторы и комната действуют через кристалл",
+        lines.join("\n")
     )
 }
 
@@ -857,10 +955,77 @@ fn glued(text: &str) -> String {
     text.replace(' ', "\u{a0}")
 }
 
+/// Условия строки наибольшей (бриф W, «макс»): дата и время, множитель и потолок, нагрузка, уровень кристалла, соседи,
+/// видеокарта, вентиляторы. `blocks` — блоки знакомства: соседи — по номеру в нём.
+fn peak_conditions(peak: &samples::Peak, blocks: &[BlockInfo]) -> String {
+    let w = &peak.when;
+    let mut parts = vec![glued(&samples::day_time(peak.at))];
+    parts.push(match w.ceiling {
+        Some(c) => format!("×{:.1} / потолок{GLUE}×{c:.0}", peak.ratio),
+        None => format!("×{:.1}", peak.ratio),
+    });
+    if let Some(b) = peak.busy {
+        parts.push(format!("нагрузка {}", glued(&percent(b))));
+    }
+    if let Some(l) = w.level {
+        parts.push(format!("кристалл {l:.1}{GLUE}°C"));
+    }
+    let near: Vec<String> = w
+        .near
+        .iter()
+        .flatten()
+        .filter_map(|&(j, t)| Some(format!("{}{GLUE}{t:.0}°", blocks.get(j)?.name)))
+        .collect();
+    if !near.is_empty() {
+        parts.push(format!("соседи {}", near.join(", ")));
+    }
+    let gpu: Vec<String> = [
+        w.gpu.temp.map(|t| format!("{t:.0}{GLUE}°C")),
+        w.gpu.power.map(|p| format!("{p:.0}{GLUE}Вт")),
+        w.gpu.busy.map(|b| glued(&percent(b))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !gpu.is_empty() {
+        parts.push(format!("видеокарта {}", gpu.join(", ")));
+    }
+    if w.fans.cpu.is_some() || w.fans.gpu.is_some() {
+        let rpm = |v: Option<f64>| v.map_or_else(|| "–".to_string(), |v| glued(&grouped(rpm_u64(v))));
+        parts.push(format!("вент.{GLUE}{} / {}", rpm(w.fans.cpu), rpm(w.fans.gpu)));
+    }
+    parts.join(" · ")
+}
+
+/// Отсечки автомодуля блоков сравнения на множителе — для подсказки столбца.
+fn cut_lines(ratio: i32, compared: &[&BlockInfo], cuts: &[(usize, &Event)]) -> Vec<String> {
+    cuts.iter()
+        .filter(|(_, a)| a.ratio.map(f64::round) == Some(f64::from(ratio)))
+        .filter_map(|(which, a)| {
+            Some(format!(
+                "{} {} {} {}: {}",
+                if a.kind == Kind::Target { "●" } else { "◆" },
+                a.time,
+                compared.get(*which)?.name,
+                a.change,
+                a.why
+            ))
+        })
+        .collect()
+}
+
 /// Подсказка столбца множителя: что у каждого блока сравнения на нём — сколько времени, ø нагрузка, обороты; ø, 95 % и
-/// ▲ наибольшая со строкой, где она была (фактический множитель, нагрузка, время).
-fn column_tip(ratio: i32, scale: Scale, compared: &[&BlockInfo], all: &[Vec<Stat>]) -> String {
-    let lines: Vec<String> = compared
+/// ▲ наибольшая со строкой, где она была (фактический множитель, нагрузка, время; с «макс» — все условия этой строки);
+/// отсечки автомодуля на этом множителе.
+fn column_tip(
+    ratio: i32,
+    input: &StatsInput,
+    compared: &[&BlockInfo],
+    all: &[Vec<Stat>],
+    cuts: &[(usize, &Event)],
+) -> String {
+    let scale = input.scale;
+    let mut lines: Vec<String> = compared
         .iter()
         .zip(all)
         .filter_map(|(b, stats)| {
@@ -881,28 +1046,90 @@ fn column_tip(ratio: i32, scale: Scale, compared: &[&BlockInfo], all: &[Vec<Stat
                 .unwrap_or_default();
             let (p95_digits, peak_digits) = match scale {
                 Scale::Absolute => (0, 0),
-                Scale::AboveDie => (1, 1),
+                _ => (1, 1),
             };
-            Some(format!(
-                "{} — {}{load}{fan}\n    ø{GLUE}{}{GLUE}°C · 95{GLUE}% ниже {}{GLUE}°C · ▲{GLUE}{}{GLUE}°C: ×{:.1}{peak_load}, {}",
+            let head = format!(
+                "{} — {}{load}{fan}\n    ø{GLUE}{}{GLUE}°C · 95{GLUE}% ниже {}{GLUE}°C",
                 capital(&whom(b)),
                 glued(&span_of(bin.secs)),
                 temp_text(scale, bin.mean().unwrap_or(s.p95), 1),
                 temp_text(scale, s.p95, p95_digits),
-                temp_text(scale, peak.temp, peak_digits),
-                peak.ratio,
-                glued(&samples::day_time(peak.at))
-            ))
+            );
+            Some(if input.max {
+                format!(
+                    "{head}\n    ▲{GLUE}макс {}{GLUE}°C: {}",
+                    temp_text(scale, peak.temp, peak_digits),
+                    peak_conditions(&peak, input.blocks)
+                )
+            } else {
+                format!(
+                    "{head} · ▲{GLUE}{}{GLUE}°C: ×{:.1}{peak_load}, {}",
+                    temp_text(scale, peak.temp, peak_digits),
+                    peak.ratio,
+                    glued(&samples::day_time(peak.at))
+                )
+            })
+        })
+        .collect();
+    lines.extend(cut_lines(ratio, compared, cuts));
+    if lines.is_empty() {
+        return String::new();
+    }
+    let what = match scale {
+        Scale::AboveDie => " · над остальным кристаллом",
+        _ => "",
+    };
+    format!("×{ratio}{what}\n{}", lines.join("\n"))
+}
+
+/// Подсказка столбца в виде «нагрев ядра»: у каждого блока — точка (частный остаток, сколько данных, ø нагрузка) и
+/// модель на этом множителе: нагрев, °C на ступень, производительность на градус (только где нагрев определён).
+fn own_column_tip(
+    ratio: i32,
+    compared: &[&BlockInfo],
+    models: &[Option<&BlockModel>],
+    points: &[Vec<OwnBin>],
+) -> String {
+    let lines: Vec<String> = compared
+        .iter()
+        .zip(models)
+        .zip(points)
+        .filter_map(|((b, m), pts)| {
+            let point = pts.iter().find(|p| p.ratio == ratio);
+            let r = f64::from(ratio);
+            let curve = m
+                .filter(|m| m.drawn())
+                .and_then(|m| Some((m.own_heat(r)?, m.own_step(r)?, m.per_degree(r))));
+            if point.is_none() && curve.is_none() {
+                return None;
+            }
+            let mut parts = Vec::new();
+            if let Some(p) = point {
+                parts.push(format!(
+                    "точка {}{GLUE}°C: {} данных, нагрузка ø{GLUE}{}",
+                    glued(&signed_temp(p.value, 1)),
+                    glued(&span_of(p.secs)),
+                    glued(&percent(p.load))
+                ));
+            }
+            if let Some((heat, step, per)) = curve {
+                parts.push(format!(
+                    "модель {}{GLUE}°C, {:.2}{GLUE}°C на ступень, производительность на градус {}",
+                    glued(&signed_temp(heat, 1)),
+                    step,
+                    per.map_or_else(|| "—".to_string(), |v| format!("{v:.1}"))
+                ));
+            }
+            Some(format!("{} — {}", capital(&whom(b)), parts.join("; ")))
         })
         .collect();
     if lines.is_empty() {
         return String::new();
     }
-    let what = match scale {
-        Scale::Absolute => "",
-        Scale::AboveDie => " · над остальным кристаллом",
-    };
-    format!("×{ratio}{what}\n{}", lines.join("\n"))
+    format!(
+        "×{ratio} · нагрев ядра при полной нагрузке, всё прочее вынесено\n{}",
+        lines.join("\n")
+    )
 }
 
 #[expect(
@@ -913,9 +1140,12 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
     let mut shown = StatsShown {
         zero: -1.0,
         cutoff: -1.0,
+        emergency: -1.0,
         swap: input.swap,
         curves: input.curves,
+        max: input.max,
         value_title: match input.scale {
+            Scale::OwnHeat => "°C своего нагрева".into(),
             Scale::AboveDie => "°C над кристаллом".into(),
             Scale::Absolute => "°C".into(),
         },
@@ -927,7 +1157,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         .iter()
         .filter_map(|&b| input.blocks.iter().find(|x| x.index == b))
         .collect();
-    shown.legend = legend(input.blocks, &compared, input.digest);
+    shown.legend = legend(input.blocks, &compared, input.digest, input.scale);
     let Some(digest) = input.digest else {
         shown.empty = "Статистика читается…".into();
         return shown;
@@ -935,29 +1165,13 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
 
     let names: Vec<&str> = compared.iter().map(|b| b.name.as_str()).collect();
     let several = compared.len() > 1;
-    shown.actions = samples::actions_for(&digest.auto, &names)
+    // Отсечки (аварийная и по цели) — отметками на линии блока и в подсказке столбца; остальные события (и прежнее
+    // снижение до 0.5.6) — в списке под графиком и на оси времени.
+    let cuts: Vec<(usize, &Event)> = crate::events::listed(&digest.events, &names, false)
         .into_iter()
-        .map(|(which, a)| ActionShown {
-            time: a.time,
-            change: if several {
-                format!("{} {}", names[which], a.change)
-            } else {
-                a.change
-            },
-            why: a.why,
-            lower: a.lower,
-            color: color_of(input.blocks, compared[which].index),
-        })
+        .filter_map(|(i, which)| Some((which?, &digest.events[i])))
+        .filter(|(_, e)| matches!(e.kind, Kind::Emergency | Kind::Target))
         .collect();
-    shown.actions_empty = if compared.is_empty() {
-        String::new()
-    } else if digest.auto.is_empty() {
-        "журнала автомодуля нет — он ещё ничего не делал".into()
-    } else if several {
-        "эти блоки автомодуль не трогал".into()
-    } else {
-        "этот блок автомодуль не трогал".into()
-    };
 
     // Срок срезов: «15.10 01:25–23:10» за один день, «14.10 – 15.10» за несколько.
     let period = match (&digest.tally.first, &digest.tally.last) {
@@ -987,6 +1201,10 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         );
         return shown;
     }
+    if input.scale == Scale::OwnHeat {
+        own_panel(input, digest, &compared, &mut shown);
+        return shown;
+    }
     // Корзины всех блоков — для осей и бледности (от выбора они не зависят); выбранных — для линий.
     let every: Vec<Vec<Stat>> = input.blocks.iter().map(|b| stats_of(digest, b, input.scale)).collect();
     let all: Vec<Vec<Stat>> = compared
@@ -1007,8 +1225,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             format!("У блока {}", compared[0].name)
         };
         shown.empty = if digest.tally.rows == 0 {
-            "Срезов пока нет. Их пишет CoreMapTray 4 раза в секунду, пока включён автомодуль и процессор нагружен."
-                .into()
+            "Срезов пока нет. Их пишет CoreMapTray 4 раза в секунду, пока включена запись и процессор нагружен.".into()
         } else if input.scale == Scale::AboveDie {
             format!(
                 "{whose} нет ни одного среза, где известны множитель, температура и уровень остального кристалла (срезов всего {}). Абсолютная температура — переключателем «абсолютная».",
@@ -1036,7 +1253,13 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
                 .collect()
         })
         .unwrap_or_default();
-    let (t0, t1, step) = value_range(input.scale, &every, &solid);
+    // Наибольшие растягивают ось, только когда их линия показана: с ней ось — по всем блокам, как у ø и 95 %.
+    let peaks: Vec<f64> = if input.max {
+        every.iter().flatten().map(|s| s.bin.peak.temp).collect()
+    } else {
+        Vec::new()
+    };
+    let (t0, t1, step) = value_range(input.scale, &every, &[solid, peaks].concat());
     let frame = Frame {
         lo,
         hi,
@@ -1048,14 +1271,13 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
     while t <= t1 + 1e-9 {
         let text = match input.scale {
             Scale::Absolute => format!("{t:.0}°"),
-            Scale::AboveDie => format!("{}°", signed_temp(t, 0)),
+            _ => format!("{}°", signed_temp(t, 0)),
         };
         shown.ticks.push((f(frame.value(t)), text));
         t += step;
     }
     match input.scale {
-        Scale::AboveDie => shown.zero = f(frame.value(0.0)),
-        // Отсечка автомодуля — абсолютная температура: на шкале «над кристаллом» её места нет.
+        // Отсечки автомодуля — абсолютная температура: на шкале «над кристаллом» им места нет.
         Scale::Absolute => {
             if let Some(c) = input.cutoff
                 && (t0..=t1).contains(&c)
@@ -1063,7 +1285,14 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
                 shown.cutoff = f(frame.value(c));
                 shown.cutoff_text = format!("{c:.0}°");
             }
+            if let Some(e) = input.emergency
+                && (t0..=t1).contains(&e)
+            {
+                shown.emergency = f(frame.value(e));
+                shown.emergency_text = format!("{e:.0}°");
+            }
         }
+        _ => shown.zero = f(frame.value(0.0)),
     }
 
     let most = fullest(&every);
@@ -1079,10 +1308,36 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             .map(|s| frame.place(s.ratio, s.bin.mean().unwrap_or(s.p95)))
             .collect();
         let highs: Vec<(f64, f64)> = stats.iter().map(|s| frame.place(s.ratio, s.p95)).collect();
+        let tops: Vec<(f64, f64)> = stats.iter().map(|s| frame.place(s.ratio, s.bin.peak.temp)).collect();
         let (model, model_dash, model_line) = match fitted.and_then(|m| model_of(m, b)) {
             Some(m) if input.model => model_paths(m, input.scale, &frame),
             _ => (String::new(), String::new(), Vec::new()),
         };
+        // Отметка отсечки — на первой показанной линии блока (ø, 95 %, наибольшие) на её множителе.
+        let line_at = |ratio: i32| -> Option<(f64, f64)> {
+            let k = stats.iter().position(|s| s.ratio == ratio)?;
+            [
+                (input.curves.mean(), means[k]),
+                (input.curves.p95(), highs[k]),
+                (input.max, tops[k]),
+            ]
+            .into_iter()
+            .find_map(|(on, at)| on.then_some(at))
+        };
+        let block_cuts: Vec<CutShown> = cuts
+            .iter()
+            .filter(|(which, _)| *which == i)
+            .filter_map(|(_, a)| {
+                let ratio = a.ratio.map(f64::round)?;
+                #[expect(clippy::cast_possible_truncation, reason = "a rounded multiplier, a few dozen")]
+                let (x, y) = line_at(ratio as i32)?;
+                Some(CutShown {
+                    x: f(x),
+                    y: f(y),
+                    kind: if a.kind == Kind::Target { 2 } else { 1 },
+                })
+            })
+            .collect();
         shown.series.push(SeriesShown {
             block: b.index,
             color: color_of(input.blocks, b.index),
@@ -1097,22 +1352,29 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             } else {
                 Vec::new()
             },
+            max: if input.max {
+                runs(stats, &tops, &inks)
+            } else {
+                Vec::new()
+            },
+            cuts: block_cuts,
             model,
             model_dash,
             model_line,
             points: stats
                 .iter()
-                .zip(means.iter().zip(&highs))
-                .zip(&inks)
-                .map(|((s, (m, q)), &k)| PointShown {
+                .enumerate()
+                .map(|(k, s)| PointShown {
                     ratio: s.ratio,
-                    x: f(m.0),
-                    y: f(m.1),
-                    qx: f(q.0),
-                    qy: f(q.1),
+                    x: f(means[k].0),
+                    y: f(means[k].1),
+                    qx: f(highs[k].0),
+                    qy: f(highs[k].1),
+                    mx: f(tops[k].0),
+                    my: f(tops[k].1),
                     samples: s.bin.n,
                     load: s.bin.load().map_or(-1.0, |l| f(l.clamp(0.0, 1.0))),
-                    ink: f(k),
+                    ink: f(inks[k]),
                 })
                 .collect(),
         });
@@ -1122,28 +1384,128 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         shown.columns.push(ColumnShown {
             ratio,
             at: f(frame.along(ratio)),
-            tip: column_tip(ratio, input.scale, &compared, &all),
+            tip: column_tip(ratio, input, &compared, &all, &cuts),
         });
     }
     shown
 }
 
-/// Место точки одной кривой: ø средней или 95 %.
+/// Вид «нагрев ядра» (бриф 16.10): у каждого выбранного блока — кривая модели (свой нагрев при полной нагрузке от
+/// множителя, сплошная по p5–p95 множителя, пунктир дальше) и частные остатки журнала точками; ось — от нуля (или
+/// ниже, если точка ниже) до наибольшего из кривой и точек у показанных блоков, с запасом; ось множителя — общая.
+fn own_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo], shown: &mut StatsShown) {
+    let fitted = digest.model.as_deref();
+    let models: Vec<Option<&BlockModel>> = compared
+        .iter()
+        .map(|b| fitted.and_then(|m| model_of(m, b)).filter(|m| m.shaped.is_some()))
+        .collect();
+    let points: Vec<Vec<OwnBin>> = models
+        .iter()
+        .map(|m| m.map(BlockModel::own_points).unwrap_or_default())
+        .collect();
+    if points.iter().all(Vec::is_empty) && models.iter().all(|m| !m.is_some_and(BlockModel::drawn)) {
+        shown.empty = if fitted.is_none() {
+            "Модель нагрева ещё считается — нагрев ядра появится, когда она будет готова.".into()
+        } else {
+            "Нагрева ядра нет: у выбранных блоков нет модели — нужно хотя бы 10 минут годных срезов (подробно — в подсказке блока над графиком). Срезы как есть — видами «над кристаллом» и «абсолютная».".into()
+        };
+        return;
+    }
+    let Some((lo, hi)) = axis(input.blocks, input.fused, Some(digest)) else {
+        return;
+    };
+    let mut values: Vec<f64> = points.iter().flatten().map(|p| p.value).collect();
+    for m in models.iter().flatten().filter(|m| m.drawn()) {
+        values.extend(model_solid(m, Scale::OwnHeat));
+    }
+    let (t0, t1, step) = value_range(Scale::OwnHeat, &[], &values);
+    let frame = Frame {
+        lo,
+        hi,
+        t0,
+        t1,
+        swap: input.swap,
+    };
+    let mut t = t0;
+    while t <= t1 + 1e-9 {
+        shown.ticks.push((f(frame.value(t)), format!("{}°", signed_temp(t, 0))));
+        t += step;
+    }
+    shown.zero = f(frame.value(0.0));
+    let most = points.iter().flatten().map(|p| p.secs).fold(0.0, f64::max);
+    let mut order: Vec<usize> = (0..compared.len()).collect();
+    order.sort_by_key(|&i| input.highlight == Some(compared[i].index));
+    for i in order {
+        let b = compared[i];
+        let (model, model_dash, model_line) = match models[i] {
+            Some(m) if input.model => model_paths(m, Scale::OwnHeat, &frame),
+            _ => (String::new(), String::new(), Vec::new()),
+        };
+        shown.series.push(SeriesShown {
+            block: b.index,
+            color: color_of(input.blocks, b.index),
+            faded: input.highlight.is_some_and(|h| h != b.index),
+            model,
+            model_dash,
+            model_line,
+            points: points[i]
+                .iter()
+                .map(|p| {
+                    let (x, y) = frame.place(p.ratio, p.value);
+                    PointShown {
+                        ratio: p.ratio,
+                        x: f(x),
+                        y: f(y),
+                        load: f(p.load.clamp(0.0, 1.0)),
+                        ink: f(ink(p.secs, most)),
+                        ..PointShown::default()
+                    }
+                })
+                .collect(),
+            ..SeriesShown::default()
+        });
+    }
+    for ratio in lo..=hi {
+        shown.columns.push(ColumnShown {
+            ratio,
+            at: f(frame.along(ratio)),
+            tip: own_column_tip(ratio, compared, &models, &points),
+        });
+    }
+}
+
+// Место точки одной кривой: ø средней или 95 %.
 type PlaceOf = fn(&PointShown) -> (f32, f32);
 
 /// Линия какого блока ближе всего к курсору: поле графика w × h пикселей, курсор (x, y) от его левого верхнего угла;
 /// None — ни одна не ближе `NEAR_PX`. Считаются показанные кривые блока — ø средняя и 95 % (по `curves`) и кривая модели
 /// (её ломаные пусты, когда она скрыта): подсветка работает с тем, что видно. Места точек уже повёрнуты
 /// (`Frame::place`), поэтому одинаково при любой раскладке осей.
+#[cfg(test)]
 #[must_use]
 pub fn nearest(series: &[SeriesShown], cursor: (f64, f64), field: (f64, f64), curves: Curves) -> Option<usize> {
+    nearest_with(series, cursor, field, curves, false)
+}
+
+/// То же, и линия наибольших, когда она показана (`max`).
+#[must_use]
+pub fn nearest_with(
+    series: &[SeriesShown],
+    cursor: (f64, f64),
+    field: (f64, f64),
+    curves: Curves,
+    max: bool,
+) -> Option<usize> {
     let (width, height) = field;
-    let mut kinds: Vec<PlaceOf> = Vec::with_capacity(2);
+    let mut kinds: Vec<PlaceOf> = Vec::with_capacity(3);
     if curves.mean() {
         kinds.push(|p| (p.x, p.y));
     }
     if curves.p95() {
         kinds.push(|p| (p.qx, p.qy));
+    }
+    if max {
+        kinds.push(|p| (p.mx, p.my));
     }
     let mut best: Option<(f64, usize)> = None;
     for s in series {
@@ -1273,6 +1635,7 @@ mod tests {
             curves: Curves::Both,
             model: true,
             swap,
+            ..StatsInput::default()
         })
     }
 
@@ -1318,11 +1681,10 @@ mod tests {
     }
 
     #[test]
-    fn above_the_die_is_the_default_and_the_axis_follows_it() {
+    fn above_the_die_axis_follows_it() {
         // Ядро 0 на 80 и 70 °C, кластер — всегда 60 °C: над кристаллом ядро на +20 и +10.
         let d = thirty(false);
         let s = stats_with(&d, &[0], None, None, Scale::AboveDie, false);
-        assert_eq!(Scale::default(), Scale::AboveDie);
         assert_eq!(s.value_title, "°C над кристаллом");
         let tip = s.columns[2].tip.replace('\u{a0}', " ");
         assert!(
@@ -1345,6 +1707,7 @@ mod tests {
             curves: Curves::Both,
             model: true,
             swap: false,
+            ..StatsInput::default()
         });
         assert!(with_cutoff.cutoff < 0.0);
     }
@@ -1433,6 +1796,7 @@ mod tests {
                 curves,
                 model: true,
                 swap: false,
+                ..StatsInput::default()
             })
         };
         let both = with(Curves::Both);
@@ -1516,6 +1880,7 @@ mod tests {
             curves: Curves::Both,
             model: true,
             swap: false,
+            ..StatsInput::default()
         });
         assert!(
             (s.cutoff - 0.75).abs() < 1e-6,
@@ -1698,9 +2063,120 @@ mod tests {
             curves: Curves::Both,
             model: false,
             swap: false,
+            ..StatsInput::default()
         });
         assert!(off.series.iter().all(|l| l.model.is_empty() && l.model_dash.is_empty()));
         // У ядра 0 пять соседних множителей — его линия ø осталась (у кластера один множитель — линии и не было).
         assert!(!off.series[0].mean.is_empty(), "линия ø осталась");
+    }
+
+    /// Строки «макс»: ядро 0 и его сосед 1 и несоседний 2 (по 0,25 с, 10:00:00 … 10:00:09.750); у ядра 0 наибольшая —
+    /// 88 °C в 10:00:05.250 на ×45.3 при потолке 46 (в остальных строках 70 °C, потолок 47); видеокарта — в 10:00:03.750
+    /// (65 °C) и в 10:00:05.750 (66 °C, ближе — на 0,5 с), вентиляторы — в 10:00:04.250 (4100 / 4300, ближе — на 1 с)
+    /// и в 10:00:07.000 (5000 / 5200).
+    fn max_rows() -> Vec<String> {
+        (0..40)
+            .map(|k: u32| {
+                let ms = k * 250;
+                let time = format!("2026-10-15 10:00:{:02}.{:03}", ms / 1000, ms % 1000);
+                let (temp, ceiling) = if ms == 5250 { (88, 46) } else { (70, 47) };
+                let fans = match ms {
+                    4250 => "4100,4300",
+                    7000 => "5000,5200",
+                    _ => ",",
+                };
+                let gpu = match ms {
+                    3750 => "65,110.5,0.80",
+                    5750 => "66,120.4,0.90",
+                    _ => ",,",
+                };
+                format!("{time},60,{fans},{ceiling},45.3,0.92,{temp},47,44,0.5,63,47,40,0.2,55,{gpu}")
+            })
+            .collect()
+    }
+
+    const MAX_HEADER: &str = "time,package,fan_cpu,fan_gpu,0.ceiling,0.ratio,0.busy,0.temp,1.ceiling,1.ratio,1.busy,1.temp,2.ceiling,2.ratio,2.busy,2.temp,temp_gpu,power_gpu,busy_gpu";
+
+    /// Сводка строк `max_rows`, прочитанная порциями по `chunk` строк (как файл, который дописывается).
+    fn max_digest(chunk: usize) -> Digest {
+        let mut columns = Columns::parse(MAX_HEADER).expect("заголовок");
+        columns.link(
+            &["0".to_string(), "1".to_string(), "2".to_string()],
+            &[vec![1], vec![0, 2], vec![1]],
+        );
+        let mut tally = Tally::default();
+        let mut carry = samples::Carry::default();
+        let mut scratch = Scratch::default();
+        for part in max_rows().chunks(chunk) {
+            scratch.count_keeping(&columns, &part.join("\n"), &mut carry, &mut tally, None);
+        }
+        Digest {
+            tally,
+            ..Digest::default()
+        }
+    }
+
+    #[test]
+    fn the_max_tooltip_names_the_row_of_the_maximum() {
+        // Бриф W: у «макс» подсказка — условия строки наибольшей: дата и время, множитель и потолок, нагрузка, уровень
+        // кристалла (средняя остальных блоков), температуры соседей, видеокарта и вентиляторы — ближайшее чтение не
+        // дальше 2 с. Ловит: условия другой строки (последней, первой), чтение видеокарты «последнее до» вместо
+        // ближайшего, не-соседа в списке соседей, потерю чтения после наибольшей, когда оно в следующей порции файла.
+        let blocks = vec![block(0, "0", vec![0]), block(1, "1", vec![1]), block(2, "2", vec![2])];
+        for chunk in [40, 22, 23] {
+            let d = max_digest(chunk);
+            let peak = d.tally.blocks["0"].bins[&45].peak;
+            assert_eq!(peak.at % 86_400_000, 36_005_250, "порции по {chunk}: время строки");
+            let w = peak.when;
+            assert_eq!((w.ceiling, w.near[0], w.near[1]), (Some(46.0), Some((1, 63.0)), None));
+            assert!(w.level.is_some_and(|l| (l - 59.0).abs() < 1e-9), "{:?}", w.level);
+            assert_eq!(
+                (w.gpu.temp, w.fans.cpu, w.fans.gpu),
+                (Some(66.0), Some(4100.0), Some(4300.0)),
+                "порции по {chunk}"
+            );
+            let s = stats_panel(&StatsInput {
+                blocks: &blocks,
+                compared: &[0],
+                digest: Some(&d),
+                scale: Scale::Absolute,
+                curves: Curves::Both,
+                max: true,
+                ..StatsInput::default()
+            });
+            let tip = s
+                .columns
+                .iter()
+                .find(|c| c.ratio == 45)
+                .map(|c| c.tip.replace('\u{a0}', " "))
+                .unwrap_or_default();
+            for part in [
+                "▲ макс 88 °C",
+                "15.10 10:00:05",
+                "×45.3 / потолок ×46",
+                "нагрузка 92 %",
+                "кристалл 59.0 °C",
+                "соседи 1 63°",
+                "видеокарта 66 °C, 120 Вт, 90 %",
+                "вент. 4 100 / 4 300",
+            ] {
+                assert!(tip.contains(part), "нет «{part}»: {tip}");
+            }
+            assert!(!tip.contains("2 55°"), "не сосед в соседях: {tip}");
+            let point = &s.series[0].points[0];
+            assert!(point.my > point.y, "квадрат наибольшей выше точки средней: {point:?}");
+        }
+        // Без «макс» — прежняя короткая строка наибольшей, линии нет.
+        let d = max_digest(40);
+        let plain = stats_panel(&StatsInput {
+            blocks: &blocks,
+            compared: &[0],
+            digest: Some(&d),
+            scale: Scale::Absolute,
+            curves: Curves::Both,
+            ..StatsInput::default()
+        });
+        assert_eq!(plain.series[0].max, Vec::<(f32, String)>::new());
+        assert!(!plain.columns.iter().any(|c| c.tip.contains("потолок")));
     }
 }

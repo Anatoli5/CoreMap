@@ -76,20 +76,30 @@ export struct LineRow {
     time: string,
     head: string,
     text: string,
+    more: string,   // подробности — только в подсказке строки
     color: color,
-    mark: color,    // цвет блока (действия автомодуля при сравнении)
+    mark: color,    // цвет блока (события выбранных блоков; серый — другого блока)
 }
 
-// Точка линии блока: места ø средней (x, y) и 95 % (qx, qy) — доли поля графика, y снизу вверх (оси уже повёрнуты в
-// Rust, src/chart.rs Frame); ø доля работы (0…1; < 0 — не известна) — заливка точки; a — густота краски: меньше времени
-// за точкой — бледнее.
+// Точка линии блока: места ø средней (x, y), 95 % (qx, qy) и наибольшей (mx, my) — доли поля графика, y снизу вверх
+// (оси уже повёрнуты в Rust, src/chart.rs Frame); ø доля работы (0…1; < 0 — не известна) — заливка точки; a — густота
+// краски: меньше времени за точкой — бледнее. В виде «нагрев ядра» (x, y) — частный остаток журнала.
 export struct Mark {
     x: float,
     y: float,
     qx: float,
     qy: float,
+    mx: float,
+    my: float,
     load: float,
     a: float,
+}
+
+// Отметка отсечки автомодуля на линии блока: место (доли поля, y снизу вверх), вид: 1 — аварийная, 2 — по цели.
+export struct Cut {
+    x: float,
+    y: float,
+    kind: int,
 }
 
 // Кусок линии одной густоты: путь в рамке 1000 × 1000 и густота краски.
@@ -103,11 +113,13 @@ export struct Run {
 export struct Series {
     mean: [Run],
     p95: [Run],
+    max: [Run],
     model: string,
     model-dash: string,
     color: color,
     faded: bool,
     marks: [Mark],
+    cuts: [Cut],
 }
 
 // Столбец множителя на оси: середина — доля оси множителя, множитель, подсказка (что у каждого выбранного блока на нём;
@@ -127,6 +139,35 @@ export struct LegendItem {
 export struct Tick {
     f: float,
     text: string,
+}
+
+// Ось x — время (src/timeline.rs): полоса — подпись, деления, картинка рядов (рисует Rust: путь в 64 тыс. точек
+// программный отрисовщик Slint рисовал 4,4 с на кадр), горизонтальные линии (цель, аварийная — доля высоты снизу);
+// отметка события под полосами — доля ширины и цвет; отметка события на линии блока — доли поля, цвет, вид: 1 — опускает
+// потолок, 2 — остальное.
+export struct TimeRef {
+    f: float,
+    color: color,
+    text: string,
+}
+
+export struct TimeStrip {
+    title: string,
+    ticks: [Tick],
+    picture: image,
+    refs: [TimeRef],
+}
+
+export struct TimeMark {
+    f: float,
+    color: color,
+}
+
+export struct TimeDot {
+    x: float,
+    y: float,
+    color: color,
+    kind: int,
 }
 
 export global Palette {
@@ -266,21 +307,41 @@ component Switch inherits Rectangle {
 }
 
 // Кнопка выбора вида графика: выбранная — на подложке, остальные — прозрачные. Одинаковое дело — одинаковый элемент:
-// все переключатели вида (шкала, линии, оси, подсветка) — такие кнопки. glyph: 1 — образец толстой линии с кольцом
-// (ø средняя), 2 — тонкой с точкой (95 %).
+// все переключатели вида (вид, линии, оси, подсветка, день) — такие кнопки. glyph: 1 — образец толстой линии с кольцом
+// (ø средняя), 2 — тонкой с точкой (95 %), 3 — сплошная с пунктиром (модель), 4 — тонкая с пустым квадратом (макс).
+// Недоступная (enabled: false) — серая, видна, но щелчок не действует.
 component Chip inherits Rectangle {
     in property <string> text;
     in property <bool> on;
     in property <int> glyph;
+    in property <bool> enabled: true;
     callback clicked();
     callback hover(bool);
     property <length> mark-w: root.glyph != 0 ? 20px : 0px;
     width: label.preferred-width + root.mark-w + 14px;
     height: 22px;
     border-radius: 4px;
-    background: root.on ? Palette.line : touch.has-hover ? Palette.cell : transparent;
+    background: root.on && root.enabled ? Palette.line : touch.has-hover && root.enabled ? Palette.cell : transparent;
     border-width: 1px;
     border-color: Palette.cell;
+    opacity: root.enabled ? 1 : 0.45;
+    // Наибольшие: тонкая линия с пустым квадратом.
+    if root.glyph == 4: Rectangle {
+        x: 6px;
+        y: (root.height - 1px) / 2;
+        width: 14px;
+        height: 1px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 4: Rectangle {
+        x: 10px;
+        y: (root.height - 6px) / 2;
+        width: 6px;
+        height: 6px;
+        background: Palette.panel;
+        border-width: 1px;
+        border-color: root.on ? Palette.text : Palette.dim;
+    }
     if root.glyph == 1: Rectangle {
         x: 6px;
         y: (root.height - 3px) / 2;
@@ -344,8 +405,12 @@ component Chip inherits Rectangle {
         height: root.height;
     }
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
         changed has-hover => { root.hover(self.has-hover); }
     }
 }
@@ -578,6 +643,9 @@ component Chart inherits Rectangle {
     in property <float> columns: 1; // сколько множителей на оси
     in property <float> cutoff: -1; // отсечка автомодуля — доля оси температуры; < 0 — нет
     in property <string> cutoff-text;
+    in property <float> emergency: -1; // аварийная отсечка — так же
+    in property <string> emergency-text;
+    in property <bool> show-max;
     in property <float> zero: -1;   // уровень кристалла (0 °C над ним) — доля оси температуры; < 0 — нет
     in property <bool> swap;
     in property <bool> show-mean: true;
@@ -671,6 +739,23 @@ component Chart inherits Rectangle {
         font-size: 10px;
         horizontal-alignment: right;
     }
+    // Аварийная отсечка — ярче и толще.
+    if root.drawn && root.emergency >= 0: Rectangle {
+        x: root.swap ? root.plot-x + root.emergency * root.plot-w : root.plot-x;
+        y: root.swap ? root.plot-y : root.plot-y + (1 - root.emergency) * root.plot-h;
+        width: root.swap ? 2px : root.plot-w;
+        height: root.swap ? root.plot-h : 2px;
+        background: Palette.bad;
+    }
+    if root.drawn && root.emergency >= 0: Text {
+        x: root.swap ? root.plot-x + root.emergency * root.plot-w - 124px : root.plot-x;
+        width: root.swap ? 120px : root.plot-w - 4px;
+        y: root.swap ? root.plot-y + 16px : root.plot-y + (1 - root.emergency) * root.plot-h - 15px;
+        text: "аварийная " + root.emergency-text;
+        color: Palette.bad;
+        font-size: 10px;
+        horizontal-alignment: right;
+    }
 
     // Линии блоков: куски путей в рамке 1000 × 1000 растягиваются на поле (толщина линии — снаружи поля).
     for s in root.series: Rectangle {
@@ -691,6 +776,31 @@ component Chart inherits Rectangle {
             stroke: s.color.transparentize(0.35);
             stroke-width: 1.5px;
             opacity: r.a;
+        }
+        // Наибольшие — тонкая линия и пустые квадраты.
+        for r in s.max: Path {
+            x: -1px;
+            y: -1px;
+            width: parent.width + 2px;
+            height: parent.height + 2px;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: r.d;
+            stroke: s.color.transparentize(0.2);
+            stroke-width: 1px;
+            opacity: r.a;
+        }
+        for m in s.marks: Rectangle {
+            visible: root.show-max;
+            x: m.mx * parent.width - 3px;
+            y: (1 - m.my) * parent.height - 3px;
+            width: 6px;
+            height: 6px;
+            background: Palette.panel;
+            border-width: 1px;
+            border-color: s.color;
+            opacity: m.a;
         }
         for r in s.mean: Path {
             x: -1.5px;
@@ -765,6 +875,19 @@ component Chart inherits Rectangle {
                 border-radius: self.d / 2;
                 background: s.color;
             }
+        }
+        // Отсечки автомодуля на линии блока: аварийная — красный ромб, по цели — янтарное кольцо.
+        for c in s.cuts: Path {
+            x: c.x * parent.width - 6px;
+            y: (1 - c.y) * parent.height - 6px;
+            width: 12px;
+            height: 12px;
+            viewbox-width: 12;
+            viewbox-height: 12;
+            commands: c.kind == 1 ? "M 6 0 L 12 6 L 6 12 L 0 6 Z" : "M 6 1 A 5 5 0 1 1 5.99 1 Z";
+            fill: c.kind == 1 ? Palette.bad : transparent;
+            stroke: c.kind == 1 ? Palette.panel : #ffb454;
+            stroke-width: c.kind == 1 ? 1px : 2px;
         }
     }
 
@@ -865,13 +988,243 @@ component Chart inherits Rectangle {
     }
 }
 
-// Список строк (история профилей, действия автомодуля): время, заголовок, текст; прокручивается.
+// Вид «по времени» (src/timeline.rs, бриф W): полосы одна под другой на общей оси времени, отметки действий автомодуля
+// под полосами, подписи времени внизу. Колесо — масштаб вокруг курсора, перетаскивание — сдвиг (Rust пересчитывает
+// показ и прореживание); курсор — подсказка со значениями всех рядов в ближайшей строке.
+component TimeChart inherits Rectangle {
+    in property <[TimeStrip]> strips;
+    in property <[Tick]> ticks;      // ось времени: доля ширины и подпись
+    in property <[TimeMark]> marks;
+    in property <[TimeDot]> dots;    // события на линиях блоков (раскладка «блоки», одна полоса)
+    in property <[float]> gaps;      // перерывы записи: доля ширины
+    in property <string> head;
+    in property <string> empty;
+    callback wheel(length, length, float);                       // курсор от левого края поля, ширина поля, сдвиг колеса
+    callback press(length);                                      // кнопка нажата: курсор от левого края поля
+    callback drag(length, length);                               // курсор от левого края поля, ширина поля
+    callback release();
+    callback hover(length, length, length, length) -> string;    // курсор и размер поля → текст подсказки
+    callback tip(bool, string, string, length, length, length, length, length, length, length, length, length, length);
+
+    property <length> left: 44px;
+    property <length> head-h: 18px;
+    property <length> axis-h: 18px;
+    property <length> mark-h: 12px;
+    property <length> gap: 4px;
+    out property <length> plot-x: root.left;
+    out property <length> plot-y: root.head-h;
+    out property <length> plot-w: root.width - root.left - 10px;
+    out property <length> plot-h: root.height - root.head-h - root.axis-h - root.mark-h;
+    property <length> strip-h: (root.plot-h - (root.strips.length - 1) * root.gap) / max(1, root.strips.length);
+    property <bool> drawn: root.empty == "" && root.strips.length > 0;
+
+    if root.empty != "": Text {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        text: root.empty;
+        color: Palette.dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+    if root.drawn: Text {
+        x: root.plot-x;
+        y: 0;
+        width: root.plot-w;
+        height: root.head-h - 2px;
+        text: root.head;
+        color: Palette.dim;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    for s[i] in root.strips: Rectangle {
+        visible: root.drawn;
+        x: root.plot-x;
+        y: root.plot-y + i * (root.strip-h + root.gap);
+        width: root.plot-w;
+        height: root.strip-h;
+        background: #ffffff06;
+        clip: true;
+        for t in s.ticks: Rectangle {
+            x: 0;
+            y: (1 - t.f) * parent.height;
+            width: parent.width;
+            height: 1px;
+            background: Palette.line;
+        }
+        for r in s.refs: Rectangle {
+            x: 0;
+            y: (1 - r.f) * parent.height;
+            width: parent.width;
+            height: 1px;
+            background: r.color;
+        }
+        for r in s.refs: Text {
+            x: 0;
+            width: parent.width - 4px;
+            y: (1 - r.f) * parent.height - 13px;
+            text: r.text;
+            color: r.color;
+            font-size: 10px;
+            horizontal-alignment: right;
+        }
+        Image {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            source: s.picture;
+            image-fit: fill;
+        }
+        Text {
+            x: 4px;
+            y: 1px;
+            text: s.title;
+            color: Palette.dim;
+            font-size: 10px;
+        }
+    }
+    // Подписи делений полос — слева от поля (поле полосы обрезает своё содержимое).
+    for s[i] in root.strips: Rectangle {
+        visible: root.drawn;
+        x: 0;
+        y: root.plot-y + i * (root.strip-h + root.gap);
+        width: root.left - 4px;
+        height: root.strip-h;
+        for t in s.ticks: Text {
+            x: 0;
+            width: parent.width;
+            y: (1 - t.f) * parent.height - 7px;
+            height: 14px;
+            text: t.text;
+            color: Palette.dim;
+            font-size: 10px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+    // Перерывы записи — тонкие пунктирные отметки через все полосы (их длительность — в подсказке курсора).
+    for g in root.gaps: Path {
+        visible: root.drawn;
+        x: root.plot-x + g * root.plot-w - 1px;
+        y: root.plot-y;
+        width: 3px;
+        height: root.plot-h;
+        viewbox-width: 3;
+        viewbox-height: 100;
+        fit: fill;
+        commands: "M 1.5 0 L 1.5 100";
+        stroke: Palette.dim;
+        stroke-width: 1px;
+        opacity: 0.7;
+    }
+    // События на линиях блоков: опускающие потолок — треугольник остриём вниз, остальные — кружок.
+    for d in root.dots: Path {
+        visible: root.drawn && root.strips.length == 1;
+        x: root.plot-x + d.x * root.plot-w - 5px;
+        y: root.plot-y + (1 - d.y) * root.strip-h - 5px;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: d.kind == 1 ? "M 0 1 L 10 1 L 5 10 Z" : "M 5 1 A 4 4 0 1 1 4.99 1 Z";
+        fill: d.color;
+        stroke: Palette.bg;
+        stroke-width: 1px;
+    }
+    // События без места на линии (раскладка «параметры», события без блока) — треугольники над осью времени.
+    for m in root.marks: Path {
+        visible: root.drawn;
+        x: root.plot-x + m.f * root.plot-w - 5px;
+        y: root.plot-y + root.plot-h + 1px;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: "M 5 0 L 10 10 L 0 10 Z";
+        fill: m.color;
+    }
+    if root.drawn: Rectangle {
+        x: root.plot-x;
+        y: root.plot-y + root.plot-h + root.mark-h;
+        width: root.plot-w;
+        height: 1px;
+        background: Palette.dim;
+    }
+    for t in root.ticks: Text {
+        visible: root.drawn;
+        x: root.plot-x + t.f * root.plot-w - 34px;
+        width: 68px;
+        y: root.plot-y + root.plot-h + root.mark-h + 3px;
+        height: 14px;
+        text: t.text;
+        color: Palette.text;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+    touch := TouchArea {
+        x: root.plot-x;
+        y: root.plot-y;
+        width: root.plot-w;
+        height: root.plot-h + root.mark-h;
+        enabled: root.drawn;
+        mouse-cursor: self.held ? MouseCursor.grabbing : MouseCursor.crosshair;
+        property <bool> held;
+        function show() {
+            root.tip(true, "time", root.hover(self.mouse-x, self.mouse-y, self.width, self.height),
+                self.absolute-position.x + self.mouse-x, self.absolute-position.y, 1px, self.height,
+                self.absolute-position.x, self.absolute-position.y, self.width, self.height,
+                self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+        }
+        scroll-event(event) => {
+            root.wheel(self.mouse-x, self.width, event.delta-y / 1px);
+            if (self.has-hover) {
+                self.show();
+            }
+            accept
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.held = true;
+                root.tip(false, "time", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                root.press(self.mouse-x);
+            } else if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.held) {
+                self.held = false;
+                root.release();
+            }
+        }
+        changed mouse-x => {
+            if (self.held) {
+                root.drag(self.mouse-x, self.width);
+            } else if (self.has-hover) {
+                self.show();
+            }
+        }
+        changed pressed => {
+            if (!self.pressed && self.held) {
+                self.held = false;
+                root.release();
+            }
+        }
+        changed has-hover => {
+            if (!self.has-hover) {
+                root.tip(false, "time", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+// Список строк (события): время, заголовок, текст; подробности — в подсказке; щелчок — строка выбрана; прокручивается.
 component Lines inherits Flickable {
     in property <[LineRow]> rows;
     in property <length> row-h: 18px;
     in property <string> empty;
     in property <bool> marks;   // у строк есть цвет блока — квадратик перед заголовком
     callback tip(bool, string, string, length, length, length, length); // как AppWindow.tip
+    callback clicked(int);
     content-height: max(self.height, root.rows.length * root.row-h);
     if root.rows.length == 0: Text {
         y: 0;
@@ -897,8 +1250,10 @@ component Lines inherits Flickable {
         y: i * root.row-h;
         height: root.row-h;
         width: root.width;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(i); }
         changed has-hover => {
-            root.tip(self.has-hover, "line" + i + r.time, r.time + "  " + r.head + "  " + r.text, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            root.tip(self.has-hover, "line" + i + r.time, r.time + "  " + r.head + "  " + r.text + (r.more != "" ? "\n" + r.more : "") + "\nщелчок — этот момент на графике по времени", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
         }
     }
 }
@@ -958,32 +1313,54 @@ export component AppWindow inherits Window {
     in property <string> chart-cutoff-text;
     in property <float> chart-zero: -1;
     in property <string> chart-value-title;
-    // Вид графика (выбор владельца, src/chart.rs): шкала над кристаллом / абсолютная; линии ø и 95 % — два
-    // независимых выключателя (владелец 16.10); оси местами.
-    in property <bool> chart-above: true;
+    // Вид графика (выбор владельца, src/chart.rs): нагрев ядра / над кристаллом / абсолютная (бриф 16.10); линии ø,
+    // 95 % и «макс» — независимые выключатели (владелец 16.10), в «нагреве ядра» они недоступны; оси местами.
+    in property <int> chart-view;            // 0 — нагрев ядра, 1 — над кристаллом, 2 — абсолютная
     in property <bool> chart-mean: true;
     in property <bool> chart-p95: true;
+    in property <bool> chart-max;
     in property <bool> chart-model: true;   // кривые модели нагрева
     in property <bool> chart-swap;
-    in property <[LineRow]> actions;
-    in property <string> actions-empty;
+    in property <float> chart-emergency: -1;
+    in property <string> chart-emergency-text;
+    // Вид «по времени» (src/timeline.rs, бриф W): вместо графика блоков — полосы дня.
+    in property <bool> chart-time;
+    in property <int> time-layout;           // 0 — «блоки», 1 — «параметры»
+    in property <int> time-quantity;         // величина «блоков»: 0 °C, 1 ×, 2 потолок, 3 нагрузка, 4 кристалл
+    in property <[TimeStrip]> time-strips;
+    in property <[Tick]> time-ticks;
+    in property <[TimeMark]> time-marks;
+    in property <[TimeDot]> time-dots;
+    in property <[float]> time-gaps;
+    in property <string> time-head;
+    in property <string> time-empty;
+    in property <string> day-text;
+    in property <bool> can-day-prev;
+    in property <bool> can-day-next;
+    in property <[LineRow]> events;
+    in property <string> events-empty;
+    in property <bool> events-all;
     // Подсветка линий: false — под курсором, true — закреплённая (владелец 15.10: попробовать обе).
     in property <bool> pin-mode;
 
-    // Автомодуль: выбор владельца из темы settings программы у часов (у движка C# темы нет — блока нет). Ползунок
-    // показывает число, пока его тянут; Rust получает его в limit-moved (линия отсечки на графике) и применяет одной
-    // командой в limit-released.
+    // Автомодуль: выбор владельца из темы settings программы у часов (у движка C# темы нет — блока нет). Ползунки
+    // показывают число, пока их тянут; Rust получает его в limit-moved / emergency-moved (линии на графике) и применяет
+    // одной командой в limit-released / emergency-released. Аварийной нет у программы до 0.5.6 — её строки нет.
     in property <bool> has-auto;
     in property <bool> auto-ready;    // связь есть — настройки можно менять
     in property <bool> auto-on;
-    in property <bool> auto-step-up;
     in property <int> auto-limit: 85;
     in property <int> auto-limit-min: 60;
     in property <int> auto-limit-max: 95;
+    in property <bool> has-emergency;
+    in property <int> auto-emergency: 95;
+    in property <int> auto-emergency-min: 86;
+    in property <int> auto-emergency-max: 100;
     callback auto-toggled();
-    callback step-up-toggled();
     callback limit-moved(int);
     callback limit-released(int);
+    callback emergency-moved(int);
+    callback emergency-released(int);
     // Журнал срезов: выбор программы у часов из темы settings (поле log), свой выключатель — «запись» в шапке
     // статистики (владелец 16.10: «отдельно какой-то выключатель для логирования»).
     in property <bool> has-log;
@@ -994,17 +1371,51 @@ export component AppWindow inherits Window {
     // Куда целится скрытая проверка: середины выключателей, дорожка ползунка.
     out property <length> auto-switch-x: auto-switch.absolute-position.x + auto-switch.width / 2;
     out property <length> auto-switch-y: auto-switch.absolute-position.y + auto-switch.height / 2;
-    out property <length> step-switch-x: step-switch.absolute-position.x + step-switch.width / 2;
-    out property <length> step-switch-y: step-switch.absolute-position.y + step-switch.height / 2;
     out property <length> limit-track-x: limit-slider.absolute-position.x + limit-slider.track-x;
     out property <length> limit-track-w: limit-slider.track-w;
     out property <length> limit-track-y: limit-slider.absolute-position.y + limit-slider.height / 2;
     out property <int> limit-shown: limit-slider.shown;
+    out property <length> emergency-track-x: emergency-slider.absolute-position.x + emergency-slider.track-x;
+    out property <length> emergency-track-w: emergency-slider.track-w;
+    out property <length> emergency-track-y: emergency-slider.absolute-position.y + emergency-slider.height / 2;
+    out property <int> emergency-shown: emergency-slider.shown;
     // Середины кнопок переключателя — по ним щёлкает скрытая проверка (src/check.rs).
     out property <length> hover-chip-x: hover-chip.absolute-position.x + hover-chip.width / 2;
     out property <length> hover-chip-y: hover-chip.absolute-position.y + hover-chip.height / 2;
     out property <length> pin-chip-x: pin-chip.absolute-position.x + pin-chip.width / 2;
     out property <length> pin-chip-y: pin-chip.absolute-position.y + pin-chip.height / 2;
+    out property <length> own-chip-x: own-chip.absolute-position.x + own-chip.width / 2;
+    out property <length> own-chip-y: own-chip.absolute-position.y + own-chip.height / 2;
+    out property <length> max-chip-x: max-chip.absolute-position.x + max-chip.width / 2;
+    out property <length> max-chip-y: max-chip.absolute-position.y + max-chip.height / 2;
+    out property <length> blocks-chip-x: blocks-chip.absolute-position.x + blocks-chip.width / 2;
+    out property <length> blocks-chip-y: blocks-chip.absolute-position.y + blocks-chip.height / 2;
+    out property <length> time-chip-x: time-chip.absolute-position.x + time-chip.width / 2;
+    out property <length> time-chip-y: time-chip.absolute-position.y + time-chip.height / 2;
+    out property <length> day-prev-x: day-prev.absolute-position.x + day-prev.width / 2;
+    out property <length> day-prev-y: day-prev.absolute-position.y + day-prev.height / 2;
+    out property <length> day-next-x: day-next.absolute-position.x + day-next.width / 2;
+    out property <length> day-next-y: day-next.absolute-position.y + day-next.height / 2;
+    out property <length> whole-chip-x: whole-chip.absolute-position.x + whole-chip.width / 2;
+    out property <length> whole-chip-y: whole-chip.absolute-position.y + whole-chip.height / 2;
+    out property <length> lay-blocks-x: lay-blocks.absolute-position.x + lay-blocks.width / 2;
+    out property <length> lay-blocks-y: lay-blocks.absolute-position.y + lay-blocks.height / 2;
+    out property <length> lay-params-x: lay-params.absolute-position.x + lay-params.width / 2;
+    out property <length> lay-params-y: lay-params.absolute-position.y + lay-params.height / 2;
+    out property <length> q-ceiling-x: q-ceiling.absolute-position.x + q-ceiling.width / 2;
+    out property <length> q-ceiling-y: q-ceiling.absolute-position.y + q-ceiling.height / 2;
+    out property <length> q-temp-x: q-temp.absolute-position.x + q-temp.width / 2;
+    out property <length> q-temp-y: q-temp.absolute-position.y + q-temp.height / 2;
+    out property <length> ev-all-x: ev-all.absolute-position.x + ev-all.width / 2;
+    out property <length> ev-all-y: ev-all.absolute-position.y + ev-all.height / 2;
+    out property <length> ev-mine-x: ev-mine.absolute-position.x + ev-mine.width / 2;
+    out property <length> ev-mine-y: ev-mine.absolute-position.y + ev-mine.height / 2;
+    out property <length> events-x: root.stats-x + root.pad;
+    out property <length> events-y: root.body-y + root.body-h - root.pad - root.events-h;
+    out property <length> time-plot-x: time-chart.x + time-chart.plot-x;
+    out property <length> time-plot-y: time-chart.y + time-chart.plot-y;
+    out property <length> time-plot-w: time-chart.plot-w;
+    out property <length> time-plot-h: time-chart.plot-h;
     out property <length> above-chip-x: above-chip.absolute-position.x + above-chip.width / 2;
     out property <length> above-chip-y: above-chip.absolute-position.y + above-chip.height / 2;
     out property <length> abs-chip-x: abs-chip.absolute-position.x + abs-chip.width / 2;
@@ -1031,8 +1442,8 @@ export component AppWindow inherits Window {
     // Шапка статистики в координатах окна: низ легенды блоков и группы кнопок вида (x, y, ширина) — скрытая проверка
     // смотрит, что они не налезают друг на друга при любой ширине.
     out property <length> key-bottom: root.body-y + root.head-h - 4px + root.key-h;
-    out property <length> scale-group-x: root.stats-x + root.pad;
-    out property <length> scale-group-y: root.body-y + root.controls-top;
+    out property <length> scale-group-x: root.stats-x + root.pad + root.g1-x;
+    out property <length> scale-group-y: root.body-y + root.controls-top + root.g1-y;
     out property <length> scale-group-w: scale-group.preferred-width;
     out property <length> curve-group-x: root.stats-x + root.pad + root.g2-x;
     out property <length> curve-group-y: root.body-y + root.controls-top + root.g2-y;
@@ -1050,11 +1461,24 @@ export component AppWindow inherits Window {
     callback chart-left();
     callback chart-click(length, length, length, length);
     callback mode-changed(bool);
-    callback scale-changed(bool);   // true — над кристаллом
+    callback view-changed(int);     // 0 — нагрев ядра, 1 — над кристаллом, 2 — абсолютная
     callback mean-toggled();        // линии ø — показать или скрыть
     callback p95-toggled();         // линии 95 % — показать или скрыть
+    callback max-toggled();         // линии наибольших — показать или скрыть
     callback model-toggled();       // кривые модели — показать или скрыть
     callback axes-changed(bool);    // true — температура по горизонтали
+    callback time-changed(bool);    // true — ось x время, false — множитель
+    callback layout-changed(int);   // 0 — «блоки», 1 — «параметры»
+    callback quantity-changed(int); // величина «блоков»
+    callback events-filter(bool);   // true — все блоки, false — выбранные
+    callback event-clicked(int);    // строка списка событий
+    callback day-step(int);         // −1 — день раньше, +1 — позже
+    callback day-whole();           // показ — весь день
+    callback time-wheel(length, length, float);
+    callback time-press(length);
+    callback time-drag(length, length);
+    callback time-release();
+    callback time-hover(length, length, length, length) -> string;
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
     callback limit-chosen(int);
     callback problem-dismissed();
@@ -1147,15 +1571,15 @@ export component AppWindow inherits Window {
     property <length> tip-room-b: root.tip-ay + root.tip-ah - (root.tip-y + root.tip-h) - 6px;
     property <bool> tip-above: root.tip-room-a >= root.tip-box-h || root.tip-room-a >= root.tip-room-b;
     out property <length> tip-box-w: !root.tip-chart ? root.tip-want-w
-        : root.chart-swap ? min(root.tip-want-w, root.tip-aw)
+        : root.tip-swap ? min(root.tip-want-w, root.tip-aw)
         : max(40px, min(root.tip-want-w, root.tip-right ? root.tip-room-r : root.tip-room-l));
     out property <length> tip-box-h: tip-wrapped.preferred-height + 14px;
     out property <length> tip-box-x: !root.tip-chart ? max(4px, min(root.tip-x, root.width - root.tip-box-w - 4px))
-        : root.chart-swap ? max(root.tip-ax, min(root.tip-cx + 14px, root.tip-ax + root.tip-aw - root.tip-box-w))
+        : root.tip-swap ? max(root.tip-ax, min(root.tip-cx + 14px, root.tip-ax + root.tip-aw - root.tip-box-w))
         : root.tip-right ? root.tip-x + root.tip-w + 6px : root.tip-x - 6px - root.tip-box-w;
     out property <length> tip-box-y: !root.tip-chart
         ? (root.tip-y + root.tip-h + 6px + root.tip-box-h <= root.height - 4px ? root.tip-y + root.tip-h + 6px : max(4px, root.tip-y - root.tip-box-h - 6px))
-        : root.chart-swap
+        : root.tip-swap
             ? (root.tip-above ? max(4px, root.tip-y - 6px - root.tip-box-h) : root.tip-y + root.tip-h + 6px)
             : max(4px, min(root.tip-cy + 16px, root.tip-ay + root.tip-ah - root.tip-box-h));
 
@@ -1228,13 +1652,31 @@ export component AppWindow inherits Window {
     property <length> key-h: ceil(root.stats-legend.length / root.key-cols) * root.key-row;
     property <length> controls-top: root.head-h - 4px + root.key-h + (root.key-h > 0 ? 4px : 0px);
     // Переключатели вида — четыре группы слева направо; не помещается — с новой строки.
+    // Подсказка графика с осями местами — над или под строкой множителя; у вида «по времени» осей местами нет.
+    property <bool> tip-swap: root.chart-swap && !root.chart-time;
     property <length> ctl-w: root.stats-w - 2 * root.pad;
     property <length> ctl-gap: 14px;
     property <length> ctl-row: 26px;
-    property <length> g2-at: scale-group.preferred-width + root.ctl-gap;
+    // Первая группа — «блоки / по времени»; за ней у блоков — вид, линии, оси, подсветка, у «по времени» — день.
+    property <length> g1-at: kind-group.preferred-width + root.ctl-gap;
+    property <bool> g1-fits: root.g1-at + scale-group.preferred-width <= root.ctl-w;
+    property <length> g1-x: root.g1-fits ? root.g1-at : 0;
+    property <length> g1-y: root.g1-fits ? 0 : root.ctl-row;
+    property <length> g2-at: root.g1-x + scale-group.preferred-width + root.ctl-gap;
     property <bool> g2-fits: root.g2-at + curve-group.preferred-width <= root.ctl-w;
     property <length> g2-x: root.g2-fits ? root.g2-at : 0;
-    property <length> g2-y: root.g2-fits ? 0 : root.ctl-row;
+    property <length> g2-y: root.g2-fits ? root.g1-y : root.g1-y + root.ctl-row;
+    property <bool> gd-fits: root.g1-at + day-group.preferred-width <= root.ctl-w;
+    property <length> gd-x: root.gd-fits ? root.g1-at : 0;
+    property <length> gd-y: root.gd-fits ? 0 : root.ctl-row;
+    property <length> gl-at: root.gd-x + day-group.preferred-width + root.ctl-gap;
+    property <bool> gl-fits: root.gl-at + layout-group.preferred-width <= root.ctl-w;
+    property <length> gl-x: root.gl-fits ? root.gl-at : 0;
+    property <length> gl-y: root.gl-fits ? root.gd-y : root.gd-y + root.ctl-row;
+    property <length> gq-at: root.gl-x + layout-group.preferred-width + root.ctl-gap;
+    property <bool> gq-fits: root.gq-at + quantity-group.preferred-width <= root.ctl-w;
+    property <length> gq-x: root.gq-fits ? root.gq-at : 0;
+    property <length> gq-y: root.gq-fits ? root.gl-y : root.gl-y + root.ctl-row;
     property <length> g3-at: root.g2-x + curve-group.preferred-width + root.ctl-gap;
     property <bool> g3-fits: root.g3-at + axes-group.preferred-width <= root.ctl-w;
     property <length> g3-x: root.g3-fits ? root.g3-at : 0;
@@ -1243,10 +1685,10 @@ export component AppWindow inherits Window {
     property <bool> g4-fits: root.g4-at + mode-group.preferred-width <= root.ctl-w;
     property <length> g4-x: root.g4-fits ? root.g4-at : 0;
     property <length> g4-y: root.g4-fits ? root.g3-y : root.g3-y + root.ctl-row;
-    property <length> controls-h: root.g4-y + root.ctl-row;
-    property <length> actions-h: min(6, max(1, root.actions.length)) * 18px;
-    out property <length> auto-h: root.has-auto ? 64px : 0px;
-    out property <length> auto-y: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.auto-h;
+    property <length> controls-h: (!root.chart-time ? root.g4-y : root.time-layout == 0 ? root.gq-y : root.gl-y) + root.ctl-row;
+    out property <length> events-h: min(6, max(1, root.events.length)) * 18px;
+    out property <length> auto-h: !root.has-auto ? 0px : root.has-emergency ? 90px : 64px;
+    out property <length> auto-y: root.body-y + root.body-h - root.pad - root.events-h - 28px - root.auto-h;
     out property <length> chart-y: root.body-y + root.controls-top + root.controls-h;
     out property <length> chart-h: root.auto-y - root.chart-y;
 
@@ -1669,43 +2111,186 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // Шкала температуры.
-        scale-group := HorizontalLayout {
+        // Что на графике: блоки (температура от множителя) или день по времени (бриф W).
+        kind-group := HorizontalLayout {
             x: root.pad;
             y: root.controls-top;
             width: self.preferred-width;
             height: 22px;
             spacing: 4px;
+            blocks-chip := Chip {
+                text: "по множителю";
+                on: !root.chart-time;
+                clicked => { root.time-changed(false); }
+                hover(on) => {
+                    root.tip(on, "kind-blocks", "По множителю\nТемпература выбранных блоков от фактического множителя — до двенадцати блоков сразу.\n• виды: нагрев ядра, над кристаллом, абсолютная", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            time-chip := Chip {
+                text: "по времени";
+                on: root.chart-time;
+                clicked => { root.time-changed(true); }
+                hover(on) => {
+                    root.tip(on, "kind-time", "По времени\nОдин день журнала на оси времени: только записанное время, перерывы записи сжаты в тонкие отметки.\n• «блоки» — выбранные блоки своими цветами, одна величина; «параметры» — первые два блока, все величины полосами\n• события — отметками на линии блока или под полосами, подсказка — у курсора\n• колесо — масштаб вокруг курсора, перетаскивание — сдвиг", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Вид графика блоков (бриф 16.10): один из трёх.
+        scale-group := HorizontalLayout {
+            visible: !root.chart-time;
+            x: root.pad + root.g1-x;
+            y: root.controls-top + root.g1-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            own-chip := Chip {
+                text: "нагрев ядра";
+                on: root.chart-view == 0;
+                clicked => { root.view-changed(0); }
+                hover(on) => {
+                    root.tip(on, "view-own", "Нагрев ядра\nСвой нагрев блока при полной нагрузке от множителя — всё прочее равно: кристалл, соседи, видеокарта и история вынесены; разница между ядрами — их тепловая эффективность.\n• линия — модель нагрева, точки — журнал с тем же вынесенным, по целым множителям; заливка точки — ø нагрузка\n• есть мощность процессора — для одинаковой работы на всех ядрах рода, нет — для нагрузки этого ядра в этой игре\n• у столбца — °C на ступень и производительность на градус\n• ø, 95 % и «макс» — для сырых срезов, здесь недоступны", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
             above-chip := Chip {
                 text: "над кристаллом";
-                on: root.chart-above;
-                clicked => { root.scale-changed(true); }
+                on: root.chart-view == 1;
+                clicked => { root.view-changed(1); }
                 hover(on) => {
-                    root.tip(on, "scale-above", "Над остальным кристаллом\nТемпература блока минус средняя остальных блоков в тот же момент: общий нагрев кристалла (игра, видеокарта, комната) вычитается, остаётся то, чем блок горячее других.\n• 0 — блок как кристалл в среднем, выше — горячее остальных\n• срез, где температура известна меньше чем у половины остальных блоков, сюда не идёт\n• отсечка автомодуля — абсолютная, её линия — на «абсолютной»", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "scale-above", "Над остальным кристаллом\nТемпература блока минус средняя остальных блоков в тот же момент: общий нагрев кристалла (игра, видеокарта, комната) вычитается, остаётся то, чем блок горячее других.\n• 0 — блок как кристалл в среднем, выше — горячее остальных\n• срез, где температура известна меньше чем у половины остальных блоков, сюда не идёт\n• отсечки автомодуля — абсолютные, их линии — на «абсолютной»", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
             abs-chip := Chip {
                 text: "абсолютная";
-                on: !root.chart-above;
-                clicked => { root.scale-changed(false); }
+                on: root.chart-view == 2;
+                clicked => { root.view-changed(2); }
                 hover(on) => {
-                    root.tip(on, "scale-abs", "Абсолютная температура\nКак её показывает датчик.\n• почти вся она — общий уровень кристалла: столбец множителя показывает больше то, когда набралось время, чем сам множитель\n• красная линия — отсечка автомодуля", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "scale-abs", "Абсолютная температура\nКак её показывает датчик.\n• почти вся она — общий уровень кристалла: столбец множителя показывает больше то, когда набралось время, чем сам множитель\n• красные линии — отсечка и аварийная отсечка автомодуля", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // День вида «по времени»: раньше, позже, весь день.
+        day-group := HorizontalLayout {
+            visible: root.chart-time;
+            x: root.pad + root.gd-x;
+            y: root.controls-top + root.gd-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            day-prev := Chip {
+                text: "◀";
+                enabled: root.can-day-prev;
+                clicked => { root.day-step(-1); }
+                hover(on) => {
+                    root.tip(on, "day-prev", "День раньше\nПредыдущий день, за который есть срезы.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            Text { text: root.day-text; color: Palette.text; font-size: 12px; vertical-alignment: center; }
+            day-next := Chip {
+                text: "▶";
+                enabled: root.can-day-next;
+                clicked => { root.day-step(1); }
+                hover(on) => {
+                    root.tip(on, "day-next", "День позже\nСледующий день, за который есть срезы; последний — сегодняшний.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            whole-chip := Chip {
+                text: "весь день";
+                clicked => { root.day-whole(); }
+                hover(on) => {
+                    root.tip(on, "day-whole", "Весь день\nПоказать день целиком — от первого среза до последнего.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Раскладка оси времени.
+        layout-group := HorizontalLayout {
+            visible: root.chart-time;
+            x: root.pad + root.gl-x;
+            y: root.controls-top + root.gl-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            lay-blocks := Chip {
+                text: "блоки";
+                on: root.time-layout == 0;
+                clicked => { root.layout-changed(0); }
+                hover(on) => {
+                    root.tip(on, "layout-blocks", "Блоки\nВсе выбранные блоки своими цветами на одной полосе — одна величина, её выбирают справа.\n• видно, какое ядро когда и в каком порядке менялось\n• события блока — на его линии: треугольник — потолок опущен, кружок — остальное", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            lay-params := Chip {
+                text: "параметры";
+                on: root.time-layout == 1;
+                clicked => { root.layout-changed(1); }
+                hover(on) => {
+                    root.tip(on, "layout-params", "Параметры\nПервые два выбранных блока — все величины полосами одна под другой.\n• температура с целью и аварийной отсечкой, множитель с потолком ступенями, нагрузка, кристалл, видеокарта (°C и Вт), вентиляторы\n• события — треугольниками под полосами", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+        // Величина раскладки «блоки».
+        quantity-group := HorizontalLayout {
+            visible: root.chart-time && root.time-layout == 0;
+            x: root.pad + root.gq-x;
+            y: root.controls-top + root.gq-y;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            q-temp := Chip {
+                text: "°C";
+                on: root.time-quantity == 0;
+                clicked => { root.quantity-changed(0); }
+                hover(on) => {
+                    root.tip(on, "q-temp", "Температура\nТемпература блока по датчику; цель и аварийная отсечка — линиями.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            Chip {
+                text: "×";
+                on: root.time-quantity == 1;
+                clicked => { root.quantity-changed(1); }
+                hover(on) => {
+                    root.tip(on, "q-ratio", "Фактический множитель\nСредний множитель блока за промежуток строки.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            q-ceiling := Chip {
+                text: "потолок";
+                on: root.time-quantity == 2;
+                clicked => { root.quantity-changed(2); }
+                hover(on) => {
+                    root.tip(on, "q-ceiling", "Потолок\nПотолок множителя блока ступенями — журнал смены потолков: кто, когда и в каком порядке.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            Chip {
+                text: "нагрузка";
+                on: root.time-quantity == 3;
+                clicked => { root.quantity-changed(3); }
+                hover(on) => {
+                    root.tip(on, "q-busy", "Нагрузка\nДоля времени, когда блок не спал, за промежуток строки, %.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            Chip {
+                text: "кристалл";
+                on: root.time-quantity == 4;
+                clicked => { root.quantity-changed(4); }
+                hover(on) => {
+                    root.tip(on, "q-die", "Кристалл\nСредняя температура остальных блоков в тот же момент — общий нагрев вокруг блока.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
         // Какие линии.
         curve-group := HorizontalLayout {
+            visible: !root.chart-time;
             x: root.pad + root.g2-x;
             y: root.controls-top + root.g2-y;
             width: self.preferred-width;
             height: 22px;
             spacing: 4px;
-            // Три независимых выключателя (владелец 16.10: «два независимых выключателя» вместо «ø / 95 % / обе»): каждый
-            // показывает или скрывает свою линию; выключены все — пустой график с осями.
+            // Независимые выключатели (владелец 16.10: «два независимых выключателя» вместо «ø / 95 % / обе»): каждый
+            // показывает или скрывает свою линию; выключены все — пустой график с осями. В «нагреве ядра» сырых корзин
+            // нет — ø, 95 % и «макс» серые.
             mean-chip := Chip {
                 text: "ø";
                 glyph: 1;
                 on: root.chart-mean;
+                enabled: root.chart-view != 0;
                 clicked => { root.mean-toggled(); }
                 hover(on) => {
                     root.tip(on, "curve-mean", "ø средняя\nТолстая линия: средняя температура по времени на каждом фактическом множителе.\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• бледнее — меньше времени за точкой: от одной строки (0,25 с) до самой полной корзины, по логарифму\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
@@ -1715,9 +2300,20 @@ export component AppWindow inherits Window {
                 text: "95 %";
                 glyph: 2;
                 on: root.chart-p95;
+                enabled: root.chart-view != 0;
                 clicked => { root.p95-toggled(); }
                 hover(on) => {
                     root.tip(on, "curve-p95", "95 % времени ниже\nТонкая линия: температура, выше которой блок был только 5 % времени на этом множителе.\n• в отличие от наибольшей не зависит от одной строки и от того, сколько строк в корзине\n• наибольшая — в подсказке столбца: ▲ со множителем, нагрузкой и временем\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            max-chip := Chip {
+                text: "макс";
+                glyph: 4;
+                on: root.chart-max;
+                enabled: root.chart-view != 0;
+                clicked => { root.max-toggled(); }
+                hover(on) => {
+                    root.tip(on, "curve-max", "Наибольшая\nТонкая линия с квадратами: самое высокое одно показание на каждом множителе.\n• в подсказке столбца — условия той строки: время, множитель и потолок, нагрузка, кристалл, соседи, видеокарта, вентиляторы\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
             model-chip := Chip {
@@ -1726,12 +2322,13 @@ export component AppWindow inherits Window {
                 on: root.chart-model;
                 clicked => { root.model-toggled(); }
                 hover(on) => {
-                    root.tip(on, "curve-model", "Модель нагрева\nСредняя линия без точек: температура блока от фактического множителя при его полной нагрузке, соседях и кристалле на их медианах — по регрессии из журнала срезов.\n• есть в журнале мощность процессора — кривая для одинаковой работы на всех ядрах одного рода, их можно сравнивать; нет — для нагрузки этого ядра в этой игре\n• сплошная — множители, на которых блок работал под нагрузкой (без редких крайних: по 5 % времени с каждой стороны); пунктир — за ними\n• модель — по последним 8 часам журнала, пересчёт не чаще раза в минуту\n• «°C на ватт», условия и ошибка модели — в подсказке блока над графиком\n• кривой нет, пока у блока меньше 10 минут годных срезов\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "curve-model", "Модель нагрева\nЛиния без точек: по регрессии из журнала срезов — в «нагреве ядра» свой нагрев блока при полной нагрузке, в остальных видах — его температура при соседях и кристалле на их медианах.\n• есть в журнале мощность процессора — кривая для одинаковой работы на всех ядрах одного рода, их можно сравнивать; нет — для нагрузки этого ядра в этой игре\n• сплошная — множители, на которых блок работал под нагрузкой (без редких крайних: по 5 % времени с каждой стороны); пунктир — за ними\n• модель — по всему журналу периода; у часто повторяющихся множителей — только новейшие срезы, пока они уточняют её; пересчёт не чаще раза в минуту\n• «°C на ватт», что влияет на температуру, условия и ошибка модели — в подсказке блока над графиком\n• кривой нет, пока у блока меньше 10 минут годных срезов\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
         // Какая ось по горизонтали.
         axes-group := HorizontalLayout {
+            visible: !root.chart-time;
             x: root.pad + root.g3-x;
             y: root.controls-top + root.g3-y;
             width: self.preferred-width;
@@ -1758,6 +2355,7 @@ export component AppWindow inherits Window {
         // Переключатель подсветки: «курсор» — линия под курсором (или плитки под курсором) поверх остальных;
         // «закреплённая» — последний добавленный блок или линия, по которой щёлкнули.
         mode-group := HorizontalLayout {
+            visible: !root.chart-time;
             x: root.pad + root.g4-x;
             y: root.controls-top + root.g4-y;
             width: self.preferred-width;
@@ -1781,18 +2379,35 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        Text {
+        // Список событий: заголовок и переключатель «все блоки / выбранные».
+        HorizontalLayout {
             x: root.pad;
-            y: parent.height - root.pad - root.actions-h - 24px;
-            text: root.has-auto
-                ? (root.stats-legend.length > 1 ? "Его действия с выбранными блоками" : "Его действия с этим блоком")
-                : (root.stats-legend.length > 1 ? "Автомодуль · действия с выбранными блоками" : "Автомодуль · действия с этим блоком");
-            color: Palette.dim;
-            font-weight: 600;
-            font-size: 12px;
+            y: parent.height - root.pad - root.events-h - 26px;
+            width: parent.width - 2 * root.pad;
+            height: 22px;
+            spacing: 4px;
+            Text { text: "События"; color: Palette.dim; font-weight: 600; font-size: 12px; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+            ev-mine := Chip {
+                text: "выбранные блоки";
+                on: !root.events-all;
+                clicked => { root.events-filter(false); }
+                hover(on) => {
+                    root.tip(on, "events-mine", "Выбранные блоки\nСобытия блоков в сравнении и события всех блоков сразу (сброс ▲ и ø, пробуждение).", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            ev-all := Chip {
+                text: "все блоки";
+                on: root.events-all;
+                clicked => { root.events-filter(true); }
+                hover(on) => {
+                    root.tip(on, "events-all", "Все блоки\nВсе события журнала, новые первыми: отсечки и возвраты автомодуля, профили, правки потолков, сбросы.\n• щелчок по строке — этот момент на графике по времени", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
         }
     }
     chart := Chart {
+        visible: !root.chart-time;
         x: root.stats-x + root.pad - 4px;
         y: root.chart-y;
         width: root.stats-w - 2 * root.pad + 4px;
@@ -1804,27 +2419,51 @@ export component AppWindow inherits Window {
         columns: root.chart-columns;
         cutoff: root.chart-cutoff;
         cutoff-text: root.chart-cutoff-text;
+        emergency: root.chart-emergency;
+        emergency-text: root.chart-emergency-text;
         zero: root.chart-zero;
         swap: root.chart-swap;
-        show-mean: root.chart-mean;
-        show-p95: root.chart-p95;
+        // В «нагреве ядра» точки — частные остатки (кольца ø), линий ø, 95 % и наибольших нет.
+        show-mean: root.chart-mean || root.chart-view == 0;
+        show-p95: root.chart-p95 && root.chart-view != 0;
+        show-max: root.chart-max && root.chart-view != 0;
         value-title: root.chart-value-title;
         tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy) => { root.chart-tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy); }
         pointer(x, y, w, h) => { root.chart-pointer(x, y, w, h); }
         exited() => { root.chart-left(); }
         clicked-at(x, y, w, h) => { root.chart-click(x, y, w, h); }
     }
-    // ----- Автомодуль: настройки программы у часов (DECISIONS #36) -----
-    // Под графиком, где его красная линия отсечки, над списком его действий: всё про автомодуль — в одном месте.
-    // Строки: выключатель и подтягивание; отсечка (глубины нет, DECISIONS #38). Одинаковое дело — одинаковый элемент:
-    // числа — ползунками, «да / нет» — выключателями.
+    time-chart := TimeChart {
+        visible: root.chart-time;
+        x: root.stats-x + root.pad - 4px;
+        y: root.chart-y;
+        width: root.stats-w - 2 * root.pad + 4px;
+        height: root.chart-h;
+        strips: root.time-strips;
+        ticks: root.time-ticks;
+        marks: root.time-marks;
+        dots: root.time-dots;
+        gaps: root.time-gaps;
+        head: root.time-head;
+        empty: root.time-empty;
+        wheel(x, w, delta) => { root.time-wheel(x, w, delta); }
+        press(x) => { root.time-press(x); }
+        drag(x, w) => { root.time-drag(x, w); }
+        release() => { root.time-release(); }
+        hover(x, y, w, h) => { return root.time-hover(x, y, w, h); }
+        tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy) => { root.chart-tip(on, key, text, x, y, w, h, ax, ay, aw, ah, cx, cy); }
+    }
+    // ----- Автомодуль: настройки программы у часов (DECISIONS #36, #40; бриф T) -----
+    // Под графиком, где его красные линии отсечек, над списком его действий: всё про автомодуль — в одном месте.
+    // Строки: выключатель; отсечка (цель); аварийная отсечка. Подтягивания вверх нет (DECISIONS #40: его заменит подбор
+    // потолков по модели). Одинаковое дело — одинаковый элемент: числа — ползунками, «да / нет» — выключателями.
     Rectangle {
         visible: root.has-auto;
         x: root.stats-x + root.pad;
         y: root.auto-y;
         width: root.stats-w - 2 * root.pad;
         height: root.auto-h;
-        property <length> label-w: 64px;
+        property <length> label-w: 76px;
         property <length> value-w: 48px;
         Rectangle { x: 0; y: 2px; width: parent.width; height: 1px; background: Palette.line; }
         auto-switch := Switch {
@@ -1834,7 +2473,7 @@ export component AppWindow inherits Window {
             enabled: root.auto-ready;
             toggled => { root.auto-toggled(); }
             hover(on) => {
-                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• опускает сколько нужно, но не ниже нижней границы потолка (той же, что в меню потолка плитки)\n• работает в CoreMapTray, окно для этого не нужно\n• выключен — CoreMapTray датчики для него не читает и потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "auto-on", "Автомодуль\nДве отсечки опускают потолок горячего блока на ступень: аварийная — по одному показанию, обычная — по 2-с медиане выше цели; опущенные блоки он возвращает к профилю.\n• при любой нагрузке: горячий и свободный блок тоже опускается\n• не ниже нижней границы потолка (той же, что в меню потолка плитки) и не выше профиля\n• работает в CoreMapTray, окно для этого не нужно\n• выключен — потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -1845,27 +2484,6 @@ export component AppWindow inherits Window {
             color: root.auto-on ? Palette.text : Palette.dim;
             font-weight: 600;
             font-size: 12px;
-            vertical-alignment: center;
-        }
-        step-switch := Switch {
-            x: parent.width - self.width;
-            y: 12px;
-            on: root.auto-step-up;
-            enabled: root.auto-ready;
-            toggled => { root.step-up-toggled(); }
-            hover(on) => {
-                root.tip(on, "step-up", "Подтягивание вверх\nБлок, который под нагрузкой упирается в свой потолок и держится прохладным, получает ступень выше принятой.\n• не выше заводского предела\n• выключено — автомодуль только снижает и возвращает к принятым", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-            }
-        }
-        Text {
-            x: 0;
-            width: parent.width - step-switch.width - 8px;
-            y: 9px;
-            height: 24px;
-            text: "подтягивание вверх";
-            color: root.auto-step-up ? Palette.text : Palette.dim;
-            font-size: 12px;
-            horizontal-alignment: right;
             vertical-alignment: center;
         }
         Text {
@@ -1891,7 +2509,7 @@ export component AppWindow inherits Window {
             moved(v) => { root.limit-moved(v); }
             released(v) => { root.limit-released(v); }
             hover(on) => {
-                root.tip(on, "limit", "Отсечка, °C\nСредняя температура блока, выше которой автомодуль снижает его потолок; на графике «абсолютная» — красная линия.\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• при смене опущенные блоки возвращаются к принятым потолкам, автомодуль судит их заново", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "limit", "Отсечка, °C\nЦель: выше неё блок работать не должен — автомодуль снижает его потолок.\n• каждые 2 с — медиана показаний блока за 2 с: выше цели и не падает — потолок на ступень ниже; выше, но падает — ждёт, прошлая ступень ещё действует\n• возврат на ступень — после 2 мин, когда все 2-с медианы были не выше цели, и не пока кристалл так же горяч, как при снижении\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -1905,16 +2523,57 @@ export component AppWindow inherits Window {
             horizontal-alignment: right;
             vertical-alignment: center;
         }
+        Text {
+            visible: root.has-emergency;
+            x: 0;
+            y: 62px;
+            width: parent.label-w;
+            height: 24px;
+            text: "аварийная";
+            color: Palette.dim;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        emergency-slider := ValueSlider {
+            visible: root.has-emergency;
+            x: parent.label-w;
+            y: 64px;
+            width: parent.width - parent.label-w - parent.value-w;
+            height: 20px;
+            minimum: root.auto-emergency-min;
+            maximum: root.auto-emergency-max;
+            value: root.auto-emergency;
+            enabled: root.auto-ready && root.has-emergency;
+            lit: root.auto-on;
+            moved(v) => { root.emergency-moved(v); }
+            released(v) => { root.emergency-released(v); }
+            hover(on) => {
+                root.tip(on, "emergency", "Аварийная отсечка, °C\nОдно показание блока не ниже неё — потолок сразу на ступень ниже: защита от резкого перегрева.\n• проверка снова через 1 с: всё ещё не ниже — ещё ступень\n• \{root.auto-emergency-min}–\{root.auto-emergency-max} °C (от цели + 1 до 100); по умолчанию 95 — на 5 °C ниже, чем троттлит ThrottleStop (100 °C)\n• возврат — как у отсечки: после 2 мин не выше цели, и не пока кристалл так же горяч, как при снижении\n• применяется, когда отпустишь ползунок; на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        Text {
+            visible: root.has-emergency;
+            x: parent.width - parent.value-w;
+            y: 62px;
+            width: parent.value-w;
+            height: 24px;
+            text: "\{emergency-slider.shown} °C";
+            color: root.auto-on ? Palette.text : Palette.dim;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
     }
     Lines {
-        x: root.stats-x + root.pad;
-        y: root.body-y + root.body-h - root.pad - root.actions-h;
+        x: root.events-x;
+        y: root.events-y;
         width: root.stats-w - 2 * root.pad;
-        height: root.actions-h;
-        rows: root.actions;
-        empty: root.actions-empty;
-        marks: root.stats-legend.length > 1;
+        height: root.events-h;
+        rows: root.events;
+        empty: root.events-empty;
+        marks: true;
         tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
+        clicked(row) => { root.event-clicked(row); }
     }
 
     // Меню потолка — слой поверх окна, а не PopupWindow: в Slint 1.18 всплывающее окно не сообщает, что его

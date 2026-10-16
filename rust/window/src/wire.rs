@@ -99,6 +99,23 @@ pub struct State {
     /// Отсечка автомодуля, °C (программа входа; null — автомодуль выключен, у движка C# поля нет).
     #[serde(default, deserialize_with = "lenient")]
     pub auto_limit: Option<f64>,
+    /// ▲ и ø плиток по потолкам, при которых блок был с последнего сброса (программа входа с 0.5.6; до неё поля нет):
+    /// ряд по блокам (как в знакомстве), у каждого — список потолков, высший первым. Поле неожиданной формы
+    /// пропускается целиком.
+    #[serde(default, deserialize_with = "lenient")]
+    pub by_ceiling: Option<Vec<Option<Vec<ByCeiling>>>>,
+}
+
+/// ▲ наибольшая и ø средняя под нагрузкой при одном потолке с последнего сброса и время под нагрузкой при нём, с.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct ByCeiling {
+    pub ceiling: i64,
+    #[serde(default)]
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub mean: Option<f64>,
+    #[serde(default)]
+    pub secs: Option<f64>,
 }
 
 /// Что автомодуль держит у блока: потолок, который он поставил, или подробнее — потолок, от какого принятого и
@@ -180,16 +197,30 @@ pub struct Limits {
 }
 
 /// Выбор владельца для автомодуля (тема программы входа «settings»; у движка C# её нет). Хозяин выбора и
-/// промежутка — программа входа (data\tray.json): окно показывает их и шлёт изменения командой auto.set. Глубины нет
-/// (DECISIONS #38): её поля от прежней программы у часов пропускаются.
+/// промежутков — программа входа (data\tray.json): окно показывает их и шлёт изменения командой auto.set. Глубины и
+/// подтягивания вверх нет (DECISIONS #38, #40): их поля от прежних программ у часов пропускаются.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSettings {
     pub on: bool,
+    /// Цель (отсечка по 2-с медиане), °C.
     pub limit: i64,
-    pub step_up: bool,
-    /// Допустимая отсечка, °C: [от, до].
+    /// Допустимая цель, °C: [от, до].
     pub limit_range: [i64; 2],
+    /// Аварийная отсечка (одно показание), °C; None — программа у часов её не знает (до 0.5.6): ползунка нет.
+    #[serde(default)]
+    pub emergency: Option<i64>,
+    /// Допустимая аварийная, °C: [цель + 1, 100]; нет — окно считает так же.
+    #[serde(default)]
+    pub emergency_range: Option<[i64; 2]>,
+}
+
+impl AutoSettings {
+    /// Допустимая аварийная: как прислала программа у часов, иначе цель + 1 … 100 (бриф T).
+    #[must_use]
+    pub fn emergency_span(&self) -> [i64; 2] {
+        self.emergency_range.unwrap_or([self.limit + 1, 100])
+    }
 }
 
 /// Журнал срезов (тема «settings», поле «log»): свой выключатель, независимый от автомодуля (владелец 16.10). Хозяин —
@@ -448,10 +479,19 @@ mod tests {
                 panic!("тема settings не разобралась: {text}");
             };
             let auto = s.auto.expect("выбор автомодуля");
-            assert_eq!((auto.on, auto.limit, auto.step_up), (true, 82, false));
+            assert_eq!((auto.on, auto.limit, auto.emergency), (true, 82, None));
             assert_eq!(auto.limit_range, [60, 95]);
+            assert_eq!(auto.emergency_span(), [83, 100]);
             assert_eq!(s.log.map(|l| l.on), log, "{text}");
         }
+        // 0.5.6: аварийная и её промежуток (бриф T), подтягивания вверх больше нет.
+        let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(
+            r#"{"t":"settings","auto":{"on":false,"limit":85,"emergency":95,"limitRange":[60,95],"emergencyRange":[86,100]},"log":{"on":true}}"#,
+        ) else {
+            panic!("тема settings 0.5.6 не разобралась");
+        };
+        let auto = s.auto.expect("выбор автомодуля");
+        assert_eq!((auto.emergency, auto.emergency_span()), (Some(95), [86, 100]));
         // Поле другой формы не ломает сообщение: настроек просто нет.
         let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(r#"{"t":"settings","auto":{"on":"да"}}"#)
         else {
@@ -468,5 +508,31 @@ mod tests {
             panic!("состояние без полей движка не разобралось");
         };
         assert!(state.load.is_empty() && state.thr.is_empty() && state.avg.is_empty() && !state.busy);
+    }
+
+    #[test]
+    fn state_carries_maxima_by_ceiling_when_the_tray_sends_them() {
+        // Дополнение брифа W: byCeiling — ряд по блокам, у блока список потолков; 0.5.5 его не шлёт; поле другой формы
+        // не ломает состояние.
+        let with = r#"{"t":"state","pkg":50,"cur":[48,47],"max":[55,50],"byCeiling":[[{"ceiling":46,"max":55,"mean":50.5,"secs":120}],null]}"#;
+        let Ok(Message::State(state)) = serde_json::from_str::<Message>(with) else {
+            panic!("состояние с byCeiling не разобралось");
+        };
+        let row = state.by_ceiling.expect("byCeiling");
+        assert_eq!(row.len(), 2);
+        assert_eq!(
+            row[0].as_ref().map(|l| (l[0].ceiling, l[0].max, l[0].secs)),
+            Some((46, Some(55.0), Some(120.0)))
+        );
+        assert!(row[1].is_none());
+        for text in [
+            r#"{"t":"state","pkg":50,"cur":[48],"max":[55]}"#,
+            r#"{"t":"state","pkg":50,"cur":[48],"max":[55],"byCeiling":"нет"}"#,
+        ] {
+            let Ok(Message::State(state)) = serde_json::from_str::<Message>(text) else {
+                panic!("состояние не разобралось: {text}");
+            };
+            assert!(state.by_ceiling.is_none() && state.max == [Some(55.0)], "{text}");
+        }
     }
 }

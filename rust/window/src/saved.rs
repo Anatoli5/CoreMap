@@ -1,4 +1,4 @@
-// Что окно помнит о себе между запусками (DECISIONS #36): блоки в сравнении, подсветку, вид графика статистики (шкала,
+// Что окно помнит о себе между запусками (DECISIONS #36): блоки в сравнении, подсветку, вид графика статистики (вид,
 // линии, оси), размер и место. Цвет у блока свой (src/chart.rs, color_of) — его помнить не нужно.
 // Это настройки только окна — ими никто, кроме окна, не пользуется, поэтому держит их оно само, в data\window.json;
 // программа у часов о них не знает (её файл data\tray.json — настройки автомодуля, которыми пользуется она: «каждая
@@ -17,7 +17,8 @@ use serde_json::{Map, Value, json};
 use slint::{ComponentHandle, LogicalSize, PhysicalPosition};
 
 use crate::AppWindow;
-use crate::chart::Curves;
+use crate::chart::{Curves, Scale};
+use crate::timeline::{Layout, Quantity};
 use crate::wire::BlockInfo;
 
 pub const FILE: &str = "window.json";
@@ -56,10 +57,21 @@ pub struct Saved {
     pub compared: Vec<String>,
     /// Подсветка закреплённая (true) или под курсором (false).
     pub pin: Option<bool>,
-    /// Шкала графика: над кристаллом (true) или абсолютная (false).
-    pub above: Option<bool>,
+    /// Вид графика: нагрев ядра, над кристаллом или абсолютная. Файл сборок до 0.5.6 писал «above» (true — над
+    /// кристаллом, false — абсолютная): он читается в тот же вид; нет ни того, ни другого — нагрев ядра (бриф 16.10).
+    pub view: Option<Scale>,
     /// Какие линии на графике.
     pub curves: Option<Curves>,
+    /// Линия наибольших («макс»).
+    pub max: Option<bool>,
+    /// Ось x — время (true) или множитель.
+    pub timeline: Option<bool>,
+    /// Раскладка по времени: «блоки» или «параметры».
+    pub layout: Option<Layout>,
+    /// Величина раскладки «блоки».
+    pub quantity: Option<Quantity>,
+    /// Список событий: все блоки (true) или выбранные.
+    pub events_all: Option<bool>,
     /// Кривые модели нагрева на графике.
     pub model: Option<bool>,
     /// Оси местами: температура по горизонтали (true).
@@ -130,8 +142,33 @@ pub fn parse(text: &str) -> Result<Saved, String> {
     Ok(Saved {
         compared,
         pin: map.get("pin").and_then(Value::as_bool),
-        above: map.get("above").and_then(Value::as_bool),
+        view: match map.get("view").and_then(Value::as_str) {
+            Some("own") => Some(Scale::OwnHeat),
+            Some("above") => Some(Scale::AboveDie),
+            Some("abs") => Some(Scale::Absolute),
+            _ => match map.get("above").and_then(Value::as_bool) {
+                Some(true) => Some(Scale::AboveDie),
+                Some(false) => Some(Scale::Absolute),
+                None => None,
+            },
+        },
         curves,
+        max: map.get("max").and_then(Value::as_bool),
+        timeline: map.get("timeline").and_then(Value::as_bool),
+        layout: match map.get("layout").and_then(Value::as_str) {
+            Some("blocks") => Some(Layout::Blocks),
+            Some("params") => Some(Layout::Params),
+            _ => None,
+        },
+        quantity: match map.get("quantity").and_then(Value::as_str) {
+            Some("temp") => Some(Quantity::Temp),
+            Some("ratio") => Some(Quantity::Ratio),
+            Some("ceiling") => Some(Quantity::Ceiling),
+            Some("busy") => Some(Quantity::Busy),
+            Some("die") => Some(Quantity::Level),
+            _ => None,
+        },
+        events_all: map.get("eventsAll").and_then(Value::as_bool),
         model: map.get("model").and_then(Value::as_bool),
         swap: map.get("swap").and_then(Value::as_bool),
         size,
@@ -148,8 +185,39 @@ pub fn text(saved: &Saved) -> String {
     if let Some(pin) = saved.pin {
         map.insert("pin".into(), pin.into());
     }
-    if let Some(above) = saved.above {
-        map.insert("above".into(), above.into());
+    if let Some(view) = saved.view {
+        let name = match view {
+            Scale::OwnHeat => "own",
+            Scale::AboveDie => "above",
+            Scale::Absolute => "abs",
+        };
+        map.insert("view".into(), name.into());
+    }
+    if let Some(max) = saved.max {
+        map.insert("max".into(), max.into());
+    }
+    if let Some(timeline) = saved.timeline {
+        map.insert("timeline".into(), timeline.into());
+    }
+    if let Some(layout) = saved.layout {
+        let name = match layout {
+            Layout::Blocks => "blocks",
+            Layout::Params => "params",
+        };
+        map.insert("layout".into(), name.into());
+    }
+    if let Some(quantity) = saved.quantity {
+        let name = match quantity {
+            Quantity::Temp => "temp",
+            Quantity::Ratio => "ratio",
+            Quantity::Ceiling => "ceiling",
+            Quantity::Busy => "busy",
+            Quantity::Level => "die",
+        };
+        map.insert("quantity".into(), name.into());
+    }
+    if let Some(all) = saved.events_all {
+        map.insert("eventsAll".into(), all.into());
     }
     if let Some(curves) = saved.curves {
         let name = match curves {
@@ -303,8 +371,13 @@ mod tests {
         let saved = Saved {
             compared: vec!["2–5".into(), "0".into()],
             pin: Some(true),
-            above: Some(false),
+            view: Some(Scale::Absolute),
             curves: Some(Curves::P95),
+            max: Some(true),
+            timeline: Some(false),
+            layout: Some(Layout::Params),
+            quantity: Some(Quantity::Ceiling),
+            events_all: Some(true),
             model: Some(false),
             swap: Some(true),
             size: Some((1500.0, 900.0)),
@@ -353,6 +426,29 @@ mod tests {
     }
 
     #[test]
+    fn an_old_scale_maps_to_the_same_raw_view_and_none_to_own_heating() {
+        // Бриф 16.10: «an old saved value maps to the same raw view; a missing value maps to «нагрев ядра»». Ловит:
+        // прежний файл, открывшийся не в том виде; новый ключ, не переживший запись.
+        assert_eq!(parse(r#"{"above":true}"#).map(|s| s.view), Ok(Some(Scale::AboveDie)));
+        assert_eq!(parse(r#"{"above":false}"#).map(|s| s.view), Ok(Some(Scale::Absolute)));
+        assert_eq!(parse("{}").map(|s| s.view), Ok(None));
+        assert_eq!(parse(r#"{"above":"да"}"#).map(|s| s.view), Ok(None));
+        assert_eq!(Scale::default(), Scale::OwnHeat, "нет записи — нагрев ядра");
+        // Новый ключ сильнее прежнего (файл, записанный новой сборкой поверх прежнего).
+        assert_eq!(
+            parse(r#"{"view":"own","above":true}"#).map(|s| s.view),
+            Ok(Some(Scale::OwnHeat))
+        );
+        for view in [Scale::OwnHeat, Scale::AboveDie, Scale::Absolute] {
+            let saved = Saved {
+                view: Some(view),
+                ..Saved::default()
+            };
+            assert_eq!(parse(&text(&saved)).map(|s| s.view), Ok(Some(view)));
+        }
+    }
+
+    #[test]
     fn lines_of_the_three_way_switch_map_onto_the_two_switches() {
         // Файл сборки с «ø / 95 % / обе»: только ø, только 95 %, обе; и новое «обе выключены» — туда и обратно.
         for (word, mean, p95) in [
@@ -377,7 +473,10 @@ mod tests {
         )
         .expect("объект");
         assert_eq!(saved.compared, ["0".to_string(), "2–5".to_string()]);
-        assert_eq!((saved.pin, saved.above, saved.curves), (Some(true), Some(false), None));
+        assert_eq!(
+            (saved.pin, saved.view, saved.curves),
+            (Some(true), Some(Scale::Absolute), None)
+        );
         assert_eq!((saved.size, saved.position), (None, None));
         for bad in [
             r#"{"size":[0,700]}"#,

@@ -71,21 +71,23 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     let bytes: usize = logs.iter().map(|l| l.bytes()).sum();
     let _ = writeln!(
         text,
-        "files with 0.25-s rows: {}, rows kept (last {} h before the newest row, as in the window): {rows}, memory of kept rows: {:.1} MB, reading and parsing: {:.0} ms",
+        "files with 0.25-s rows: {}, rows: {rows} (every row of the folder: no 8-h cap since brief W 16.10), memory of the rows: {:.1} MB, reading and parsing: {:.0} ms",
         logs.len(),
-        model::KEEP_MS / 3_600_000,
         mb(bytes),
         read_time.as_secs_f64() * 1000.0
     );
     let fitted = model::fit(&logs, &die);
     let _ = writeln!(
         text,
-        "fit time (L3 with the shape and the proxy form, all blocks, 4 folds, halves, three passes): {:.0} ms",
+        "fit time on all rows (L3 with the shape, the shared P-core rank, the proxy form, all blocks, 4 folds, ablations, halves, three passes): {:.0} ms",
         fitted.time.as_secs_f64() * 1000.0
     );
+    retention_section(&logs, &die, &fitted, text);
     let _ = writeln!(text);
     blocks(&fitted, &die, text);
     acceptance(&fitted, text);
+    rank_section(&fitted, text);
+    influence_section(&fitted, text);
     shape_tables(&logs, &die, &fitted, text);
     split_power_section(&fitted, text);
     equal_load_section(&fitted, text);
@@ -95,6 +97,105 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     level_section(&logs, &die, text);
     power_section(&logs, &die, text);
     0
+}
+
+/// Хранение строк (бриф W): что оно оставило бы после этой подгонки, память и время подгонки по оставленному.
+fn retention_section(logs: &[&Log], die: &Die, fitted: &Model, text: &mut String) {
+    let mut kept: Vec<Log> = logs.iter().map(|&l| l.clone()).collect(); // the report's own copy of the rows, once
+    let started = Instant::now();
+    let r = model::retain(&mut kept.iter_mut().collect::<Vec<_>>(), die, fitted);
+    let retain_time = started.elapsed();
+    let refit = model::fit(&kept.iter().collect::<Vec<_>>(), die);
+    let errors = |m: &Model| {
+        let mut e: Vec<f64> = m.blocks.iter().filter_map(|b| b.errors.map(|e| e.full)).collect();
+        e.sort_by(f64::total_cmp);
+        e.get(e.len() / 2).copied()
+    };
+    let _ = writeln!(
+        text,
+        "retention (cell = block x whole multiplier; newest 10-s windows until the standard error of the cell's mean partial residual <= {} °C, at least {} windows; rows older than that dropped unless another block needs them; 16 s before each kept row and the last {} s kept): {} of {} cells saturated; rows {} -> {}, memory {:.1} MB -> {:.1} MB, retention pass {:.0} ms",
+        model::SATURATED,
+        model::MIN_WINDOWS,
+        model::LIVE_MS / 1000,
+        r.saturated,
+        r.cells,
+        r.before,
+        r.after,
+        mb(logs.iter().map(|l| l.bytes()).sum()),
+        mb(r.bytes),
+        retain_time.as_secs_f64() * 1000.0
+    );
+    let _ = writeln!(
+        text,
+        "fit time on the retained rows: {:.0} ms; median held-out (c) over blocks: all rows {}, retained rows {}",
+        refit.time.as_secs_f64() * 1000.0,
+        errors(fitted).map_or_else(|| "-".into(), |v| format!("{v:.2} °C")),
+        errors(&refit).map_or_else(|| "-".into(), |v| format!("{v:.2} °C"))
+    );
+}
+
+/// Общий ранг P-ядер (дополнение брифа 16.10): только здесь, не в окне.
+fn rank_section(fitted: &Model, text: &mut String) {
+    let _ = writeln!(text, "\n== shared P-core rank (report only) ==");
+    let _ = writeln!(
+        text,
+        "term: busy*[rank = k]*p(r) (own fast p in rows where the core's ceiling is the highest (rank 1) or the next distinct (rank 2) among P-cores; rank 3 = base), one coefficient per rank for all P-cores, any sign; identified only by rank changes within a core"
+    );
+    let r = &fitted.rank;
+    for k in 0..model::RANKS {
+        if !r.used[k] {
+            let _ = writeln!(
+                text,
+                "rank {}: not in the fit - no P-core has >= {} usable loaded rows both in and out of this rank",
+                k + 1,
+                model::MIN_ROWS
+            );
+            continue;
+        }
+        let _ = writeln!(
+            text,
+            "rank {}: {:+.2} °C per unit own p (folds {:+.2} .. {:+.2}) - {}",
+            k + 1,
+            r.value[k],
+            r.lo[k],
+            r.hi[k],
+            if r.determined[k] {
+                "determined (the fold range does not cross 0)"
+            } else {
+                "not determined (the fold range crosses 0 or a fold did not solve)"
+            }
+        );
+    }
+}
+
+/// «Что влияет на температуру ядра» (бриф W): изменчивость вклада групп и ошибка без группы.
+fn influence_section(fitted: &Model, text: &mut String) {
+    let _ = writeln!(text, "\n== what affects the core temperature (per block) ==");
+    let _ = writeln!(
+        text,
+        "size = time-weighted SD of the group's contribution over the fitted rows, °C (folds lo..hi; '?' = the fold range reaches 0); ablation = held-out (c) error without the group minus with it, °C"
+    );
+    let names = ["die", "own work", "neighbours", "history", "rank"];
+    for b in &fitted.blocks {
+        let Some(inf) = b.influence else {
+            let _ = writeln!(text, "block {:>5}: no fit", b.name);
+            continue;
+        };
+        let parts: Vec<String> = (0..model::GROUPS)
+            .map(|g| {
+                format!(
+                    "{} {:.2}{} ({:.2}..{:.2}; {})",
+                    names[g],
+                    inf.size[g],
+                    if inf.determined(g) { "" } else { "?" },
+                    inf.lo[g],
+                    inf.hi[g],
+                    inf.ablation[g].map_or_else(|| "-".into(), |a| format!("{a:+.3}"))
+                )
+            })
+            .collect();
+        let _ = writeln!(text, "block {:>5}: {}", b.name, parts.join(" | "));
+    }
 }
 
 fn mb(bytes: usize) -> f64 {
@@ -674,10 +775,13 @@ fn split_section(logs: &[&Log], die: &Die, at: &str, text: &mut String) {
     }
     let _ = writeln!(
         text,
-        "parts of the predicted mean after the split: [a + (beta-1)*D, own fast (shape or K*pfast), own history, neighbours] for (c) and (c old); mean own busy and multiplier on the test rows"
+        "parts of the predicted mean after the split: [a + (beta-1)*D, own fast (shape or K*pfast), own history, neighbours, rank] for (c) and (c old); mean own busy and multiplier on the test rows; shared rank of the fit before the split: {}",
+        result
+            .first()
+            .map_or_else(|| "-".into(), |b| format!("{:+.2}, {:+.2}", b.rank[0], b.rank[1]))
     );
     for b in &result {
-        let show4 = |p: &[f64; 4]| format!("[{:+.2}, {:+.2}, {:+.2}, {:+.2}]", p[0], p[1], p[2], p[3]);
+        let show4 = |p: &[f64; 5]| format!("[{:+.2}, {:+.2}, {:+.2}, {:+.2}, {:+.2}]", p[0], p[1], p[2], p[3], p[4]);
         let _ = writeln!(
             text,
             "block {:>5}: (c) {} (c old) {}; busy {}, x{}",

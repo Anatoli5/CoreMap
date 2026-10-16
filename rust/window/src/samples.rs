@@ -1,6 +1,5 @@
-// Статистика из журналов программы входа (DECISIONS #32): срезы data\samples\<дата>.csv и журнал действий автомодуля
-// data\auto-log.jsonl. Здесь только разбор и счёт — без окна и без потоков: что и когда читать, решает store.rs, как
-// показать — panels.rs.
+// Статистика из журнала срезов программы входа (DECISIONS #32): data\samples\<дата>.csv. Здесь только разбор и счёт —
+// без окна и без потоков: что и когда читать, решает store.rs, как показать — chart.rs и timeline.rs; события — events.rs.
 //
 // Срезы пишутся, пока работает автомодуль и процессор занят: до 0.5.2 — строка раз в 2 с, время до секунды; с 0.5.2 —
 // раз в 0,25 с, время до миллисекунды (выбор владельца 15.10, вариант А), обороты — только в строке, где прочитаны
@@ -22,13 +21,10 @@
 //   кристалла, корзина множителя по абсолютной температуре говорит в основном о том, когда она набралась); у каждого
 //   вида — гистограмма по времени (`Hist`), из неё 95-й процентиль вместо наибольшей одной строки.
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
-
-use serde::Deserialize;
 
 use crate::model::Log;
 
@@ -260,14 +256,54 @@ struct Seen {
     at: i64,
 }
 
-/// Строка наибольшей температуры корзины: температура, фактический множитель, доля работы и время (мс по местным
-/// часам от 1970-01-01, `row_time`).
+/// Строка наибольшей температуры корзины: температура, фактический множитель, доля работы, время (мс по местным
+/// часам от 1970-01-01, `row_time`) и условия этой строки (`Conditions`).
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Peak {
     pub temp: f64,
     pub ratio: f64,
     pub busy: Option<f64>,
     pub at: i64,
+    pub when: Conditions,
+}
+
+/// Соседей блока на схеме — не больше стольких (сбоку и сверху-снизу).
+pub const NEAR_MAX: usize = 4;
+/// Видеокарта и вентиляторы пишутся раз в 2 с — у строки берётся ближайшее их чтение не дальше этого (бриф W).
+pub const NEAREST_MS: i64 = 2000;
+
+/// Условия строки наибольшей температуры (бриф W, «макс»): потолок блока, уровень кристалла (средняя остальных
+/// блоков), температуры соседей (номер блока в знакомстве и температура; соседей знает файл — `Columns::link`),
+/// видеокарта и вентиляторы — ближайшее чтение не дальше `NEAREST_MS`.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Conditions {
+    pub ceiling: Option<f64>,
+    pub level: Option<f64>,
+    pub near: [Option<(usize, f64)>; NEAR_MAX],
+    pub gpu: Gpu,
+    pub fans: Fans,
+}
+
+/// Чтение видеокарты: когда (мс), температура, мощность, занятость; `at` None — чтения нет.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Gpu {
+    pub at: Option<i64>,
+    pub temp: Option<f64>,
+    pub power: Option<f64>,
+    pub busy: Option<f64>,
+}
+
+/// Чтение вентиляторов: когда (мс), процессора и видеокарты, об/мин.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Fans {
+    pub at: Option<i64>,
+    pub cpu: Option<f64>,
+    pub gpu: Option<f64>,
+}
+
+/// Ближе ли чтение в момент `reading` к строке `at`, чем прежнее (`was`), и не дальше `NEAREST_MS`.
+fn nearer(at: i64, reading: i64, was: Option<i64>) -> bool {
+    (reading - at).abs() <= NEAREST_MS && was.is_none_or(|w| (reading - at).abs() < (w - at).abs())
 }
 
 impl Peak {
@@ -296,14 +332,17 @@ pub struct Bin {
 }
 
 impl Bin {
-    fn add(&mut self, seen: Seen, fan: Option<f64>) {
+    /// Строка в корзину; true — она стала наибольшей (её условия заполняет вызвавший).
+    fn add(&mut self, seen: Seen, fan: Option<f64>) -> bool {
         let peak = Peak {
             temp: seen.temp,
             ratio: seen.ratio,
             busy: seen.busy,
             at: seen.at,
+            when: Conditions::default(),
         };
-        if self.n == 0 || peak.above(&self.peak) {
+        let top = self.n == 0 || peak.above(&self.peak);
+        if top {
             self.peak = peak;
         }
         self.n += 1;
@@ -318,6 +357,7 @@ impl Bin {
             self.fan_sum += f;
             self.fan_n += 1;
         }
+        top
     }
 
     fn merge(&mut self, other: &Bin) {
@@ -486,14 +526,19 @@ pub fn effect(splits: &BTreeMap<i32, Split>) -> Option<Effect> {
 // ----- срезы: столбцы и строки -----
 
 /// Где в строке что лежит — по заголовку файла (а не по порядку): файл с другим набором блоков тоже читается.
-/// Мощность процессора и видеокарты (с 0.5.3), напряжение блоков (`<блок>.volts`) и мощность ядер (`power_cores`, с
-/// 0.5.4) нужны только модели нагрева (model.rs): статистика графика их не считает.
+/// Мощность процессора (с 0.5.3) и мощность ядер (`power_cores`, с 0.5.4) нужны модели нагрева (model.rs); видеокарта
+/// (с 0.5.3), вентиляторы и потолки — условиям строки наибольшей температуры («макс») и виду «по времени»
+/// (timeline.rs); потолки — ещё и рангу P-ядер в модели. Напряжение блоков журналов 0.5.4 (`<блок>.volts`) не читается:
+/// модель его больше не берёт.
 #[derive(Clone, Debug)]
 pub struct Columns {
     width: usize,
     fan_cpu: Option<usize>,
+    fan_gpu: Option<usize>,
     power_cpu: Option<usize>,
+    temp_gpu: Option<usize>,
     power_gpu: Option<usize>,
+    busy_gpu: Option<usize>,
     power_cores: Option<usize>,
     blocks: Vec<BlockColumns>,
 }
@@ -504,7 +549,28 @@ struct BlockColumns {
     ratio: Option<usize>,
     busy: Option<usize>,
     temp: Option<usize>,
-    volts: Option<usize>,
+    ceiling: Option<usize>,
+    /// Соседи блока на схеме: (номер блока в файле, номер в знакомстве) — `Columns::link`.
+    near: Vec<(usize, usize)>,
+}
+
+/// Что из блока строки взять (`Columns::value`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum What {
+    Ratio,
+    Busy,
+    Temp,
+    Ceiling,
+}
+
+/// Что из строки взять, кроме блоков (`Columns::shared`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shared {
+    FanCpu,
+    FanGpu,
+    TempGpu,
+    PowerGpu,
+    BusyGpu,
 }
 
 impl Columns {
@@ -527,7 +593,8 @@ impl Columns {
                     ratio: None,
                     busy: None,
                     temp: None,
-                    volts: None,
+                    ceiling: None,
+                    near: Vec::new(),
                 });
                 blocks.len() - 1
             };
@@ -536,16 +603,20 @@ impl Columns {
                 "ratio" => b.ratio = Some(i),
                 "busy" => b.busy = Some(i),
                 "temp" => b.temp = Some(i),
-                "volts" => b.volts = Some(i),
+                "ceiling" => b.ceiling = Some(i),
                 _ => {}
             }
         }
+        let at = |name: &str| names.iter().position(|c| *c == name);
         (!blocks.is_empty()).then(|| Columns {
             width: names.len(),
-            fan_cpu: names.iter().position(|c| *c == "fan_cpu"),
-            power_cpu: names.iter().position(|c| *c == "power_cpu"),
-            power_gpu: names.iter().position(|c| *c == "power_gpu"),
-            power_cores: names.iter().position(|c| *c == "power_cores"),
+            fan_cpu: at("fan_cpu"),
+            fan_gpu: at("fan_gpu"),
+            power_cpu: at("power_cpu"),
+            temp_gpu: at("temp_gpu"),
+            power_gpu: at("power_gpu"),
+            busy_gpu: at("busy_gpu"),
+            power_cores: at("power_cores"),
             blocks,
         })
     }
@@ -554,6 +625,95 @@ impl Columns {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.blocks.iter().map(|b| b.name.as_str())
     }
+
+    /// Соседи блоков по знакомству окна (названия блоков и их соседи — `model::Die`): у каждого блока файла — его соседи,
+    /// которые тоже есть в файле. Без этого у строки наибольшей температуры нет температур соседей.
+    pub fn link(&mut self, names: &[String], neighbours: &[Vec<usize>]) {
+        let file: Vec<String> = self.blocks.iter().map(|b| b.name.clone()).collect(); // a dozen names, once per file
+        for b in &mut self.blocks {
+            b.near = names
+                .iter()
+                .position(|n| *n == b.name)
+                .and_then(|d| neighbours.get(d))
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|&j| Some((file.iter().position(|f| Some(f) == names.get(j))?, j)))
+                        .take(NEAR_MAX)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+    }
+
+    /// Номер блока файла по названию.
+    #[must_use]
+    pub fn block(&self, name: &str) -> Option<usize> {
+        self.blocks.iter().position(|b| b.name == name)
+    }
+
+    /// Сколько блоков в файле.
+    #[must_use]
+    pub fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Поля строки (начало и конец каждого) — в `fields`; false — строка короче заголовка (испорчена или дописывается).
+    pub fn split(&self, line: &str, fields: &mut Vec<(usize, usize)>) -> bool {
+        fields.clear();
+        let mut start = 0;
+        for (i, b) in line.bytes().enumerate() {
+            if b == b',' {
+                fields.push((start, i));
+                start = i + 1;
+            }
+        }
+        fields.push((start, line.len()));
+        fields.len() >= self.width
+    }
+
+    /// Значение блока `block` из строки, разбитой `split`.
+    #[must_use]
+    pub fn value(&self, line: &str, fields: &[(usize, usize)], block: usize, what: What) -> Option<f64> {
+        let b = self.blocks.get(block)?;
+        let column = match what {
+            What::Ratio => b.ratio,
+            What::Busy => b.busy,
+            What::Temp => b.temp,
+            What::Ceiling => b.ceiling,
+        };
+        field(line, fields, column).and_then(number)
+    }
+
+    /// Общее значение строки (видеокарта, вентиляторы) из строки, разбитой `split`.
+    #[must_use]
+    pub fn shared(&self, line: &str, fields: &[(usize, usize)], what: Shared) -> Option<f64> {
+        let column = match what {
+            Shared::FanCpu => self.fan_cpu,
+            Shared::FanGpu => self.fan_gpu,
+            Shared::TempGpu => self.temp_gpu,
+            Shared::PowerGpu => self.power_gpu,
+            Shared::BusyGpu => self.busy_gpu,
+        };
+        field(line, fields, column).and_then(number)
+    }
+}
+
+/// Поле строки по номеру столбца.
+fn field<'a>(line: &'a str, fields: &[(usize, usize)], column: Option<usize>) -> Option<&'a str> {
+    column.and_then(|i| fields.get(i)).map(|&(s, e)| &line[s..e])
+}
+
+/// Что строки файла передают следующей порции того же файла (файл дочитывается порциями): время последней строки,
+/// последние чтения видеокарты и вентиляторов и наибольшие прошлых порций, у которых ближайшее чтение может прийти
+/// позже (`Scratch::readings`).
+#[derive(Clone, Debug, Default)]
+pub struct Carry {
+    pub previous: Option<i64>,
+    gpu: Gpu,
+    fans: Fans,
+    /// Наибольшие прошлых порций, ждущие чтения после себя: (блок, корзина, над кристаллом ли, время строки).
+    wait_gpu: Vec<(String, i32, bool, i64)>,
+    wait_fans: Vec<(String, i32, bool, i64)>,
 }
 
 /// Счёт строк в плотных массивах (по месту столбца), потом сброс в `Tally` по названиям. Плотный счёт — чтобы на
@@ -571,6 +731,10 @@ pub struct Scratch {
     pairs: Vec<Split>,           // [(блок × n + другой) × BINS]
     cells: Vec<Cell>,            // по блокам, текущая строка
     fields: Vec<(usize, usize)>, // начало и конец полей текущей строки
+    /// Наибольшие этой порции, у которых ближайшее чтение видеокарты (вентиляторов) может прийти после них: (место
+    /// корзины, над кристаллом ли).
+    wait_gpu: Vec<(usize, bool)>,
+    wait_fans: Vec<(usize, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -578,7 +742,7 @@ struct Cell {
     ratio: Option<f64>,
     busy: Option<f64>,
     temp: Option<f64>,
-    volts: Option<f64>,
+    ceiling: Option<f64>,
 }
 
 fn number(text: &str) -> Option<f64> {
@@ -620,6 +784,8 @@ impl Scratch {
         self.secs = 0.0;
         self.first = None;
         self.last = None;
+        self.wait_gpu.clear();
+        self.wait_fans.clear();
     }
 
     /// Строки срезов (полные, без заголовка) — в сводку файла. `previous` — время последней посчитанной строки этого
@@ -627,16 +793,21 @@ impl Scratch {
     /// читает через `count_keeping`; этот — тестам статистики.
     #[cfg(test)]
     pub fn count(&mut self, columns: &Columns, text: &str, previous: &mut Option<i64>, into: &mut Tally) {
-        self.count_keeping(columns, text, previous, into, None);
+        let mut carry = Carry {
+            previous: *previous,
+            ..Carry::default()
+        };
+        self.count_keeping(columns, text, &mut carry, into, None);
+        *previous = carry.previous;
     }
 
     /// То же, и строки журнала по 0,25 с — ещё и в `keep` (строки файла для модели нагрева, model.rs): тот же разбор
-    /// той же строки, второго чтения файла нет.
+    /// той же строки, второго чтения файла нет. `carry` — что передала прошлая порция того же файла.
     pub fn count_keeping(
         &mut self,
         columns: &Columns,
         text: &str,
-        previous: &mut Option<i64>,
+        carry: &mut Carry,
         into: &mut Tally,
         mut keep: Option<&mut Log>,
     ) {
@@ -647,7 +818,7 @@ impl Scratch {
         let mut earliest: Option<(i64, &str)> = None;
         let mut latest: Option<(i64, &str)> = None;
         for line in text.lines() {
-            if let Some((time, ms)) = self.row(columns, line.trim_end_matches('\r'), previous, keep.as_deref_mut()) {
+            if let Some((time, ms)) = self.row(columns, line.trim_end_matches('\r'), carry, into, keep.as_deref_mut()) {
                 if earliest.is_none_or(|(e, _)| ms < e) {
                     earliest = Some((ms, time));
                 }
@@ -658,7 +829,100 @@ impl Scratch {
         }
         self.first = earliest.map(|(_, t)| t.to_string()); // once per chunk
         self.last = latest.map(|(_, t)| t.to_string());
-        self.flush(columns, into);
+        self.flush(columns, into, carry);
+    }
+
+    /// Чтения видеокарты и вентиляторов в строке времени `at`: они — последние для следующих наибольших; и ближе
+    /// прежних к наибольшим, поставленным после прошлого чтения (этой порции и прошлых — `carry`).
+    fn readings(&mut self, columns: &Columns, line: &str, at: i64, carry: &mut Carry, into: &mut Tally) {
+        let shared = |what| columns.shared(line, &self.fields, what);
+        let (temp, power, busy) = (
+            shared(Shared::TempGpu),
+            shared(Shared::PowerGpu),
+            shared(Shared::BusyGpu),
+        );
+        if temp.is_some() || power.is_some() || busy.is_some() {
+            carry.gpu = Gpu {
+                at: Some(at),
+                temp,
+                power,
+                busy,
+            };
+            let gpu = carry.gpu;
+            for (slot, above) in self.wait_gpu.drain(..) {
+                let peak = &mut if above { &mut self.above } else { &mut self.bins }[slot].peak;
+                if nearer(peak.at, at, peak.when.gpu.at) {
+                    peak.when.gpu = gpu;
+                }
+            }
+            for (name, ratio, above, peak_at) in carry.wait_gpu.drain(..) {
+                if let Some(peak) = tally_peak(into, &name, ratio, above, peak_at)
+                    && nearer(peak.at, at, peak.when.gpu.at)
+                {
+                    peak.when.gpu = gpu;
+                }
+            }
+        }
+        let (cpu, gpu) = (shared(Shared::FanCpu), shared(Shared::FanGpu));
+        if cpu.is_some() || gpu.is_some() {
+            carry.fans = Fans { at: Some(at), cpu, gpu };
+            let fans = carry.fans;
+            for (slot, above) in self.wait_fans.drain(..) {
+                let peak = &mut if above { &mut self.above } else { &mut self.bins }[slot].peak;
+                if nearer(peak.at, at, peak.when.fans.at) {
+                    peak.when.fans = fans;
+                }
+            }
+            for (name, ratio, above, peak_at) in carry.wait_fans.drain(..) {
+                if let Some(peak) = tally_peak(into, &name, ratio, above, peak_at)
+                    && nearer(peak.at, at, peak.when.fans.at)
+                {
+                    peak.when.fans = fans;
+                }
+            }
+        }
+    }
+
+    /// Условия строки времени `at` для блока `a`, ставшей наибольшей в корзине `slot` (`above` — над кристаллом):
+    /// потолок, уровень кристалла, соседи, последние чтения (если не дальше `NEAREST_MS`); если чтение было раньше этой
+    /// строки, корзина ждёт следующего — оно может быть ближе.
+    fn mark(
+        &mut self,
+        columns: &Columns,
+        a: usize,
+        (slot, above): (usize, bool),
+        at: i64,
+        level: Option<f64>,
+        carry: &Carry,
+    ) {
+        let mut near = [None; NEAR_MAX];
+        for (into, &(b, d)) in near.iter_mut().zip(&columns.blocks[a].near) {
+            *into = self.cells[b].temp.map(|t| (d, t));
+        }
+        let gpu = carry
+            .gpu
+            .at
+            .filter(|&g| at - g <= NEAREST_MS)
+            .map_or_else(Gpu::default, |_| carry.gpu);
+        let fans = carry
+            .fans
+            .at
+            .filter(|&f| at - f <= NEAREST_MS)
+            .map_or_else(Fans::default, |_| carry.fans);
+        let peak = &mut if above { &mut self.above } else { &mut self.bins }[slot].peak;
+        peak.when = Conditions {
+            ceiling: self.cells[a].ceiling,
+            level,
+            near,
+            gpu,
+            fans,
+        };
+        if gpu.at != Some(at) {
+            self.wait_gpu.push((slot, above));
+        }
+        if fans.at != Some(at) {
+            self.wait_fans.push((slot, above));
+        }
     }
 
     /// Одна строка; Some((время, мс)) — строка принята.
@@ -666,26 +930,18 @@ impl Scratch {
         &mut self,
         columns: &Columns,
         line: &'a str,
-        previous: &mut Option<i64>,
+        carry: &mut Carry,
+        into: &mut Tally,
         keep: Option<&mut Log>,
     ) -> Option<(&'a str, i64)> {
-        self.fields.clear();
-        let mut start = 0;
-        for (i, b) in line.bytes().enumerate() {
-            if b == b',' {
-                self.fields.push((start, i));
-                start = i + 1;
-            }
-        }
-        self.fields.push((start, line.len()));
         // Строка короче заголовка — испорчена (или дописывалась при сбое): не в счёт.
-        if self.fields.len() < columns.width {
+        if !columns.split(line, &mut self.fields) {
             return None;
         }
         let time = &line[self.fields[0].0..self.fields[0].1];
         // Без времени у строки нет длительности: не в счёт.
         let at = row_time(time)?;
-        let span = span_ms(*previous, at);
+        let span = span_ms(carry.previous, at);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a span of milliseconds between two rows, far below 2^52"
@@ -693,17 +949,18 @@ impl Scratch {
         let secs = span as f64 / 1000.0;
         // Промежуток — не больше полутора шагов записи (span_ms), то есть 3 с: в u32 помещается всегда.
         let ms = u32::try_from(span).unwrap_or(0);
-        *previous = Some(at.ms);
-        let field = |column: Option<usize>| column.and_then(|i| self.fields.get(i)).map(|&(s, e)| &line[s..e]);
-        let fan = field(columns.fan_cpu).and_then(number);
-        for (cell, b) in self.cells.iter_mut().zip(&columns.blocks) {
+        carry.previous = Some(at.ms);
+        let fan = columns.shared(line, &self.fields, Shared::FanCpu);
+        for (a, cell) in self.cells.iter_mut().enumerate() {
+            let value = |what| columns.value(line, &self.fields, a, what);
             *cell = Cell {
-                ratio: field(b.ratio).and_then(number),
-                busy: field(b.busy).and_then(number),
-                temp: field(b.temp).and_then(number),
-                volts: field(b.volts).and_then(number),
+                ratio: value(What::Ratio),
+                busy: value(What::Busy),
+                temp: value(What::Temp),
+                ceiling: value(What::Ceiling),
             };
         }
+        self.readings(columns, line, at.ms, carry, into);
         // Модели — только строки по 0,25 с: прежние (по 2 с) отстоят друг от друга больше секунды, каждая начинала бы
         // скользящие средние заново, и ни одна не годилась бы в счёт (model.rs, GAP_MS).
         if let Some(log) = keep
@@ -711,11 +968,11 @@ impl Scratch {
         {
             log.push(
                 at.ms,
-                self.cells.iter().map(|c| [c.ratio, c.busy, c.temp, c.volts]),
+                self.cells.iter().map(|c| [c.ratio, c.busy, c.temp, c.ceiling]),
                 [
-                    field(columns.power_cpu).and_then(number),
-                    field(columns.power_gpu).and_then(number),
-                    field(columns.power_cores).and_then(number),
+                    field(line, &self.fields, columns.power_cpu).and_then(number),
+                    field(line, &self.fields, columns.power_gpu).and_then(number),
+                    field(line, &self.fields, columns.power_cores).and_then(number),
                 ],
             );
         }
@@ -741,12 +998,17 @@ impl Scratch {
                 at: at.ms,
             };
             let at_bin = a * BINS + bin;
-            self.bins[at_bin].add(seen, fan);
+            let level = die_level(sum - temp, known - 1, n - 1);
+            if self.bins[at_bin].add(seen, fan) {
+                self.mark(columns, a, (at_bin, false), at.ms, level, carry);
+            }
             self.hists[2 * at_bin].add(temp, ms);
             // Над остальным кристаллом: то же правило, что `above_die`, без второго прохода по блокам.
-            if let Some(level) = die_level(sum - temp, known - 1, n - 1) {
+            if let Some(level) = level {
                 let above = temp - level;
-                self.above[at_bin].add(Seen { temp: above, ..seen }, fan);
+                if self.above[at_bin].add(Seen { temp: above, ..seen }, fan) {
+                    self.mark(columns, a, (at_bin, true), at.ms, Some(level), carry);
+                }
                 self.hists[2 * at_bin + 1].add(above, ms);
             }
             // Связь соседей: только пока блок сам занят, сосед — занят или свободен (это правило не менялось).
@@ -771,7 +1033,7 @@ impl Scratch {
         Some((time, at.ms))
     }
 
-    fn flush(&self, columns: &Columns, into: &mut Tally) {
+    fn flush(&mut self, columns: &Columns, into: &mut Tally, carry: &mut Carry) {
         let chunk = Tally {
             rows: self.rows,
             secs: self.secs,
@@ -780,6 +1042,27 @@ impl Scratch {
             blocks: BTreeMap::new(),
         };
         into.merge(&chunk);
+        // Наибольшие, всё ещё ждущие чтения после себя, ждут его в следующей порции — уже в сводке файла.
+        let waiting = |list: &mut Vec<(usize, bool)>, bins: (&[Bin], &[Bin])| -> Vec<(String, i32, bool, i64)> {
+            list.drain(..)
+                .filter_map(|(slot, above)| {
+                    let block = &columns.blocks.get(slot / BINS)?.name;
+                    let peak = if above { bins.1 } else { bins.0 }.get(slot)?.peak;
+                    Some((block.clone(), ratio_of(slot % BINS), above, peak.at)) // a few names per chunk
+                })
+                .collect()
+        };
+        carry
+            .wait_gpu
+            .extend(waiting(&mut self.wait_gpu, (&self.bins, &self.above)));
+        carry
+            .wait_fans
+            .extend(waiting(&mut self.wait_fans, (&self.bins, &self.above)));
+        // Дальше `NEAREST_MS` от последней строки чтение уже не ближе: ждать нечего (файл без видеокарты не копит ожидание).
+        let latest = carry.previous;
+        let fresh = |w: &(String, i32, bool, i64)| latest.is_some_and(|l| l - w.3 <= NEAREST_MS);
+        carry.wait_gpu.retain(fresh);
+        carry.wait_fans.retain(fresh);
         let n = self.n;
         for (a, block) in columns.blocks.iter().enumerate() {
             let mut touched = false;
@@ -825,7 +1108,14 @@ impl Scratch {
     }
 }
 
-/// Номер корзины (0..BINS) как множитель.
+/// Наибольшая корзины в сводке файла, если она всё ещё строка времени `at` (иначе её сменила другая строка).
+fn tally_peak<'a>(into: &'a mut Tally, name: &str, ratio: i32, above: bool, at: i64) -> Option<&'a mut Peak> {
+    let block = into.blocks.get_mut(name)?;
+    let bin = if above { &mut block.above } else { &mut block.bins }.get_mut(&ratio)?;
+    (bin.peak.at == at).then_some(&mut bin.peak)
+}
+
+// Номер корзины (0..BINS) как множитель.
 fn ratio_of(bin: usize) -> i32 {
     i32::try_from(bin).unwrap_or(i32::MAX)
 }
@@ -875,120 +1165,6 @@ pub fn read_new(path: &Path, tail: &mut Tail) -> io::Result<Fresh> {
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
     Ok(if again { Fresh::Again(text) } else { Fresh::More(text) })
-}
-
-// ----- журнал действий автомодуля -----
-
-/// Строка `data\auto-log.jsonl` (пишет `rust\tray\src\app\auto.rs`: `record` и `put_back`). Поля, которых окно не
-/// показывает (температуры всех блоков, вентиляторы…), пропускаются.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct AutoEntry {
-    #[serde(default)]
-    pub time: Option<String>,
-    pub act: String,
-    #[serde(default)]
-    pub block: Option<String>,
-    #[serde(default)]
-    pub from: Option<i64>,
-    #[serde(default)]
-    pub to: Option<i64>,
-    #[serde(default)]
-    pub mean: Option<f64>,
-    #[serde(default)]
-    pub max: Option<f64>,
-    #[serde(default)]
-    pub cool: Option<u64>,
-    #[serde(default)]
-    pub ban: Option<i64>,
-    #[serde(default)]
-    pub until: Option<String>,
-    #[serde(default)]
-    pub strikes: Option<u32>,
-    #[serde(default)]
-    pub why: Option<String>,
-    #[serde(default)]
-    pub blocks: Vec<String>,
-}
-
-pub fn auto_entries(text: &str, into: &mut Vec<AutoEntry>) {
-    into.extend(text.lines().filter_map(|l| serde_json::from_str::<AutoEntry>(l).ok()));
-}
-
-/// Действие автомодуля над блоком — для списка под графиком.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Action {
-    pub time: String,
-    pub change: String,
-    pub why: String,
-    pub lower: bool,
-}
-
-/// Действия над блоками `names` (сравнение нескольких блоков), новые первыми: номер названия в `names` и действие.
-pub fn actions_for(entries: &[AutoEntry], names: &[&str]) -> Vec<(usize, Action)> {
-    let mut out = Vec::new();
-    for e in entries {
-        let time = || e.time.as_deref().map(short_time).unwrap_or_default();
-        match e.act.as_str() {
-            "lower" | "raise" => {
-                let Some(which) = e.block.as_deref().and_then(|b| names.iter().position(|n| *n == b)) else {
-                    continue;
-                };
-                let lower = e.act == "lower";
-                let change = match (e.from, e.to) {
-                    (Some(f), Some(t)) => format!("×{f} → ×{t}"),
-                    (_, Some(t)) => format!("→ ×{t}"),
-                    _ => String::new(),
-                };
-                let why = if lower {
-                    let mut why = match (e.mean, e.max) {
-                        (Some(m), Some(x)) => format!("перегрев: ø {m:.0} °C, ▲ {x:.0} °C"),
-                        (Some(m), None) => format!("перегрев: ø {m:.0} °C"),
-                        _ => "перегрев".to_string(),
-                    };
-                    if let Some(ban) = e.ban {
-                        let until = e.until.as_deref().map(short_time).unwrap_or_default();
-                        let strikes = e.strikes.map(|s| format!(", {s}-й раз")).unwrap_or_default();
-                        let _ = write!(why, "; ×{ban} не раньше {until}{strikes}"); // into a String
-                    }
-                    why
-                } else {
-                    e.cool.map_or_else(
-                        || "прохладен под нагрузкой".to_string(),
-                        |c| format!("прохладен под нагрузкой {c} с"),
-                    )
-                };
-                out.push((
-                    which,
-                    Action {
-                        time: time(),
-                        change,
-                        why,
-                        lower,
-                    },
-                ));
-            }
-            // Возврат принятых — одна строка журнала на все блоки: по действию на каждый выбранный из них.
-            "back" => {
-                for (which, name) in names.iter().enumerate() {
-                    let prefix = format!("{name} ×");
-                    if let Some(item) = e.blocks.iter().find(|b| b.starts_with(&prefix)) {
-                        out.push((
-                            which,
-                            Action {
-                                time: time(),
-                                change: format!("→ {}", &item[name.len() + 1..]),
-                                why: format!("принятый возвращён: {}", e.why.as_deref().unwrap_or("")),
-                                lower: false,
-                            },
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out.reverse();
-    out
 }
 
 // ----- время -----
@@ -1376,43 +1552,6 @@ mod tests {
         std::fs::write(&path, format!("{HEADER}\n")).expect("переписать короче");
         assert!(matches!(read_new(&path, &mut tail), Ok(Fresh::Again(_))));
         let _ = std::fs::remove_file(&path); // временный файл теста; не удалился — не беда
-    }
-
-    #[test]
-    fn auto_actions_of_one_block_newest_first() {
-        let log = [
-            r#"{"time":"2026-10-15T01:25:08.0000000+03:00","act":"lower","block":"2–5","from":46,"to":45,"mean":88.4,"max":93.0,"ban":46,"until":"2026-10-15T01:55:08.0000000+03:00","strikes":1,"temps":[1,2]}"#,
-            r#"{"time":"2026-10-15T01:26:00.0000000+03:00","act":"lower","block":"0","from":53,"to":52,"mean":90.0,"max":95.0}"#,
-            r#"{"time":"2026-10-15T01:30:00.0000000+03:00","act":"raise","block":"2–5","from":45,"to":46,"cool":120}"#,
-            r#"{"time":"2026-10-15T01:40:00.0000000+03:00","act":"back","why":"выход","blocks":["0 ×53","2–5 ×46"]}"#,
-            "не json",
-        ];
-        let mut entries = Vec::new();
-        auto_entries(&log.join("\n"), &mut entries);
-        assert_eq!(entries.len(), 4);
-        let actions: Vec<Action> = actions_for(&entries, &["2–5"]).into_iter().map(|(_, a)| a).collect();
-        assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0].time, "15.10 01:40");
-        assert_eq!(actions[0].change, "→ ×46");
-        assert_eq!(actions[1].change, "×45 → ×46");
-        assert!(actions[1].why.contains("120 с"));
-        assert!(
-            actions[2].lower && actions[2].why.contains("88") && actions[2].why.contains("×46 не раньше 15.10 01:55")
-        );
-        assert!(actions_for(&entries, &["2"]).is_empty(), "«2» — не «2–5»");
-        // Два блока сразу: одно время по журналу, новые первыми; возврат принятых — по строке на каждый блок.
-        let both = actions_for(&entries, &["0", "2–5"]);
-        let order: Vec<(usize, &str)> = both.iter().map(|(w, a)| (*w, a.change.as_str())).collect();
-        assert_eq!(
-            order,
-            [
-                (1, "→ ×46"),
-                (0, "→ ×53"),
-                (1, "×45 → ×46"),
-                (0, "×53 → ×52"),
-                (1, "×46 → ×45")
-            ]
-        );
     }
 
     #[test]

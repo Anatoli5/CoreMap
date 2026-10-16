@@ -37,7 +37,8 @@ use crate::chart::{self, Curves, E_COLORS, P_COLORS, Scale};
 use crate::panels::{self, f};
 use crate::pipe::{Event, Link};
 use crate::samples;
-use crate::store::{Digest, Order};
+use crate::store::{Delivery, Order};
+use crate::timeline::{Layout, Quantity};
 use crate::view::View;
 use crate::wire::{BlockInfo, Hello, Limits};
 
@@ -62,10 +63,12 @@ pub enum Mode {
 }
 
 /// Что проход --settings делает с настройками и окном, а --reopened и проверка программы у часов
-/// (`rust/tray/src/check_window.rs`, `WINDOW_LIMIT`) ждут: отсечка, размер перед закрытием.
+/// (`rust/tray/src/check_window.rs`, `WINDOW_LIMIT`) ждут: отсечка, аварийная, размер перед закрытием.
 const LIMIT_TO: i32 = 88;
+const EMERGENCY_TO: i32 = 97;
 const CLOSED_SIZE: (u32, u32) = (1500, 900);
-/// Жестов с настройками в проходе --settings: включить, отсечка, подтягивание, выключить (глубины нет, DECISIONS #38).
+/// Жестов с настройками в проходе --settings: включить, отсечка, аварийная, выключить (глубины и подтягивания нет,
+/// DECISIONS #38, #40).
 const GESTURES: u32 = 4;
 /// Профиль, который проверка сохраняет, применяет, перезаписывает и удаляет щелчками (его же ищет проверка программы у
 /// часов в истории профилей, `WINDOW_PROFILE`).
@@ -81,7 +84,7 @@ struct Check {
     window: Rc<MinimalSoftwareWindow>,
     view: Rc<RefCell<View>>,
     events: mpsc::Receiver<Event>,
-    digests: Option<mpsc::Receiver<Arc<Digest>>>,
+    digests: Option<mpsc::Receiver<Delivery>>,
     stats: Option<mpsc::Sender<Order>>,
     size: (u32, u32),
     buffer: Vec<Rgb8Pixel>,
@@ -93,6 +96,8 @@ struct Check {
     data: PathBuf,
     own_data: bool,
     mode: Mode,
+    /// Начало проверки — для отчёта по ходу.
+    started: Instant,
 }
 
 pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>, mode: Mode) -> i32 {
@@ -141,6 +146,7 @@ pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>
         data: dir,
         own_data,
         mode,
+        started: Instant::now(),
     };
     if let Err(e) = created {
         check.check(false, format!("папка {} не создана: {e}", check.data.display()));
@@ -188,11 +194,24 @@ impl Check {
     fn check(&mut self, ok: bool, what: impl AsRef<str>) -> bool {
         self.lines
             .push(format!("{}{}", if ok { "ok      " } else { "FAILED  " }, what.as_ref()));
+        self.progress();
         ok
     }
 
     fn note(&mut self, what: impl AsRef<str>) {
         self.lines.push(format!("        {}", what.as_ref()));
+        self.progress();
+    }
+
+    /// Отчёт по ходу проверки: проверку, которую запустивший её прервал по сроку, видно до места, где она встала (в
+    /// конце отчёт пишется целиком заново). Не записался — не беда: в конце он пишется ещё раз.
+    fn progress(&self) {
+        let text = format!(
+            "FAILED\nпроверка не дошла до конца ({:.1} с) — строки до места, где её прервали:\n{}\n",
+            self.started.elapsed().as_secs_f64(),
+            self.lines.join("\n")
+        );
+        let _ = std::fs::write(format!("{}.txt", self.snapshot), text); // see the comment above
     }
 
     fn draw(&mut self) -> bool {
@@ -207,8 +226,11 @@ impl Check {
     fn pump(&mut self, until: impl Fn(&View) -> bool, seconds: f64) -> bool {
         let end = Instant::now() + Duration::from_secs_f64(seconds);
         loop {
-            while let Some(digest) = self.digests.as_ref().and_then(|d| d.try_recv().ok()) {
-                self.view.borrow_mut().on_digest(digest);
+            while let Some(delivery) = self.digests.as_ref().and_then(|d| d.try_recv().ok()) {
+                match delivery {
+                    Delivery::Digest(digest) => self.view.borrow_mut().on_digest(digest),
+                    Delivery::Day(day) => self.view.borrow_mut().on_day(day),
+                }
             }
             while let Ok(event) = self.events.try_recv() {
                 let before = self.view.borrow().changes.states;
@@ -309,14 +331,17 @@ impl Check {
         );
         self.idle();
         self.restore_repaint();
+        self.own_view(&p_block, &e_block);
         self.select(&p_block, &e_block, expected.as_ref());
         self.chart_views(&p_block, &e_block, expected.as_ref());
         self.model_curves(&p_block, &e_block);
         self.curve_switches(&e_block);
+        self.max_and_cuts(&p_block, &e_block);
         self.means_and_reset(&p_block);
         self.limit_menu(&limits, &e_block);
         self.profiles(&limits, &e_block);
         self.sizes(&p_block, &e_block);
+        self.time_view(&p_block, &e_block, expected.as_ref());
     }
 
     /// Обход ошибки Slint 1.18.1 (src/restore.rs): путь восстановления из свёрнутого меняет прозрачный слой во всё окно —
@@ -675,10 +700,13 @@ impl Check {
                     axis_e.last().copied().unwrap_or_default()
                 ),
             );
-            let actions = self.ui.get_actions().row_count();
+            let events = self.ui.get_events().row_count();
             self.check(
-                actions == s.actions,
-                format!("действий автомодуля с блоком {actions}, в журнале {}", s.actions),
+                events == s.events_mine,
+                format!(
+                    "событий с блоком и без блока в списке {events}, должно быть {} (прежний журнал автомодуля до первого события и файл событий дня)",
+                    s.events_mine
+                ),
             );
         }
         // Второй блок — к первому: две линии, ось та же.
@@ -988,15 +1016,15 @@ impl Check {
                 .map(|t| t.text.to_string())
                 .collect::<Vec<_>>()
         };
-        // Шкала над кристаллом — по умолчанию: 0 на оси, подписи со знаком.
-        let above = self.view.borrow().scale == Scale::AboveDie && self.ui.get_chart_above();
+        // Шкала над кристаллом (её выбрал шаг `own_view`): 0 на оси, подписи со знаком.
+        let above = self.view.borrow().scale == Scale::AboveDie && self.ui.get_chart_view() == 1;
         let first = ticks(self);
         self.check(
             above
                 && first.iter().any(|t| t == "0°")
                 && first.iter().any(|t| t.starts_with('+'))
                 && self.ui.get_chart_value_title().contains("над кристаллом"),
-            format!("по умолчанию шкала над кристаллом: деления {first:?}"),
+            format!("шкала над кристаллом: деления {first:?}"),
         );
         if let Some(s) = expected {
             let digest = self.view.borrow().digest.clone();
@@ -2015,6 +2043,51 @@ impl Check {
         self.memory_before_close(&p, &e);
     }
 
+    /// То же для ползунка аварийной отсечки.
+    fn emergency_x(&self, value: i32) -> (f32, f32) {
+        let ui = &self.ui;
+        let (x, y, w, low, high) = (
+            ui.get_emergency_track_x(),
+            ui.get_emergency_track_y(),
+            ui.get_emergency_track_w(),
+            ui.get_auto_emergency_min(),
+            ui.get_auto_emergency_max(),
+        );
+        #[expect(clippy::cast_precision_loss, reason = "slider values are tens: exact in f32")]
+        let share = (value - low) as f32 / (high - low).max(1) as f32;
+        (x + share * w, y)
+    }
+
+    /// Перетаскивание ползунка аварийной — как `drag`.
+    fn emergency_drag(&mut self, from: i32, to: i32, mut during: impl FnMut(&mut Check, i32)) {
+        let (x0, y) = self.emergency_x(from);
+        let at = LogicalPosition::new(x0, y);
+        let window = self.ui.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position: at });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: at,
+            button: PointerEventButton::Left,
+        });
+        self.pump(|_| true, 0.0);
+        let step = if to >= from { 1 } else { -1 };
+        let (mut under, mut x) = (from, x0);
+        while under != to {
+            under += step;
+            x = self.emergency_x(under).0;
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, y),
+            });
+            self.pump(|_| true, 0.0);
+            during(self, under);
+        }
+        self.ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        });
+        self.ui.window().dispatch_event(WindowEvent::PointerExited);
+        self.pump(|_| true, 0.0);
+    }
+
     /// Мышь на дорожку ползунка отсечки: число `value` — координаты окна (как Slint считает число под мышью,
     /// ValueSlider.at).
     fn slider_x(&self, value: i32) -> (f32, f32) {
@@ -2079,25 +2152,40 @@ impl Check {
             return;
         };
         let ui = &self.ui;
+        let span = start.emergency_span();
         let shown = came
             && ui.get_has_auto()
             && ui.get_auto_ready()
             && i64::from(ui.get_auto_limit()) == start.limit
             && ui.get_auto_on() == start.on
-            && ui.get_auto_step_up() == start.step_up
             && i64::from(ui.get_auto_limit_min()) == start.limit_range[0]
-            && i64::from(ui.get_auto_limit_max()) == start.limit_range[1];
+            && i64::from(ui.get_auto_limit_max()) == start.limit_range[1]
+            && ui.get_has_emergency() == start.emergency.is_some()
+            && start.emergency.is_none_or(|e| {
+                i64::from(ui.get_auto_emergency()) == e
+                    && i64::from(ui.get_auto_emergency_min()) == span[0]
+                    && i64::from(ui.get_auto_emergency_max()) == span[1]
+            });
         self.check(
             shown,
             format!(
-                "настройки показаны так, как их прислал CoreMapTray: {} {} °C, подтягивание {}, отсечка {}–{} °C",
+                "настройки показаны так, как их прислал CoreMapTray: {} {} °C, отсечка {}–{} °C, аварийная {:?} ({}–{} °C)",
                 if start.on { "вкл" } else { "выкл" },
                 start.limit,
-                start.step_up,
                 start.limit_range[0],
-                start.limit_range[1]
+                start.limit_range[1],
+                start.emergency,
+                span[0],
+                span[1]
             ),
         );
+        if start.emergency.is_none() {
+            self.check(
+                false,
+                "CoreMapTray не прислал аварийную отсечку (тема settings до 0.5.6)",
+            );
+            return;
+        }
         if start.on || i64::from(LIMIT_TO) == start.limit {
             self.check(false, "проверка ждёт выключенный автомодуль с другой отсечкой");
             return;
@@ -2190,11 +2278,37 @@ impl Check {
         let shot = self.shot("main");
         self.check(shot, "картинка: настройки автомодуля под графиком, отсечка на графике");
 
-        // 3. Подтягивание — щелчок по его выключателю.
-        let (x, y) = (self.ui.get_step_switch_x(), self.ui.get_step_switch_y());
-        self.click(x, y, PointerEventButton::Left);
-        let up = self.pump(|v| v.auto.as_ref().is_some_and(|a| a.step_up), 5.0);
-        self.check(up && self.ui.get_auto_step_up(), "щелчок включил подтягивание вверх");
+        // 3. Аварийная — тем же перетаскиванием до EMERGENCY_TO: команд нет, пока тянут, одна — когда отпустили; линия
+        // аварийной на «абсолютной» идёт за ручкой; нижний край её ползунка — цель + 1.
+        let sent_before = self.view.borrow().sent;
+        let from = self.ui.get_auto_emergency();
+        let low = self.ui.get_auto_emergency_min();
+        let mut followed = true;
+        self.emergency_drag(from, EMERGENCY_TO, |c, under| {
+            followed &= c.ui.get_emergency_shown() == under
+                && c.ui.get_chart_emergency_text() == format!("{under}°")
+                && c.view.borrow().sent == sent_before;
+        });
+        let confirmed = self.pump(
+            |v| {
+                v.auto
+                    .as_ref()
+                    .is_some_and(|a| a.emergency == Some(i64::from(EMERGENCY_TO)))
+            },
+            5.0,
+        );
+        self.check(
+            followed
+                && confirmed
+                && self.view.borrow().sent == sent_before + 1
+                && self.ui.get_auto_emergency() == EMERGENCY_TO
+                && low == LIMIT_TO + 1,
+            format!(
+                "аварийная {from} → {EMERGENCY_TO} °C перетаскиванием: пока тянут — команд нет, ручка и линия за мышью ({followed}); отпустили — одна команда, CoreMapTray подтвердил ({confirmed}); нижний край ползунка {low} (цель {LIMIT_TO} + 1)"
+            ),
+        );
+        let shot = self.shot("emergency");
+        self.check(shot, "картинка: обе отсечки на «абсолютной», ползунки цели и аварийной");
 
         // 4. Выключить: линии отсечки нет.
         let (x, y) = (self.ui.get_auto_switch_x(), self.ui.get_auto_switch_y());
@@ -2263,10 +2377,10 @@ impl Check {
                 && clicked.pin == Some(true)
                 && clicked.swap == Some(true)
                 && clicked.curves == Some(Curves::P95)
-                && clicked.above == Some(false),
+                && clicked.view == Some(Scale::Absolute),
             format!(
-                "щелчки по плитке {}, «закреплённая», «°C» и «ø» (ø скрыты — остались 95 %) сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}, оси местами {:?}, линии {:?}, над кристаллом {:?}",
-                e.name, clicked.compared, clicked.pin, clicked.swap, clicked.curves, clicked.above
+                "щелчки по плитке {}, «закреплённая», «°C» и «ø» (ø скрыты — остались 95 %) сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}, оси местами {:?}, линии {:?}, вид {:?}",
+                e.name, clicked.compared, clicked.pin, clicked.swap, clicked.curves, clicked.view
             ),
         );
         self.resize(CLOSED_SIZE);
@@ -2323,10 +2437,10 @@ impl Check {
         let came = self.pump(|v| v.auto.is_some(), 5.0);
         let auto = self.view.borrow().auto.clone();
         self.check(
-            came && auto
-                .as_ref()
-                .is_some_and(|a| !a.on && a.limit == i64::from(LIMIT_TO) && a.step_up)
-                && self.ui.get_auto_limit() == LIMIT_TO,
+            came && auto.as_ref().is_some_and(|a| {
+                !a.on && a.limit == i64::from(LIMIT_TO) && a.emergency == Some(i64::from(EMERGENCY_TO))
+            }) && self.ui.get_auto_limit() == LIMIT_TO
+                && self.ui.get_auto_emergency() == EMERGENCY_TO,
             format!("настройки автомодуля — от CoreMapTray, какими их оставили: {auto:?}"),
         );
         self.statistics(&hello, &limits, &e);
@@ -2412,6 +2526,557 @@ fn rounded(v: f32) -> u32 {
     v.max(1.0).ceil() as u32
 }
 
+// ----- нагрев ядра, «макс», отсечки, вид «по времени» (бриф W) -----
+
+impl Check {
+    /// Шаг 1б: вид «нагрев ядра» (бриф 16.10) — по умолчанию (файла окна нет): у блока — кривая модели и точки частных
+    /// остатков, ø, 95 % и «макс» недоступны (щелчок по «ø» ничего не меняет), ось — «°C своего нагрева» от нуля; в
+    /// подсказке столбца — нагрев, °C на ступень и производительность на градус, в подсказке блока — что влияет на
+    /// температуру ядра. Картинки F-own.png, F-own-tip.png. В конце — «над кристаллом» и снова один P-блок: дальше идут
+    /// шаги сырых корзин.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario of clicks, hovers and pictures, read top to bottom"
+    )]
+    fn own_view(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
+        let (p, e) = (p_block.index, e_block.index);
+        let default = self.view.borrow().scale == Scale::OwnHeat && self.ui.get_chart_view() == 0;
+        let ready = |v: &View| {
+            v.shown_stats
+                .as_ref()
+                .and_then(|s| s.series.iter().find(|l| l.block == p))
+                .is_some_and(|l| !l.points.is_empty() && !l.model.is_empty())
+        };
+        let drawn = self.pump(ready, 30.0);
+        let series = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.series.iter().find(|l| l.block == p).cloned());
+        let plain = series
+            .as_ref()
+            .is_some_and(|l| l.mean.is_empty() && l.p95.is_empty() && l.max.is_empty());
+        let ticks: Vec<String> = self.ui.get_chart_ticks().iter().map(|t| t.text.to_string()).collect();
+        let from_zero = self
+            .ui
+            .get_chart_ticks()
+            .iter()
+            .map(|t| t.f)
+            .fold(f32::INFINITY, f32::min)
+            <= self.ui.get_chart_zero() + 1e-6;
+        self.check(
+            default
+                && drawn
+                && plain
+                && from_zero
+                && self.ui.get_chart_value_title().contains("своего нагрева"),
+            format!(
+                "по умолчанию — «нагрев ядра»: у {} кривая модели и {} точек частных остатков, линий ø, 95 % и наибольших нет; ось от нуля (или ниже): {ticks:?}",
+                p_block.name,
+                series.as_ref().map_or(0, |l| l.points.len())
+            ),
+        );
+        // Кривая не падает с множителем (путь в рамке 1000 × 1000, y вниз).
+        let numbers: Vec<f64> = series
+            .as_ref()
+            .map(|l| l.model.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+            .unwrap_or_default();
+        let points: Vec<(f64, f64)> = numbers.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect();
+        let rising = points.len() >= 2 && points.windows(2).all(|w| w[1].0 >= w[0].0 && w[1].1 <= w[0].1 + 1e-6);
+        self.check(rising, "кривая нагрева ядра не падает с множителем");
+        // ø, 95 % и «макс» в этом виде недоступны: настоящий щелчок по «ø» ничего не меняет.
+        let curves = self.view.borrow().curves;
+        let (x, y) = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
+        self.click(x, y, PointerEventButton::Left);
+        let (x, y) = (self.ui.get_max_chip_x(), self.ui.get_max_chip_y());
+        self.click(x, y, PointerEventButton::Left);
+        let still = self.view.borrow().curves == curves && !self.view.borrow().max;
+        self.check(
+            still,
+            "щелчки по серым «ø» и «макс» в «нагреве ядра» ничего не изменили",
+        );
+        // Второй блок — кластер: две линии.
+        let (ex, ey) = self.tile_center(e);
+        self.click(ex, ey, PointerEventButton::Left);
+        let two = self.pump(|v| v.compared == [p, e], 2.0);
+        let lines = self.ui.get_chart_series().row_count();
+        self.check(
+            two && lines == 2,
+            format!("кластер {} добавлен: линий {lines}", e_block.name),
+        );
+        let shot = self.shot("own");
+        self.check(shot, "картинка: нагрев ядра у P-ядра и кластера");
+        // Подсказка столбца: у столбца с точкой P-ядра — точка, нагрев, °C на ступень, производительность на градус.
+        let (column, tip) = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| {
+                s.columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.tip.contains("точка") && c.tip.contains("на ступень"))
+                    .map(|(i, c)| (i, c.tip.replace('\u{a0}', " ")))
+            })
+            .unwrap_or_default();
+        let tip_ok = tip.contains("нагрев ядра при полной нагрузке")
+            && tip.contains("°C на ступень")
+            && tip.contains("производительность на градус")
+            && tip.contains("нагрузка ø");
+        self.check(
+            tip_ok,
+            format!("подсказка столбца нагрева ядра: «{}»", tip.replace('\n', " / ")),
+        );
+        self.chart_tip(column, 0.5, "нагрев ядра: подсказка столбца");
+        let shot = self.shot("own-tip");
+        self.check(shot, "картинка: подсказка столбца нагрева ядра");
+        self.leave();
+        let legend: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.tip.to_string()).collect();
+        let influence = legend.iter().all(|t| {
+            t.contains("Что влияет на температуру ядра")
+                && t.contains("кристалл")
+                && t.contains("своя работа")
+                && t.contains("соседи")
+                && t.contains("предыдущие секунды")
+                && t.contains("действуют через кристалл")
+                && t.contains("все прочие равны: соседи, кристалл, видеокарта, история вынесены")
+        });
+        self.check(
+            influence,
+            format!(
+                "в подсказке блока — что влияет на температуру ядра и условия нагрева ядра: {}",
+                legend
+                    .first()
+                    .map(|t| t
+                        .lines()
+                        .filter(|l| l.starts_with("• "))
+                        .collect::<Vec<_>>()
+                        .join(" / "))
+                    .unwrap_or_default()
+            ),
+        );
+        // Дальше — сырые корзины: «над кристаллом» и снова один P-блок.
+        let above = (self.ui.get_above_chip_x(), self.ui.get_above_chip_y());
+        self.chip(above, |v| v.scale == Scale::AboveDie, "щелчок по «над кристаллом»");
+        self.click(ex, ey, PointerEventButton::Left);
+        let back = self.pump(|v| v.compared == [p], 2.0);
+        self.check(back, "кластер убран: в сравнении снова один P-блок");
+    }
+
+    /// Шаг 2д: «макс» — третий независимый выключатель на сырых видах: линия наибольших, в подсказке столбца — условия
+    /// строки наибольшей (время, множитель и потолок, нагрузка, кристалл, соседи, видеокарта, вентиляторы); отсечки
+    /// автомодуля (аварийная и по цели) — отметками на линии блока и строкой в подсказке столбца. Картинки F-max.png,
+    /// F-max-tip.png.
+    fn max_and_cuts(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
+        let e = e_block.index;
+        let one = self.compare_exactly(&[e]);
+        let abs = (self.ui.get_abs_chip_x(), self.ui.get_abs_chip_y());
+        self.chip(abs, |v| v.scale == Scale::Absolute, "«абсолютная» для «макс»");
+        let at = (self.ui.get_max_chip_x(), self.ui.get_max_chip_y());
+        self.chip(at, |v| v.max, "щелчок по «макс» — линия наибольших видна");
+        let (line, others) = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.series.first())
+            .map(|l| (!l.max.is_empty(), !l.mean.is_empty() && !l.p95.is_empty()))
+            .unwrap_or_default();
+        let peaks: Vec<f64> = self
+            .view
+            .borrow()
+            .digest
+            .as_ref()
+            .and_then(|d| d.tally.blocks.get(&e_block.name))
+            .map(|t| t.bins.values().map(|b| b.peak.temp).collect())
+            .unwrap_or_default();
+        self.check(
+            one && line && others && self.ui.get_chart_max(),
+            format!(
+                "«макс»: у {} линия наибольших ({} точек), ø и 95 % не тронуты",
+                e_block.name,
+                peaks.len()
+            ),
+        );
+        let tips: Vec<(usize, String)> = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .map(|s| {
+                s.columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.tip.contains("макс"))
+                    .map(|(i, c)| (i, c.tip.replace('\u{a0}', " ")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let conditions = !tips.is_empty()
+            && tips.iter().all(|(_, t)| {
+                t.contains("потолок ×") && t.contains("кристалл") && t.contains("соседи") && t.contains("нагрузка")
+            });
+        let readings = tips
+            .iter()
+            .any(|(_, t)| t.contains("видеокарта") && t.contains("вент."));
+        self.check(
+            conditions && readings,
+            format!(
+                "в подсказке столбца — условия строки наибольшей: {}",
+                tips.first()
+                    .map(|(_, t)| t.lines().nth(2).unwrap_or_default().to_string())
+                    .unwrap_or_default()
+            ),
+        );
+        // Отсечки из журнала автомодуля (придуманные: аварийная и по цели на ×(заводской − 1)) — на линии блока.
+        let cuts: Vec<i32> = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.series.first())
+            .map(|l| l.cuts.iter().map(|c| c.kind).collect())
+            .unwrap_or_default();
+        let listed = tips
+            .iter()
+            .any(|(_, t)| t.contains("аварийная отсечка") && t.contains("отсечка: 2-с медиана"));
+        self.check(
+            cuts.contains(&1) && cuts.contains(&2) && listed,
+            format!(
+                "отсечки на линии {}: виды {cuts:?}; в подсказке столбца — обе: {listed}",
+                e_block.name
+            ),
+        );
+        let shot = self.shot("max");
+        self.check(shot, "картинка: «макс» и отметки отсечек, абсолютная шкала");
+        if let Some(&(column, _)) = tips.first() {
+            self.chart_tip(column, 0.5, "«макс»: подсказка столбца с условиями строки");
+            let shot = self.shot("max-tip");
+            self.check(shot, "картинка: подсказка столбца с условиями наибольшей");
+            self.leave();
+        }
+        self.chip(at, |v| !v.max, "второй щелчок по «макс» — линии наибольших нет");
+        let gone = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .is_some_and(|s| s.series.iter().all(|l| l.max.is_empty()));
+        self.check(gone, "линия наибольших скрыта");
+        let above = (self.ui.get_above_chip_x(), self.ui.get_above_chip_y());
+        self.chip(above, |v| v.scale == Scale::AboveDie, "снова «над кристаллом»");
+        let back = self.compare_exactly(&[e, p_block.index]);
+        self.check(back, "в сравнении снова кластер и P-ядро");
+    }
+
+    /// Шаг 5: ось x — время (бриф W с поправкой 16.10). Щелчок по «по времени» — день читается потоком статистики;
+    /// раскладка «блоки»: одна полоса, выбранные блоки своими цветами, события блока — на его линии, сброс — под полосой,
+    /// перерыв записи 08:00–08:30 сжат в отметку (подсказка — его длительность); величина «потолок» — ступени; колесо —
+    /// масштаб вокруг курсора, перетаскивание — сдвиг, «весь день» — назад; ◀ — вчера, ▶ — сегодня; «параметры» — семь
+    /// полос первых двух блоков. Список событий: «все блоки» — все строки; щелчок по строке из вида «по множителю» — ось x
+    /// время и момент события посередине. Цена: пересчёт полос и перерисовка окна. Картинки F-time.png, F-time-zoom.png,
+    /// F-time-tip.png, F-time-gap.png, F-time-params.png, F-time-1280.png.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario of clicks, wheel, drag and pictures, read top to bottom"
+    )]
+    fn time_view(&mut self, p_block: &BlockInfo, e_block: &BlockInfo, expected: Option<&Synthetic>) {
+        // В сравнении кластер и P-ядро: «выбранные» — ещё две строки, если P-ядро — тот «другой» блок журнала.
+        let (want_mine, want_all) = expected.map_or((0, 0), |s| {
+            (
+                s.events_mine + if s.events_other == p_block.name { 2 } else { 0 },
+                s.events_all,
+            )
+        });
+        let size = (1920, 1040);
+        self.resize(size);
+        let at = (self.ui.get_time_chip_x(), self.ui.get_time_chip_y());
+        self.chip(at, |v| v.timeline, "щелчок по «по времени»");
+        let began = Instant::now();
+        let read = self.pump(
+            |v| v.day_data.is_some() && v.shown_time.as_ref().is_some_and(|t| !t.strips.is_empty()),
+            30.0,
+        );
+        let arrived = began.elapsed().as_secs_f64();
+        // Цена показа: пересчёт полос (прореживание, картинки) и одна перерисовка окна целиком.
+        let started = Instant::now();
+        self.view.borrow_mut().shown_time = None;
+        self.view.borrow_mut().refresh_time();
+        let panel = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        self.window.request_redraw();
+        self.draw();
+        let drawn = started.elapsed().as_secs_f64() * 1000.0;
+        self.note(format!(
+            "день прочитан и показан за {arrived:.1} с; пересчёт полос {panel:.0} мс, перерисовка окна {drawn:.0} мс"
+        ));
+        let (strips, dots, marks, gaps, inked, head) = self
+            .view
+            .borrow()
+            .shown_time
+            .as_ref()
+            .map(|t| {
+                (
+                    t.strips.len(),
+                    t.dots.len(),
+                    t.marks.len(),
+                    t.gaps.len(),
+                    t.strips
+                        .first()
+                        .map_or(0, |s| s.picture.rgba.chunks(4).filter(|p| p[3] > 0).count()),
+                    t.head.clone(),
+                )
+            })
+            .unwrap_or_default();
+        let rows = self.view.borrow().day_data.as_ref().map_or(0, |d| d.t.len());
+        let names: Vec<String> = self
+            .view
+            .borrow()
+            .day_data
+            .as_ref()
+            .map(|d| d.blocks.iter().map(|b| b.name.clone()).collect())
+            .unwrap_or_default();
+        self.check(
+            read && strips == 1
+                && self.ui.get_chart_time()
+                && self.ui.get_time_strips().row_count() == 1
+                && names == [e_block.name.clone(), p_block.name.clone()]
+                && dots > 0
+                && marks > 0
+                && gaps > 0
+                && inked > 0,
+            format!(
+                "«блоки»: день прочитан ({rows} строк), полоса {strips}, блоки {names:?}, событий на линиях {dots}, под полосой {marks}, перерывов {gaps}, закрашено пикселей {inked}; «{head}»"
+            ),
+        );
+        let at = (self.ui.get_q_ceiling_x(), self.ui.get_q_ceiling_y());
+        self.chip(at, |v| v.quantity == Quantity::Ceiling, "щелчок по «потолок»");
+        let ceilings = self.pump(
+            |v| {
+                v.day_data.as_ref().is_some_and(|d| d.quantities == [Quantity::Ceiling])
+                    && v.shown_time
+                        .as_ref()
+                        .is_some_and(|t| t.strips.first().is_some_and(|s| s.title.starts_with("потолок")))
+            },
+            30.0,
+        );
+        self.check(
+            ceilings,
+            "«потолок»: день перечитан с потолками, полоса — ступени потолка",
+        );
+        let shot = self.shot("time");
+        self.check(shot, "картинка: «блоки» × потолок, весь день");
+        // Колесо: курсор на 30 % ширины поля, ступень колеса от себя — показ уже, время под курсором то же.
+        let ui = &self.ui;
+        let (px, py, pw, ph) = (
+            ui.get_time_plot_x(),
+            ui.get_time_plot_y(),
+            ui.get_time_plot_w(),
+            ui.get_time_plot_h(),
+        );
+        let span0 = self.view.borrow().span.unwrap_or_default();
+        let at_time = |span: (i64, i64), share: f64| {
+            #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
+            let t = span.0 as f64 + share * (span.1 - span.0) as f64;
+            t
+        };
+        let cursor = LogicalPosition::new(px + 0.3 * pw, py + ph * 0.5);
+        self.ui
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position: cursor });
+        for _ in 0..3 {
+            self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: cursor,
+                delta_x: 0.0,
+                delta_y: 60.0,
+            });
+            self.pump(|_| true, 0.0);
+        }
+        let span1 = self.view.borrow().span.unwrap_or_default();
+        #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
+        let narrower = (span1.1 - span1.0) as f64 / (span0.1 - span0.0).max(1) as f64;
+        let fixed = (at_time(span1, 0.3) - at_time(span0, 0.3)).abs();
+        self.check(
+            (narrower - 0.512).abs() < 0.01 && fixed <= 2.0,
+            format!(
+                "три ступени колеса над 30 % ширины: показ уже в {narrower:.3} раза (0,8³), место под курсором сдвинулось на {fixed:.0} мс"
+            ),
+        );
+        let shot = self.shot("time-zoom");
+        self.check(shot, "картинка: после колеса");
+        // Подсказка у курсора: время строки и потолок каждого блока.
+        self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(cursor.x + 1.0, cursor.y),
+        });
+        self.pump(|_| false, 0.7);
+        let shot = self.shot("time-tip");
+        let hover = self.view.borrow().time_hover(cursor.x + 1.0 - px, pw);
+        self.check(
+            self.ui.get_tip_shown() && hover.matches("потолок ×").count() == 2 && shot,
+            format!("подсказка курсора: «{}»", hover.replace('\n', " / ")),
+        );
+        // Перетаскивание: нажать, вести на четверть ширины вправо, отпустить — показ сдвинут на четверть раньше.
+        let from = LogicalPosition::new(px + 0.5 * pw, py + ph * 0.5);
+        let window = self.ui.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position: from });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position: from,
+            button: PointerEventButton::Left,
+        });
+        self.pump(|_| true, 0.0);
+        for k in 1..=5 {
+            let x = from.x + 0.05 * f32::from(u8::try_from(k).unwrap_or(0)) * pw;
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, from.y),
+            });
+            self.pump(|_| true, 0.0);
+        }
+        self.ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(from.x + 0.25 * pw, from.y),
+            button: PointerEventButton::Left,
+        });
+        self.ui.window().dispatch_event(WindowEvent::PointerExited);
+        self.pump(|_| true, 0.0);
+        let span2 = self.view.borrow().span.unwrap_or_default();
+        #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
+        let moved = (span1.0 - span2.0) as f64 / (span1.1 - span1.0).max(1) as f64;
+        self.check(
+            (moved - 0.25).abs() < 0.01 && span2.1 - span2.0 == span1.1 - span1.0,
+            format!("перетаскивание на четверть ширины вправо: показ сдвинут раньше на {moved:.3} своей ширины, ширина та же"),
+        );
+        let whole = (self.ui.get_whole_chip_x(), self.ui.get_whole_chip_y());
+        let bounds = self.view.borrow().day_data.as_ref().and_then(|d| d.bounds());
+        self.click(whole.0, whole.1, PointerEventButton::Left);
+        let whole_day = self.view.borrow().span == bounds;
+        self.check(whole_day, "«весь день» — показ снова от первого среза до последнего");
+        // Перерыв записи: курсор на его отметке — подсказка с началом, концом и длительностью.
+        self.pump(|v| v.shown_time.is_some(), 1.0);
+        let gap = self
+            .view
+            .borrow()
+            .shown_time
+            .as_ref()
+            .and_then(|t| t.gaps.first().copied());
+        if let Some(g) = gap {
+            let x = px + g * pw;
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, py + ph * 0.5),
+            });
+            self.pump(|_| false, 0.7);
+            let shot = self.shot("time-gap");
+            let hover = self.view.borrow().time_hover(x - px, pw);
+            self.check(
+                hover.starts_with("Перерыв записи 07:59:58–08:30:00") && hover.contains("30 мин") && shot,
+                format!("подсказка на отметке перерыва: «{}»", hover.replace('\n', " / ")),
+            );
+            self.ui.window().dispatch_event(WindowEvent::PointerExited);
+            self.pump(|_| true, 0.0);
+        } else {
+            self.check(false, "отметки перерыва нет");
+        }
+        // ◀ — вчера (в придуманных срезах вчерашний вечер есть), ▶ — снова сегодня.
+        let today = self.view.borrow().day_data.as_ref().map(|d| d.date.clone());
+        let (x, y) = (self.ui.get_day_prev_x(), self.ui.get_day_prev_y());
+        self.click(x, y, PointerEventButton::Left);
+        let yesterday = self.pump(
+            |v| {
+                v.day_data
+                    .as_ref()
+                    .is_some_and(|d| Some(&d.date) != today.as_ref() && !d.t.is_empty())
+            },
+            30.0,
+        );
+        let day_text = self.ui.get_day_text().to_string();
+        let (x, y) = (self.ui.get_day_next_x(), self.ui.get_day_next_y());
+        self.click(x, y, PointerEventButton::Left);
+        let again = self.pump(|v| v.day_data.as_ref().map(|d| d.date.clone()) == today, 30.0);
+        self.check(
+            yesterday && again && !self.ui.get_can_day_next(),
+            format!("◀ — вчерашний день («{day_text}»), ▶ — снова сегодня; дальше сегодня некуда"),
+        );
+        // «параметры»: семь полос первых двух блоков, события — под полосами.
+        let at = (self.ui.get_lay_params_x(), self.ui.get_lay_params_y());
+        self.chip(at, |v| v.layout == Layout::Params, "щелчок по «параметры»");
+        let params = self.pump(
+            |v| {
+                v.day_data.as_ref().is_some_and(|d| d.quantities.len() == 5)
+                    && v.shown_time.as_ref().is_some_and(|t| t.strips.len() == 7)
+            },
+            30.0,
+        );
+        let marks = self.view.borrow().shown_time.as_ref().map_or(0, |t| t.marks.len());
+        self.check(
+            params && self.ui.get_time_strips().row_count() == 7 && marks > 0,
+            format!("«параметры»: полос 7, событий под полосами {marks}"),
+        );
+        let shot = self.shot("time-params");
+        self.check(shot, "картинка: «параметры», весь день");
+        self.resize((1280, 800));
+        self.pump(|v| v.shown_time.is_some(), 1.0);
+        self.view.borrow_mut().refresh_time();
+        self.pump(|_| true, 0.0);
+        let shot = self.shot("time-1280");
+        self.check(shot, "картинка: «параметры» при 1280×800");
+        self.resize(size);
+        let at = (self.ui.get_lay_blocks_x(), self.ui.get_lay_blocks_y());
+        self.chip(at, |v| v.layout == Layout::Blocks, "снова «блоки»");
+        // Список событий: «все блоки» — все строки; снова «выбранные блоки».
+        let mine = self.ui.get_events().row_count();
+        let at = (self.ui.get_ev_all_x(), self.ui.get_ev_all_y());
+        self.chip(at, |v| v.events_all, "щелчок по «все блоки»");
+        let all = self.ui.get_events().row_count();
+        let at = (self.ui.get_ev_mine_x(), self.ui.get_ev_mine_y());
+        self.chip(at, |v| !v.events_all, "щелчок по «выбранные блоки»");
+        self.check(
+            all == want_all && mine == want_mine,
+            format!("список событий: выбранные блоки {mine}, все {all} (должно {want_mine} и {want_all})"),
+        );
+        // Щелчок по строке из вида «по множителю»: ось x — время, момент события посередине.
+        let at = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
+        self.chip(at, |v| !v.timeline, "щелчок по «по множителю»");
+        let event_at = self.view.borrow().first_event_time();
+        let (x, y) = (self.ui.get_events_x() + 120.0, self.ui.get_events_y() + 9.0);
+        self.click(x, y, PointerEventButton::Left);
+        let centred = self.pump(
+            |v| {
+                v.timeline
+                    && v.day_data
+                        .as_ref()
+                        .zip(v.span)
+                        .zip(event_at)
+                        .and_then(|((d, s), t)| Some((d.place(t)? - i64::midpoint(s.0, s.1)).abs() <= 1000))
+                        .unwrap_or(false)
+            },
+            30.0,
+        );
+        let span = self.view.borrow().span.map(|s| s.1 - s.0);
+        self.check(
+            centred && span == Some(600_000),
+            format!("щелчок по первой строке списка: ось x — время, событие посередине, показ {span:?} мс (10 мин)"),
+        );
+        let at = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
+        self.chip(at, |v| !v.timeline, "снова «по множителю»");
+        let file = self.data.join(crate::saved::FILE);
+        let saved = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| crate::saved::parse(&t).ok())
+            .unwrap_or_default();
+        self.check(
+            saved.timeline == Some(false)
+                && saved.view.is_some()
+                && saved.layout == Some(Layout::Blocks)
+                && saved.quantity == Some(Quantity::Ceiling)
+                && saved.events_all == Some(false),
+            format!(
+                "файл окна помнит вид: по времени {:?}, вид {:?}, раскладка {:?}, величина {:?}, события все {:?}",
+                saved.timeline, saved.view, saved.layout, saved.quantity, saved.events_all
+            ),
+        );
+    }
+}
+
 // ----- придуманные срезы -----
 
 /// На сколько градусов блок горячее за каждого занятого соседа (в придуманных срезах).
@@ -2433,7 +3098,11 @@ struct Synthetic {
     ms: u64,
     today_rows: u64,
     today_bytes: u64,
-    actions: usize,
+    /// Строк списка событий: с выбранным кластером («выбранные блоки») и всех.
+    events_mine: usize,
+    events_all: usize,
+    /// Блок двух строк журнала «не кластера» (прежнее снижение и событие незнакомого вида).
+    events_other: String,
 }
 
 /// Отрезок строк одного файла: `count` срезов дня `date` с шагом `step_ms` от `start_ms` после полуночи; `from` — номер
@@ -2497,12 +3166,12 @@ fn rows(
         } else {
             k.is_multiple_of(8)
         };
-        let fan = if read {
-            (2500 + 40 * package).to_string()
+        let (fan, fan_gpu) = if read {
+            ((2500 + 40 * package).to_string(), (2700 + 40 * package).to_string())
         } else {
-            String::new()
+            (String::new(), String::new())
         };
-        let _ = write!(text, ",{package},{fan},"); // into a String
+        let _ = write!(text, ",{package},{fan},{fan_gpu}"); // into a String
         // Сначала значения всех блоков (уровень кристалла строки — по ним всем), потом запись и счёт.
         cells.clear();
         for (j, b) in hello.blocks.iter().enumerate() {
@@ -2581,6 +3250,12 @@ fn rows(
             power += if b.kind == "E" { 4.0 * 2.5 * p } else { 9.0 * p };
         }
         let _ = write!(text, ",{power:.1}"); // into a String
+        // Видеокарта — в той же строке, что вентиляторы (раз в 2 с у нового журнала): «макс» берёт ближайшее чтение.
+        if read {
+            let _ = write!(text, ",{},{}.5,0.{}", 60 + i % 10, 100 + i % 50, 40 + i % 50); // into a String
+        } else {
+            text.push_str(",,,");
+        }
         text.push('\n');
         if let Some(s) = counted.as_deref_mut() {
             s.rows += 1;
@@ -2639,7 +3314,7 @@ fn synthesize(
     for b in &hello.blocks {
         let _ = write!(header, ",{}.volts", b.name); // into a String
     }
-    header.push_str(",power_cores\n");
+    header.push_str(",power_cores,temp_gpu,power_gpu,busy_gpu\n");
     let mut s = Synthetic {
         focus: e_block.name.clone(),
         ..Synthetic::default()
@@ -2699,7 +3374,8 @@ fn synthesize(
     rows(&mut text, stale, hello, limits, &neighbours, None);
     std::fs::write(samples_dir.join(format!("{long_ago}.csv")), &text)?;
 
-    // Журнал автомодуля: три действия с кластером, одно с другим блоком.
+    // Прежний журнал автомодуля (до 0.5.6): три действия с кластером, одно с другим блоком — до первого события файла
+    // событий, поэтому все в списке.
     let name = &e_block.name;
     let fused = limits.fused.get(e_block.first).copied().unwrap_or(40);
     let other = hello
@@ -2725,6 +3401,38 @@ fn synthesize(
         ),
     ];
     std::fs::write(dir.join("auto-log.jsonl"), log.join("\n") + "\n")?;
-    s.actions = 3;
+    // Файл событий дня (0.5.6): две отсечки и возврат на ×(заводской − 1) — корзине кластера с данными; сброс без блока;
+    // возврат потолков профиля; событие незнакомого вида с другим блоком.
+    let events = [
+        format!(
+            r#"{{"time":"{date}T11:20:00.0000000+03:00","kind":"emergency","block":"{name}","from":{fused},"to":{},"period":{{"ceiling":{fused},"secs":600,"max":96,"maxTime":"{date}T11:19:58.0000000+03:00","mean":81.2}},"conditions":{{"reading":96.0,"die":71.4,"medians":[80.1],"ratio":{}.2,"busy":0.9,"gpu":{{"temp":70,"power":120.5,"busy":0.93}},"fans":[4100,4300]}}}}"#,
+            fused - 1,
+            fused - 1
+        ),
+        format!(
+            r#"{{"time":"{date}T11:30:00.0000000+03:00","kind":"target","block":"{name}","from":{fused},"to":{},"conditions":{{"median":86.5,"die":70.1,"ratio":{}.3,"busy":0.88}}}}"#,
+            fused - 1,
+            fused - 1
+        ),
+        format!(
+            r#"{{"time":"{date}T11:40:00.0000000+03:00","kind":"return","block":"{name}","from":{},"to":{fused},"conditions":{{"median":80.0,"die":65.0,"ratio":{}.1,"busy":0.7}}}}"#,
+            fused - 1,
+            fused - 1
+        ),
+        format!(r#"{{"time":"{date}T11:45:00.0000000+03:00","kind":"reset"}}"#),
+        format!(
+            r#"{{"time":"{date}T11:50:00.0000000+03:00","kind":"putback","reason":"settings","block":"{name}","from":{},"to":{fused}}}"#,
+            fused - 1
+        ),
+        format!(r#"{{"time":"{date}T11:55:00.0000000+03:00","kind":"mystery","block":"{other}"}}"#),
+    ];
+    std::fs::create_dir_all(dir.join("events"))?;
+    std::fs::write(
+        dir.join("events").join(format!("{date}.jsonl")),
+        events.join("\n") + "\n",
+    )?;
+    s.events_mine = 8;
+    s.events_all = 10;
+    s.events_other = other.to_string();
     Ok(s)
 }

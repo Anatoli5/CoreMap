@@ -17,10 +17,9 @@
 // У каждого теста в комментарии — какую неверную реализацию он ловит.
 
 use crate::model::{
-    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, Hinge, KEEP_MS, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU,
-    REFERENCE, Reference, TAUS, WARM_MS, fit, log_from_csv, nnls, proxy, trim,
+    ASLEEP, Averages, BlockModel, Coef, Die, GAP_MS, Hinge, Log, MIN_MINUTES, MIN_ROWS, Model, NEIGHBOUR_TAU, OwnSums,
+    REFERENCE, Reference, TAUS, WARM_MS, fit, log_from_csv, nnls, proxy, retain,
 };
-use crate::samples::row_time;
 
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -946,8 +945,11 @@ impl Synth {
                 random(2000, 4000).unwrap_or(3000).to_string(),
                 random(2000, 4000).unwrap_or(2900).to_string(),
             ];
+            // Потолок строки случаен, но один у всех блоков: ранг P-ядер (дополнение брифа 16.10 — из порядка
+            // потолков) у всех один и тот же, сам потолок входом не бывает.
+            let ceiling = random(30, 26).unwrap_or(50).to_string();
             for (l, temp) in row.iter().zip(&self.temps[t]) {
-                fields.push(random(30, 26).unwrap_or(50).to_string());
+                fields.push(ceiling.clone()); // a short number per field, test data
                 fields.push(l.ratio.map_or_else(String::new, |r| r.to_string()));
                 fields.push(format!("{}.{:02}", l.busy / 100, l.busy % 100));
                 fields.push(temp.clone()); // текст поля строки
@@ -1390,8 +1392,9 @@ fn reference_conditions_and_curve_follow_the_true_layer() {
 fn ceiling_fan_package_and_power_columns_do_not_change_the_layer() {
     // Слова владельца: «потолок вообще не должен ебать агрессионную модель»; бриф: вентилятор — не вход, мощности
     // процессора и видеокарты — только в слое уровня кристалла (L4). Тот же журнал с постоянными и со случайными
-    // потолками, корпусом, вентиляторами, мощностями и видеокартой — слой L3 (в старом виде и с формой, с самой формой
-    // и её узлами), опорные условия и кривые те же.
+    // потолками (у всех блоков строки — один: ранг P-ядер, дополнение 16.10, тот же), корпусом, вентиляторами,
+    // мощностями и видеокартой — слой L3 (в старом виде и с формой, с самой формой и её узлами), опорные условия и
+    // кривые те же.
     // Ловит: потолок как вход или подстановку потолка вместо пустого множителя спящего ядра, потолок вместо
     // фактического множителя в форме или в её узлах, вентилятор или корпус как уровень кристалла, мощность в слое
     // блока.
@@ -2012,110 +2015,13 @@ fn solid_range_takes_the_value_where_the_share_is_reached_exactly() {
     assert!(close(rf.median, 40.0, 1e-9), "медиана ×{}", rf.median);
 }
 
-// ─── 11. Окно данных: восемь часов до новейшей строки ─────────────────────────────────────────────────────────────
-
-const HOUR: i64 = 3_600_000;
-
-// Журнал блоков 0–3 из строк с этим временем (мс от полуночи 15.10), обычные поля.
-fn timed_log(ms: &[i64]) -> Log {
-    let blocks = names(&["0", "1", "2", "3"]);
-    let rows: Vec<(i64, Vec<Cell>)> = ms
-        .iter()
-        .enumerate()
-        .map(|(k, &t)| (t, (0..4).map(|b| usual(k, b)).collect()))
-        .collect();
-    hand_log(&blocks, &rows)
-}
-
-// Время строки в масштабе журнала, как его читает окно (samples::row_time): мс от 1970-01-01 по местным часам.
-fn scale(ms: i64) -> i64 {
-    row_time(&stamp(ms)).expect("время строки").ms
-}
-
-// Строка для push: у каждого из четырёх блоков ×45, нагрузка 0,8, 60 °C, без напряжения; мощностей нет.
-fn push_row(log: &mut Log, ms: i64) {
-    log.push(
-        scale(ms),
-        std::iter::repeat_n([Some(45.0), Some(0.8), Some(60.0), None], 4),
-        [None; 3],
-    );
-}
-
-#[test]
-fn trim_drops_rows_older_than_eight_hours_before_the_newest_row_of_all_logs() {
-    // Журнал A: 01:00, 02:59:59.999, 03:00, 02:30 (часы назад), 04:00; журнал B: 05:00, 09:00, 11:00. Новейшая строка —
-    // 11:00 в B, граница — 03:00: в A остаются 03:00 (ровно на границе) и 04:00, B не меняется.
-    // Ловит: границу по своему файлу (A по своей 04:00 не потерял бы ничего), строку ровно на границе выброшенной
-    // («>» вместо «≥»), строку на 1 мс раньше оставленной, срез только с начала файла (02:30 после 03:00 осталась бы),
-    // окно не 8 ч, изменённый второй журнал.
-    assert_eq!(KEEP_MS, 8 * HOUR);
-    let mut a = timed_log(&[HOUR, 3 * HOUR - 1, 3 * HOUR, 2 * HOUR + HOUR / 2, 4 * HOUR]);
-    let mut b = timed_log(&[5 * HOUR, 9 * HOUR, 11 * HOUR]);
-    assert_eq!(b.newest(), Some(scale(11 * HOUR)));
-    let cut = trim(&mut [&mut a, &mut b]);
-    assert_eq!(cut, Some(scale(3 * HOUR)));
-    assert_eq!((a.rows(), a.newest()), (2, Some(scale(4 * HOUR))));
-    assert_eq!((b.rows(), b.newest()), (3, Some(scale(11 * HOUR))));
-}
-
-#[test]
-fn trim_without_rows_changes_nothing_and_an_empty_log_does_not_decide() {
-    // Ловит: границу из пустого журнала (ноль или минимум времени), изменение журналов, когда строк нет нигде.
-    let mut a = timed_log(&[]);
-    let mut b = timed_log(&[]);
-    assert_eq!(a.newest(), None);
-    assert_eq!(trim(&mut [&mut a, &mut b]), None);
-    let mut c = timed_log(&[HOUR, 2 * HOUR]);
-    assert_eq!(trim(&mut [&mut a, &mut c]), Some(scale(2 * HOUR) - KEEP_MS));
-    assert_eq!((a.rows(), c.rows()), (0, 2), "всё в пределах 8 ч — ничего не выброшено");
-}
-
-#[test]
-fn admit_from_rejects_later_older_rows_and_leaves_kept_ones() {
-    // API: admit_from меняет только приём следующих строк — push молча пропускает строки старше границы, граница только
-    // растёт (меньшая потом не действует); уже принятые строки не трогаются. Ловит: admit_from, выбрасывающий принятое;
-    // push, принимающий строку старше границы или отвергающий строку ровно на ней; границу, опущенную вторым вызовом.
-    let mut a = timed_log(&[HOUR, 2 * HOUR, 3 * HOUR]);
-    a.admit_from(scale(5 * HOUR));
-    assert_eq!(
-        (a.rows(), a.newest()),
-        (3, Some(scale(3 * HOUR))),
-        "admit_from не трогает принятое"
-    );
-    push_row(&mut a, 4 * HOUR);
-    assert_eq!(a.rows(), 3, "строка старше границы не принята");
-    push_row(&mut a, 5 * HOUR);
-    assert_eq!(
-        (a.rows(), a.newest()),
-        (4, Some(scale(5 * HOUR))),
-        "строка ровно на границе принята"
-    );
-    a.admit_from(scale(2 * HOUR));
-    push_row(&mut a, 4 * HOUR + HOUR / 2);
-    assert_eq!(a.rows(), 4, "меньшая граница не действует: 04:30 всё ещё старше 05:00");
-    push_row(&mut a, 6 * HOUR);
-    assert_eq!((a.rows(), a.newest()), (5, Some(scale(6 * HOUR))));
-}
-
-#[test]
-fn keep_from_drops_older_kept_rows_and_admits_from_the_same_time() {
-    // API: keep_from(at) = admit_from(at) и выбросить принятые строки старше at; строка ровно на at остаётся;
-    // выброшенное меньшая граница не возвращает. Ловит: keep_from, выбросивший строку на границе или оставивший строку
-    // старше её; keep_from без admit_from (строка старше границы, пришедшая потом, принята бы).
-    let mut b = timed_log(&[HOUR, 2 * HOUR, 3 * HOUR]);
-    b.keep_from(scale(2 * HOUR));
-    assert_eq!(
-        (b.rows(), b.newest()),
-        (2, Some(scale(3 * HOUR))),
-        "выброшена только 01:00"
-    );
-    b.keep_from(scale(HOUR));
-    assert_eq!(b.rows(), 2, "выброшенное не возвращается");
-    push_row(&mut b, HOUR + HOUR / 2);
-    assert_eq!(b.rows(), 2, "строка старше границы keep_from не принята");
-    push_row(&mut b, 2 * HOUR);
-    assert_eq!(b.rows(), 3, "строка ровно на границе принята");
-}
+// ─── 11. Нагрев ядра, частные остатки и хранение строк (бриф W 16.10) ─────────────────────────────────────────────
+// Источник — outputs/own-heating-view-brief-2026-10-16.md и outputs/window-pass-brief-2026-10-16.md. Нагрев ядра
+// H(r) — установившийся свой нагрев при полной нагрузке: форма g(r) + Σ средних · p(r); без свободного члена, кристалла,
+// соседей и ранга. Частный остаток строки — T − (a + β·D + соседи + ранг), делённый на занятость; точка корзины —
+// средняя с весом занятость × время, то есть Σ остатков / Σ занятостей. Хранение: по клетке (блок, целый множитель)
+// новейшие окна 10 с, пока стандартная ошибка средней остатка по окнам не дошла до 0,1 °C (не меньше 10 окон); старше —
+// выбрасываются, если строка не нужна другому блоку; ненасыщенные клетки держат всё.
 
 // Числа слоя L3 блока: a, β, свои, соседи (быстрый, 4-с).
 fn coef_numbers(c: &Coef) -> Vec<f64> {
@@ -2125,61 +2031,265 @@ fn coef_numbers(c: &Coef) -> Vec<f64> {
     v
 }
 
+// Нагрузки [строка][блок]: отрезки по `segment` строк постоянной нагрузки — множитель и занятость по кругу, у каждого
+// блока со своим сдвигом (средние всех времён успевают установиться).
+fn steady_loads(rows: usize, blocks: usize, segment: usize) -> Vec<Vec<Load>> {
+    let ratios = [38_u32, 40, 42, 44, 46, 48];
+    let busies = [100_u32, 60, 85, 40, 95, 70, 50];
+    (0..rows)
+        .map(|t| {
+            (0..blocks)
+                .map(|b| {
+                    let k = t / segment + 3 * b;
+                    Load {
+                        busy: busies[k % busies.len()],
+                        ratio: Some(ratios[(k / 2 + b) % ratios.len()]),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+// Четыре блока квадратом; у блока 0 — свой быстрый нагрев с коленом и средние HISTORY; `a` и множитель соседей блока 0
+// заданы (`base`, `near`), остальное — как в square().
+fn own_case(base: f64, near: f64, rows: usize) -> (Synth, Vec<Truth>) {
+    let mut truths = square();
+    truths[0] = truth_with_shape(
+        base,
+        0.55,
+        Box::new(|r: f64| 6.0 + 0.2 * (r - 38.0) + 1.2 * (r - 44.0).max(0.0)),
+        HISTORY,
+        &[(1, 1.5 * near, 2.0 * near), (2, 0.0, 3.0 * near)],
+    );
+    let s = synth_from(&truths, steady_loads(rows, 4, 1200), times(rows, &[]), false);
+    (s, truths)
+}
+
+// Установившийся свой нагрев истины блока 0 при полной нагрузке на r: форма + Σ средних · p(r).
+fn true_own(r: f64) -> f64 {
+    6.0 + 0.2 * (r - 38.0) + 1.2 * (r - 44.0).max(0.0) + HISTORY.iter().sum::<f64>() * cube(r)
+}
+
 #[test]
-fn fit_on_trimmed_logs_equals_fit_on_the_recent_rows_only() {
-    // Синтетический журнал из 4000 строк с 10:00:00; второй журнал — 10 строк, последняя ровно через 8 ч после строки
-    // 2000 первого. trim оставляет в первом строки 2000…3999; модель по ним должна совпасть с моделью по журналу,
-    // собранному только из этих строк (первая оставшаяся строка — начало файла).
-    // Ловит: выброшенные строки, всё ещё влияющие на модель (средние, тянущиеся от них; разогрев от выброшенного
-    // начала; счёт строк и минут; lo, hi и узлы формы по выброшенным строкам); срез, сбивший порядок или поля
-    // оставшихся строк.
-    let truths = square();
-    let s = synth(&truths, 4000, &GAPS, 15, false);
-    let text = s.csv(None, None);
-    let mut lines = text.lines();
-    let head = lines.next().expect("заголовок");
-    let rows: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
-    let recent = format!("{head}\n{}\n", rows[2000..].join("\n"));
-    let edge = s.times[2000];
-    let late: Vec<i64> = (0..10).map(|k| edge + KEEP_MS - 250 * (9 - k)).collect();
-    let mut first = log_from_csv(&text);
-    let mut second = timed_log(&late);
-    assert_eq!(trim(&mut [&mut first, &mut second]), Some(scale(edge)));
-    assert_eq!((first.rows(), second.rows()), (2000, 10));
-    let trimmed = fit(&[&first, &second], &s.die);
-    let fresh = fit(&[&log_from_csv(&recent), &timed_log(&late)], &s.die);
-    assert_eq!(trimmed.rows, fresh.rows);
-    for (i, (x, y)) in trimmed.blocks.iter().zip(&fresh.blocks).enumerate() {
-        assert_eq!(x.usable, y.usable, "блок {i}: пригодных строк");
+fn own_heating_is_the_own_part_and_excludes_the_base_and_the_neighbours() {
+    // Тот же свой нагрев блока 0, а свободный член (18 и 30 °C) и связь с соседями (×1 и ×2) разные: нагрев ядра один и
+    // тот же и равен истинному g(r) + Σ средних · p(r) на сплошной части; кривая абсолютной температуры — разная.
+    // Ловит: нагрев ядра со свободным членом, с кристаллом или с соседями; без средних своей нагрузки; не по форме.
+    let fitted = |base: f64, near: f64| {
+        let (s, _) = own_case(base, near, 14_400);
+        fit(&[&log_from_csv(&s.csv(None, None))], &s.die)
+    };
+    let (one, two) = (fitted(18.0, 1.0), fitted(30.0, 2.0));
+    let (x, y) = (&one.blocks[0], &two.blocks[0]);
+    let rf = x.reference.as_ref().expect("опорные условия");
+    for r in grid(rf.lo, rf.hi, 0.5) {
+        let (hx, hy) = (x.own_heat(r).expect("нагрев ядра"), y.own_heat(r).expect("нагрев ядра"));
         assert!(
-            close(x.minutes, y.minutes, 1e-9),
-            "блок {i}: минуты {} против {}",
-            x.minutes,
-            y.minutes
+            close(hx, true_own(r), 0.05) && close(hy, true_own(r), 0.05),
+            "×{r}: нагрев ядра {hx:.3} и {hy:.3}, истинный {:.3}",
+            true_own(r)
         );
-        let (cx, cy) = (
-            x.coef.as_ref().expect("коэффициенты"),
-            y.coef.as_ref().expect("коэффициенты"),
-        );
-        let (fx, fy) = (coef_numbers(cx), coef_numbers(cy));
+        let (cx, cy) = (x.curve(r).expect("кривая"), y.curve(r).expect("кривая"));
         assert!(
-            fx.iter().zip(&fy).all(|(a, b)| close(*a, *b, 1e-9 * (1.0 + a.abs()))),
-            "блок {i}: {fx:?} против {fy:?}"
-        );
-        let (rx, ry) = (
-            x.reference.as_ref().expect("опора"),
-            y.reference.as_ref().expect("опора"),
-        );
-        assert!(
-            [(rx.die, ry.die), (rx.lo, ry.lo), (rx.hi, ry.hi), (rx.median, ry.median)]
-                .iter()
-                .all(|&(a, b)| close(a, b, 1e-9 * (1.0 + a.abs()))),
-            "блок {i}: опорные условия разные"
+            cy - cx > 10.0,
+            "×{r}: кривая абсолютной температуры не сдвинулась ({cx:.2} → {cy:.2})"
         );
     }
-    // Дополнение 16.10: и слой с формой (веса, lo и узлы по оставшимся строкам), и кривые те же.
-    assert!(trimmed.blocks.iter().all(|b| b.shaped.is_some()), "слой с формой есть");
-    same_models(&trimmed, &fresh, 1e-9);
+}
+
+#[test]
+fn partial_residuals_lie_on_the_own_heating_curve() {
+    // Точный журнал с отрезками по 5 минут постоянной нагрузки: средняя частных остатков по корзине множителя (Σ остаток
+    // / Σ занятость) — на кривой нагрева ядра у каждого множителя с данными (средние своей нагрузки успевают
+    // установиться; погрешность — только переходы). Ловит: остаток с кристаллом, соседями или свободным членом;
+    // остаток без деления на занятость (точки ниже кривой в разы при занятости 0,4); вес не по занятости.
+    let (s, _) = own_case(18.0, 1.0, 14_400);
+    let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+    let b = &model.blocks[0];
+    let points = b.own_points();
+    assert!(points.len() >= 5, "точек {}: {points:?}", points.len());
+    for p in &points {
+        let h = b.own_heat(f64::from(p.ratio)).expect("нагрев ядра");
+        assert!(
+            close(p.value, h, 0.25),
+            "×{}: точка {:.3} (нагрузка {:.2}, {:.0} с), кривая {h:.3}",
+            p.ratio,
+            p.value,
+            p.load,
+            p.secs
+        );
+    }
+}
+
+#[test]
+fn a_bin_is_the_sum_of_residuals_over_the_sum_of_busy() {
+    // Бриф W: точка — все годные строки с весом занятости, остаток строки делится на занятость: Σ w·(о/b) / Σ w при w =
+    // b × время = Σ время·о / Σ время·b. Строка A: занятость 1, остаток 10; строка B: 0,1 и 1,5 (1,5/0,1 = 15 °C на полную
+    // нагрузку). Точка — 11,5/1,1 = 10,45; не 12,5 (простая средняя о/b) и не 5,75 (средняя остатков). Меньше одной строки
+    // полной нагрузки (0,25 с × 1) — точки нет.
+    let mut bin = OwnSums::default();
+    bin.add(250.0, 1.0, 10.0);
+    bin.add(250.0, 0.1, 1.5);
+    let p = bin.bin(45).expect("точка");
+    assert!(close(p.value, 11.5 / 1.1, 1e-9), "{p:?}");
+    assert!(close(p.load, 0.55, 1e-9) && close(p.secs, 0.5, 1e-9), "{p:?}");
+    let mut thin = OwnSums::default();
+    thin.add(250.0, 0.5, 3.0);
+    assert!(thin.bin(45).is_none(), "полстроки полной нагрузки — точки нет");
+}
+
+#[test]
+fn per_degree_is_shown_only_where_the_own_heating_is_determined() {
+    // «Производительность на градус» = r / H(r), только где разброс H по подгонкам без куска не доходит до нуля.
+    let (s, _) = own_case(18.0, 1.0, 14_400);
+    let model = fit(&[&log_from_csv(&s.csv(None, None))], &s.die);
+    let b = &model.blocks[0];
+    let (lo, hi) = b.own_heat_range(44.0).expect("разброс");
+    let h = b.own_heat(44.0).expect("нагрев ядра");
+    assert!(lo <= h && h <= hi && lo > 0.0, "{lo} {h} {hi}");
+    assert!(close(b.per_degree(44.0).expect("определена"), 44.0 / h, 1e-9));
+}
+
+// Двухблочный журнал хранения: 30 мин по 0,25 с; блок 0 на ×45 всё время, кроме строк 3000…3199 (50 с) на ×40;
+// температура постоянна в каждой клетке; блок 1 — сосед, всегда ×45.
+fn retention_log() -> (Log, Die) {
+    let die = Die {
+        names: names(&["0", "1"]),
+        e: vec![false; 2],
+        neighbours: vec![vec![1], vec![0]],
+    };
+    let rows: Vec<(i64, Vec<Cell>)> = (0..7200_usize)
+        .map(|k| {
+            let rare = (3000..3200).contains(&k);
+            let cells = vec![
+                (
+                    if rare { "40" } else { "45" }.to_string(),
+                    "0.80".to_string(),
+                    if rare { "62" } else { "66" }.to_string(),
+                ),
+                ("45".to_string(), "0.80".to_string(), "58".to_string()),
+            ];
+            (START_MS + 250 * i64::try_from(k).expect("строк мало"), cells)
+        })
+        .collect();
+    (hand_log(&die.names, &rows), die)
+}
+
+#[test]
+fn retention_keeps_the_newest_rows_of_a_saturated_cell_and_every_row_of_a_rare_one() {
+    // Клетка (0, ×45) и (1, ×45): остаток постоянен — стандартная ошибка 0 уже на 10 окнах: остаются новейшие 10 окон
+    // (100 с) и последние 60 с журнала; клетка (0, ×40) — 5 окон, не насыщена: все её строки остаются, и с ними 16 с
+    // перед ними (средние) и следующая строка. Ловит: хранение по самым старым строкам; выброс ненасыщенной клетки;
+    // строки без средних перед ними (тогда их не взять в счёт); выброс нужной другому блоку строки.
+    let (mut log, die) = retention_log();
+    let times: Vec<i64> = log.times().to_vec();
+    let model = fit(&[&log], &die);
+    let kept = retain(&mut [&mut log], &die, &model);
+    let after: Vec<i64> = log.times().to_vec();
+    assert_eq!(kept.before, 7200);
+    assert_eq!(kept.after, after.len());
+    assert!(kept.saturated >= 2 && kept.cells >= 3, "{kept:?}");
+    let has = |k: usize| after.binary_search(&times[k]).is_ok();
+    assert!((3000..3200).all(has), "строки редкой клетки остались");
+    assert!((2936..3000).all(has), "16 с перед ними остались");
+    assert!(has(3200), "и следующая строка");
+    assert!((6800..7200).all(has), "новейшие 100 с остались");
+    assert!(
+        !has(100) && !has(2000) && !has(5000),
+        "старые строки насыщенной клетки выброшены"
+    );
+    assert!(after.len() < 1000, "оставлено {} строк из 7200", after.len());
+    // Оставленное годится в счёт: редкая клетка — в модели, как и была.
+    let again = fit(&[&log], &die);
+    let rare = |m: &Model| m.blocks[0].own_bins.iter().find(|b| b.ratio == 40).map(|b| b.secs);
+    assert!(
+        rare(&again).is_some() && close(rare(&again).unwrap_or(0.0), rare(&model).unwrap_or(f64::NAN), 0.6),
+        "×40 до {:?} и после {:?}",
+        rare(&model),
+        rare(&again)
+    );
+}
+
+// Три P-ядра без соседей, ×45 всегда, занятость — отрезками по 13…40 строк; потолки (50, 48, 46) по кругу каждые 600
+// строк — каждое ядро бывает в каждом ранге. Температура: 20 + 10·pfast + 3·pfast в ранге 1 + 1·pfast в ранге 2.
+fn ranked_log() -> (Log, Die) {
+    let die = Die {
+        names: names(&["0", "1", "2"]),
+        e: vec![false; 3],
+        neighbours: vec![Vec::new(); 3],
+    };
+    let rows = 7200_usize;
+    let busy = |b: usize, k: usize| 0.2 + 0.1 * real((k / (13 + 9 * b) + b) % 8);
+    let ceiling = |b: usize, k: usize| [50, 48, 46][(b + k / 600) % 3];
+    let mut text = String::from(
+        "time,0.ceiling,0.ratio,0.busy,0.temp,1.ceiling,1.ratio,1.busy,1.temp,2.ceiling,2.ratio,2.busy,2.temp",
+    );
+    for k in 0..rows {
+        text.push(char::from(10));
+        text.push_str(&stamp(START_MS + 250 * i64::try_from(k).expect("строк мало")));
+        for b in 0..3 {
+            let next = if k + 1 < rows { busy(b, k + 1) } else { busy(b, k) };
+            let fast = f64::midpoint(busy(b, k), next);
+            let rank = match ceiling(b, k) {
+                50 => 3.0,
+                48 => 1.0,
+                _ => 0.0,
+            };
+            let temp = 20.0 + (10.0 + rank) * fast;
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!(",{},45,{:.2},{temp:.6}", ceiling(b, k), busy(b, k)),
+            ); // into a String
+        }
+    }
+    text.push(char::from(10));
+    (log_from_csv(&text), die)
+}
+
+#[test]
+fn a_shared_rank_term_is_recovered_and_kept_out_of_the_own_heating() {
+    // Дополнение брифа 16.10: общий для P-ядер член на ранг 1 и 2 (знак любой), опознаётся сменой ранга внутри ядра;
+    // нагрев ядра — при общем ранге (без члена ранга). Истина: ранг 1 — +3·pfast, ранг 2 — +1·pfast. Ловит: ранг по
+    // своему ядру, а не общий; ранг в нагреве ядра (тогда у ядер разный H при одном своём нагреве 10 °C); ранг не по
+    // порядку потолков P-ядер.
+    let (log, die) = ranked_log();
+    let model = fit(&[&log], &die);
+    let r = &model.rank;
+    assert!(r.used[0] && r.used[1], "{r:?}");
+    assert!(
+        close(r.value[0], 3.0, 0.02) && close(r.value[1], 1.0, 0.02),
+        "ранг {:?}",
+        r.value
+    );
+    assert!(r.determined[0] && r.determined[1], "{r:?}");
+    for b in &model.blocks {
+        let h = b.own_heat(45.0).expect("нагрев ядра");
+        assert!(close(h, 10.0, 0.05), "блок {}: нагрев ядра {h}", b.name);
+    }
+}
+
+#[test]
+fn a_rank_without_rank_changes_is_not_in_the_fit() {
+    // У всех ядер всегда один потолок (журнал hand_log: 50 у всех) — смены ранга нет, его член не в счёте.
+    let (log, die) = retention_log();
+    let model = fit(&[&log], &die);
+    assert_eq!(model.rank.used, [false, false]);
+    assert_eq!(model.rank.value, [0.0, 0.0]);
+}
+
+#[test]
+fn retention_without_a_model_of_a_block_keeps_every_row_of_it() {
+    // Модели нет (другой кристалл — блоки другие): хранить не по чему — все строки остаются.
+    let (mut log, die) = retention_log();
+    let other = Die {
+        names: names(&["x", "y"]),
+        e: vec![false; 2],
+        neighbours: vec![vec![1], vec![0]],
+    };
+    let model = fit(&[&log], &other);
+    let kept = retain(&mut [&mut log], &die, &model);
+    assert_eq!((kept.before, kept.after), (7200, 7200));
 }
 
 // ─── 12. Выученная форма своего быстрого нагрева ─────────────────────────────────────────────────────────────────
