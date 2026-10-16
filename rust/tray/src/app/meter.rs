@@ -125,7 +125,7 @@ impl Meter {
         self.package.filter(|read| read.at.elapsed() <= age)
     }
 
-    /// Показание ядра за всё время с прошлого раза (температура — последняя) и начать сумму заново.
+    /// Показание ядра за всё время с прошлого раза (температура и напряжение — последние) и начать сумму заново.
     pub fn drain(&mut self, core: usize) -> Reading {
         let Some(sum) = self.sums.get_mut(core).map(std::mem::take) else {
             return Reading::default();
@@ -135,6 +135,7 @@ impl Meter {
             temp: self.latest[core].temp,
             busy,
             ratio,
+            volts: self.latest[core].volts,
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
             temp: Some(temp),
             busy: Some(busy),
             ratio,
+            volts: None,
         }
     }
 

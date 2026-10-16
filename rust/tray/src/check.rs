@@ -945,7 +945,8 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
         idle && planted
             && kept
             && first.starts_with(&format!("{old_header},"))
-            && first.ends_with(",power_cpu,temp_gpu,power_gpu,busy_gpu")
+            && first.contains(",power_cpu,temp_gpu,power_gpu,busy_gpu,")
+            && first.rsplit(',').next().is_some_and(is_volts)
             && text.lines().count() >= 4
             && text.lines().skip(1).all(|l| l.split(',').count() == width)
             && told == 1,
@@ -966,7 +967,7 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
     pump(shell, app, Duration::from_secs(2));
     let again = app.gpu_calls() - failed;
     let after = lines_after(&part2, at);
-    let blank = after.iter().all(|l| l.ends_with(",,,"));
+    let blank = after.iter().all(|l| card_of(l) == ",,");
     let going = app.logging().on;
     let gpu_told = errors(data, "видеокарта не прочитана (проверка)");
     app.sim_gpu(false);
@@ -1033,14 +1034,19 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
     );
     let samples = fs::read_to_string(today(data)).unwrap_or_default();
     let mut lines = samples.lines();
-    // Время, корпус, два вентилятора; по 4 на блок; в конце — мощность корпуса и видеокарта (DECISIONS #37).
-    let width = 4 + 4 * blocks + 4;
+    // Время, корпус, два вентилятора; по 4 на блок; мощность корпуса и видеокарта (DECISIONS #37); в конце —
+    // напряжение каждого блока.
+    let pack = 4 + 4 * blocks;
+    let width = pack + 4 + blocks;
     let head = lines.next().unwrap_or_default();
     let header = head.split(',').count();
     let rows: Vec<&str> = lines.collect();
     r.check(
         header == width
-            && head.ends_with(",power_cpu,temp_gpu,power_gpu,busy_gpu")
+            && field(head, pack) == "power_cpu"
+            && field(head, pack + 3) == "busy_gpu"
+            && is_volts(field(head, pack + 4))
+            && is_volts(field(head, width - 1))
             && !rows.is_empty()
             && rows.iter().all(|l| l.split(',').count() == width),
         &format!("срезы: заголовок {header} столбцов из {width}, строк {}", rows.len()),
@@ -1056,10 +1062,10 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
     );
     // Мощность корпуса — в каждой строке (у имитации она есть всегда); видеокарта — только где прочитана, и тогда все
     // три числа имитации.
-    let power = rows.iter().filter(|l| !field(l, width - 4).is_empty()).count();
+    let power = rows.iter().filter(|l| !field(l, pack).is_empty()).count();
     let cards: Vec<String> = rows
         .iter()
-        .map(|l| l.split(',').skip(width - 3).collect::<Vec<_>>().join(","))
+        .map(|l| l.split(',').skip(pack + 1).take(3).collect::<Vec<_>>().join(","))
         .collect();
     let read = cards.iter().filter(|c| *c == SIM_GPU).count();
     let empty = cards.iter().filter(|c| *c == ",,").count();
@@ -1070,10 +1076,42 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             rows.len()
         ),
     );
+    // Напряжение блока стоит в своём столбце: у имитации оно есть ровно там, где есть фактический множитель того же
+    // блока, и равно 0,6 В + 12,5 мВ на ступень (machine sim.rs).
+    let mut filled = 0;
+    let mut wrong = 0;
+    for l in &rows {
+        for k in 0..blocks {
+            let ratio = field(l, 4 + 4 * k + 1).parse::<f64>().ok();
+            let volts = field(l, pack + 4 + k).parse::<f64>().ok();
+            match (ratio, volts) {
+                (Some(r), Some(v)) if (v - (0.6 + 0.0125 * r)).abs() < 0.001 => filled += 1,
+                (None, None) => {}
+                _ => wrong += 1,
+            }
+        }
+    }
+    r.check(
+        filled > 0 && wrong == 0,
+        &format!("срезы: напряжение блока — в {filled} полях, где есть его множитель; не на месте или не то — {wrong}"),
+    );
 }
 
 /// Видеокарта имитации в строке среза: температура, мощность, занятость (app/sense.rs, `sim_gpu`).
 const SIM_GPU: &str = "61,95.5,0.72";
+
+/// Три поля видеокарты строки среза (температура, мощность, занятость) через запятую. Строка: время, корпус, два
+/// вентилятора, по 4 на блок, мощность корпуса и видеокарта, напряжение на блок — 8 + 5 × блоков полей.
+fn card_of(line: &str) -> String {
+    let fields: Vec<&str> = line.split(',').collect();
+    let at = 4 + 4 * (fields.len().saturating_sub(8) / 5) + 1;
+    fields.get(at..at + 3).map(|f| f.join(",")).unwrap_or_default()
+}
+
+/// Столбец напряжения блока: «<блок>.volts» (app/sense.rs, `header`).
+fn is_volts(column: &str) -> bool {
+    column.rsplit_once('.').is_some_and(|(_, what)| what == "volts")
+}
 
 /// Поле строки среза по номеру ("" — нет такого).
 fn field(line: &str, k: usize) -> &str {
@@ -1182,7 +1220,7 @@ fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, h
     let card_rows: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.ends_with(SIM_GPU))
+        .filter(|(_, l)| card_of(l) == SIM_GPU)
         .map(|(i, _)| i)
         .collect();
     let card_gaps: Vec<usize> = card_rows.windows(2).map(|w| w[1] - w[0]).collect();
@@ -1190,7 +1228,10 @@ fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, h
         card_rows.first().is_some_and(|&first| first < 8)
             && card_rows.len() >= 2
             && card_gaps.iter().all(|&g| g == 8)
-            && rows.iter().all(|l| l.ends_with(SIM_GPU) || l.ends_with(",,,")),
+            && rows.iter().all(|l| {
+                let card = card_of(l);
+                card == SIM_GPU || card == ",,"
+            }),
         &format!(
             "видеокарта — в одной из первых восьми строк и дальше в каждой восьмой (строки {card_rows:?} из {}), в остальных пусто",
             rows.len()

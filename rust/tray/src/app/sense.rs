@@ -24,6 +24,10 @@
 // занятость, NVML, crate::gpu) — раз в 2 с, как обороты, только в строке, где прочитана. Не прочиталось — пусто и одна
 // строка в error.log на одну и ту же беду; журнал идёт дальше.
 //
+// Напряжение каждого блока (владелец 16.10: регрессия строится по фактическому состоянию ядра; мощность ядра ≈ нагрузка ×
+// множитель × напряжение²) — в каждой строке, показание первого ядра блока в момент чтения (machine thermal.rs).
+// Столбцы `<блок>.volts` — после столбцов теплового пакета: новые столбцы идут только в конец.
+//
 // Файл дня открыт, пока пишется журнал. Не открылся или не принял строку — одна строка ошибки и следующая попытка
 // через 10 с, а не в каждом опросе (ревизия 15.10, п. 7). Раз в 2 с — тот ли это файл, что лежит под своим именем:
 // удалённый или перемещённый открытый файл Windows принимает строки дальше без ошибки (проверено на этой машине
@@ -482,6 +486,10 @@ impl App {
             put(&mut text, card.and_then(|g| g.power), 1);
             text.push(',');
             put(&mut text, card.and_then(|g| g.busy), 2);
+            for block in &self.topology.blocks {
+                text.push(',');
+                put(&mut text, self.meter.latest(block.first).volts, 3);
+            }
             text.push('\n');
         }
         let written = match self.logging.file.as_mut() {
@@ -657,6 +665,9 @@ fn header(blocks: &[Block]) -> String {
         let _ = write!(text, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String: cannot fail
     }
     text.push_str(PACKAGE_COLUMNS);
+    for block in blocks {
+        let _ = write!(text, ",{}.volts", block.name); // into a String: cannot fail
+    }
     text
 }
 
@@ -801,9 +812,12 @@ mod tests {
             "old columns keep their places: {head}"
         );
         let added: Vec<&str> = head[OLD.len() + 1..].split(',').collect();
-        assert_eq!(added, ["power_cpu", "temp_gpu", "power_gpu", "busy_gpu"]);
-        // The window takes «X.Y» as column Y of block X (rust/window/src/samples.rs, Columns::parse).
-        assert!(added.iter().all(|c| !c.contains('.')), "{added:?}");
+        assert_eq!(added[..4], ["power_cpu", "temp_gpu", "power_gpu", "busy_gpu"]);
+        // The window takes «X.Y» as column Y of block X (rust/window/src/samples.rs, Columns::parse): package columns
+        // have no dot; each block's voltage is «<block>.volts», which the window's statistics skip.
+        assert!(added[..4].iter().all(|c| !c.contains('.')), "{added:?}");
+        let volts: Vec<String> = blocks().iter().map(|b| format!("{}.volts", b.name)).collect();
+        assert_eq!(added[4..], volts[..]);
     }
 
     #[test]
