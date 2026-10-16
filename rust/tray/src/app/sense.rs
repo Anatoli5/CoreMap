@@ -26,7 +26,8 @@
 //
 // Напряжение каждого блока (владелец 16.10: регрессия строится по фактическому состоянию ядра; мощность ядра ≈ нагрузка ×
 // множитель × напряжение²) — в каждой строке, показание первого ядра блока в момент чтения (machine thermal.rs).
-// Столбцы `<блок>.volts` — после столбцов теплового пакета: новые столбцы идут только в конец.
+// Столбцы `<блок>.volts` — после столбцов теплового пакета: новые столбцы идут только в конец. За ними `power_cores` —
+// мощность одних ядер (счётчик 0x639), средняя за промежуток, как мощность корпуса (machine thermal.rs).
 //
 // Файл дня открыт, пока пишется журнал. Не открылся или не принял строку — одна строка ошибки и следующая попытка
 // через 10 с, а не в каждом опросе (ревизия 15.10, п. 7). Раз в 2 с — тот ли это файл, что лежит под своим именем:
@@ -42,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use machine::HwError;
 use machine::clock::{Pattern, Stamp};
-use machine::thermal::Reading;
+use machine::thermal::{Power, Reading};
 use machine::topology::Block;
 
 use super::auto::COST_EVERY;
@@ -316,15 +317,15 @@ impl App {
     /// Мощность корпуса за промежуток с прошлого чтения (под арендой, в опросе срезов). Не прочиталась — пусто, одна
     /// строка в error.log на одну и ту же беду, следующая попытка через `POWER_RETRY`: журнал идёт и без неё. Вторым —
     /// сколько стоило чтение (None — не читалась).
-    fn read_power(&mut self) -> (Option<f64>, Option<Duration>) {
+    fn read_power(&mut self) -> (Power, Option<Duration>) {
         let started = Instant::now();
         if self.logging.power_retry.is_some_and(|at| started < at) {
-            return (None, None);
+            return (Power::default(), None);
         }
         let Some(device) = self.device.as_mut() else {
-            return (None, None);
+            return (Power::default(), None);
         };
-        let result = device.thermal().package_power();
+        let result = device.thermal().power();
         let cost = Some(started.elapsed());
         match result {
             Ok(watts) => {
@@ -339,7 +340,7 @@ impl App {
                     self.journal.error(&format!("автомодуль: {text}"));
                     self.logging.power_said = Some(text);
                 }
-                (None, cost)
+                (Power::default(), cost)
             }
         }
     }
@@ -440,7 +441,7 @@ impl App {
     /// потолок, фактический множитель, доля работы, температура; в конце — мощность корпуса за промежуток и видеокарта
     /// (только если прочитана в этом опросе). Заголовок — в новый файл; новый день — новый файл и чистка старых. Файла
     /// нет и открыть его пока нельзя (`retry`) — строка не пишется: об ошибке уже сказано.
-    fn write_sample(&mut self, stamp: Stamp, package: Option<f64>, fans: bool, power: Option<f64>, gpu: bool) {
+    fn write_sample(&mut self, stamp: Stamp, package: Option<f64>, fans: bool, power: Power, gpu: bool) {
         let now = Instant::now();
         let mut day = std::mem::take(&mut self.logging.day);
         day.clear();
@@ -478,7 +479,7 @@ impl App {
             }
             // Порядок — как в `PACKAGE_COLUMNS`.
             text.push(',');
-            put(&mut text, power, 1);
+            put(&mut text, power.package, 1);
             let card = if gpu { self.logging.gpu.reading } else { None };
             text.push(',');
             put(&mut text, card.and_then(|g| g.temp), 0);
@@ -490,6 +491,8 @@ impl App {
                 text.push(',');
                 put(&mut text, self.meter.latest(block.first).volts, 3);
             }
+            text.push(',');
+            put(&mut text, power.cores, 1);
             text.push('\n');
         }
         let written = match self.logging.file.as_mut() {
@@ -668,6 +671,7 @@ fn header(blocks: &[Block]) -> String {
     for block in blocks {
         let _ = write!(text, ",{}.volts", block.name); // into a String: cannot fail
     }
+    text.push_str(",power_cores");
     text
 }
 
@@ -816,7 +820,8 @@ mod tests {
         // The window takes «X.Y» as column Y of block X (rust/window/src/samples.rs, Columns::parse): package columns
         // have no dot; each block's voltage is «<block>.volts», which the window's statistics skip.
         assert!(added[..4].iter().all(|c| !c.contains('.')), "{added:?}");
-        let volts: Vec<String> = blocks().iter().map(|b| format!("{}.volts", b.name)).collect();
+        let mut volts: Vec<String> = blocks().iter().map(|b| format!("{}.volts", b.name)).collect();
+        volts.push("power_cores".into());
         assert_eq!(added[4..], volts[..]);
     }
 

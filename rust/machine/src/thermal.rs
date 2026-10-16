@@ -14,6 +14,11 @@
 // их читала (data\joint-20261014-153258.json: 21,7 Вт). Счётчик 32-битный и переполняется: при 200 Вт и единице
 // 61 мкДж — раз в 22 минуты; между чтениями раз в 0,25 с переполнение бывает не больше одного.
 //
+// Мощность одних ядер — по счётчику энергии ядер (0x639, PP0: все ядра вместе, без кольца, памяти и графики; та же
+// единица и та же арифметика). Модуль IntelMSR его читать пускает (список чтения в IntelMSR.p). Зачем (владелец 16.10:
+// тепловая эффективность ядра): тепло ядра — это ватты его работы, а не доля времени, которую оно не спит; ватты ядер
+// модель окна делит между блоками, чистые от кольца и памяти они делятся точнее, чем мощность корпуса.
+//
 // Напряжение ядра — биты 47:32 регистра 0x198 (IA32_PERF_STATUS) этого ядра, в единицах 1/2^13 В (Intel SDM том 4,
 // MSR_PERF_STATUS, начиная со 2-го поколения Core), показание в момент чтения. Модуль IntelMSR регистр читать пускает
 // (KNOWLEDGE.md: 0x198 доступен, измерено); что поле напряжения на 275HX заполнено — не проверено, покажет журнал.
@@ -34,6 +39,7 @@ const PLATFORM_INFO: u32 = 0xCE;
 const PERF_STATUS: u32 = 0x198;
 const RAPL_POWER_UNIT: u32 = 0x606;
 const PKG_ENERGY_STATUS: u32 = 0x611;
+const PP0_ENERGY_STATUS: u32 = 0x639;
 /// Меньше стольких опорных тактов между опросами — ядро почти всё время спало, множитель не считается (как в C#).
 const AWAKE_AT_LEAST: u64 = 10_000_000;
 /// Промежуток длиннее — доля работы за него ничего не говорит о нынешней нагрузке: опрос начинается заново.
@@ -58,15 +64,23 @@ pub struct Reading {
     pub volts: Option<f64>,
 }
 
+/// Средняя мощность с прошлого чтения, Вт: корпуса и одних ядер. None — первый вызов, перерыв дольше 10 с, счётчик за
+/// промежуток не сдвинулся либо сброшен; у ядер — ещё и не прочитался.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Power {
+    pub package: Option<f64>,
+    pub cores: Option<f64>,
+}
+
 /// Датчики: настоящий процессор (`MailboxCpu`) или имитация (`sim::SimCpu`). Ядро — первое ядро блока.
 pub trait Thermal: std::fmt::Debug {
     /// Температура корпуса, °C. Регистр общий для всего процессора: поток к ядру не привязывается.
     fn package(&mut self) -> Result<Option<f64>, HwError>;
     /// Показание блока по его первому ядру.
     fn block(&mut self, core: usize) -> Result<Reading, HwError>;
-    /// Средняя мощность корпуса, Вт, с прошлого вызова. None — первый вызов, перерыв дольше 10 с или счётчик за
-    /// промежуток не сдвинулся либо сброшен. Регистр общий для всего процессора: поток к ядру не привязывается.
-    fn package_power(&mut self) -> Result<Option<f64>, HwError>;
+    /// Средняя мощность корпуса и ядер с прошлого вызова (`Power`). Ошибка — не прочитался счётчик корпуса. Регистры
+    /// общие для всего процессора: поток к ядру не привязывается.
+    fn power(&mut self) -> Result<Power, HwError>;
 }
 
 /// Состояние датчиков настоящего процессора между опросами.
@@ -79,6 +93,8 @@ pub struct Counters {
     joules: Option<f64>,
     /// Счётчик энергии корпуса на прошлом чтении и когда.
     energy: Option<(u32, Instant)>,
+    /// Счётчик энергии ядер на прошлом чтении и когда.
+    cores_energy: Option<(u32, Instant)>,
 }
 
 impl Counters {
@@ -90,6 +106,7 @@ impl Counters {
             last: vec![None; cores],
             joules: None,
             energy: None,
+            cores_energy: None,
         }
     }
 }
@@ -194,7 +211,7 @@ impl Thermal for MailboxCpu {
         })
     }
 
-    fn package_power(&mut self) -> Result<Option<f64>, HwError> {
+    fn power(&mut self) -> Result<Power, HwError> {
         let unit = if let Some(unit) = self.sensors.joules {
             unit
         } else {
@@ -203,9 +220,25 @@ impl Thermal for MailboxCpu {
             unit
         };
         let raw = u32::try_from(self.msr.read(PKG_ENERGY_STATUS)? & 0xFFFF_FFFF).unwrap_or(0);
+        // Ядра — лишний столбец журнала: их отказ не должен останавливать мощность корпуса, он виден пустым столбцом.
+        let cores = self
+            .msr
+            .read(PP0_ENERGY_STATUS)
+            .ok()
+            .map(|v| u32::try_from(v & 0xFFFF_FFFF).unwrap_or(0));
         let now = Instant::now();
-        let previous = self.sensors.energy.replace((raw, now));
-        Ok(previous.and_then(|(was, at)| watts(was, raw, unit, now.duration_since(at).as_secs_f64())))
+        let since = |previous: Option<(u32, Instant)>, raw: u32| {
+            previous.and_then(|(was, at)| watts(was, raw, unit, now.duration_since(at).as_secs_f64()))
+        };
+        let package = since(self.sensors.energy.replace((raw, now)), raw);
+        // Не прочитался — прошлое показание забыто: следующее прочитанное будет первым, а не концом долгого промежутка.
+        let cores = if let Some(raw) = cores {
+            since(self.sensors.cores_energy.replace((raw, now)), raw)
+        } else {
+            self.sensors.cores_energy = None;
+            None
+        };
+        Ok(Power { package, cores })
     }
 }
 

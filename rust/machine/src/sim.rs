@@ -5,7 +5,7 @@
 
 use crate::HwError;
 use crate::mailbox::{Allowed, Cpu, Limit};
-use crate::thermal::{Reading, Thermal};
+use crate::thermal::{Power, Reading, Thermal};
 use crate::topology::{Kind, Topology};
 
 #[derive(Debug, Clone)]
@@ -127,11 +127,16 @@ impl Thermal for SimCpu {
         })
     }
 
-    /// Мощность имитации — как у `SimBackend` в Sensors.cs: 12 Вт в покое и 9 Вт на каждое полностью занятое ядро.
-    fn package_power(&mut self) -> Result<Option<f64>, HwError> {
+    /// Мощность имитации — как у `SimBackend` в Sensors.cs: 12 Вт в покое и 9 Вт на каждое полностью занятое ядро; из
+    /// них ядрам — всё, кроме 8 Вт покоя корпуса.
+    fn power(&mut self) -> Result<Power, HwError> {
         if self.power_refused {
             return Err(HwError("чтение регистра 0x611 не удалось (проверка)".into()));
         }
-        Ok(Some(12.0 + 9.0 * self.load.iter().sum::<f64>()))
+        let busy = self.load.iter().sum::<f64>();
+        Ok(Power {
+            package: Some(12.0 + 9.0 * busy),
+            cores: Some(4.0 + 9.0 * busy),
+        })
     }
 }

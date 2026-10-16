@@ -946,7 +946,7 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
             && kept
             && first.starts_with(&format!("{old_header},"))
             && first.contains(",power_cpu,temp_gpu,power_gpu,busy_gpu,")
-            && first.rsplit(',').next().is_some_and(is_volts)
+            && first.ends_with(".volts,power_cores")
             && text.lines().count() >= 4
             && text.lines().skip(1).all(|l| l.split(',').count() == width)
             && told == 1,
@@ -1037,7 +1037,7 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
     // Время, корпус, два вентилятора; по 4 на блок; мощность корпуса и видеокарта (DECISIONS #37); в конце —
     // напряжение каждого блока.
     let pack = 4 + 4 * blocks;
-    let width = pack + 4 + blocks;
+    let width = pack + 4 + blocks + 1;
     let head = lines.next().unwrap_or_default();
     let header = head.split(',').count();
     let rows: Vec<&str> = lines.collect();
@@ -1046,7 +1046,8 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             && field(head, pack) == "power_cpu"
             && field(head, pack + 3) == "busy_gpu"
             && is_volts(field(head, pack + 4))
-            && is_volts(field(head, width - 1))
+            && is_volts(field(head, width - 2))
+            && field(head, width - 1) == "power_cores"
             && !rows.is_empty()
             && rows.iter().all(|l| l.split(',').count() == width),
         &format!("срезы: заголовок {header} столбцов из {width}, строк {}", rows.len()),
@@ -1095,16 +1096,33 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
         filled > 0 && wrong == 0,
         &format!("срезы: напряжение блока — в {filled} полях, где есть его множитель; не на месте или не то — {wrong}"),
     );
+    // Мощность ядер — в последнем столбце каждой строки; у имитации это мощность корпуса без 8 Вт его покоя
+    // (machine sim.rs), а не повтор её.
+    let cores_ok = rows
+        .iter()
+        .filter(|l| {
+            let package = field(l, pack).parse::<f64>().ok();
+            let cores = field(l, width - 1).parse::<f64>().ok();
+            matches!((package, cores), (Some(p), Some(c)) if (p - c - 8.0).abs() < 0.15)
+        })
+        .count();
+    r.check(
+        cores_ok == rows.len(),
+        &format!(
+            "срезы: мощность ядер — в {cores_ok} строках из {}, на 8 Вт меньше мощности корпуса",
+            rows.len()
+        ),
+    );
 }
 
 /// Видеокарта имитации в строке среза: температура, мощность, занятость (app/sense.rs, `sim_gpu`).
 const SIM_GPU: &str = "61,95.5,0.72";
 
 /// Три поля видеокарты строки среза (температура, мощность, занятость) через запятую. Строка: время, корпус, два
-/// вентилятора, по 4 на блок, мощность корпуса и видеокарта, напряжение на блок — 8 + 5 × блоков полей.
+/// вентилятора, по 4 на блок, мощность корпуса и видеокарта, напряжение на блок, мощность ядер — 9 + 5 × блоков полей.
 fn card_of(line: &str) -> String {
     let fields: Vec<&str> = line.split(',').collect();
-    let at = 4 + 4 * (fields.len().saturating_sub(8) / 5) + 1;
+    let at = 4 + 4 * (fields.len().saturating_sub(9) / 5) + 1;
     fields.get(at..at + 3).map(|f| f.join(",")).unwrap_or_default()
 }
 
