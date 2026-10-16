@@ -40,9 +40,9 @@ mod meter;
 mod sense;
 mod serve;
 use crate::shell::{Event, Item, Loop, Menu, Shell};
-pub use auto::{AUTO_ON, AutoTiming, DEPTH_ID, LIMIT_ID};
+pub use auto::{AUTO_ON, AUTO_WINDOW_ID, AutoTiming, Choice, STEP_UP_ID};
 pub use sense::LogCount;
-pub use serve::Confirm;
+pub use serve::{Confirm, WINDOW_EXE};
 
 /// «Окно»: открыть окно CoreMapWindow.exe (пункт по умолчанию — щелчок по значку).
 pub const WINDOW_ID: u32 = 1;

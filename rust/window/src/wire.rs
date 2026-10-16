@@ -191,6 +191,27 @@ pub struct Limits {
     pub choices: Vec<Vec<i64>>,
 }
 
+/// Выбор владельца для автомодуля (тема программы входа «settings»; у движка C# её нет). Хозяин выбора и
+/// промежутков — программа входа (data\tray.json): окно показывает их и шлёт изменения командой auto.set.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSettings {
+    pub on: bool,
+    pub limit: i64,
+    pub depth: i64,
+    pub step_up: bool,
+    /// Допустимая отсечка, °C, и глубина, ступеней: [от, до].
+    pub limit_range: [i64; 2],
+    pub depth_range: [i64; 2],
+}
+
+/// Тема «settings»: выбор автомодуля; поле неожиданной формы — как будто темы нет (настройки в окне не показываются).
+#[derive(Deserialize, Clone, Debug)]
+pub struct Settings {
+    #[serde(default, deserialize_with = "lenient")]
+    pub auto: Option<AutoSettings>,
+}
+
 /// Сообщение владельцу (то, что программа сказала бы всплывающим окошком); прочитано — команда notices.seen {seq}.
 #[derive(Deserialize, Clone, Debug)]
 pub struct Notice {
@@ -222,6 +243,8 @@ pub enum Message {
     History(History),
     #[serde(rename = "notice")]
     Notice(Notice),
+    #[serde(rename = "settings")]
+    Settings(Settings),
     #[serde(other)]
     Other,
 }
@@ -363,6 +386,24 @@ mod tests {
             panic!("история не разобралась");
         };
         assert_eq!(h.entries.len(), 1);
+    }
+
+    #[test]
+    fn settings_topic_as_the_logon_program_writes_it() {
+        // Тема в том виде, в каком её пишет программа входа (rust/tray/src/app/auto.rs, Choice::topic).
+        let text = r#"{"t":"settings","auto":{"on":true,"limit":82,"depth":4,"stepUp":false,"limitRange":[60,95],"depthRange":[1,8]}}"#;
+        let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(text) else {
+            panic!("тема settings не разобралась");
+        };
+        let auto = s.auto.expect("выбор автомодуля");
+        assert_eq!((auto.on, auto.limit, auto.depth, auto.step_up), (true, 82, 4, false));
+        assert_eq!((auto.limit_range, auto.depth_range), ([60, 95], [1, 8]));
+        // Поле другой формы не ломает сообщение: настроек просто нет.
+        let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(r#"{"t":"settings","auto":{"on":"да"}}"#)
+        else {
+            panic!("тема settings другой формы сломала разбор");
+        };
+        assert!(s.auto.is_none());
     }
 
     #[test]

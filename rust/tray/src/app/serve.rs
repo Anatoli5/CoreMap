@@ -7,12 +7,14 @@
 //   знакомстве и потом только когда изменились.
 // • state — показания, дважды в секунду, пока окно подключено (пока пишется журнал срезов — из каждого второго его
 //   опроса, app/sense.rs), и сразу после исполненной команды; окна нет — нет ни таймера, ни чтения датчиков.
-// Новое, чего у движка не было: history — последние смены потолков (app/history.rs); в state — доля работы ядер
-// (busyShare), потолок автомодуля по блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля
-// (autoLimit).
+// Новое, чего у движка не было: history — последние смены потолков (app/history.rs); settings — выбор владельца для
+// автомодуля и допустимые промежутки (по изменению); в state — доля работы ядер (busyShare), потолок автомодуля по
+// блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля (autoLimit).
 //
 // Команды — тоже как у движка (src/Commands.cs): limit.set, profile.save/open/accept/revert/delete, max.reset,
-// notices.seen. Нагрузки и замеров в программе входа нет: их команды отклоняются одной фразой. Поднять потолок выше
+// notices.seen; новая — auto.set (настройки автомодуля из окна, app/auto.rs). Что окно помнит о себе (выбранные
+// блоки, подсветку, размер и место), программа входа не получает и не хранит: это настройки окна, их держит оно само
+// (DECISIONS #36). Нагрузки и замеров в программе входа нет: их команды отклоняются одной фразой. Поднять потолок выше
 // заводского — только после «Да» владельца в окошке самой программы входа (у неё права администратора: в него не
 // щёлкнет другая программа). Пока работает прежнее окно или движок на C#, потолками владеют они: команды потолков и
 // профилей отклоняются с причиной, состояние идёт без показаний датчиков (их нельзя читать — DECISIONS #31).
@@ -31,6 +33,7 @@ use machine::profile::{self, Set, same_name};
 use machine::topology::Kind;
 use serde_json::{Map, Value, json};
 
+use super::auto::Choice;
 use super::history::Change;
 use super::meter::Watch;
 use super::{App, parts};
@@ -89,6 +92,8 @@ struct Session {
     seen_current: Vec<i32>,
     seen_version: u64,
     sent_history: Option<u64>,
+    /// Какой выбор автомодуля окно уже знает (тема settings).
+    sent_settings: Option<Choice>,
     sent_notice: u64,
     /// Почему в состоянии нет показаний датчиков; None — есть.
     trouble: Option<String>,
@@ -313,6 +318,7 @@ impl App {
             seen_current: Vec::new(),
             seen_version: 0,
             sent_history: None,
+            sent_settings: None,
             sent_notice: 0,
             trouble: None,
             unread: None,
@@ -638,7 +644,7 @@ impl App {
         .to_string()
     }
 
-    /// Что изменилось с прошлого раза: потолки и «было», профили, история, сообщения владельцу.
+    /// Что изменилось с прошлого раза: потолки и «было», профили, история, выбор автомодуля, сообщения владельцу.
     fn push_topics(&mut self, shell: &Shell) {
         if !self.serving.attached() {
             return;
@@ -681,6 +687,14 @@ impl App {
         {
             session.sent_history = Some(written);
             out.push(self.history.topic());
+        }
+        // Выбор автомодуля — при знакомстве и после каждой смены (окно, меню значка).
+        let choice = self.auto.choice;
+        if let Some(session) = self.serving.session.as_mut()
+            && session.sent_settings != Some(choice)
+        {
+            session.sent_settings = Some(choice);
+            out.push(choice.topic());
         }
         let (seen, last) = (self.serving.notices_seen, self.serving.notice_seq);
         if let Some(session) = self.serving.session.as_mut()
@@ -811,6 +825,7 @@ impl App {
                 }
                 None
             }
+            "auto.set" => self.set_auto(shell, f),
             "notices.seen" => match int(f, "seq").and_then(|v| u64::try_from(v).ok()) {
                 Some(seq) => {
                     self.serving.notices_seen = self.serving.notices_seen.max(seq);

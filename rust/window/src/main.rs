@@ -4,10 +4,14 @@
 //
 //   CoreMapWindow.exe                       окно; канал — программы входа этого сеанса Windows (CoreMap.Logon.<сеанс>)
 //   CoreMapWindow.exe --pipe N              то же с каналом N
-//   CoreMapWindow.exe --data D              статистика из папки D (по умолчанию — data рядом с программой)
+//   CoreMapWindow.exe --data D              статистика и файл окна (window.json) — в папке D (по умолчанию — data
+//                                           рядом с программой)
 //   CoreMapWindow.exe --pipe N --snapshot F [--size WxH]
 //                                           скрытая проверка (src/check.rs): без окна на экране, картинки и отчёт;
-//                                           её статистика — из своей временной папки с придуманными срезами
+//                                           её статистика и файл окна — в своей временной папке с придуманными срезами
+//   CoreMapWindow.exe --pipe N --snapshot F --data D --settings / --reopened
+//                                           скрытая проверка настроек автомодуля и памяти окна — против программы у
+//                                           часов (её запускает скрытая проверка CoreMapTray.exe)
 //   CoreMapWindow.exe --probe               ничего не делает и выходит: пустил ли Windows свежую сборку (tools\rust.ps1)
 #![windows_subsystem = "windows"]
 
@@ -31,6 +35,8 @@ mod die;
 mod panels;
 mod pipe;
 mod samples;
+mod saved;
+mod screen;
 // Тесты модуля samples по спецификации, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
 #[cfg(test)]
 mod samples_spec;
@@ -88,6 +94,22 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_profile_delete(move || v.borrow_mut().profile_delete());
     let v = Rc::clone(view);
     ui.on_name_edited(move || v.borrow_mut().name_edited());
+    let v = Rc::clone(view);
+    ui.on_auto_toggled(move || v.borrow_mut().auto_toggled());
+    let v = Rc::clone(view);
+    ui.on_step_up_toggled(move || v.borrow_mut().step_up_toggled());
+    let v = Rc::clone(view);
+    ui.on_limit_moved(move |value| v.borrow_mut().limit_moved(value));
+    let v = Rc::clone(view);
+    ui.on_limit_released(move |value| v.borrow_mut().limit_released(value));
+    let v = Rc::clone(view);
+    ui.on_depth_released(move |value| v.borrow_mut().depth_released(value));
+    // Закрытие: размер и место — в файл окна; окно прячется, его цикл кончается.
+    let v = Rc::clone(view);
+    ui.window().on_close_requested(move || {
+        v.borrow_mut().closing();
+        slint::CloseRequestResponse::HideWindow
+    });
 }
 
 thread_local! {
@@ -111,7 +133,7 @@ fn to_view(work: impl FnOnce(&mut view::View) + Send + 'static) {
 #[used]
 static STAMP: &str = env!("COREMAP_BUILT");
 
-/// Папка данных: `--data`, иначе data рядом с программой (её пишет программа входа).
+/// Папка данных: `--data`, иначе data рядом с программой (её пишет программа входа; файл окна в ней пишет окно).
 fn data_dir(args: &[String]) -> PathBuf {
     arg(args, "--data").map_or_else(
         || {
@@ -143,6 +165,13 @@ fn main() {
             &snapshot,
             size,
             arg(&args, "--data").map(PathBuf::from),
+            if args.iter().any(|a| a == "--reopened") {
+                check::Mode::Reopened
+            } else if args.iter().any(|a| a == "--settings") {
+                check::Mode::Settings
+            } else {
+                check::Mode::Full
+            },
         ));
     }
 
@@ -153,12 +182,15 @@ fn main() {
     let ui = AppWindow::new().expect("окно");
     // Номер версии (файл VERSION, tools\rust.ps1); метка сборки в заголовок не идёт — она только делает файл другим.
     ui.set_version(env!("COREMAP_VERSION").into());
+    let data = data_dir(&args);
+    // Размер и место из файла окна — до показа: окно сразу открывается там, где его оставили.
+    let memory = saved::open(&ui, &data);
     // События канала приходят в его потоке и передаются в поток окна по порядку.
     let link = pipe::Link::start(pipe, |event| to_view(move |view| view.on_event(event)));
-    let view = Rc::new(RefCell::new(view::View::new(&ui, link)));
+    let view = Rc::new(RefCell::new(view::View::new(&ui, link, memory)));
     VIEW.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&view)));
     connect(&ui, &view);
     // Поток статистики живёт, пока жив его отправитель, — до конца окна.
-    let _stats = store::start(data_dir(&args), |digest| to_view(move |view| view.on_digest(digest)));
+    let _stats = store::start(data, |digest| to_view(move |view| view.on_digest(digest)));
     ui.run().expect("окно");
 }

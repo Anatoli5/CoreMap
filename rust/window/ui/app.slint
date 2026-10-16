@@ -1,5 +1,6 @@
 // Окно CoreMap (DECISIONS #28, #32 шаг 2): верхняя полоса, строка отказа, три раздела — «Кристалл» (плитки блоков и
-// полосы тепловой связи соседей), «Профили», «Статистика» выбранного блока — и меню потолка.
+// полосы тепловой связи соседей), «Профили», «Статистика» выбранного блока с настройками автомодуля под графиком
+// (DECISIONS #36) — и меню потолка.
 // Что и каким цветом показывать, решает Rust (src/view.rs, src/panels.rs): сюда приходят готовые строки, цвета и
 // места в долях, отсюда уходят щелчки. Строка модели перерисовывается, только когда Rust её заменил, — а он заменяет
 // только изменившуюся.
@@ -176,6 +177,116 @@ component Btn inherits Rectangle {
         clicked => {
             if (root.enabled) {
                 root.clicked();
+            }
+        }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
+// Выключатель: настройка «да / нет» — ручка справа и цвет автомодуля, когда включено.
+component Switch inherits Rectangle {
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback toggled();
+    callback hover(bool);
+    width: 32px;
+    height: 18px;
+    border-radius: 9px;
+    background: root.on && root.enabled ? Palette.auto.darker(0.55) : Palette.cell;
+    border-width: 1px;
+    border-color: root.on && root.enabled ? Palette.auto : Palette.line;
+    Rectangle {
+        x: root.on ? root.width - self.width - 3px : 3px;
+        y: 3px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: !root.enabled ? Palette.line : root.on ? Palette.auto : Palette.dim;
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.toggled(); }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
+// Ползунок целого числа. Пока его тянут, число под ручкой видно сразу (shown, moved — для показа), а применяется оно
+// одним released, когда кнопку отпустили: программа у часов получает одну команду за движение, а не десятки.
+component ValueSlider inherits Rectangle {
+    in property <int> minimum;
+    in property <int> maximum;
+    in property <int> value;
+    in property <bool> enabled: true;
+    in property <bool> lit: true;   // настройка действует сейчас — заливка цветом автомодуля, иначе серая
+    out property <int> shown: root.held ? root.drag : root.value;
+    // Дорожка внутри ползунка — по ней скрытая проверка (src/check.rs) ставит мышь на нужное число.
+    out property <length> track-x: root.knob / 2;
+    out property <length> track-w: root.width - root.knob;
+    property <length> knob: 14px;
+    property <bool> held;
+    property <int> drag;
+    callback moved(int);
+    callback released(int);
+    callback hover(bool);
+    function at(x: length) -> int {
+        return max(root.minimum, min(root.maximum, round(root.minimum + (x - root.knob / 2) / max(1px, root.track-w) * (root.maximum - root.minimum))));
+    }
+    function share(v: int) -> float {
+        return (v - root.minimum) / max(1, root.maximum - root.minimum);
+    }
+    Rectangle {
+        x: root.knob / 2;
+        y: (root.height - 4px) / 2;
+        width: root.track-w;
+        height: 4px;
+        border-radius: 2px;
+        background: Palette.cell;
+    }
+    Rectangle {
+        x: root.knob / 2;
+        y: (root.height - 4px) / 2;
+        width: root.share(root.shown) * root.track-w;
+        height: 4px;
+        border-radius: 2px;
+        background: !root.enabled ? Palette.line : root.lit ? Palette.auto : Palette.dim;
+    }
+    Rectangle {
+        x: root.share(root.shown) * root.track-w;
+        y: (root.height - root.knob) / 2;
+        width: root.knob;
+        height: root.knob;
+        border-radius: root.knob / 2;
+        background: !root.enabled ? Palette.line : root.held || touch.has-hover ? #ffffff : Palette.text;
+        border-width: 2px;
+        border-color: Palette.panel;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.held = true;
+                root.drag = root.at(self.mouse-x);
+                root.moved(root.drag);
+            } else if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up && root.held) {
+                root.held = false;
+                root.released(root.drag);
+            }
+        }
+        moved => {
+            if (root.held) {
+                if (root.at(self.mouse-x) != root.drag) {
+                    root.drag = root.at(self.mouse-x);
+                    root.moved(root.drag);
+                }
+            }
+        }
+        // Нажатие сорвалось без отпускания (курсор ушёл из окна): то, до чего дотянули, применяется так же.
+        changed pressed => {
+            if (!self.pressed && root.held) {
+                root.held = false;
+                root.released(root.drag);
             }
         }
         changed has-hover => { root.hover(self.has-hover); }
@@ -634,6 +745,38 @@ export component AppWindow inherits Window {
     in property <string> actions-empty;
     // Подсветка линий: false — под курсором, true — закреплённая (владелец 15.10: попробовать обе).
     in property <bool> pin-mode;
+
+    // Автомодуль: выбор владельца из темы settings программы у часов (у движка C# темы нет — блока нет). Ползунки
+    // показывают число, пока их тянут; Rust получает его в limit-moved (линия отсечки на графике) и применяет одной
+    // командой в limit-released / depth-released.
+    in property <bool> has-auto;
+    in property <bool> auto-ready;    // связь есть — настройки можно менять
+    in property <bool> auto-on;
+    in property <bool> auto-step-up;
+    in property <int> auto-limit: 85;
+    in property <int> auto-limit-min: 60;
+    in property <int> auto-limit-max: 95;
+    in property <int> auto-depth: 4;
+    in property <int> auto-depth-min: 1;
+    in property <int> auto-depth-max: 8;
+    callback auto-toggled();
+    callback step-up-toggled();
+    callback limit-moved(int);
+    callback limit-released(int);
+    callback depth-released(int);
+    // Куда целится скрытая проверка: середины выключателей, дорожки ползунков.
+    out property <length> auto-switch-x: auto-switch.absolute-position.x + auto-switch.width / 2;
+    out property <length> auto-switch-y: auto-switch.absolute-position.y + auto-switch.height / 2;
+    out property <length> step-switch-x: step-switch.absolute-position.x + step-switch.width / 2;
+    out property <length> step-switch-y: step-switch.absolute-position.y + step-switch.height / 2;
+    out property <length> limit-track-x: limit-slider.absolute-position.x + limit-slider.track-x;
+    out property <length> limit-track-w: limit-slider.track-w;
+    out property <length> limit-track-y: limit-slider.absolute-position.y + limit-slider.height / 2;
+    out property <length> depth-track-x: depth-slider.absolute-position.x + depth-slider.track-x;
+    out property <length> depth-track-w: depth-slider.track-w;
+    out property <length> depth-track-y: depth-slider.absolute-position.y + depth-slider.height / 2;
+    out property <int> limit-shown: limit-slider.shown;
+    out property <int> depth-shown: depth-slider.shown;
     // Середины кнопок переключателя — по ним щёлкает скрытая проверка (src/check.rs).
     out property <length> hover-chip-x: hover-chip.absolute-position.x + hover-chip.width / 2;
     out property <length> hover-chip-y: hover-chip.absolute-position.y + hover-chip.height / 2;
@@ -705,8 +848,11 @@ export component AppWindow inherits Window {
     out property <length> natural-h: root.top-h + root.margin + root.head-h + root.die-nat-h + root.legend-h + root.pad + root.margin;
     preferred-width: root.natural-w;
     preferred-height: root.natural-h;
-    min-width: 900px;
-    min-height: 560px;
+    // Наименьший размер; Rust (src/saved.rs) не даёт запомненному размеру быть меньше.
+    out property <length> least-w: 900px;
+    out property <length> least-h: 560px;
+    min-width: root.least-w;
+    min-height: root.least-h;
 
     // Схема растёт по высоте окна, но оставляет панелям их наименьшую ширину.
     out property <length> body-y: root.top-h + root.problem-h + root.margin;
@@ -744,10 +890,12 @@ export component AppWindow inherits Window {
     property <length> note-y: root.row-c-y + root.btn-h + 4px;
     property <length> hist-y: root.note-y + 18px + 8px;
 
-    // Статистика
+    // Статистика: график, под ним настройки автомодуля (три строки), под ними — его действия.
     property <length> actions-h: min(6, max(1, root.actions.length)) * 18px;
+    out property <length> auto-h: root.has-auto ? 92px : 0px;
+    out property <length> auto-y: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.auto-h;
     out property <length> chart-y: root.body-y + root.head-h + 22px;
-    out property <length> chart-h: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.chart-y;
+    out property <length> chart-h: root.auto-y - root.chart-y;
 
     out property <length> menu-x;
     out property <length> menu-y;
@@ -1273,7 +1421,9 @@ export component AppWindow inherits Window {
         Text {
             x: root.pad;
             y: parent.height - root.pad - root.actions-h - 24px;
-            text: root.stats-legend.length > 1 ? "Автомодуль · действия с выбранными блоками" : "Автомодуль · действия с этим блоком";
+            text: root.has-auto
+                ? (root.stats-legend.length > 1 ? "Его действия с выбранными блоками" : "Его действия с этим блоком")
+                : (root.stats-legend.length > 1 ? "Автомодуль · действия с выбранными блоками" : "Автомодуль · действия с этим блоком");
             color: Palette.dim;
             font-weight: 600;
             font-size: 12px;
@@ -1295,6 +1445,134 @@ export component AppWindow inherits Window {
         pointer(x, y, w, h) => { root.chart-pointer(x, y, w, h); }
         exited() => { root.chart-left(); }
         clicked-at(x, y, w, h) => { root.chart-click(x, y, w, h); }
+    }
+    // ----- Автомодуль: настройки программы у часов (DECISIONS #36) -----
+    // Под графиком, где его красная линия отсечки, над списком его действий: всё про автомодуль — в одном месте.
+    // Строки: выключатель и подтягивание; отсечка; глубина. Одинаковое дело — одинаковый элемент: числа — ползунками,
+    // «да / нет» — выключателями.
+    Rectangle {
+        visible: root.has-auto;
+        x: root.stats-x + root.pad;
+        y: root.auto-y;
+        width: root.stats-w - 2 * root.pad;
+        height: root.auto-h;
+        property <length> label-w: 64px;
+        property <length> value-w: 48px;
+        Rectangle { x: 0; y: 2px; width: parent.width; height: 1px; background: Palette.line; }
+        auto-switch := Switch {
+            x: 0;
+            y: 12px;
+            on: root.auto-on;
+            enabled: root.auto-ready;
+            toggled => { root.auto-toggled(); }
+            hover(on) => {
+                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• работает в программе у часов, окно для этого не нужно\n• выключен — программа датчики для него не читает и потолки не трогает\n• то же — в меню значка у часов", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        Text {
+            x: 40px;
+            y: 9px;
+            height: 24px;
+            text: "Автомодуль";
+            color: root.auto-on ? Palette.text : Palette.dim;
+            font-weight: 600;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        step-switch := Switch {
+            x: parent.width - self.width;
+            y: 12px;
+            on: root.auto-step-up;
+            enabled: root.auto-ready;
+            toggled => { root.step-up-toggled(); }
+            hover(on) => {
+                root.tip(on, "step-up", "Подтягивание вверх\nБлок, который под нагрузкой упирается в свой потолок и держится прохладным, получает ступень выше принятой.\n• не выше заводского предела\n• выключено — автомодуль только снижает и возвращает к принятым", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        Text {
+            x: 0;
+            width: parent.width - step-switch.width - 8px;
+            y: 9px;
+            height: 24px;
+            text: "подтягивание вверх";
+            color: root.auto-step-up ? Palette.text : Palette.dim;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 0;
+            y: 36px;
+            width: parent.label-w;
+            height: 24px;
+            text: "отсечка";
+            color: Palette.dim;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        limit-slider := ValueSlider {
+            x: parent.label-w;
+            y: 38px;
+            width: parent.width - parent.label-w - parent.value-w;
+            height: 20px;
+            minimum: root.auto-limit-min;
+            maximum: root.auto-limit-max;
+            value: root.auto-limit;
+            enabled: root.auto-ready;
+            lit: root.auto-on;
+            moved(v) => { root.limit-moved(v); }
+            released(v) => { root.limit-released(v); }
+            hover(on) => {
+                root.tip(on, "limit", "Отсечка, °C\nСредняя температура блока, выше которой автомодуль снижает его потолок; на графике — красная линия.\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• при смене опущенные блоки возвращаются к принятым потолкам, автомодуль судит их заново", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        Text {
+            x: parent.width - parent.value-w;
+            y: 36px;
+            width: parent.value-w;
+            height: 24px;
+            text: "\{limit-slider.shown} °C";
+            color: root.auto-on ? Palette.text : Palette.dim;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 0;
+            y: 64px;
+            width: parent.label-w;
+            height: 24px;
+            text: "глубина";
+            color: Palette.dim;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        depth-slider := ValueSlider {
+            x: parent.label-w;
+            y: 66px;
+            width: parent.width - parent.label-w - parent.value-w;
+            height: 20px;
+            minimum: root.auto-depth-min;
+            maximum: root.auto-depth-max;
+            value: root.auto-depth;
+            enabled: root.auto-ready;
+            lit: root.auto-on;
+            released(v) => { root.depth-released(v); }
+            hover(on) => {
+                root.tip(on, "depth", "Глубина, ступеней\nНа сколько ступеней ниже своего фактического множителя автомодуль может опустить блок.\n• \{root.auto-depth-min}–\{root.auto-depth-max}; ступень — 2–5 °C у занятого блока (замер)\n• защита на случай, когда охлаждение не справляется: ниже автомодуль не пойдёт", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+        Text {
+            x: parent.width - parent.value-w;
+            y: 64px;
+            width: parent.value-w;
+            height: 24px;
+            text: "−\{depth-slider.shown}";
+            color: root.auto-on ? Palette.text : Palette.dim;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
     }
     Lines {
         x: root.stats-x + root.pad;

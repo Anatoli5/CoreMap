@@ -9,6 +9,11 @@
 // Жесты (владелец 15.10: «по две функции на одно действие… так не делается»): щелчок по плитке — добавить блок в
 // статистику или убрать его оттуда (сравнение до четырёх блоков, владелец 15.10), и только; правая кнопка — меню
 // потолка. Нагрузки у окна нет.
+//
+// Настройки автомодуля (DECISIONS #36) — выбор программы у часов: окно показывает тему settings и шлёт изменения
+// командой auto.set; ползунок — одной командой, когда его отпустили. Пока его тянут и пока программа не подтвердила
+// новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад.
+// Что окно помнит о себе (сравниваемые блоки, подсветка, размер и место) — его собственный файл (src/saved.rs).
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -20,8 +25,9 @@ use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::die::{self, Geometry};
 use crate::panels::{self, ProfileInput, ProfileShown, StatsShown};
 use crate::pipe::{Event, Link};
+use crate::saved::{self, Remembered};
 use crate::store::Digest;
-use crate::wire::{Hello, Limits, Message, Profiles, State};
+use crate::wire::{AutoSettings, Hello, Limits, Message, Profiles, State};
 use crate::{AppWindow, CellData, LineRow, LinkData, MenuEntry, SetRow, TileData};
 
 const TEXT: [u8; 3] = [0xe6, 0xe8, 0xec];
@@ -98,12 +104,31 @@ pub struct Changes {
     pub last: u32,
 }
 
+/// Число ползунка, которое ждёт подтверждения программы у часов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Limit,
+    Depth,
+}
+
 /// Команда, на которую ждём ответ: что сказать при отказе и что сделать при успехе.
 #[derive(Debug)]
 struct Pending {
     failure: &'static str,
     /// «Сохранить как»: название, которое станет выбранным, когда движок ответит «сделано».
     saved_as: Option<String>,
+    /// Число ползунка в этой команде: отказ — ручка возвращается к выбору программы.
+    held: Option<Held>,
+}
+
+impl Pending {
+    fn failing(failure: &'static str) -> Self {
+        Self {
+            failure,
+            saved_as: None,
+            held: None,
+        }
+    }
 }
 
 #[expect(
@@ -145,14 +170,32 @@ pub struct View {
     pending: HashMap<i64, Pending>,
     menu_block: Option<usize>,
     pub changes: Changes,
+    /// Выбор автомодуля из темы settings программы у часов; None — его нет (движок C# такой темы не шлёт).
+    pub auto: Option<AutoSettings>,
+    /// Отсечка под ручкой ползунка: пока его тянут и после отпускания, пока программа не подтвердила её (темой и
+    /// состоянием); None — ручка и линия стоят на выборе программы.
+    limit_held: Option<i32>,
+    limit_dragging: bool,
+    /// Глубина после отпускания, пока программа не подтвердила её темой.
+    depth_held: Option<i32>,
+    /// Сколько команд окно послало (скрытой проверке: движение ползунка — одна команда).
+    pub sent: u32,
+    /// Файл окна: что оно помнит о себе; запоминается при смене выбора и подсветки и при закрытии.
+    memory: Remembered,
+    /// Сравниваемые блоки из файла окна ждут первого знакомства: только тогда известно, какие блоки есть.
+    restore: Option<Vec<(String, usize)>>,
 }
 
 impl View {
-    pub fn new(ui: &AppWindow, link: Arc<Link>) -> View {
+    /// `memory` — что окно помнит о себе (src/saved.rs, `saved::open`): подсветка — сразу, блоки — при знакомстве.
+    pub fn new(ui: &AppWindow, link: Arc<Link>, memory: Remembered) -> View {
         let tiles = Rc::new(VecModel::default());
         ui.set_tiles(ModelRc::from(Rc::clone(&tiles)));
         let sets = Rc::new(VecModel::default());
         ui.set_sets(ModelRc::from(Rc::clone(&sets)));
+        let pin_mode = memory.saved.pin.unwrap_or(false);
+        let restore = (!memory.saved.compared.is_empty()).then(|| memory.saved.compared.clone()); // a few names, once
+        let problem = memory.trouble.clone(); // one line, once
         let view = View {
             ui: ui.as_weak(),
             link,
@@ -166,7 +209,7 @@ impl View {
             tiles,
             sets,
             compared: Vec::new(),
-            pin_mode: false,
+            pin_mode,
             pinned: None,
             hovered: None,
             chosen: None,
@@ -177,13 +220,24 @@ impl View {
             refused: None,
             up: false,
             why: "окно запускается".into(),
-            problem: None,
+            problem,
             notice: None,
             pending: HashMap::new(),
             menu_block: None,
             changes: Changes::default(),
+            auto: None,
+            limit_held: None,
+            limit_dragging: false,
+            depth_held: None,
+            sent: 0,
+            memory,
+            restore,
         };
         view.show_link();
+        view.show_problem();
+        if ui.get_pin_mode() != pin_mode {
+            ui.set_pin_mode(pin_mode);
+        }
         view
     }
 
@@ -193,12 +247,19 @@ impl View {
                 self.up = true;
                 self.refused = None;
                 self.show_link();
+                self.show_auto();
             }
             Event::Down(why) => {
                 self.up = false;
                 self.why = why;
                 self.pending.clear();
+                // Ответов на посланное уже не будет: ручки — на последнем известном выборе программы.
+                self.limit_held = None;
+                self.limit_dragging = false;
+                self.depth_held = None;
                 self.show_link();
+                self.show_auto();
+                self.refresh_stats();
             }
             Event::Message(Message::Hello(hello)) => self.greet(hello),
             Event::Message(Message::State(state)) => self.apply(state),
@@ -236,6 +297,17 @@ impl View {
                     } else {
                         Some(format!("{}: {}", pending.failure, reply.why.unwrap_or_default()))
                     };
+                    if !reply.ok {
+                        match pending.held {
+                            Some(Held::Limit) => self.limit_held = None,
+                            Some(Held::Depth) => self.depth_held = None,
+                            None => {}
+                        }
+                        if pending.held.is_some() {
+                            self.show_auto();
+                            self.refresh_stats();
+                        }
+                    }
                     if reply.ok
                         && let Some(name) = pending.saved_as
                     {
@@ -250,6 +322,15 @@ impl View {
                 if self.notice.as_ref().is_none_or(|(seq, _)| n.seq > *seq) {
                     self.notice = Some((n.seq, n.text));
                     self.show_problem();
+                }
+            }
+            Event::Message(Message::Settings(settings)) => {
+                self.auto = settings.auto;
+                let cutoff = self.cutoff();
+                self.settle_holds();
+                self.show_auto();
+                if self.cutoff() != cutoff {
+                    self.refresh_stats();
                 }
             }
             Event::Message(Message::Other) => {}
@@ -311,10 +392,17 @@ impl View {
         self.geometry = die::geometry(&hello);
         ui.set_die_nat_w(self.geometry.width);
         ui.set_die_nat_h(self.geometry.height);
-        // Выбор переживает новое знакомство, пока такие блоки есть; пусто — первое P-ядро.
+        // Выбор переживает новое знакомство, пока такие блоки есть; при первом — выбор из файла окна (его блоки,
+        // которых больше нет, выпадают); пусто — первое P-ядро.
         self.compared.retain(|&(b, _)| b < hello.blocks.len());
         self.pinned = self.pinned.filter(|&b| b < hello.blocks.len());
         self.hovered = None;
+        if let Some(restore) = self.restore.take()
+            && self.compared.is_empty()
+        {
+            self.compared = saved::compared(&restore, &hello.blocks);
+            self.pinned = self.compared.last().map(|(b, _)| *b);
+        }
         if self.compared.is_empty()
             && let Some(first) = hello
                 .blocks
@@ -367,14 +455,16 @@ impl View {
             .as_ref()
             .is_none_or(|old| old.limit != state.limit || old.auto != state.auto || old.busy != state.busy);
         // Статистика зависит от состояния только отсечкой автомодуля (линия на графике).
-        let cutoff_moved = self.state.as_ref().is_none_or(|old| old.auto_limit != state.auto_limit);
+        let cutoff = self.cutoff();
+        let first = self.state.is_none();
         self.state = Some(state);
+        self.settle_holds();
         self.show_problem();
         self.refresh(false);
         if profiles_moved {
             self.refresh_profiles();
         }
-        if cutoff_moved {
+        if first || self.cutoff() != cutoff {
             self.refresh_stats();
         }
     }
@@ -577,14 +667,22 @@ impl View {
         if self.pin_mode { self.pinned } else { self.hovered }
     }
 
+    /// Отсечка на графике: пока автомодуль включён (в состоянии есть его отсечка) — она, а пока ползунок тянут или его
+    /// число ещё не подтверждено — число под ручкой. Выключен — линии нет.
+    fn cutoff(&self) -> Option<f64> {
+        let on = self.state.as_ref().and_then(|s| s.auto_limit)?;
+        Some(self.limit_held.map_or(on, f64::from))
+    }
+
     fn refresh_stats(&mut self) {
+        let cutoff = self.cutoff();
         let Some(hello) = self.hello.as_ref() else { return };
         let shown = panels::stats_panel(&panels::StatsInput {
             blocks: &hello.blocks,
             compared: &self.compared,
             highlight: self.highlight(),
             fused: self.limits.as_ref().map(|l| l.fused.as_slice()),
-            cutoff: self.state.as_ref().and_then(|s| s.auto_limit),
+            cutoff,
             digest: self.digest.as_deref(),
         });
         if self.shown_stats.as_ref() == Some(&shown) {
@@ -722,21 +820,205 @@ impl View {
     // ----- команды владельца -----
 
     pub fn order(&mut self, command: &str, args: Map<String, Value>, failure: &'static str) {
-        self.order_then(command, args, failure, None);
+        self.order_then(command, args, Pending::failing(failure));
     }
 
-    fn order_then(&mut self, command: &str, args: Map<String, Value>, failure: &'static str, saved_as: Option<String>) {
+    /// Команда; false — канала нет (сказано строкой под верхней полосой).
+    fn order_then(&mut self, command: &str, args: Map<String, Value>, pending: Pending) -> bool {
         // На эти команды программа может спросить владельца своим окошком (потолок выше заводского): пусть оно выйдет
         // на передний план, а не мигает под окном.
         if matches!(command, "limit.set" | "profile.open" | "profile.revert") {
             self.link.allow_foreground();
         }
         if let Some(id) = self.link.ask(command, args) {
-            self.pending.insert(id, Pending { failure, saved_as });
+            self.sent += 1;
+            self.pending.insert(id, pending);
+            true
         } else {
-            self.problem = Some(format!("{failure}: нет связи с программой у часов"));
+            self.problem = Some(format!("{}: нет связи с программой у часов", pending.failure));
             self.show_problem();
+            false
         }
+    }
+
+    // ----- автомодуль -----
+
+    /// Выключатели и ползунки — по выбору программы у часов; ручки, которые ждут подтверждения, — на своём числе.
+    fn show_auto(&self) {
+        let ui = self.ui();
+        let has = self.auto.is_some();
+        if ui.get_has_auto() != has {
+            ui.set_has_auto(has);
+        }
+        let ready = has && self.up && self.refused.is_none();
+        if ui.get_auto_ready() != ready {
+            ui.set_auto_ready(ready);
+        }
+        let Some(a) = &self.auto else { return };
+        let ints = [
+            (
+                ui.get_auto_limit(),
+                self.limit_held.unwrap_or_else(|| slint_int(a.limit)),
+                AppWindow::set_auto_limit as fn(&AppWindow, i32),
+            ),
+            (
+                ui.get_auto_limit_min(),
+                slint_int(a.limit_range[0]),
+                AppWindow::set_auto_limit_min,
+            ),
+            (
+                ui.get_auto_limit_max(),
+                slint_int(a.limit_range[1]),
+                AppWindow::set_auto_limit_max,
+            ),
+            (
+                ui.get_auto_depth(),
+                self.depth_held.unwrap_or_else(|| slint_int(a.depth)),
+                AppWindow::set_auto_depth,
+            ),
+            (
+                ui.get_auto_depth_min(),
+                slint_int(a.depth_range[0]),
+                AppWindow::set_auto_depth_min,
+            ),
+            (
+                ui.get_auto_depth_max(),
+                slint_int(a.depth_range[1]),
+                AppWindow::set_auto_depth_max,
+            ),
+        ];
+        for (now, want, set) in ints {
+            if now != want {
+                set(&ui, want);
+            }
+        }
+        if ui.get_auto_on() != a.on {
+            ui.set_auto_on(a.on);
+        }
+        if ui.get_auto_step_up() != a.step_up {
+            ui.set_auto_step_up(a.step_up);
+        }
+    }
+
+    /// Ручки, которые ждали подтверждения: отсечка — когда и тема, и состояние (линия) показывают её число (или
+    /// автомодуль выключен — линии нет); глубина — когда тема её показывает.
+    #[expect(
+        clippy::float_cmp,
+        reason = "both sides are whole degrees sent as JSON integers: exact in f64"
+    )]
+    fn settle_holds(&mut self) {
+        let Some(a) = &self.auto else { return };
+        if !self.limit_dragging
+            && let Some(held) = self.limit_held
+            && i64::from(held) == a.limit
+            && self
+                .state
+                .as_ref()
+                .and_then(|s| s.auto_limit)
+                .is_none_or(|line| line == f64::from(held))
+        {
+            self.limit_held = None;
+        }
+        if self.depth_held.is_some_and(|held| i64::from(held) == a.depth) {
+            self.depth_held = None;
+        }
+    }
+
+    fn set_auto(&mut self, field: &str, value: Value, failure: &'static str, held: Option<Held>) -> bool {
+        let mut args = Map::new();
+        args.insert(field.into(), value);
+        self.order_then(
+            "auto.set",
+            args,
+            Pending {
+                failure,
+                saved_as: None,
+                held,
+            },
+        )
+    }
+
+    pub fn auto_toggled(&mut self) {
+        if let Some(on) = self.auto.as_ref().map(|a| a.on) {
+            self.set_auto("on", (!on).into(), "Автомодуль не переключён", None);
+        }
+    }
+
+    pub fn step_up_toggled(&mut self) {
+        if let Some(up) = self.auto.as_ref().map(|a| a.step_up) {
+            self.set_auto("stepUp", (!up).into(), "Подтягивание не переключено", None);
+        }
+    }
+
+    /// Ползунок отсечки тянут: число под ручкой — линией на графике (если автомодуль включён). Команды нет.
+    pub fn limit_moved(&mut self, value: i32) {
+        let cutoff = self.cutoff();
+        self.limit_dragging = true;
+        self.limit_held = Some(value);
+        if self.cutoff() != cutoff {
+            self.refresh_stats();
+        }
+    }
+
+    /// Ползунок отсечки отпустили: одна команда, если число другое.
+    pub fn limit_released(&mut self, value: i32) {
+        let cutoff = self.cutoff();
+        self.limit_dragging = false;
+        let same = self.auto.as_ref().is_none_or(|a| a.limit == i64::from(value));
+        self.limit_held =
+            (!same && self.set_auto("limit", value.into(), "Отсечка не изменена", Some(Held::Limit))).then_some(value);
+        self.show_auto();
+        if self.cutoff() != cutoff {
+            self.refresh_stats();
+        }
+    }
+
+    /// Ползунок глубины отпустили: одна команда, если число другое.
+    pub fn depth_released(&mut self, value: i32) {
+        let same = self.auto.as_ref().is_none_or(|a| a.depth == i64::from(value));
+        self.depth_held =
+            (!same && self.set_auto("depth", value.into(), "Глубина не изменена", Some(Held::Depth))).then_some(value);
+        self.show_auto();
+    }
+
+    // ----- что окно помнит о себе -----
+
+    /// Пишет файл окна, если запомненное изменилось: сравниваемые блоки (по названиям), подсветка, обычные размер и
+    /// место. Развёрнутое или свёрнутое окно своих обычных размера и места не сообщает — остаются прежние.
+    fn remember(&mut self) {
+        let ui = self.ui();
+        let window = ui.window();
+        let mut saved = self.memory.saved.clone(); // a few names and numbers, once per click
+        if let Some(hello) = &self.hello {
+            saved.compared = self
+                .compared
+                .iter()
+                .filter_map(|&(b, slot)| Some((hello.blocks.get(b)?.name.clone(), slot)))
+                .collect();
+        }
+        saved.pin = Some(self.pin_mode);
+        saved.maximized = window.is_maximized();
+        if !window.is_maximized() && !window.is_minimized() {
+            let size = window.size().to_logical(window.scale_factor());
+            saved.size = Some((size.width, size.height));
+            let at = window.position();
+            saved.position = Some((at.x, at.y));
+        }
+        if saved == self.memory.saved {
+            return;
+        }
+        match saved::write(&self.memory.path, &saved) {
+            Ok(()) => self.memory.saved = saved,
+            Err(e) => {
+                self.problem = Some(format!("Окно не запомнило выбор: {} не записан ({e})", saved::FILE));
+                self.show_problem();
+            }
+        }
+    }
+
+    /// Окно закрывают: размер и место — в файл окна (событий о перемещении нет, это единственная минута их узнать).
+    pub fn closing(&mut self) {
+        self.remember();
     }
 
     /// Щелчок по плитке: блока нет в статистике — добавить (до `COMPARE` блоков, у каждого свой цвет), есть — убрать.
@@ -768,6 +1050,7 @@ impl View {
         }
         self.refresh(false);
         self.refresh_stats();
+        self.remember();
     }
 
     /// Курсор над плиткой или ушёл с неё: в подсветке «под курсором» её линия — поверх остальных.
@@ -809,6 +1092,7 @@ impl View {
         if self.pin_mode != pin {
             self.pin_mode = pin;
             self.refresh_stats();
+            self.remember();
         }
     }
 
@@ -946,7 +1230,15 @@ impl View {
         if name.is_empty() {
             return;
         }
-        self.order_then("profile.save", Self::named(&name), "Профиль не сохранён", Some(name));
+        self.order_then(
+            "profile.save",
+            Self::named(&name),
+            Pending {
+                failure: "Профиль не сохранён",
+                saved_as: Some(name),
+                held: None,
+            },
+        );
     }
 
     pub fn profile_accept(&mut self) {

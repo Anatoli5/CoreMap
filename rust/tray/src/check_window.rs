@@ -6,7 +6,8 @@
 
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use machine::named::Names;
 use serde_json::{Value, json};
 
-use crate::app::{AUTO_ON, App, AutoTiming, Confirm, LIMIT_ID, WINDOW_ID};
+use crate::app::{AUTO_ON, App, AutoTiming, Choice, Confirm, WINDOW_EXE, WINDOW_ID};
 use crate::check::{Report, ceilings_now, hold, logged, pump, pump_until};
 use crate::shell::{self, Shell};
 
@@ -349,6 +350,207 @@ fn logging_with_window(r: &mut Report, app: &mut App, shell: &mut Shell, client:
     );
 }
 
+/// 12b. Настройки автомодуля по каналу (DECISIONS #36): тема settings при знакомстве (выбор и промежутки), auto.set
+/// меняет выбор — data\tray.json, тема, autoLimit в состоянии (линия отсечки окна); негодное — отказ с причиной без
+/// записи. Включается на одно состояние и выключается: регулятору нужны минуты, ничего не успеет сдвинуться.
+fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client, data: &Path, state: &Value) {
+    let settings = client.last("settings").cloned().unwrap_or(Value::Null);
+    let auto = &settings["auto"];
+    r.check(
+        auto["on"] == false
+            && auto["limit"].is_i64()
+            && auto["depth"].is_i64()
+            && auto["stepUp"].is_boolean()
+            && auto["limitRange"] == json!([60, 95])
+            && auto["depthRange"] == json!([1, 8]),
+        &format!("settings при знакомстве: {auto}"),
+    );
+    let file = data.join("tray.json");
+    let before = fs::read_to_string(&file).unwrap_or_default();
+    let mut refused = Vec::new();
+    for bad in [
+        json!({ "limit": 96 }),
+        json!({ "limit": 85.5 }),
+        json!({ "depth": 0 }),
+        json!({ "on": true, "limit": 59 }),
+        json!({ "limt": 80 }),
+        json!({}),
+    ] {
+        let (_, ok, why) = order(shell, app, client, "auto.set", &bad);
+        refused.push((bad, ok, why));
+    }
+    let untouched = fs::read_to_string(&file).unwrap_or_default() == before;
+    r.check(
+        refused.iter().all(|(_, ok, why)| !ok && !why.is_empty()) && untouched && app.auto_choice().limit != 59,
+        &format!(
+            "auto.set с негодным — отказ с причиной, tray.json не тронут: {}",
+            refused
+                .iter()
+                .map(|(bad, _, why)| format!("{bad} — {why}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
+    let off = state["autoLimit"].is_null();
+    let (id, ok, why) = order(shell, app, client, "auto.set", &json!({ "on": true, "limit": 77 }));
+    let on = client.state_after(id).cloned().unwrap_or(Value::Null);
+    let topic = client.last("settings").cloned().unwrap_or(Value::Null);
+    let written = fs::read_to_string(&file).unwrap_or_default();
+    r.check(
+        ok && on["autoLimit"] == json!(77)
+            && topic["auto"]["on"] == true
+            && topic["auto"]["limit"] == json!(77)
+            && written.contains("\"auto\":true")
+            && written.contains("\"limit\":77"),
+        &format!(
+            "auto.set {{on, 77}}: принято {why}, тема settings {}, autoLimit в состоянии {}, tray.json {written}",
+            topic["auto"], on["autoLimit"]
+        ),
+    );
+    let (id, ok, _) = order(shell, app, client, "auto.set", &json!({ "on": false }));
+    let off_again = client.state_after(id).is_some_and(|s| s["autoLimit"].is_null());
+    r.check(
+        off && ok && off_again,
+        "отсечка автомодуля в состоянии: выключен — null, включён на 77 °C — 77, выключен снова — null",
+    );
+    // То же значение ещё раз — ничего не меняется: ни строки журнала, ни записи файла.
+    let lines = logged(app, "автомодуль (окно)");
+    let stamp = fs::metadata(&file).and_then(|m| m.modified()).ok();
+    let (_, ok, _) = order(shell, app, client, "auto.set", &json!({ "on": false }));
+    r.check(
+        ok && logged(app, "автомодуль (окно)") == lines && fs::metadata(&file).and_then(|m| m.modified()).ok() == stamp,
+        "auto.set без изменения — принято, но ни записи tray.json, ни строки журнала",
+    );
+}
+
+/// Что настоящее окно делает в своей проверке настроек (rust/window/src/check.rs, `settings`): включает автомодуль,
+/// тянет ползунок отсечки до 88 °C и глубины до 6, включает подтягивание, выключает автомодуль — пять жестов.
+const WINDOW_LIMIT: i32 = 88;
+const WINDOW_DEPTH: i32 = 6;
+const WINDOW_GESTURES: usize = 5;
+
+/// Окно проверки: CoreMapWindow.exe с ключами `pass` против канала программы входа; её цикл крутится, пока окно не
+/// выйдет (не дольше 90 с). Отчёт окна — в этот отчёт строками; пройдена — код 0 и отчёт «ok».
+fn window_pass(r: &mut Report, app: &mut App, shell: &mut Shell, exe: &Path, picture: &Path, pass: &[&str]) {
+    let report = PathBuf::from(format!("{}.txt", picture.display()));
+    let _ = fs::remove_file(&report); // отчёта прошлой проверки нет — тем лучше; не удалился — его выдаст код выхода
+    let started = Instant::now();
+    let child = Command::new(exe)
+        .arg("--pipe")
+        .arg(&app.serving().pipe)
+        .arg("--snapshot")
+        .arg(picture)
+        .args(pass)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            r.check(false, &format!("{WINDOW_EXE} {} не запустился: {e}", pass.join(" ")));
+            return;
+        }
+    };
+    let deadline = started + Duration::from_secs(90);
+    let code = loop {
+        pump(shell, app, Duration::from_millis(50));
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < deadline => {}
+            Ok(None) | Err(_) => {
+                let _ = child.kill(); // не уложилось — код None, проверка ниже это скажет
+                break None;
+            }
+        }
+    };
+    let text = fs::read_to_string(&report).unwrap_or_default();
+    r.note(&format!(
+        "--- окно {WINDOW_EXE} {} против программы входа, картинка {} ---",
+        pass.join(" "),
+        picture.display()
+    ));
+    for line in text.lines() {
+        r.note(line);
+    }
+    r.check(
+        code == Some(0) && text.starts_with("ok"),
+        &format!(
+            "окно {} прошло свою проверку против программы входа за {:.1} с; код {code:?}",
+            pass.join(" "),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+}
+
+/// 12n. Настоящее окно CoreMapWindow.exe против программы входа (DECISIONS #36), два запуска с одной папкой окна.
+/// Первый (--settings) щёлкает выключатели и тянет ползунки настоящими событиями мыши и смотрит, что вернулось в окно;
+/// здесь — что дошло до программы входа: выбор, data\tray.json (только настройки автомодуля), по строке журнала на
+/// жест, а не на каждый шаг ползунка. Затем он выбирает блоки, подсветку, размер и закрывается — это окно пишет в
+/// свой файл, программа входа о нём не знает. Второй (--reopened) — новое окно, новое знакомство: открылось ли оно
+/// таким, каким его закрыли. Выбор автомодуля после шага возвращается прежним: дальше шаги на нём.
+fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, out: &Path, data: &Path) {
+    let exe = root.join(WINDOW_EXE);
+    if !exe.exists() {
+        r.check(
+            false,
+            &format!("нет {WINDOW_EXE} рядом с программой входа (его кладёт tools\\rust.ps1)"),
+        );
+        return;
+    }
+    // Папка окна в проверке — своя, внутри временной папки программы входа: окно пишет туда придуманные срезы для
+    // графика и свой файл; срезы программы входа (шаг 13 после этого) им не мешают. Картинки — logon-*.png, не
+    // window*.png: проверка движка C# (Tray.cs, EngineCheck) стирает window*.png перед своим окном.
+    let folder = data.join("window-check");
+    let folder_arg = folder.display().to_string();
+    let before = app.auto_choice();
+    let lines = logged(app, "автомодуль (окно)");
+    window_pass(
+        r,
+        app,
+        shell,
+        &exe,
+        &out.with_file_name("logon-auto.png"),
+        &["--settings", "--data", &folder_arg],
+    );
+    let after = app.auto_choice();
+    let written = fs::read_to_string(data.join("tray.json")).unwrap_or_default();
+    let want = Choice {
+        on: false,
+        limit: WINDOW_LIMIT,
+        depth: WINDOW_DEPTH,
+        step_up: true,
+    };
+    r.check(
+        after == want && written == want.file_text(),
+        &format!("выбор из окна дошёл до программы входа: {after:?}; tray.json {written}"),
+    );
+    let gestures = logged(app, "автомодуль (окно)") - lines;
+    r.check(
+        gestures == WINDOW_GESTURES,
+        &format!(
+            "строк журнала «автомодуль (окно)»: {gestures} — по одной на жест ({WINDOW_GESTURES}), не на каждый шаг ползунка"
+        ),
+    );
+    // Второй запуск — и после неудачи первого: отчёт покажет, что из запомненного дошло.
+    window_pass(
+        r,
+        app,
+        shell,
+        &exe,
+        &out.with_file_name("logon-reopen.png"),
+        &["--reopened", "--data", &folder_arg],
+    );
+    // Прежний выбор: следующие шаги проверки рассчитаны на него.
+    let mut back = serde_json::Map::new();
+    back.insert("limit".into(), json!(before.limit));
+    back.insert("depth".into(), json!(before.depth));
+    back.insert("stepUp".into(), json!(before.step_up));
+    back.insert("on".into(), json!(before.on));
+    let refused = app.set_auto(shell, &back);
+    r.check(
+        refused.is_none(),
+        &format!("прежний выбор автомодуля возвращён {refused:?}"),
+    );
+}
+
 fn cores_of(value: &Value) -> Vec<i64> {
     value
         .as_array()
@@ -360,7 +562,8 @@ fn cores_of(value: &Value) -> Vec<i64> {
     clippy::too_many_lines,
     reason = "one scenario, step after step, reads best as one piece"
 )]
-pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data: &Path) {
+pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, places: (&Path, &Path, &Path)) {
+    let (root, out, data) = places;
     let pipe = app.serving().pipe.clone();
     let cores = app.topology().cores.len();
     let blocks = app.topology().blocks.len();
@@ -440,24 +643,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data
         state["fans"]["rpm"] == json!([3200, 3000]),
         &format!("обороты вентиляторов в состоянии ({})", state["fans"]["rpm"]),
     );
-    // Отсечка автомодуля для линии на графике окна: выключен — null; включён — его предел (первый пресет, 75 °C).
-    // Включается на одно состояние и сразу выключается: регулятору нужны минуты, ничего не успеет сдвинуться.
-    let off = state["autoLimit"].is_null();
-    app.command(shell, AUTO_ON);
-    app.command(shell, LIMIT_ID);
-    let from = client.of("state").len();
-    let on = wait(shell, app, &mut client, Duration::from_secs(2), |c| {
-        c.of("state").len() > from && c.last("state").is_some_and(|s| s["autoLimit"] == json!(75))
-    });
-    app.command(shell, AUTO_ON);
-    let from = client.of("state").len();
-    let off_again = wait(shell, app, &mut client, Duration::from_secs(2), |c| {
-        c.of("state").len() > from && c.last("state").is_some_and(|s| s["autoLimit"].is_null())
-    });
-    r.check(
-        off && on && off_again,
-        "отсечка автомодуля в состоянии: выключен — null, включён на 75 °C — 75, выключен снова — null",
-    );
+    auto_settings(r, app, shell, &mut client, data, &state);
 
     // 12c. Средняя под нагрузкой: нагруженный блок получает среднюю после 2 с прогрева, ненагруженный — нет;
     //      «сбросить максимумы» обнуляет и наибольшие, и средние.
@@ -892,4 +1078,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data
         to.cpu.saturating_sub(from.cpu) < 200_000,
         "окно ушло — в покое процессор не тратится (меньше 20 мс за 3 с)",
     );
+
+    // 12n. Настоящее окно: настройки автомодуля щелчками и ползунками.
+    real_window(r, app, shell, root, out, data);
 }

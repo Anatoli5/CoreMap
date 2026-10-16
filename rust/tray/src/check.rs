@@ -17,7 +17,9 @@ use machine::events::{Event, EventLog};
 use machine::named::{self, Names};
 use machine::thermal::Thermal;
 
-use crate::app::{AUTO_ON, App, AutoTiming, Config, Confirm, DEPTH_ID, EXIT_ID, FACTORY_ID, LIMIT_ID, WINDOW_ID};
+use crate::app::{
+    AUTO_ON, AUTO_WINDOW_ID, App, AutoTiming, Config, Confirm, EXIT_ID, FACTORY_ID, STEP_UP_ID, WINDOW_ID,
+};
 use crate::shell::{self, Item, Menu, Shell};
 
 /// Журнал без сбоев: проверка не зависит от истории машины.
@@ -223,7 +225,7 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
     let result = App::new(config, Box::new(QuietLog))
         .and_then(|app| Shell::new(&format!("CoreMap.Logon.Check.{pid}"), false).map(|shell| (app, shell)));
     match result {
-        Ok((mut app, mut shell)) => scenario(&mut r, &mut app, &mut shell, &names, &data),
+        Ok((mut app, mut shell)) => scenario(&mut r, &mut app, &mut shell, &names, (root, out, &data)),
         Err(e) => r.check(false, &format!("запуск: {e}")),
     }
     let mut text = String::from(if r.failed { "FAILED\n" } else { "ok\n" });
@@ -244,7 +246,8 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
     clippy::too_many_lines,
     reason = "one scenario, step after step, reads best as one piece"
 )]
-fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, data: &Path) {
+fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, places: (&Path, &Path, &Path)) {
+    let data = places.2;
     // 0. Метка автомодуля от прежней загрузки (процессор с тех пор сброшен): по ней ничего не поднимается, даже
     //    если в ней записано выше заводского (ревизия H1).
     let lps: Vec<u32> = app.topology().lps().iter().map(|lp| lp.0).collect();
@@ -314,6 +317,21 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
                     .is_some_and(|t| t.contains("Новое окно") || t.contains("прежнее окно"))
             });
             r.check(old.count() == 0, "в меню нет «Новое окно» и «Открыть прежнее окно»");
+            // Отсечка и глубина — в окне (DECISIONS #36): в подменю автомодуля только включение, подтягивание и пункт,
+            // который открывает окно; пресетов отсечки и глубины нет.
+            let auto: Vec<u32> = seen
+                .iter()
+                .find(|i| {
+                    i.text
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with("Автоограничение нагрева"))
+                })
+                .map(|i| i.children.iter().filter(|c| c.text.is_some()).map(|c| c.id).collect())
+                .unwrap_or_default();
+            r.check(
+                auto == [AUTO_ON, STEP_UP_ID, AUTO_WINDOW_ID],
+                &format!("подменю автомодуля: включение, подтягивание, «настроить в окне» — без пресетов ({auto:?})"),
+            );
             r.check(seen.iter().any(|i| i.id == EXIT_ID && i.enabled), "«Выход» доступен");
         }
         Err(e) => r.check(false, &e),
@@ -646,8 +664,15 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
     let first = block.first;
     let marker = data.join("auto-held.json");
     app.command(shell, AUTO_ON);
-    app.command(shell, LIMIT_ID); // 75 °C
-    app.command(shell, DEPTH_ID + 1); // 4 ступени
+    // Отсечка и глубина — тем же путём, что команда окна «auto.set» (пунктов меню для них больше нет).
+    let refused = app.set_auto(
+        shell,
+        &serde_json::from_str(r#"{"limit":75,"depth":4}"#).unwrap_or_default(),
+    );
+    r.check(
+        refused.is_none(),
+        &format!("автомодуль: отсечка 75 °C, глубина 4 приняты {refused:?}"),
+    );
     let settings = fs::read_to_string(data.join("tray.json")).unwrap_or_default();
     r.check(
         settings.contains("\"auto\":true") && settings.contains("\"limit\":75") && settings.contains("\"depth\":4"),
@@ -816,7 +841,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, dat
 
     // 12. Окно по каналу (DECISIONS #32, шаг 2) — после замера цены: его клиент держит в этом же процессе все
     //     полученные сообщения, и память после него — уже не память программы входа.
-    crate::check_window::run(r, app, shell, names, data);
+    crate::check_window::run(r, app, shell, names, places);
 
     // 13. Журнал срезов, когда что-то не так: файл дня удалён, перемещён, не открывается; обороты отказывают; потолки
     //     не читаются. Последним шагом: файл дня после него может не открываться ещё 10 с.

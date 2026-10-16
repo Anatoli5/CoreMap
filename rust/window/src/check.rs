@@ -1,8 +1,13 @@
 // Скрытая проверка окна (--snapshot F): ни окна на экране, ни кнопки на панели задач. Окно рисуется программно
-// (программный отрисовщик Slint в буфер), щелчки и нажатия клавиш — настоящие события по координатам плиток, кнопок и
-// строк. Против движка на имитации; запускает её проверка движка (Tray.cs C#-части). Итог — F.txt рядом с картинкой
-// F, первая строка ok / FAILED; картинки F, F-select.png, F-pin.png, F-tip.png, F-profiles.png, F-menu.png, F-1280.png, F-natural.png
-// смотрит агент — как выглядит окно, проверка не судит.
+// (программный отрисовщик Slint в буфер), щелчки, перетаскивания и нажатия клавиш — настоящие события по координатам
+// плиток, кнопок, ползунков и строк. Итог — F.txt рядом с картинкой F, первая строка ok / FAILED; картинки смотрит
+// агент — как выглядит окно, проверка не судит.
+// Три прохода (`Mode`):
+// • полный — против движка на имитации, его запускает проверка движка (Tray.cs C#-части): картинки F, F-select.png,
+//   F-pin.png, F-tip.png, F-profiles.png, F-menu.png, F-1280.png, F-natural.png;
+// • --settings — против программы у часов, её запускает её скрытая проверка (rust/tray/src/check_window.rs): настройки
+//   автомодуля выключателями и ползунками, затем выбор блоков, подсветка, размер — и закрытие окна; картинка F;
+// • --reopened — второй запуск с той же папкой (--data): окно открылось таким, каким его закрыли; картинка F.
 //
 // Статистика — из своей временной папки: придуманные срезы за сегодня (полный день, 43 200 строк — цена разбора дня),
 // вчера и 40 дней назад (не должны войти), обрезанная последняя строка, журнал автомодуля и журнал профилей. Что
@@ -39,6 +44,22 @@ impl Platform for Headless {
     }
 }
 
+/// Какой проход проверки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Full,
+    Settings,
+    Reopened,
+}
+
+/// Что проход --settings делает с настройками и окном, а --reopened и проверка программы у часов
+/// (`rust/tray/src/check_window.rs`, `WINDOW_LIMIT`, `WINDOW_DEPTH`) ждут: отсечка, глубина, размер перед закрытием.
+const LIMIT_TO: i32 = 88;
+const DEPTH_TO: i32 = 6;
+const CLOSED_SIZE: (u32, u32) = (1500, 900);
+/// Жестов с настройками в проходе --settings: включить, отсечка, глубина, подтягивание, выключить.
+const GESTURES: u32 = 5;
+
 struct Check {
     ui: AppWindow,
     window: Rc<MinimalSoftwareWindow>,
@@ -52,11 +73,13 @@ struct Check {
     lines: Vec<String>,
     sampling: bool,
     samples: Vec<(u32, bool)>, // на каждое состояние: сколько показанного изменилось, перерисовалось ли окно
-    data: Option<PathBuf>,
+    /// Папка статистики и файла окна: своя временная (удаляется в конце) или данная ключом --data.
+    data: PathBuf,
     own_data: bool,
+    mode: Mode,
 }
 
-pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>) -> i32 {
+pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>, mode: Mode) -> i32 {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(Headless {
         window: Rc::clone(&window),
@@ -64,15 +87,24 @@ pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>
     .expect("платформа проверки");
     let ui = AppWindow::new().expect("окно");
     ui.window().set_size(PhysicalSize::new(size.0, size.1));
+    let own_data = data.is_none();
+    let dir = data.unwrap_or_else(|| std::env::temp_dir().join(format!("coremap-window-check-{}", std::process::id())));
+    if own_data {
+        let _ = std::fs::remove_dir_all(&dir); // остатки проверки с тем же номером процесса — не наши данные
+    }
+    let created = std::fs::create_dir_all(&dir);
+    // Окно открывается тем же путём, что настоящее (main.rs): размер и место из файла окна — до показа.
+    let memory = crate::saved::open(&ui, &dir);
     ui.show().expect("окно");
+    let shown = ui.window().size();
+    let size = (shown.width, shown.height);
     let (send, events) = mpsc::channel();
     let link = Link::start(pipe, move |event| {
         // Приёмник живёт до конца проверки; после неё событие некому принять.
         let _ = send.send(event);
     });
-    let view = Rc::new(RefCell::new(View::new(&ui, link)));
+    let view = Rc::new(RefCell::new(View::new(&ui, link, memory)));
     crate::connect(&ui, &view);
-    let own_data = data.is_none();
     let mut check = Check {
         ui,
         window,
@@ -86,19 +118,27 @@ pub fn run(pipe: String, snapshot: &str, size: (u32, u32), data: Option<PathBuf>
         lines: Vec::new(),
         sampling: false,
         samples: Vec::new(),
-        data,
+        data: dir,
         own_data,
+        mode,
     };
+    if let Err(e) = created {
+        check.check(false, format!("папка {} не создана: {e}", check.data.display()));
+    }
     let started = Instant::now();
-    check.steps();
+    match mode {
+        Mode::Full => check.steps(),
+        Mode::Settings => check.settings_steps(),
+        Mode::Reopened => check.reopened_steps(),
+    }
     // Своя временная папка статистики не остаётся после проверки; не удалилась — сказано в отчёте.
     if check.own_data
-        && let Some(dir) = &check.data
-        && let Err(e) = std::fs::remove_dir_all(dir)
+        && let Err(e) = std::fs::remove_dir_all(&check.data)
     {
-        check
-            .lines
-            .push(format!("        временная папка {} не удалена: {e}", dir.display()));
+        check.lines.push(format!(
+            "        временная папка {} не удалена: {e}",
+            check.data.display()
+        ));
     }
     let failed = check.lines.iter().any(|l| l.starts_with("FAILED"));
     let mut report = vec![if failed { "FAILED".to_string() } else { "ok".to_string() }];
@@ -296,13 +336,17 @@ impl Check {
         Some((hello, limits))
     }
 
-    /// Придуманные срезы и журналы во временной папке; поток статистики над ней; первая сводка.
+    /// Придуманные срезы и журналы в папке проверки; поток статистики над ней; первая сводка. Полный проход пишет
+    /// полный день (цена разбора), проход --settings — короткий (график для линии отсечки), --reopened — читает то,
+    /// что записал проход --settings.
     fn statistics(&mut self, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -> Option<Synthetic> {
-        let expected = if self.data.is_none() {
-            let dir = std::env::temp_dir().join(format!("coremap-window-check-{}", std::process::id()));
-            let made = synthesize(&dir, hello, limits, e_block);
-            self.data = Some(dir);
-            match made {
+        let synthesized = match self.mode {
+            Mode::Full => self.own_data,
+            Mode::Settings => !self.data.join("samples").exists(),
+            Mode::Reopened => false,
+        };
+        let expected = if synthesized {
+            match synthesize(&self.data, hello, limits, e_block, self.mode != Mode::Full) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     self.check(false, format!("придуманные срезы не записаны: {e}"));
@@ -312,7 +356,7 @@ impl Check {
         } else {
             None
         };
-        let dir = self.data.clone().unwrap_or_default();
+        let dir = self.data.clone();
         let (send, digests) = mpsc::channel();
         self.digests = Some(digests);
         let started = Instant::now();
@@ -337,7 +381,7 @@ impl Check {
         ));
         if let Some(s) = &expected {
             self.note(format!(
-                "        из них сегодняшний день (8 ч по 2 с, перерыв, 6 ч по 0,25 с): {} строк, {:.1} МБ",
+                "        из них сегодняшний день (по 2 с, перерыв, по 0,25 с): {} строк, {:.1} МБ",
                 s.today_rows,
                 to_mb(s.today_bytes)
             ));
@@ -1062,6 +1106,319 @@ impl Check {
     }
 }
 
+impl Check {
+    /// Первый P-блок и первый кластер E-ядер знакомства — их выбирают оба прохода с памятью окна.
+    fn p_and_e(&mut self, hello: &Hello) -> Option<(BlockInfo, BlockInfo)> {
+        let p = hello.blocks.iter().find(|b| b.kind == "P").cloned();
+        let e = hello.blocks.iter().find(|b| b.kind == "E").cloned();
+        let found = p.zip(e);
+        if found.is_none() {
+            self.check(false, "в знакомстве нет P-блока или кластера E-ядер");
+        }
+        found
+    }
+
+    /// Проход --settings: настройки автомодуля, потом память окна до закрытия.
+    fn settings_steps(&mut self) {
+        let Some((hello, limits)) = self.arrival() else { return };
+        let Some((p, e)) = self.p_and_e(&hello) else { return };
+        self.statistics(&hello, &limits, &e);
+        self.auto_settings();
+        self.memory_before_close(&p, &e);
+    }
+
+    /// Мышь на дорожку ползунка: число `value` — координаты окна (как Slint считает число под мышью, ValueSlider.at).
+    fn slider_x(&self, value: i32, depth: bool) -> (f32, f32) {
+        let ui = &self.ui;
+        let (x, y, w, low, high) = if depth {
+            (
+                ui.get_depth_track_x(),
+                ui.get_depth_track_y(),
+                ui.get_depth_track_w(),
+                ui.get_auto_depth_min(),
+                ui.get_auto_depth_max(),
+            )
+        } else {
+            (
+                ui.get_limit_track_x(),
+                ui.get_limit_track_y(),
+                ui.get_limit_track_w(),
+                ui.get_auto_limit_min(),
+                ui.get_auto_limit_max(),
+            )
+        };
+        #[expect(clippy::cast_precision_loss, reason = "slider values are tens: exact in f32")]
+        let share = (value - low) as f32 / (high - low).max(1) as f32;
+        (x + share * w, y)
+    }
+
+    /// Перетаскивание ползунка настоящими событиями мыши: нажать на ручке `from`, вести через середины всех чисел до
+    /// `to` (середина — чтобы число под мышью не зависело от округления на краю), отпустить. После каждого шага —
+    /// `during(проверка, число под мышью)`.
+    fn drag(&mut self, from: i32, to: i32, depth: bool, mut during: impl FnMut(&mut Check, i32)) {
+        let (x0, y) = self.slider_x(from, depth);
+        let at = LogicalPosition::new(x0, y);
+        self.ui
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position: at });
+        self.ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: at,
+            button: PointerEventButton::Left,
+        });
+        self.pump(|_| true, 0.0);
+        let step = if to >= from { 1 } else { -1 };
+        let mut under = from;
+        let mut x = x0;
+        while under != to {
+            under += step;
+            x = self.slider_x(under, depth).0;
+            self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, y),
+            });
+            self.pump(|_| true, 0.0);
+            during(self, under);
+        }
+        self.ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        });
+        self.ui.window().dispatch_event(WindowEvent::PointerExited);
+        self.pump(|_| true, 0.0);
+    }
+
+    /// Настройки автомодуля (DECISIONS #36): выключатель, ползунки отсечки и глубины, подтягивание — щелчками и
+    /// перетаскиваниями; команда уходит одна на жест, программа у часов подтверждает темой settings и состоянием,
+    /// линия отсечки на графике идёт за ползунком и встаёт на подтверждённое.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scripted round of gestures, read top to bottom"
+    )]
+    fn auto_settings(&mut self) {
+        let came = self.pump(|v| v.auto.is_some(), 5.0);
+        let Some(start) = self.view.borrow().auto.clone() else {
+            self.check(
+                false,
+                "тема settings от программы у часов не пришла — настроек в окне нет",
+            );
+            return;
+        };
+        let ui = &self.ui;
+        let shown = came
+            && ui.get_has_auto()
+            && ui.get_auto_ready()
+            && i64::from(ui.get_auto_limit()) == start.limit
+            && i64::from(ui.get_auto_depth()) == start.depth
+            && ui.get_auto_on() == start.on
+            && ui.get_auto_step_up() == start.step_up
+            && i64::from(ui.get_auto_limit_min()) == start.limit_range[0]
+            && i64::from(ui.get_auto_limit_max()) == start.limit_range[1];
+        self.check(
+            shown,
+            format!(
+                "настройки показаны так, как их прислала программа у часов: {} {} °C, глубина {}, подтягивание {}, отсечка {}–{} °C",
+                if start.on { "вкл" } else { "выкл" },
+                start.limit,
+                start.depth,
+                start.step_up,
+                start.limit_range[0],
+                start.limit_range[1]
+            ),
+        );
+        if start.on || i64::from(LIMIT_TO) == start.limit || i64::from(DEPTH_TO) == start.depth {
+            self.check(
+                false,
+                "проверка ждёт выключенный автомодуль с другими отсечкой и глубиной",
+            );
+            return;
+        }
+        let sent = self.view.borrow().sent;
+        let start_limit = i32::try_from(start.limit).unwrap_or(LIMIT_TO);
+        let start_depth = i32::try_from(start.depth).unwrap_or(DEPTH_TO);
+
+        // 1. Включить — щелчок по выключателю.
+        let (x, y) = (self.ui.get_auto_switch_x(), self.ui.get_auto_switch_y());
+        self.click(x, y, PointerEventButton::Left);
+        let on = self.pump(
+            |v| {
+                v.auto.as_ref().is_some_and(|a| a.on)
+                    && v.state.as_ref().and_then(|s| s.auto_limit) == Some(f64::from(start_limit))
+            },
+            5.0,
+        );
+        let line_on = self.ui.get_chart_cutoff();
+        let text_on = self.ui.get_chart_cutoff_text().to_string();
+        self.check(
+            on && self.ui.get_auto_on() && line_on >= 0.0 && text_on == format!("{start_limit}°"),
+            format!(
+                "щелчок по выключателю включил автомодуль: линия отсечки на графике, «{text_on}» на {line_on:.3} высоты"
+            ),
+        );
+
+        // 2. Ползунок отсечки — до LIMIT_TO: пока тянут, команды нет, а ручка и линия идут за мышью.
+        let mut during: Vec<(i32, i32, String, u32)> = Vec::new();
+        self.drag(start_limit, LIMIT_TO, false, |c, under| {
+            during.push((
+                under,
+                c.ui.get_limit_shown(),
+                c.ui.get_chart_cutoff_text().to_string(),
+                c.view.borrow().sent,
+            ));
+        });
+        let quiet = during.iter().all(|(_, _, _, s)| *s == sent + 1);
+        let followed = during
+            .iter()
+            .all(|(under, shown, text, _)| shown == under && *text == format!("{under}°"));
+        self.check(
+            quiet && followed,
+            format!(
+                "ползунок отсечки тянут: команд нет, ручка и линия идут за мышью ({})",
+                during
+                    .iter()
+                    .map(|(u, s, t, _)| format!("{u}:{s}/{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        );
+        let sent_after = self.view.borrow().sent;
+        let confirmed = self.pump(
+            |v| {
+                v.auto.as_ref().is_some_and(|a| a.limit == i64::from(LIMIT_TO))
+                    && v.state.as_ref().and_then(|s| s.auto_limit) == Some(f64::from(LIMIT_TO))
+            },
+            5.0,
+        );
+        let line = self.ui.get_chart_cutoff();
+        let text = self.ui.get_chart_cutoff_text().to_string();
+        self.check(
+            sent_after == sent + 2
+                && confirmed
+                && self.ui.get_auto_limit() == LIMIT_TO
+                && text == format!("{LIMIT_TO}°")
+                && line > line_on,
+            format!(
+                "отпустили на {LIMIT_TO} °C — одна команда ({}), программа у часов подтвердила, линия отсечки поднялась {line_on:.3} → {line:.3} («{text}»)",
+                sent_after - sent - 1
+            ),
+        );
+        let shot = self.shot("main");
+        self.check(shot, "картинка: настройки автомодуля под графиком, отсечка на графике");
+
+        // 3. Ползунок глубины — до DEPTH_TO, одной командой.
+        self.drag(start_depth, DEPTH_TO, true, |_, _| {});
+        let depth = self.pump(|v| v.auto.as_ref().is_some_and(|a| a.depth == i64::from(DEPTH_TO)), 5.0);
+        self.check(
+            depth && self.view.borrow().sent == sent + 3 && self.ui.get_auto_depth() == DEPTH_TO,
+            format!("ползунок глубины отпустили на {DEPTH_TO} — одна команда, программа подтвердила"),
+        );
+
+        // 4. Подтягивание — щелчок по его выключателю.
+        let (x, y) = (self.ui.get_step_switch_x(), self.ui.get_step_switch_y());
+        self.click(x, y, PointerEventButton::Left);
+        let up = self.pump(|v| v.auto.as_ref().is_some_and(|a| a.step_up), 5.0);
+        self.check(up && self.ui.get_auto_step_up(), "щелчок включил подтягивание вверх");
+
+        // 5. Выключить: линии отсечки нет.
+        let (x, y) = (self.ui.get_auto_switch_x(), self.ui.get_auto_switch_y());
+        self.click(x, y, PointerEventButton::Left);
+        let off = self.pump(
+            |v| v.auto.as_ref().is_some_and(|a| !a.on) && v.state.as_ref().is_some_and(|s| s.auto_limit.is_none()),
+            5.0,
+        );
+        let sent_total = self.view.borrow().sent - sent;
+        self.check(
+            off && self.ui.get_chart_cutoff() < 0.0 && sent_total == GESTURES,
+            format!("щелчок выключил автомодуль — линии отсечки нет; команд за {GESTURES} жестов: {sent_total}"),
+        );
+    }
+
+    /// Память окна до закрытия: щелчки по плитке и подсветке сразу пишутся в файл окна, закрытие дописывает размер.
+    fn memory_before_close(&mut self, p: &BlockInfo, e: &BlockInfo) {
+        let names = |v: &View| {
+            v.compared
+                .iter()
+                .filter_map(|(b, slot)| Some((v.hello.as_ref()?.blocks.get(*b)?.name.clone(), *slot)))
+                .collect::<Vec<_>>()
+        };
+        let wanted = vec![(p.name.clone(), 0), (e.name.clone(), 1)];
+        let first = names(&self.view.borrow());
+        let (x, y) = self.tile_center(e.index);
+        self.click(x, y, PointerEventButton::Left);
+        let (x, y) = (self.ui.get_pin_chip_x(), self.ui.get_pin_chip_y());
+        self.click(x, y, PointerEventButton::Left);
+        let file = self.data.join(crate::saved::FILE);
+        let read = || {
+            std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| crate::saved::parse(&t).ok())
+                .unwrap_or_default()
+        };
+        let clicked = read();
+        self.check(
+            first == wanted[..1]
+                && names(&self.view.borrow()) == wanted
+                && clicked.compared == wanted
+                && clicked.pin == Some(true),
+            format!(
+                "щелчки по плитке {} и по «закреплённая» сразу записаны в файл окна: {:?}, подсветка закреплённая {:?}",
+                e.name, clicked.compared, clicked.pin
+            ),
+        );
+        self.resize(CLOSED_SIZE);
+        self.ui.window().dispatch_event(WindowEvent::CloseRequested);
+        self.pump(|_| true, 0.0);
+        let closed = read();
+        #[expect(clippy::cast_precision_loss, reason = "window sizes, exact in f32")]
+        let size = (CLOSED_SIZE.0 as f32, CLOSED_SIZE.1 as f32);
+        self.check(
+            closed.size == Some(size) && closed.compared == wanted && closed.pin == Some(true),
+            format!(
+                "закрытие окна записало размер {:?} (окно {}×{}) — файл окна {}",
+                closed.size,
+                CLOSED_SIZE.0,
+                CLOSED_SIZE.1,
+                file.display()
+            ),
+        );
+    }
+
+    /// Проход --reopened: окно открылось таким, каким его закрыли, — блоки в сравнении с их цветами, подсветка, размер;
+    /// настройки автомодуля — те, что держит программа у часов (их окно не помнит, только показывает).
+    fn reopened_steps(&mut self) {
+        let Some((hello, limits)) = self.arrival() else { return };
+        let Some((p, e)) = self.p_and_e(&hello) else { return };
+        let size = self.ui.window().size();
+        self.check(
+            (size.width, size.height) == CLOSED_SIZE,
+            format!(
+                "окно открылось размером, с каким его закрыли: {}×{}",
+                size.width, size.height
+            ),
+        );
+        let compared = self.view.borrow().compared.clone();
+        self.check(
+            compared == [(p.index, 0), (e.index, 1)],
+            format!(
+                "в сравнении — те же блоки {} и {} с теми же цветами: {compared:?}",
+                p.name, e.name
+            ),
+        );
+        let pinned = self.ui.get_pin_mode() && self.view.borrow().pin_mode;
+        self.check(pinned, "подсветка — закреплённая, как была");
+        let came = self.pump(|v| v.auto.is_some(), 5.0);
+        let auto = self.view.borrow().auto.clone();
+        self.check(
+            came && auto.as_ref().is_some_and(|a| {
+                !a.on && a.limit == i64::from(LIMIT_TO) && a.depth == i64::from(DEPTH_TO) && a.step_up
+            }) && self.ui.get_auto_limit() == LIMIT_TO
+                && self.ui.get_auto_depth() == DEPTH_TO,
+            format!("настройки автомодуля — от программы у часов, какими их оставили: {auto:?}"),
+        );
+        self.statistics(&hello, &limits, &e);
+        let shot = self.shot("main");
+        self.check(shot, "картинка: окно открылось таким, каким его закрыли");
+    }
+}
+
 fn limit(v: &View, first: usize) -> Option<i64> {
     v.state
         .as_ref()
@@ -1219,7 +1576,13 @@ fn rows(
     clippy::too_many_lines,
     reason = "one synthetic data folder — three sample files and two logs — reads best top to bottom"
 )]
-fn synthesize(dir: &Path, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -> std::io::Result<Synthetic> {
+fn synthesize(
+    dir: &Path,
+    hello: &Hello,
+    limits: &Limits,
+    e_block: &BlockInfo,
+    short: bool,
+) -> std::io::Result<Synthetic> {
     let samples_dir = dir.join("samples");
     std::fs::create_dir_all(&samples_dir)?;
     // Соседи — по раскладке, как у окна: столбец или ряд отличаются на один.
@@ -1247,21 +1610,23 @@ fn synthesize(dir: &Path, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -
     let (old, new) = (samples::OLD_STEP_MS.unsigned_abs(), samples::STEP_MS.unsigned_abs());
 
     // Сегодня — день, когда поставлена новая сборка: 00:00–08:00 прежний журнал по 2 с, перерыв, 08:30–14:30 новый по
-    // 0,25 с (6 часов игры), и обрезанная строка в конце (программа входа дописывает её как раз сейчас).
+    // 0,25 с (6 часов игры), и обрезанная строка в конце (программа входа дописывает её как раз сейчас). Короткий
+    // вариант (проход --settings: нужен только график) — в 20 раз меньше строк.
+    let (morning_rows, game_rows) = if short { (720, 4_320) } else { (14_400, 86_400) };
     let today = day(0);
     let mut text = header.clone();
     let morning = Stretch {
         date: &today,
         from: 0,
-        count: 14_400,
+        count: morning_rows,
         start_ms: 0,
         step_ms: old,
     };
     rows(&mut text, morning, hello, limits, &neighbours, Some(&mut s));
     let game = Stretch {
         date: &today,
-        from: 14_400,
-        count: 86_400,
+        from: morning_rows,
+        count: game_rows,
         start_ms: 8 * 3_600_000 + 30 * 60_000,
         step_ms: new,
     };
