@@ -88,6 +88,32 @@ pub struct Config {
     pub auto: AutoTiming,
 }
 
+/// Откуда пришла постановка набора (`App::apply_set`): строка журнала программы и запись истории профилей.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Via {
+    /// Щелчок по набору в меню значка.
+    Menu,
+    /// «Применить» в окне (команда profile.open).
+    Window,
+}
+
+impl Via {
+    /// Что сделано — в data\profile-log.jsonl (те же значения, что и до 0.5.4: menu, open).
+    fn act(self) -> &'static str {
+        match self {
+            Self::Menu => "menu",
+            Self::Window => "open",
+        }
+    }
+
+    fn journal(self) -> &'static str {
+        match self {
+            Self::Menu => "из меню",
+            Self::Window => "из окна",
+        }
+    }
+}
+
 /// Кто сейчас держит потолки вместо этой программы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Other {
@@ -165,15 +191,12 @@ pub struct App {
     /// C#-часть только что закрылась, возврат права ещё впереди (пауза `grace`).
     take_back_pending: bool,
     listed: Vec<String>,
-    /// «Было» (Core.Was в C#): потолки, принятые последними — после входа то, что поставил профиль запуска; None —
-    /// потолки ещё не прочитаны.
-    was: Option<Vec<i32>>,
-    /// Набор, который владелец открыл или сохранил последним: так называются потолки, записанные под несколькими
+    /// Набор, который владелец применил или сохранил последним: так называются потолки, записанные под несколькими
     /// названиями (Core.Preferred).
     preferred: Option<String>,
     /// Во сколько профиль запуска поставлен при входе («HH:mm»); None — не ставился.
     at_startup: Option<String>,
-    /// Растёт при каждой смене профилей, наборов или «было»: окну пора заново собрать сообщение «профили».
+    /// Растёт при каждой смене профилей или наборов: окну пора заново собрать сообщение «профили».
     version: u64,
     history: history::History,
     meter: meter::Meter,
@@ -224,7 +247,6 @@ impl App {
             power_while_away: false,
             take_back_pending: false,
             listed: Vec::new(),
-            was: None,
             preferred: None,
             at_startup: None,
             version: 0,
@@ -283,6 +305,12 @@ impl App {
     #[must_use]
     pub fn intended(&self) -> Option<&[i32]> {
         self.intended.as_deref()
+    }
+
+    /// Что можно поставить ядру, по убыванию (скрытая проверка: нижняя граница — последний пункт); потолков нет — пусто.
+    #[must_use]
+    pub fn limits_choices(&self, core: usize) -> Vec<i32> {
+        self.limits.as_ref().map(|l| l.choices(core)).unwrap_or_default()
     }
 
     /// Канал окна: имя, вопросы владельцу, счёт окон и состояний (скрытая проверка).
@@ -505,7 +533,6 @@ impl App {
             self.journal.note(note);
         }
         self.intended = self.limits.as_ref().map(|l| l.current().to_vec());
-        self.was.clone_from(&self.intended);
         self.version += 1;
         let in_effect = self
             .profile
@@ -787,9 +814,6 @@ impl App {
             if app.intended.is_none() {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
             }
-            if app.was.is_none() {
-                app.was.clone_from(&app.intended);
-            }
             said
         });
         self.version += 1;
@@ -840,21 +864,44 @@ impl App {
         shell.destroy();
     }
 
-    /// Щелчок по набору: ставит его и делает профилем запуска; «заводские» — профиля запуска больше нет. Как у
-    /// резидента C#, это «открыть и принять» сразу. None — сделано; иначе — что сказать владельцу.
+    /// Щелчок по набору в меню значка: ставит его (`apply_set`); профиль запуска не меняется. None — сделано; иначе —
+    /// что сказать владельцу (оно же — в подсказке значка, пока не пройдёт).
     pub fn switch(&mut self, name: &str) -> Option<String> {
-        let title = if name.is_empty() {
-            "Заводские потолки".to_string()
-        } else {
-            format!("Профиль «{name}»")
-        };
-        let ratios = if name.is_empty() {
+        let ratios = self.set_ratios(name.trim());
+        match self.apply_set(name, ratios, Via::Menu) {
+            Ok(()) => {
+                self.refusal = None;
+                None
+            }
+            Err(refusal) => {
+                self.refusal = Some(refusal.clone());
+                Some(refusal)
+            }
+        }
+    }
+
+    /// Потолки набора: «» — заводские, иначе сохранённый набор или профиль запуска с этим названием; None — такого нет.
+    fn set_ratios(&self, name: &str) -> Option<Vec<i32>> {
+        if name.is_empty() {
             self.limits.as_ref().map(|l| l.fused().to_vec())
         } else {
             self.listed_sets()
                 .into_iter()
                 .find(|s| same_name(&s.name, name))
                 .map(|s| s.ratios)
+        }
+    }
+
+    /// Ставит набор (`ratios` — его потолки; None — набора нет): он становится текущим состоянием. Один путь для щелчка
+    /// по набору в меню значка и «применить» в окне (владелец 15.10: «если ты применил какой-то профиль, этот профиль
+    /// становится текущим состоянием»; DECISIONS #38). Профиль запуска не меняется: его выбирают отдельно — отметкой
+    /// «загружать при старте Windows» в окне. Err — что сказать владельцу.
+    pub(super) fn apply_set(&mut self, name: &str, ratios: Option<Vec<i32>>, via: Via) -> Result<(), String> {
+        let name = name.trim();
+        let title = if name.is_empty() {
+            "Заводские потолки".to_string()
+        } else {
+            format!("Профиль «{name}»")
         };
         let before = self.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
         let done = self.with_ceilings(|app| -> Result<(), String> {
@@ -870,27 +917,11 @@ impl App {
                     if name.is_empty() { "ы" } else { "" }
                 ));
             }
-            let limits = app.limits.as_ref().ok_or("потолки недоступны")?;
-            if name.is_empty() {
-                app.store
-                    .forget_profile()
-                    .map_err(|e| format!("файл профиля не удалён: {e}"))?;
-                app.profile = None;
-            } else if !app
-                .profile
-                .as_ref()
-                .is_some_and(|p| same_name(&p.name, name) && !p.disabled())
-            {
-                // Профиль запуска, который и так стоит, заново не записывается: это обнулило бы его испытательный срок.
-                let saved = profile::save(&app.store, limits, name.trim(), Stamp::now())
-                    .map_err(|e| format!("{title}: файл профиля не записан ({e})"))?;
-                app.profile = Some(saved);
-            }
-            app.note = None;
             app.intended = Some(limits.current().to_vec());
             app.auto_new_set();
             app.journal.note(&format!(
-                "из меню поставлен {}",
+                "{} поставлен {}",
+                via.journal(),
                 if name.is_empty() {
                     "заводские потолки"
                 } else {
@@ -907,26 +938,19 @@ impl App {
         self.version += 1;
         match done {
             Ok(Ok(())) => {
-                // Выбор в меню — «открыть и принять» сразу: стоящее — и «было».
-                self.was.clone_from(&self.intended);
                 if !name.is_empty() {
-                    self.preferred = Some(name.trim().to_string());
+                    self.preferred = Some(name.to_string());
                 }
-                self.refusal = None;
-                self.log_change("menu", Some(name.trim()), &before, None, None);
-                None
+                self.log_change(via.act(), Some(name), &before, None, None);
+                Ok(())
             }
             Ok(Err(refusal)) => {
-                self.refusal = Some(refusal.clone());
                 if self.limits.as_ref().is_some_and(|l| l.current() != before.as_slice()) {
-                    self.log_change("menu", Some(name.trim()), &before, None, Some(&refusal));
+                    self.log_change(via.act(), Some(name), &before, None, Some(&refusal));
                 }
-                Some(refusal)
+                Err(refusal)
             }
-            Err(refusal) => {
-                self.refusal = Some(refusal.clone());
-                Some(refusal)
-            }
+            Err(refusal) => Err(refusal),
         }
     }
 
@@ -1068,8 +1092,6 @@ impl App {
             }
             app.power_while_away = false;
             app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
-            // Что C#-часть приняла, программа входа не знает: «было» — то, что она оставила.
-            app.was.clone_from(&app.intended);
             app.journal.note("C#-часть закрылась — потолки снова мои");
             said
         });

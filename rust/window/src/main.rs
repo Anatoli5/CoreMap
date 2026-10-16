@@ -95,15 +95,13 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_set_clicked(move |row| v.borrow_mut().set_clicked(row));
     let v = Rc::clone(view);
-    ui.on_profile_open(move || v.borrow_mut().profile_open());
+    ui.on_profile_apply(move || v.borrow_mut().profile_apply());
     let v = Rc::clone(view);
     ui.on_profile_save(move || v.borrow_mut().profile_save());
     let v = Rc::clone(view);
     ui.on_profile_save_as(move || v.borrow_mut().profile_save_as());
     let v = Rc::clone(view);
-    ui.on_profile_accept(move || v.borrow_mut().profile_accept());
-    let v = Rc::clone(view);
-    ui.on_profile_revert(move || v.borrow_mut().profile_revert());
+    ui.on_startup_toggled(move || v.borrow_mut().startup_toggled());
     let v = Rc::clone(view);
     ui.on_profile_delete(move || v.borrow_mut().profile_delete());
     let v = Rc::clone(view);
@@ -116,8 +114,6 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_limit_moved(move |value| v.borrow_mut().limit_moved(value));
     let v = Rc::clone(view);
     ui.on_limit_released(move |value| v.borrow_mut().limit_released(value));
-    let v = Rc::clone(view);
-    ui.on_depth_released(move |value| v.borrow_mut().depth_released(value));
     // Закрытие: размер и место — в файл окна; окно прячется, его цикл кончается.
     let v = Rc::clone(view);
     ui.window().on_close_requested(move || {

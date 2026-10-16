@@ -7,14 +7,15 @@
 //   F-pin.png, F-tip.png, F-abs.png, F-all.png, F-chart-tip.png, F-swap.png, F-swap-tip.png, F-profiles.png,
 //   F-menu.png, F-1280.png, F-1280-tip.png, F-1280-swap.png, F-1500.png, F-natural.png;
 // • --settings — против программы у часов, её запускает её скрытая проверка (rust/tray/src/check_window.rs): настройки
-//   автомодуля выключателями и ползунками, затем выбор блоков, подсветка, размер — и закрытие окна; картинка F;
+//   автомодуля выключателями и ползунком, профили щелчками (с отметкой «загружать при старте Windows»), затем выбор
+//   блоков, подсветка, размер — и закрытие окна; картинки F, F-profiles.png;
 // • --reopened — второй запуск с той же папкой (--data): окно открылось таким, каким его закрыли; картинка F.
 // • --lost — CoreMapTray пропадает без «bye» (его проверка рвёт свой канал, как при падении): окно остаётся и одной
 //   строкой говорит, что CoreMapTray не отвечает; картинка F.
 // • --bye — CoreMapTray выходит («Выход» в меню) и говорит «bye»: окно записывает себя в файл окна и закрывается.
 //
 // Статистика — из своей временной папки: придуманные срезы за сегодня (полный день, 43 200 строк — цена разбора дня),
-// вчера и 40 дней назад (не должны войти), обрезанная последняя строка, журнал автомодуля и журнал профилей. Что
+// вчера и 40 дней назад (не должны войти), обрезанная последняя строка и журнал автомодуля. Что
 // должно получиться, генератор считает сам, не разбором файлов: по нему сверяются точки графика. Папка удаляется в конце.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -33,7 +34,7 @@ use slint::{ComponentHandle, LogicalPosition, Model, PhysicalSize, Rgb8Pixel};
 
 use crate::AppWindow;
 use crate::chart::{self, Curves, E_COLORS, P_COLORS, Scale};
-use crate::panels::f;
+use crate::panels::{self, f};
 use crate::pipe::{Event, Link};
 use crate::samples;
 use crate::store::Digest;
@@ -61,12 +62,14 @@ pub enum Mode {
 }
 
 /// Что проход --settings делает с настройками и окном, а --reopened и проверка программы у часов
-/// (`rust/tray/src/check_window.rs`, `WINDOW_LIMIT`, `WINDOW_DEPTH`) ждут: отсечка, глубина, размер перед закрытием.
+/// (`rust/tray/src/check_window.rs`, `WINDOW_LIMIT`) ждут: отсечка, размер перед закрытием.
 const LIMIT_TO: i32 = 88;
-const DEPTH_TO: i32 = 6;
 const CLOSED_SIZE: (u32, u32) = (1500, 900);
-/// Жестов с настройками в проходе --settings: включить, отсечка, глубина, подтягивание, выключить.
-const GESTURES: u32 = 5;
+/// Жестов с настройками в проходе --settings: включить, отсечка, подтягивание, выключить (глубины нет, DECISIONS #38).
+const GESTURES: u32 = 4;
+/// Профиль, который проверка сохраняет, применяет, перезаписывает и удаляет щелчками (его же ищет проверка программы у
+/// часов в истории профилей, `WINDOW_PROFILE`).
+const PROFILE: &str = "проверка окна";
 /// Размер окна в проходе --bye: в файле окна его нет (там `CLOSED_SIZE`), записать его может только «bye». Его же ждёт
 /// проверка программы у часов (`rust/tray/src/check_window.rs`, `WINDOW_LEFT_SIZE`).
 const LEFT_SIZE: (u32, u32) = (1400, 860);
@@ -612,11 +615,6 @@ impl Check {
             self.check(
                 actions == s.actions,
                 format!("действий автомодуля с блоком {actions}, в журнале {}", s.actions),
-            );
-            let history = self.view.borrow().history_shown();
-            self.check(
-                history == s.history,
-                format!("строк истории профилей {history}, в журнале {}", s.history),
             );
         }
         // Второй блок — к первому: две линии, ось та же.
@@ -1258,15 +1256,15 @@ impl Check {
         self.check(set, format!("пункт ×{target} поставил потолок"));
         let closed = !self.ui.get_menu_shown();
         self.check(closed, "меню закрылось");
-        let diff = target - limits.was[e_block.first];
-        let expected = crate::panels::signed(diff);
-        let delta = self
-            .view
-            .borrow()
-            .shown(e_block.index)
-            .map(|t| t.delta.to_string())
-            .unwrap_or_default();
-        self.check(delta == expected, format!("на плитке разница с «было»: «{delta}»"));
+        self.pump(|v| v.profiles.is_some(), 5.0);
+        let expected = self
+            .profile_value(e_block.first)
+            .map_or_else(String::new, |p| panels::signed(target - p));
+        let delta = self.delta(e_block.index);
+        self.check(
+            delta == expected,
+            format!("на плитке разница с выбранным профилем: «{delta}»"),
+        );
         let mut args = Map::new();
         args.insert("block".into(), e_block.index.into());
         args.insert("ratio".into(), before.into());
@@ -1297,141 +1295,309 @@ impl Check {
         self.click(x, y, PointerEventButton::Left);
     }
 
-    /// 5. Профили щелчками: сохранить как, открыть заводские, откатить, открыть сохранённый; затем всё как было.
+    /// Щелчок по строке списка: выбор профиля.
+    fn choose(&mut self, key: &str) -> bool {
+        let Some(row) = self.set_row(key) else {
+            self.check(false, format!("строки «{key}» в списке нет"));
+            return false;
+        };
+        self.press(row);
+        self.view.borrow().chosen.as_deref() == Some(key)
+    }
+
+    /// Потолок выбранного профиля у ядра; None — профиль не выбран или его потолков нет.
+    fn profile_value(&self, first: usize) -> Option<i64> {
+        let v = self.view.borrow();
+        panels::chosen_ratios(v.profiles.as_ref(), v.limits.as_ref(), v.chosen.as_deref())
+            .and_then(|r| r.get(first).copied())
+    }
+
+    /// Разница на плитке блока, как она показана.
+    fn delta(&self, block: usize) -> String {
+        self.view
+            .borrow()
+            .shown(block)
+            .map(|t| t.delta.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Строка панели профилей и доступность кнопок, как они показаны: (строка, применить, сохранить, отметка доступна,
+    /// отметка стоит).
+    fn panel(&self) -> (String, bool, bool, bool, bool) {
+        let ui = &self.ui;
+        (
+            ui.get_prof_status().to_string(),
+            ui.get_can_apply(),
+            ui.get_can_save(),
+            ui.get_can_startup(),
+            ui.get_startup_on(),
+        )
+    }
+
+    /// Профиль запуска по теме профилей: название; None — его нет.
+    fn startup_name(&self) -> Option<String> {
+        let v = self.view.borrow();
+        let p = v.profiles.as_ref()?;
+        p.startup.exists.then(|| p.startup.name.clone()).flatten()
+    }
+
+    /// Шаг 5 — профили щелчками (DECISIONS #38): окно открылось на профиле запуска; выбор строки ничего не ставит и ничего не
+    /// шлёт, а строка и плитки показывают разницу выбранного с текущим; «сохранить как», «применить» и «сохранить»
+    /// делают их одинаковыми и сереют; «удалить». Против программы у часов — ещё отметка «загружать при старте Windows»:
+    /// доступна только у сохранённого профиля, переходит на другой, снимается; в конце — как была. Потолки — как были.
     #[expect(
         clippy::too_many_lines,
         reason = "one scripted round trip, step by step, read top to bottom"
     )]
     fn profiles(&mut self, limits: &Limits, e_block: &BlockInfo) {
-        const NAME: &str = "проверка окна";
         let arrived = self.pump(|v| v.profiles.is_some(), 5.0);
         if !self.check(arrived && self.ui.get_has_profiles(), "профили пришли, панель показана")
         {
             return;
         }
+        let (chosen, wanted, logon) = {
+            let v = self.view.borrow();
+            (
+                v.chosen.clone(),
+                v.profiles.as_ref().map(panels::default_choice),
+                self.startup_name(),
+            )
+        };
+        self.check(
+            chosen.is_some() && chosen == wanted,
+            format!("выбран профиль запуска (или совпадающий с текущим, или заводские): {chosen:?}, профиль запуска {logon:?}"),
+        );
         let first = e_block.first;
         let fused = limits.fused[first];
-        let lowered = fused - 1;
-        // Потолок кластера на ступень ниже заводского — то, что будет сохранено.
+        let Some(start) = limit(&self.view.borrow(), first) else {
+            self.check(false, format!("потолок {} неизвестен", e_block.name));
+            return;
+        };
+        let target = if start == fused - 1 { fused - 2 } else { fused - 1 };
+        let name = &e_block.name;
+
+        // Текущее состояние: потолок кластера на ступень ниже — то, что будет сохранено.
         let mut args = Map::new();
         args.insert("block".into(), e_block.index.into());
-        args.insert("ratio".into(), lowered.into());
+        args.insert("ratio".into(), target.into());
         self.view.borrow_mut().order("limit.set", args, "Потолок не изменён");
-        let set = self.pump(|v| limit(v, first) == Some(lowered), 5.0);
-        self.check(set, format!("потолок {} ×{lowered} для сохранения", e_block.name));
+        let lowered = self.pump(|v| limit(v, first) == Some(target), 5.0);
+        self.check(lowered, format!("текущее состояние: {name} ×{target}"));
 
-        // Сохранить как: щелчок в поле, название с клавиатуры, кнопка.
+        // Сохранить как: щелчок в поле, название с клавиатуры, кнопка — новый профиль выбран и совпадает с текущим.
         let field = (
             self.ui.get_prof_x() + self.ui.get_pad() + 40.0,
             self.ui.get_row_c_y() + self.ui.get_btn_h() / 2.0,
         );
         self.press(field);
-        self.type_text(NAME);
+        self.type_text(PROFILE);
         let typed = self.ui.get_prof_name().to_string();
         self.check(
-            typed == NAME && self.ui.get_can_save_as(),
+            typed == PROFILE && self.ui.get_can_save_as(),
             format!("в поле названия «{typed}», «сохранить как» доступна"),
         );
-        let save_as = (
+        let save_as_button = (
             self.ui.get_prof_x() + self.ui.get_prof_w() - self.ui.get_pad() - 64.0,
             self.ui.get_row_c_y() + self.ui.get_btn_h() / 2.0,
         );
-        self.press(save_as);
+        self.press(save_as_button);
         let saved = self.pump(
             |v| {
-                v.profiles
-                    .as_ref()
-                    .is_some_and(|p| p.standing.as_deref() == Some(NAME) && p.sets.iter().any(|s| s.name == NAME))
+                v.chosen.as_deref() == Some(PROFILE)
+                    && v.profiles.as_ref().is_some_and(|p| {
+                        p.standing.as_deref() == Some(PROFILE) && p.sets.iter().any(|s| s.name == PROFILE)
+                    })
             },
             5.0,
         );
-        let cleared = self.pump(|_| false, 0.5) || self.ui.get_prof_name().is_empty();
+        let (status, apply, save, ..) = self.panel();
         self.check(
-            saved && cleared,
-            format!("«сохранить как» записал «{NAME}», он стоит сейчас, поле очищено"),
+            saved && self.ui.get_prof_name().is_empty() && status == format!("«{PROFILE}» — совпадает с текущим") && !apply && !save,
+            format!("«сохранить как» записал «{PROFILE}» и выбрал его: «{status}», применить {apply}, сохранить {save} — обе серые"),
         );
-        let delta = self
-            .view
-            .borrow()
-            .shown(e_block.index)
-            .map(|t| t.delta.to_string())
-            .unwrap_or_default();
-        self.check(
-            delta.is_empty(),
-            format!("после сохранения разницы с «было» нет: «{delta}»"),
-        );
+        let delta = self.delta(e_block.index);
+        self.check(delta.is_empty(), format!("на плитке разницы нет: «{delta}»"));
 
-        // Открыть заводские: строка списка, кнопка «открыть».
-        let Some(row) = self.set_row("") else {
-            self.check(false, "строки «заводские» в списке нет");
-            return;
-        };
-        self.press(row);
-        let open = self.button(self.ui.get_row_b_y(), 0);
-        let enabled = self.ui.get_can_open();
-        self.press(open);
-        let opened = self.pump(|v| limit(v, first) == Some(fused), 5.0);
-        let delta = self
-            .view
-            .borrow()
-            .shown(e_block.index)
-            .map(|t| t.delta.to_string())
-            .unwrap_or_default();
+        // Выбор строки ничего не ставит и не шлёт: «заводские» — только другая строка и плитки.
+        let sent = self.view.borrow().sent;
+        let picked = self.choose("");
+        self.pump(|_| false, 0.6);
+        let (status, apply, save, can_mark, _) = self.panel();
+        let delta = self.delta(e_block.index);
+        let still = limit(&self.view.borrow(), first) == Some(target) && self.view.borrow().sent == sent;
         self.check(
-            enabled && opened && delta == "+1",
-            format!("«открыть» заводские: ×{fused}, на плитке «{delta}»"),
+            picked
+                && still
+                && status.starts_with("заводские — отличается:")
+                && apply
+                && !save
+                && !can_mark
+                && delta == panels::signed(target - fused),
+            format!(
+                "щелчок по «заводские»: ничего не поставлено и не послано ({still}); «{status}»; на плитке «{delta}»; применить {apply}, сохранить {save}, отметка при старте {can_mark}"
+            ),
         );
         let shot = self.shot("profiles");
-        self.check(shot, "картинка: открыты заводские, «было» — сохранённый");
+        self.check(shot, "картинка: выбраны заводские, разница с текущим");
 
-        // Откатить к «было».
-        let revert = self.button(self.ui.get_row_a_y(), 1);
-        self.press(revert);
-        let reverted = self.pump(|v| limit(v, first) == Some(lowered), 5.0);
-        self.check(reverted, format!("«откатить» вернул ×{lowered}"));
+        // Текущее состояние меняется — выбранный профиль показывает разницу, обе кнопки доступны.
+        self.choose(PROFILE);
+        let mut args = Map::new();
+        args.insert("block".into(), e_block.index.into());
+        args.insert("ratio".into(), start.into());
+        self.view.borrow_mut().order("limit.set", args, "Потолок не изменён");
+        self.pump(|v| limit(v, first) == Some(start), 5.0);
+        let (status, apply, save, ..) = self.panel();
+        let delta = self.delta(e_block.index);
+        let expected = format!("«{PROFILE}» — отличается: {name} ×{target} → сейчас ×{start}");
+        self.check(
+            status == expected && apply && save && delta == panels::signed(start - target),
+            format!("текущее изменилось: «{status}», на плитке «{delta}»; применить {apply}, сохранить {save}"),
+        );
 
-        // Заводские, затем открыть сохранённый.
-        self.press(row);
-        self.press(open);
-        self.pump(|v| limit(v, first) == Some(fused), 5.0);
-        if let Some(mine) = self.set_row(NAME) {
-            self.press(mine);
-            self.press(open);
-        }
-        let back = self.pump(
+        // «Применить»: потолки профиля — в процессор; совпадает, обе серые.
+        let apply_at = self.button(self.ui.get_row_b_y(), 0);
+        self.press(apply_at);
+        let applied = self.pump(|v| limit(v, first) == Some(target), 5.0);
+        self.pump(|_| false, 0.3);
+        let (status, apply, save, ..) = self.panel();
+        self.check(
+            applied && status == format!("«{PROFILE}» — совпадает с текущим") && !apply && !save,
+            format!("«применить» поставил ×{target}: «{status}», применить {apply}, сохранить {save}"),
+        );
+
+        // «Сохранить»: текущее — в профиль; совпадает, обе серые.
+        let mut args = Map::new();
+        args.insert("block".into(), e_block.index.into());
+        args.insert("ratio".into(), start.into());
+        self.view.borrow_mut().order("limit.set", args, "Потолок не изменён");
+        self.pump(
+            |v| limit(v, first) == Some(start) && v.profile_shown().is_some_and(|p| p.can_save),
+            5.0,
+        );
+        let save_button = self.button(self.ui.get_row_b_y(), 1);
+        let enabled = self.ui.get_can_save();
+        self.press(save_button);
+        let rewritten = self.pump(
             |v| {
-                limit(v, first) == Some(lowered)
-                    && v.profiles.as_ref().is_some_and(|p| p.standing.as_deref() == Some(NAME))
+                v.profiles.as_ref().is_some_and(|p| {
+                    p.sets
+                        .iter()
+                        .any(|s| s.name == PROFILE && s.ratios.get(first) == Some(&start))
+                })
             },
             5.0,
         );
-        self.check(back, format!("«открыть» «{NAME}» вернул ×{lowered}"));
-
-        // Как было: заводские, «принять», удалить сохранённый.
-        self.press(row);
-        self.press(open);
-        self.pump(|v| limit(v, first) == Some(fused), 5.0);
-        let accept = self.button(self.ui.get_row_a_y(), 0);
-        self.press(accept);
-        let accepted = self.pump(
-            |v| v.limits.as_ref().is_some_and(|l| l.was.get(first) == Some(&fused)),
-            5.0,
+        self.pump(|_| false, 0.3);
+        let (status, apply, save, ..) = self.panel();
+        self.check(
+            enabled && rewritten && status == format!("«{PROFILE}» — совпадает с текущим") && !apply && !save,
+            format!("«сохранить» (была доступна: {enabled}) записал ×{start} в «{PROFILE}»: «{status}», обе серые"),
         );
-        self.check(accepted, "«принять» сделал заводские «было»");
-        if let Some(mine) = self.set_row(NAME) {
-            self.press(mine);
-            let delete = self.button(self.ui.get_row_b_y(), 2);
-            self.press(delete);
+
+        // Отметка «загружать при старте Windows».
+        self.choose("");
+        let factory = self.panel().3;
+        self.choose(PROFILE);
+        let mine = self.panel().3;
+        self.check(
+            !factory && mine,
+            format!(
+                "отметка «при старте Windows»: у «заводские» недоступна ({factory}), у сохранённого — доступна ({mine})"
+            ),
+        );
+        if self.mode == Mode::Settings {
+            self.startup_marks(logon.as_deref());
         }
+
+        // «Удалить».
+        self.choose(PROFILE);
+        let delete = self.button(self.ui.get_row_b_y(), 2);
+        self.press(delete);
         let deleted = self.pump(
             |v| {
                 v.profiles
                     .as_ref()
-                    .is_some_and(|p| !p.sets.iter().any(|s| s.name == NAME))
+                    .is_some_and(|p| !p.sets.iter().any(|s| s.name == PROFILE))
             },
             5.0,
         );
-        self.check(deleted, format!("«удалить» убрал «{NAME}»"));
+        let back = limit(&self.view.borrow(), first) == Some(start);
+        self.check(
+            deleted && back,
+            format!("«удалить» убрал «{PROFILE}»; потолок {name} — как до шага (×{start}): {back}"),
+        );
+    }
+
+    /// Отметка «загружать при старте Windows» щелчками (против программы у часов): ставится у «проверка окна», переходит
+    /// на другой сохранённый профиль, снимается; в конце — профиль запуска, какой был (`logon`).
+    fn startup_marks(&mut self, logon: Option<&str>) {
+        let marked = |v: &View| {
+            v.profile_shown()
+                .map(|p| {
+                    p.rows
+                        .iter()
+                        .filter(|r| r.startup)
+                        .map(|r| r.key.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let mark_at = (
+            self.ui.get_prof_x() + self.ui.get_pad() + 7.0,
+            self.ui.get_startup_y() + 11.0,
+        );
+        self.choose(PROFILE);
+        self.press(mark_at);
+        let on = self.pump(
+            |v| marked(v) == [PROFILE] && v.profile_shown().is_some_and(|p| p.startup_on),
+            5.0,
+        );
+        self.check(
+            on && self.startup_name().as_deref() == Some(PROFILE),
+            format!(
+                "щелчок по отметке: «{PROFILE}» загружается при старте, знак ► только у него ({:?})",
+                marked(&self.view.borrow())
+            ),
+        );
+        let other = self
+            .view
+            .borrow()
+            .profiles
+            .as_ref()
+            .and_then(|p| p.sets.iter().map(|s| s.name.clone()).find(|n| n != PROFILE));
+        if let Some(other) = other {
+            self.choose(&other);
+            let before = self.panel().4;
+            self.press(mark_at);
+            let moved = self.pump(|v| marked(v) == [other.as_str()], 5.0);
+            self.check(
+                !before && moved && self.startup_name().as_deref() == Some(other.as_str()),
+                format!(
+                    "отметка у «{other}»: перешла на него, у «{PROFILE}» снята ({:?})",
+                    marked(&self.view.borrow())
+                ),
+            );
+            self.press(mark_at);
+            let cleared = self.pump(|v| marked(v).is_empty(), 5.0);
+            self.check(
+                cleared && self.startup_name().is_none() && !self.panel().4,
+                "снять отметку у отмеченного: при старте ничего не загружается, знаков ► нет",
+            );
+        } else {
+            self.note("других сохранённых профилей нет — перенос отметки не проверен");
+            self.choose(PROFILE);
+            self.press(mark_at);
+            let cleared = self.pump(|v| marked(v).is_empty(), 5.0);
+            self.check(cleared && self.startup_name().is_none(), "снять отметку: знаков ► нет");
+        }
+        // Как было.
+        if let Some(logon) = logon {
+            self.choose(logon);
+            self.press(mark_at);
+            let again = self.pump(|v| marked(v) == [logon], 5.0);
+            self.check(again, format!("профиль запуска снова «{logon}», как до шага"));
+        }
     }
 
     /// Шаг 6: окно 1280×800, 1500×900 и по содержимому — разделы не налезают друг на друга и не выходят за окно;
@@ -1589,35 +1755,27 @@ impl Check {
         found
     }
 
-    /// Проход --settings: настройки автомодуля, потом память окна до закрытия.
+    /// Проход --settings: настройки автомодуля, профили щелчками, потом память окна до закрытия.
     fn settings_steps(&mut self) {
         let Some((hello, limits)) = self.arrival() else { return };
         let Some((p, e)) = self.p_and_e(&hello) else { return };
         self.statistics(&hello, &limits, &e);
         self.auto_settings();
+        self.profiles(&limits, &e);
         self.memory_before_close(&p, &e);
     }
 
-    /// Мышь на дорожку ползунка: число `value` — координаты окна (как Slint считает число под мышью, ValueSlider.at).
-    fn slider_x(&self, value: i32, depth: bool) -> (f32, f32) {
+    /// Мышь на дорожку ползунка отсечки: число `value` — координаты окна (как Slint считает число под мышью,
+    /// ValueSlider.at).
+    fn slider_x(&self, value: i32) -> (f32, f32) {
         let ui = &self.ui;
-        let (x, y, w, low, high) = if depth {
-            (
-                ui.get_depth_track_x(),
-                ui.get_depth_track_y(),
-                ui.get_depth_track_w(),
-                ui.get_auto_depth_min(),
-                ui.get_auto_depth_max(),
-            )
-        } else {
-            (
-                ui.get_limit_track_x(),
-                ui.get_limit_track_y(),
-                ui.get_limit_track_w(),
-                ui.get_auto_limit_min(),
-                ui.get_auto_limit_max(),
-            )
-        };
+        let (x, y, w, low, high) = (
+            ui.get_limit_track_x(),
+            ui.get_limit_track_y(),
+            ui.get_limit_track_w(),
+            ui.get_auto_limit_min(),
+            ui.get_auto_limit_max(),
+        );
         #[expect(clippy::cast_precision_loss, reason = "slider values are tens: exact in f32")]
         let share = (value - low) as f32 / (high - low).max(1) as f32;
         (x + share * w, y)
@@ -1626,8 +1784,8 @@ impl Check {
     /// Перетаскивание ползунка настоящими событиями мыши: нажать на ручке `from`, вести через середины всех чисел до
     /// `to` (середина — чтобы число под мышью не зависело от округления на краю), отпустить. После каждого шага —
     /// `during(проверка, число под мышью)`.
-    fn drag(&mut self, from: i32, to: i32, depth: bool, mut during: impl FnMut(&mut Check, i32)) {
-        let (x0, y) = self.slider_x(from, depth);
+    fn drag(&mut self, from: i32, to: i32, mut during: impl FnMut(&mut Check, i32)) {
+        let (x0, y) = self.slider_x(from);
         let at = LogicalPosition::new(x0, y);
         self.ui
             .window()
@@ -1642,7 +1800,7 @@ impl Check {
         let mut x = x0;
         while under != to {
             under += step;
-            x = self.slider_x(under, depth).0;
+            x = self.slider_x(under).0;
             self.ui.window().dispatch_event(WindowEvent::PointerMoved {
                 position: LogicalPosition::new(x, y),
             });
@@ -1657,9 +1815,9 @@ impl Check {
         self.pump(|_| true, 0.0);
     }
 
-    /// Настройки автомодуля (DECISIONS #36): выключатель, ползунки отсечки и глубины, подтягивание — щелчками и
-    /// перетаскиваниями; команда уходит одна на жест, программа у часов подтверждает темой settings и состоянием,
-    /// линия отсечки на графике идёт за ползунком и встаёт на подтверждённое.
+    /// Настройки автомодуля (DECISIONS #36, #38): выключатель, ползунок отсечки, подтягивание — щелчками и
+    /// перетаскиванием; команда уходит одна на жест, программа у часов подтверждает темой settings и состоянием, линия
+    /// отсечки на графике идёт за ползунком и встаёт на подтверждённое. Глубины нет.
     #[expect(
         clippy::too_many_lines,
         reason = "one scripted round of gestures, read top to bottom"
@@ -1675,7 +1833,6 @@ impl Check {
             && ui.get_has_auto()
             && ui.get_auto_ready()
             && i64::from(ui.get_auto_limit()) == start.limit
-            && i64::from(ui.get_auto_depth()) == start.depth
             && ui.get_auto_on() == start.on
             && ui.get_auto_step_up() == start.step_up
             && i64::from(ui.get_auto_limit_min()) == start.limit_range[0]
@@ -1683,20 +1840,16 @@ impl Check {
         self.check(
             shown,
             format!(
-                "настройки показаны так, как их прислал CoreMapTray: {} {} °C, глубина {}, подтягивание {}, отсечка {}–{} °C",
+                "настройки показаны так, как их прислал CoreMapTray: {} {} °C, подтягивание {}, отсечка {}–{} °C",
                 if start.on { "вкл" } else { "выкл" },
                 start.limit,
-                start.depth,
                 start.step_up,
                 start.limit_range[0],
                 start.limit_range[1]
             ),
         );
-        if start.on || i64::from(LIMIT_TO) == start.limit || i64::from(DEPTH_TO) == start.depth {
-            self.check(
-                false,
-                "проверка ждёт выключенный автомодуль с другими отсечкой и глубиной",
-            );
+        if start.on || i64::from(LIMIT_TO) == start.limit {
+            self.check(false, "проверка ждёт выключенный автомодуль с другой отсечкой");
             return;
         }
         // Отсечка — абсолютная температура: её линия — на абсолютной шкале (на шкале над кристаллом её места нет).
@@ -1708,7 +1861,6 @@ impl Check {
         );
         let sent = self.view.borrow().sent;
         let start_limit = i32::try_from(start.limit).unwrap_or(LIMIT_TO);
-        let start_depth = i32::try_from(start.depth).unwrap_or(DEPTH_TO);
 
         // 1. Включить — щелчок по выключателю.
         let (x, y) = (self.ui.get_auto_switch_x(), self.ui.get_auto_switch_y());
@@ -1741,7 +1893,7 @@ impl Check {
 
         // 2. Ползунок отсечки — до LIMIT_TO: пока тянут, команды нет, а ручка и линия идут за мышью.
         let mut during: Vec<(i32, i32, String, u32)> = Vec::new();
-        self.drag(start_limit, LIMIT_TO, false, |c, under| {
+        self.drag(start_limit, LIMIT_TO, |c, under| {
             during.push((
                 under,
                 c.ui.get_limit_shown(),
@@ -1788,21 +1940,13 @@ impl Check {
         let shot = self.shot("main");
         self.check(shot, "картинка: настройки автомодуля под графиком, отсечка на графике");
 
-        // 3. Ползунок глубины — до DEPTH_TO, одной командой.
-        self.drag(start_depth, DEPTH_TO, true, |_, _| {});
-        let depth = self.pump(|v| v.auto.as_ref().is_some_and(|a| a.depth == i64::from(DEPTH_TO)), 5.0);
-        self.check(
-            depth && self.view.borrow().sent == sent + 3 && self.ui.get_auto_depth() == DEPTH_TO,
-            format!("ползунок глубины отпустили на {DEPTH_TO} — одна команда, программа подтвердила"),
-        );
-
-        // 4. Подтягивание — щелчок по его выключателю.
+        // 3. Подтягивание — щелчок по его выключателю.
         let (x, y) = (self.ui.get_step_switch_x(), self.ui.get_step_switch_y());
         self.click(x, y, PointerEventButton::Left);
         let up = self.pump(|v| v.auto.as_ref().is_some_and(|a| a.step_up), 5.0);
         self.check(up && self.ui.get_auto_step_up(), "щелчок включил подтягивание вверх");
 
-        // 5. Выключить: линии отсечки нет.
+        // 4. Выключить: линии отсечки нет.
         let (x, y) = (self.ui.get_auto_switch_x(), self.ui.get_auto_switch_y());
         self.click(x, y, PointerEventButton::Left);
         let off = self.pump(
@@ -1909,10 +2053,10 @@ impl Check {
         let came = self.pump(|v| v.auto.is_some(), 5.0);
         let auto = self.view.borrow().auto.clone();
         self.check(
-            came && auto.as_ref().is_some_and(|a| {
-                !a.on && a.limit == i64::from(LIMIT_TO) && a.depth == i64::from(DEPTH_TO) && a.step_up
-            }) && self.ui.get_auto_limit() == LIMIT_TO
-                && self.ui.get_auto_depth() == DEPTH_TO,
+            came && auto
+                .as_ref()
+                .is_some_and(|a| !a.on && a.limit == i64::from(LIMIT_TO) && a.step_up)
+                && self.ui.get_auto_limit() == LIMIT_TO,
             format!("настройки автомодуля — от CoreMapTray, какими их оставили: {auto:?}"),
         );
         self.statistics(&hello, &limits, &e);
@@ -2020,7 +2164,6 @@ struct Synthetic {
     today_rows: u64,
     today_bytes: u64,
     actions: usize,
-    history: usize,
 }
 
 /// Отрезок строк одного файла: `count` срезов дня `date` с шагом `step_ms` от `start_ms` после полуночи; `from` — номер
@@ -2167,10 +2310,6 @@ fn exact_quantile(rows: &[(f64, u64)], share: (u64, u64)) -> Option<f64> {
     None
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one synthetic data folder — three sample files and two logs — reads best top to bottom"
-)]
 fn synthesize(
     dir: &Path,
     hello: &Hello,
@@ -2285,24 +2424,5 @@ fn synthesize(
     ];
     std::fs::write(dir.join("auto-log.jsonl"), log.join("\n") + "\n")?;
     s.actions = 3;
-    // Журнал смен профиля: две записи в том виде, в каком их пишет программа входа (потолки по ядрам до и после).
-    let before = serde_json::Value::from(limits.fused.clone()).to_string(); // a dozen numbers, once
-    let mut lowered = limits.fused.clone();
-    for &i in &e_block.members {
-        if let Some(v) = lowered.get_mut(i) {
-            *v -= 2;
-        }
-    }
-    let after = serde_json::Value::from(lowered).to_string();
-    let history = [
-        format!(
-            r#"{{"time":"{date}T09:00:00.0000000+03:00","at":1,"act":"open","name":"тихий","before":{before},"after":{after}}}"#
-        ),
-        format!(
-            r#"{{"time":"{date}T09:10:00.0000000+03:00","at":2,"act":"save","name":"тихий","before":{after},"after":{after}}}"#
-        ),
-    ];
-    std::fs::write(dir.join("profile-log.jsonl"), history.join("\n") + "\n")?;
-    s.history = 2;
     Ok(s)
 }

@@ -360,11 +360,11 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
     r.check(
         auto["on"] == false
             && auto["limit"].is_i64()
-            && auto["depth"].is_i64()
             && auto["stepUp"].is_boolean()
             && auto["limitRange"] == json!([60, 95])
-            && auto["depthRange"] == json!([1, 8]),
-        &format!("settings при знакомстве: {auto}"),
+            && auto.get("depth").is_none()
+            && auto.get("depthRange").is_none(),
+        &format!("settings при знакомстве (глубины нет): {auto}"),
     );
     let file = data.join("tray.json");
     let before = fs::read_to_string(&file).unwrap_or_default();
@@ -372,7 +372,7 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
     for bad in [
         json!({ "limit": 96 }),
         json!({ "limit": 85.5 }),
-        json!({ "depth": 0 }),
+        json!({ "depth": 4 }),
         json!({ "on": true, "limit": 59 }),
         json!({ "limt": 80 }),
         json!({}),
@@ -425,10 +425,11 @@ fn auto_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut 
 }
 
 /// Что настоящее окно делает в своей проверке настроек (rust/window/src/check.rs, `settings`): включает автомодуль,
-/// тянет ползунок отсечки до 88 °C и глубины до 6, включает подтягивание, выключает автомодуль — пять жестов.
+/// тянет ползунок отсечки до 88 °C, включает подтягивание, выключает автомодуль — четыре жеста (глубины нет, #38).
 const WINDOW_LIMIT: i32 = 88;
-const WINDOW_DEPTH: i32 = 6;
-const WINDOW_GESTURES: usize = 5;
+const WINDOW_GESTURES: usize = 4;
+/// Название профиля, который окно в той же проверке сохраняет, применяет, перезаписывает и удаляет щелчками.
+const WINDOW_PROFILE: &str = "проверка окна";
 
 /// Отчёт окна проверки — рядом с его картинкой.
 fn report_of(picture: &Path) -> PathBuf {
@@ -503,12 +504,14 @@ fn window_report(r: &mut Report, picture: &Path, pass: &[&str], code: Option<i32
     );
 }
 
-/// 12n. Настоящее окно CoreMapWindow.exe против программы входа (DECISIONS #36), два запуска с одной папкой окна.
-/// Первый (--settings) щёлкает выключатели и тянет ползунки настоящими событиями мыши и смотрит, что вернулось в окно;
+/// 12n. Настоящее окно CoreMapWindow.exe против программы входа (DECISIONS #36, #38), два запуска с одной папкой окна.
+/// Первый (--settings) щёлкает выключатели и тянет ползунок настоящими событиями мыши и смотрит, что вернулось в окно;
 /// здесь — что дошло до программы входа: выбор, data\tray.json (только настройки автомодуля), по строке журнала на
-/// жест, а не на каждый шаг ползунка. Затем он выбирает блоки, подсветку, размер и закрывается — это окно пишет в
-/// свой файл, программа входа о нём не знает. Второй (--reopened) — новое окно, новое знакомство: открылось ли оно
-/// таким, каким его закрыли. Выбор автомодуля после шага возвращается прежним: дальше шаги на нём.
+/// жест, а не на каждый шаг ползунка. Затем щелчками — профили: выбор строки ничего не ставит, «сохранить как»,
+/// «применить», «сохранить», «удалить»; здесь — что стоит, profiles.json, профиль запуска и история. Затем он выбирает
+/// блоки, подсветку, размер и закрывается — это окно пишет в свой файл, программа входа о нём не знает. Второй
+/// (--reopened) — новое окно, новое знакомство: открылось ли оно таким, каким его закрыли. Выбор автомодуля после шага
+/// возвращается прежним: дальше шаги на нём.
 fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, out: &Path, data: &Path) {
     let exe = root.join(WINDOW_EXE);
     if !exe.exists() {
@@ -525,6 +528,13 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     let folder_arg = folder.display().to_string();
     let before = app.auto_choice();
     let lines = logged(app, "автомодуль (окно)");
+    let ceilings = ceilings_now(app);
+    let history = profile_log(data).len();
+    let logon = app.store().read_profile().ok().flatten().map(|p| p.name);
+    let (marked, unmarked) = (
+        logged(app, "при старте Windows загружается"),
+        logged(app, "больше не загружается при старте Windows"),
+    );
     window_pass(
         r,
         app,
@@ -538,7 +548,6 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     let want = Choice {
         on: false,
         limit: WINDOW_LIMIT,
-        depth: WINDOW_DEPTH,
         step_up: true,
     };
     r.check(
@@ -552,6 +561,31 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
             "строк журнала «автомодуль (окно)»: {gestures} — по одной на жест ({WINDOW_GESTURES}), не на каждый шаг ползунка"
         ),
     );
+    // Профили щелчками окна: что окно оставило программе входа.
+    let acts: Vec<(String, Value)> = profile_log(data)
+        .into_iter()
+        .skip(history)
+        .filter(|l| l["name"] == WINDOW_PROFILE)
+        .map(|l| (l["act"].as_str().unwrap_or("").to_string(), l))
+        .collect();
+    let names: Vec<&str> = acts.iter().map(|(a, _)| a.as_str()).collect();
+    let left = app.store().read_sets().unwrap_or_default();
+    let logon_after = app.store().read_profile().ok().flatten().map(|p| p.name);
+    r.check(
+        names == ["save", "open", "save", "delete"]
+            && !left.iter().any(|s| s.name == WINDOW_PROFILE)
+            && logon_after == logon
+            && ceilings_now(app) == ceilings,
+        &format!(
+            "профили из окна дошли до программы входа: история {names:?} (сохранить как, применить, сохранить, удалить), набора больше нет, профиль запуска как до окна ({logon_after:?}), потолки как до окна"
+        ),
+    );
+    let marks = logged(app, "при старте Windows загружается") - marked;
+    let unmarks = logged(app, "больше не загружается при старте Windows") - unmarked;
+    r.check(
+        marks >= 1 && unmarks >= 1,
+        &format!("отметка «загружать при старте Windows» щелчками окна: поставлена {marks} раз, снята {unmarks} раз"),
+    );
     // Второй запуск — и после неудачи первого: отчёт покажет, что из запомненного дошло.
     window_pass(
         r,
@@ -564,7 +598,6 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
     // Прежний выбор: следующие шаги проверки рассчитаны на него.
     let mut back = serde_json::Map::new();
     back.insert("limit".into(), json!(before.limit));
-    back.insert("depth".into(), json!(before.depth));
     back.insert("stepUp".into(), json!(before.step_up));
     back.insert("on".into(), json!(before.on));
     let refused = app.set_auto(shell, &back);
@@ -572,6 +605,15 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
         refused.is_none(),
         &format!("прежний выбор автомодуля возвращён {refused:?}"),
     );
+}
+
+/// Строки data\profile-log.jsonl по порядку (испорченные пропускаются).
+fn profile_log(data: &Path) -> Vec<Value> {
+    fs::read_to_string(data.join("profile-log.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 fn cores_of(value: &Value) -> Vec<i64> {
@@ -597,7 +639,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
         "без окна и автомодуля датчики не читаются (канал ждёт окно, таймера нет)",
     );
 
-    // 12a. Знакомство: ответ, hello, limits, profiles, history, потом состояния.
+    // 12a. Знакомство: ответ, hello, limits, profiles, потом состояния.
     let mut client = Client::hello(&pipe);
     let greeted = wait(shell, app, &mut client, Duration::from_secs(5), |c| {
         !c.of("state").is_empty() || c.closed()
@@ -629,15 +671,17 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     r.check(
         limits["choices"].as_array().map(Vec::len) == Some(blocks)
             && limits["fused"].as_array().map(Vec::len) == Some(cores)
-            && limits["was"].as_array().map(Vec::len) == Some(cores),
-        "limits: заводские, «было», допустимые значения по блокам",
+            && limits.get("was").is_none(),
+        "limits: заводские и допустимые значения по блокам; «было» больше нет (DECISIONS #38)",
     );
+    let profiles = client.last("profiles").cloned().unwrap_or(Value::Null);
     r.check(
-        client
-            .last("profiles")
-            .is_some_and(|p| p["startup"].is_object() && p["sets"].is_array())
-            && client.last("history").is_some_and(|h| h["entries"].is_array()),
-        "profiles и history пришли при знакомстве",
+        profiles["startup"].is_object()
+            && profiles["sets"].is_array()
+            && profiles.get("wasNamed").is_none()
+            && profiles.get("canAccept").is_none()
+            && client.last("history").is_none(),
+        "profiles пришли при знакомстве (без «было» и «принять»); истории окну больше не шлётся",
     );
 
     // 12b. Состояние дважды в секунду; в нём всё, что читает окно, и новое: доля работы, автомодуль, потолки владельца.
@@ -743,10 +787,7 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     let at = block.first;
     let was = ceilings_now(app).get(at).copied().unwrap_or(0);
     let fused = cores_of(&limits["fused"]).get(at).copied().unwrap_or(0);
-    let history_before = client
-        .last("history")
-        .and_then(|h| h["entries"].as_array().map(Vec::len))
-        .unwrap_or(0);
+    let history_before = profile_log(data).len();
     let writes = app.sim().map_or(0, |s| s.writes);
     let (id, ok, why) = order(
         shell,
@@ -767,19 +808,18 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             was - 1
         ),
     );
-    wait(shell, app, &mut client, Duration::from_secs(2), |c| {
-        c.last("history").and_then(|h| h["entries"].as_array().map(Vec::len)) > Some(history_before)
-    });
-    let entry = client
-        .last("history")
-        .and_then(|h| h["entries"].as_array().and_then(|e| e.last()).cloned())
+    let log = profile_log(data);
+    let entry = log
+        .last()
+        .filter(|_| log.len() > history_before)
+        .cloned()
         .unwrap_or(Value::Null);
     r.check(
         entry["act"] == "limit"
             && entry["block"] == json!(block.name)
             && entry["after"][at] == json!(was - 1)
             && entry["before"][at] == json!(was),
-        &format!("история: ручной потолок записан ({entry})"),
+        &format!("profile-log.jsonl: ручной потолок записан ({entry})"),
     );
     let asked = app.serving().asked.len();
     let (_, ok, why) = order(shell, app, &mut client, "limit.set", &json!({ "block": 4, "ratio": 5 }));
@@ -826,11 +866,14 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     );
     r.check(ok && ceilings_now(app).get(at) == Some(&was), "и возвращён");
 
-    // 12f. Профили по кругу: сохранить, открыть другой, откатить, принять заводские и свой, удалить — файлы такие же,
-    //      как пишет C#-часть.
+    // 12f. Профили по кругу (DECISIONS #38): сохранить, отметить «при старте Windows», применить другой, применить свой,
+    //      сохранить в отмеченный, перенести и снять отметку, применить заводские, удалить. Применение и сохранение
+    //      профиль запуска не меняют; «принять» и «откатить» больше нет; набор выше заводского применяется только после
+    //      «Да»; файлы такие же, как пишет C#-часть.
     // Название по алфавиту между наборами владельца (цифры, латиница): порядок в файле виден.
     let name = "b-окно";
     let saved_ratios = ceilings_now(app);
+    let logon_before = fs::read_to_string(data.join("profile.json")).ok();
     let (_, ok, why) = order(shell, app, &mut client, "profile.save", &json!({ "name": name }));
     let sets = app.store().read_sets().unwrap_or_default();
     let text = fs::read_to_string(data.join("profiles.json")).unwrap_or_default();
@@ -844,31 +887,41 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             && ordered,
         &format!("profile.save «{name}»: набор в profiles.json, порядок по алфавиту, вид файла как у C# {why}"),
     );
+    r.check(
+        fs::read_to_string(data.join("profile.json")).ok() == logon_before
+            && client.last("profiles").is_some_and(|p| p["standing"] == name),
+        "сохранение профиль запуска не меняет (profile.json тот же); в профилях совпадает с текущим — он",
+    );
+    let (_, ok, why) = order(
+        shell,
+        app,
+        &mut client,
+        "profile.startup",
+        &json!({ "name": name, "on": true }),
+    );
     let startup = app.store().read_profile().ok().flatten();
     r.check(
-        startup.as_ref().is_some_and(|p| {
+        ok && startup.as_ref().is_some_and(|p| {
             p.name == name && p.ratios == saved_ratios && p.state.as_deref() == Some("trusted") && p.boots == 0
-        }),
-        "и он профиль запуска (profile.json: то, что стоит, «trusted», 0 перезапусков)",
+        }) && client.last("profiles").is_some_and(|p| p["startup"]["name"] == name),
+        &format!("profile.startup «{name}» вкл: он профиль запуска (profile.json: его потолки, «trusted», 0 перезапусков) {why}"),
     );
-    wait(shell, app, &mut client, Duration::from_secs(2), |c| {
-        c.last("limits")
-            .is_some_and(|l| cores_of(&l["was"]) == saved_ratios.iter().map(|&v| i64::from(v)).collect::<Vec<_>>())
-    });
-    let profiles = client.last("profiles").cloned().unwrap_or(Value::Null);
+    let (_, ok, why) = order(
+        shell,
+        app,
+        &mut client,
+        "profile.startup",
+        &json!({ "name": "", "on": true }),
+    );
     r.check(
-        client
-            .last("limits")
-            .is_some_and(|l| cores_of(&l["was"]) == saved_ratios.iter().map(|&v| i64::from(v)).collect::<Vec<_>>())
-            && profiles["standing"] == name
-            && profiles["wasNamed"] == name
-            && profiles["canAccept"] == false,
-        &format!(
-            "«было» — сохранённое; стоит «{}», было «{}», принимать нечего ({})",
-            profiles["standing"].as_str().unwrap_or("?"),
-            profiles["wasNamed"].as_str().unwrap_or("?"),
-            profiles["canAccept"]
-        ),
+        !ok && !why.is_empty()
+            && app
+                .store()
+                .read_profile()
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.name == name),
+        &format!("«заводские» при старте не загружаются — отказ: {why}"),
     );
     let other_name = sets
         .iter()
@@ -887,11 +940,13 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             .collect(),
     };
     let (_, ok, why) = order(shell, app, &mut client, "profile.open", &json!({ "name": opened }));
-    let profiles = client.last("profiles").cloned().unwrap_or(Value::Null);
+    let logon = app.store().read_profile().ok().flatten().map(|p| p.name);
     r.check(
-        ok && ceilings_now(app) == wanted && profiles["wasNamed"] == name && profiles["canAccept"] == true,
+        ok && ceilings_now(app) == wanted
+            && logon.as_deref() == Some(name)
+            && client.last("profiles").is_some_and(|p| p["standing"] == json!(opened)),
         &format!(
-            "profile.open «{}»: стоит он, «было» прежнее, можно принять {why}",
+            "profile.open «{}» (применить): стоит он, профиль запуска прежний ({logon:?}) {why}",
             if opened.is_empty() {
                 "заводские"
             } else {
@@ -899,52 +954,156 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             }
         ),
     );
-    let (_, ok, why) = order(shell, app, &mut client, "profile.revert", &json!({}));
+    for gone in ["profile.accept", "profile.revert"] {
+        let (_, ok, why) = order(shell, app, &mut client, gone, &json!({}));
+        r.check(
+            !ok && why.contains("неизвестная команда") && ceilings_now(app) == wanted,
+            &format!("{gone} больше нет — {why}"),
+        );
+    }
+    let (_, ok, why) = order(shell, app, &mut client, "profile.open", &json!({ "name": name }));
     r.check(
         ok && ceilings_now(app) == saved_ratios,
-        &format!("profile.revert: вернулось «было» {why}"),
+        &format!("profile.open «{name}»: снова стоит {why}"),
     );
-    let (_, ok_open, _) = order(shell, app, &mut client, "profile.open", &json!({ "name": "" }));
-    let (_, ok_accept, why) = order(shell, app, &mut client, "profile.accept", &json!({}));
-    r.check(
-        ok_open
-            && ok_accept
-            && app.store().read_profile().ok().flatten().is_none()
-            && !data.join("profile.json").exists(),
-        &format!("заводские приняты — профиля запуска больше нет {why}"),
+    // Сохранение в отмеченный профиль: при входе будут его новые потолки.
+    let lowered = was - 1;
+    let (_, ok_set, _) = order(
+        shell,
+        app,
+        &mut client,
+        "limit.set",
+        &json!({ "block": 4, "ratio": lowered }),
     );
-    let (_, ok_open, _) = order(shell, app, &mut client, "profile.open", &json!({ "name": name }));
-    let (_, ok_accept, why) = order(shell, app, &mut client, "profile.accept", &json!({}));
+    let (_, ok, why) = order(shell, app, &mut client, "profile.save", &json!({ "name": name }));
+    let marked = app.store().read_profile().ok().flatten();
     r.check(
-        ok_open
-            && ok_accept
-            && app
+        ok_set
+            && ok
+            && marked
+                .as_ref()
+                .is_some_and(|p| p.name == name && p.ratios.get(at) == Some(&lowered)),
+        &format!(
+            "сохранение в отмеченный «{name}»: в profile.json его новые потолки (×{lowered} у блока {}) {why}",
+            block.name
+        ),
+    );
+    let (_, ok_back, _) = order(
+        shell,
+        app,
+        &mut client,
+        "limit.set",
+        &json!({ "block": 4, "ratio": was }),
+    );
+    let (_, ok_saved, _) = order(shell, app, &mut client, "profile.save", &json!({ "name": name }));
+    r.check(ok_back && ok_saved && ceilings_now(app) == saved_ratios, "и обратно");
+    // Отметка переходит на другой профиль (отмечен только один) и снимается.
+    if let Some(other) = &other_name {
+        let (_, ok, why) = order(
+            shell,
+            app,
+            &mut client,
+            "profile.startup",
+            &json!({ "name": other, "on": true }),
+        );
+        let moved = app.store().read_profile().ok().flatten();
+        r.check(
+            ok && moved.as_ref().is_some_and(|p| &p.name == other && p.ratios == wanted)
+                && ceilings_now(app) == saved_ratios,
+            &format!("отметка перешла на «{other}» (его потолки при входе), в процессоре ничего не изменилось {why}"),
+        );
+        let (_, ok, why) = order(
+            shell,
+            app,
+            &mut client,
+            "profile.startup",
+            &json!({ "name": name, "on": false }),
+        );
+        r.check(
+            !ok && app
                 .store()
                 .read_profile()
                 .ok()
                 .flatten()
-                .is_some_and(|p| p.name == name),
-        &format!("свой набор принят — снова профиль запуска {why}"),
+                .is_some_and(|p| &p.name == other),
+            &format!("снять отметку с неотмеченного — отказ: {why}"),
+        );
+        let (_, ok, why) = order(
+            shell,
+            app,
+            &mut client,
+            "profile.startup",
+            &json!({ "name": other, "on": false }),
+        );
+        r.check(
+            ok && app.store().read_profile().ok().flatten().is_none() && !data.join("profile.json").exists(),
+            &format!("отметка снята — при входе ничего не ставится {why}"),
+        );
+    } else {
+        r.note("других сохранённых наборов нет — перенос отметки не проверен");
+    }
+    let (_, ok, why) = order(shell, app, &mut client, "profile.open", &json!({ "name": "" }));
+    r.check(
+        ok && cores_of(&limits["fused"]) == ceilings_now(app).iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &format!("заводские применены — стоят заводские {why}"),
     );
+    // Набор с потолком выше заводского: «применить» спрашивает владельца; «нет» — ничего не ставится.
+    let (_, ok_back, _) = order(shell, app, &mut client, "profile.open", &json!({ "name": name }));
+    app.serving_mut().confirm = Confirm::Answer(true);
+    let (_, ok_up, _) = order(
+        shell,
+        app,
+        &mut client,
+        "limit.set",
+        &json!({ "block": 4, "ratio": fused + 1 }),
+    );
+    app.serving_mut().confirm = Confirm::Answer(false);
+    let above = "b-выше";
+    let (_, ok_saved, _) = order(shell, app, &mut client, "profile.save", &json!({ "name": above }));
+    let (_, ok_open, _) = order(shell, app, &mut client, "profile.open", &json!({ "name": name }));
+    let asked = app.serving().asked.len();
+    let (_, ok, why) = order(shell, app, &mut client, "profile.open", &json!({ "name": above }));
+    r.check(
+        ok_back
+            && ok_up
+            && ok_saved
+            && ok_open
+            && !ok
+            && why.contains("не подтверждён")
+            && app.serving().asked.len() == asked + 1
+            && ceilings_now(app) == saved_ratios,
+        &format!(
+            "применить набор выше заводского без «Да» — отказ: {why}; вопрос «{}»",
+            app.serving().asked.last().map_or("", String::as_str)
+        ),
+    );
+    // Отмеченный профиль удаляется — при входе ничего не ставится.
+    let (_, ok_mark, _) = order(
+        shell,
+        app,
+        &mut client,
+        "profile.startup",
+        &json!({ "name": name, "on": true }),
+    );
+    let (_, ok_gone, _) = order(shell, app, &mut client, "profile.delete", &json!({ "name": above }));
     let (_, ok, why) = order(shell, app, &mut client, "profile.delete", &json!({ "name": name }));
     r.check(
-        ok && !app
-            .store()
-            .read_sets()
-            .unwrap_or_default()
-            .iter()
-            .any(|s| s.name == name)
+        ok_mark
+            && ok_gone
+            && ok
+            && !app
+                .store()
+                .read_sets()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == name || s.name == above)
             && app.store().read_profile().ok().flatten().is_none()
             && ceilings_now(app) == saved_ratios,
-        &format!("profile.delete: набора нет, профиля запуска нет, потолки остались {why}"),
+        &format!("profile.delete отмеченного: наборов нет, профиля запуска нет, потолки остались {why}"),
     );
     let (_, ok, why) = order(shell, app, &mut client, "profile.open", &json!({ "name": name }));
-    r.check(!ok && why.contains("нет"), &format!("удалённый не открывается: {why}"));
-    let lines: Vec<Value> = fs::read_to_string(data.join("profile-log.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    r.check(!ok && why.contains("нет"), &format!("удалённый не применяется: {why}"));
+    let lines = profile_log(data);
     let acts: Vec<&str> = lines.iter().filter_map(|l| l["act"].as_str()).collect();
     let complete = lines.iter().all(|l| {
         l["time"].is_string()
@@ -952,21 +1111,16 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
             && array_of(&l["before"], cores, Value::is_i64)
             && array_of(&l["after"], cores, Value::is_i64)
     });
-    let wanted_acts = ["limit", "save", "open", "revert", "accept", "delete"];
+    let wanted_acts = ["limit", "save", "open", "delete"];
     r.check(
-        complete && wanted_acts.iter().all(|a| acts.contains(a)),
+        complete
+            && wanted_acts.iter().all(|a| acts.contains(a))
+            && !acts.contains(&"accept")
+            && !acts.contains(&"revert"),
         &format!(
             "profile-log.jsonl: {} строк, все с временем и потолками до и после ({acts:?})",
             lines.len()
         ),
-    );
-    let shown = client
-        .last("history")
-        .and_then(|h| h["entries"].as_array().map(Vec::len))
-        .unwrap_or(0);
-    r.check(
-        shown == lines.len().min(100),
-        &format!("окну ушла история: {shown} строк"),
     );
 
     // 12g. Сообщение владельцу уходит и окну.

@@ -1,7 +1,7 @@
 // Статистика читается в своём потоке, не в потоке окна (rust\AGENTS.md: поток окна не ждёт файлов).
 //
 // Поток держит сводку по каждому файлу срезов за последние 30 дней и сколько от файла прочитано; раз в SCAN он
-// смотрит размеры и времена записи (одна папка: файл на день и его продолжения «-N», и два журнала) и дочитывает только
+// смотрит размеры и времена записи (одна папка: файл на день и его продолжения «-N», и журнал автомодуля) и дочитывает только
 // дописанное — прошлые дни не перечитываются, сегодняшний — только с прочитанного места. Ничего не изменилось — окну
 // ничего не идёт. Изменилось — окно получает новую сводку целиком (Digest) и перерисовывает то, что из неё показывает.
 use std::collections::BTreeMap;
@@ -10,8 +10,6 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-
-use serde_json::{Map, Value};
 
 use crate::samples::{self, AutoEntry, Columns, Fresh, Scratch, Tail, Tally};
 
@@ -27,8 +25,6 @@ pub struct Digest {
     pub tally: Tally,
     pub files: usize,
     pub auto: Vec<AutoEntry>,
-    /// Журнал смен профиля из data\profile-log.jsonl; None — файла нет.
-    pub history: Option<Vec<Map<String, Value>>>,
     /// Сколько байт срезов прочитано и разобрано этим проходом и за сколько: цена статистики.
     pub parsed_bytes: u64,
     pub parsed_rows: u64,
@@ -55,8 +51,6 @@ struct Worker {
     scratch: Scratch,
     auto_tail: Tail,
     auto: Vec<AutoEntry>,
-    history_tail: Tail,
-    history: Option<Vec<Map<String, Value>>>,
 }
 
 /// Запускает поток статистики над папкой данных `dir`. `deliver` получает сводку, когда она изменилась (первую —
@@ -139,25 +133,6 @@ impl Worker {
             Err(e) => trouble = Some(format!("журнал автомодуля не прочитан: {e}")),
         }
 
-        // Журнал смен профиля (пишет программа входа); нет файла — нет истории.
-        match samples::read_new(&self.dir.join("profile-log.jsonl"), &mut self.history_tail) {
-            Ok(Fresh::Same) => {}
-            Ok(Fresh::More(text)) => {
-                samples::history_entries(&text, self.history.get_or_insert_with(Vec::new));
-                changed = true;
-            }
-            Ok(Fresh::Again(text)) => {
-                let history = self.history.get_or_insert_with(Vec::new);
-                history.clear();
-                samples::history_entries(&text, history);
-                changed = true;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                changed |= self.history.take().is_some();
-            }
-            Err(e) => trouble = Some(format!("журнал профилей не прочитан: {e}")),
-        }
-
         if !changed {
             return None;
         }
@@ -168,9 +143,8 @@ impl Worker {
         Some(Digest {
             tally,
             files: self.files.len(),
-            // Копия журналов — на каждое изменение, не на каждый проход: действий автомодуля единицы в час.
+            // Копия журнала — на каждое изменение, не на каждый проход: действий автомодуля единицы в час.
             auto: self.auto.clone(),
-            history: self.history.clone(),
             parsed_bytes,
             parsed_rows,
             parse_time: started.elapsed(),

@@ -110,7 +110,7 @@ pub enum AutoMark {
     Detail {
         #[serde(alias = "ceiling")]
         to: Option<i64>,
-        /// Принятый потолок, от которого считается поправка; нет — считается от «было».
+        /// Потолок владельца, от которого считается поправка; нет — от потолков владельца в состоянии (intended).
         #[serde(alias = "accepted")]
         base: Option<i64>,
         /// Потолок, на который нельзя возвращаться до `until` (память перегрева).
@@ -161,48 +161,35 @@ pub struct ProfileSet {
     pub ratios: Vec<i64>,
 }
 
-/// Профили и что из них стоит. standing / wasNamed: название набора, "" — заводские, null — ни один сохранённый.
+/// Профили и какой из них совпадает с текущим состоянием (standing: название набора, "" — заводские, null — ни один).
+/// Поля движка C# «wasNamed» и «canAccept» окну больше не нужны («было» и «принять» убраны, DECISIONS #38).
 #[derive(Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 pub struct Profiles {
     #[serde(default)]
     pub startup: Startup,
     pub sets: Vec<ProfileSet>,
     pub standing: Option<String>,
-    #[serde(default)]
-    pub was_named: Option<String>,
-    #[serde(default)]
-    pub can_accept: bool,
 }
 
-/// Журнал смен профиля (тема программы входа «history»): записи — объекты; какие поля окно читает, см.
-/// `samples::history_line`. Сама тема может прийти списком под любым из названий ниже.
-#[derive(Deserialize, Clone, Debug)]
-pub struct History {
-    #[serde(default, alias = "items", alias = "log", alias = "lines")]
-    pub entries: Vec<serde_json::Map<String, serde_json::Value>>,
-}
-
-/// Потолки по ядрам: заводские и «было»; choices — что можно поставить блоку, по убыванию, по номеру блока.
+/// Потолки по ядрам: заводские; choices — что можно поставить блоку, по убыванию, по номеру блока. («Было» движка C#
+/// окно больше не читает.)
 #[derive(Deserialize, Clone, Debug)]
 pub struct Limits {
     pub fused: Vec<i64>,
-    pub was: Vec<i64>,
     pub choices: Vec<Vec<i64>>,
 }
 
 /// Выбор владельца для автомодуля (тема программы входа «settings»; у движка C# её нет). Хозяин выбора и
-/// промежутков — программа входа (data\tray.json): окно показывает их и шлёт изменения командой auto.set.
+/// промежутка — программа входа (data\tray.json): окно показывает их и шлёт изменения командой auto.set. Глубины нет
+/// (DECISIONS #38): её поля от прежней программы у часов пропускаются.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSettings {
     pub on: bool,
     pub limit: i64,
-    pub depth: i64,
     pub step_up: bool,
-    /// Допустимая отсечка, °C, и глубина, ступеней: [от, до].
+    /// Допустимая отсечка, °C: [от, до].
     pub limit_range: [i64; 2],
-    pub depth_range: [i64; 2],
 }
 
 /// Тема «settings»: выбор автомодуля; поле неожиданной формы — как будто темы нет (настройки в окне не показываются).
@@ -228,6 +215,10 @@ pub struct Reply {
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "t")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a message lives only from parsing to the match that moves it into the view; boxing State would add an allocation twice a second for nothing"
+)]
 pub enum Message {
     #[serde(rename = "hello")]
     Hello(Hello),
@@ -239,8 +230,6 @@ pub enum Message {
     Reply(Reply),
     #[serde(rename = "profiles")]
     Profiles(Profiles),
-    #[serde(rename = "history")]
-    History(History),
     #[serde(rename = "notice")]
     Notice(Notice),
     #[serde(rename = "settings")]
@@ -335,14 +324,34 @@ mod tests {
 
     #[test]
     fn profiles_as_the_engine_writes_them() {
+        // Поля «было» и «принять» движка C# пропускаются, не ломая разбор.
         let Ok(Message::Profiles(p)) = serde_json::from_str::<Message>(PROFILES) else {
             panic!("профили не разобрались");
         };
         assert_eq!(p.sets.len(), 2);
         assert_eq!(p.sets[1].name, "тихий");
         assert_eq!(p.standing, None);
-        assert_eq!(p.was_named.as_deref(), Some("csmart2"));
-        assert!(p.can_accept && p.startup.exists && !p.startup.disabled);
+        assert!(p.startup.exists && !p.startup.disabled);
+        assert_eq!(p.startup.name.as_deref(), Some("csmart2"));
+        // Так их пишет программа у часов с 0.5.4: без «было» и «принять».
+        let logon = r#"{"t":"profiles","startup":{"exists":false,"name":null,"state":null,"disabled":false,"describe":"при запуске ничего не ставится","details":null,"note":null},"sets":[{"name":"csmart2","ratios":[43,53]}],"standing":"csmart2"}"#;
+        let Ok(Message::Profiles(p)) = serde_json::from_str::<Message>(logon) else {
+            panic!("профили программы у часов не разобрались");
+        };
+        assert_eq!((p.standing.as_deref(), p.startup.exists), (Some("csmart2"), false));
+    }
+
+    #[test]
+    fn limits_with_or_without_was() {
+        for text in [
+            r#"{"t":"limits","fused":[54,46],"was":[50,44],"unread":null,"choices":[[55,54],[47,46]]}"#,
+            r#"{"t":"limits","fused":[54,46],"unread":null,"choices":[[55,54],[47,46]]}"#,
+        ] {
+            let Ok(Message::Limits(l)) = serde_json::from_str::<Message>(text) else {
+                panic!("потолки не разобрались: {text}");
+            };
+            assert_eq!((l.fused, l.choices.len()), (vec![54, 46], 2));
+        }
     }
 
     #[test]
@@ -391,30 +400,33 @@ mod tests {
     }
 
     #[test]
-    fn notice_and_history_topics() {
+    fn notice_topic_and_a_history_of_an_older_logon_program() {
         let Ok(Message::Notice(n)) =
             serde_json::from_str::<Message>(r#"{"t":"notice","seq":3,"text":"профиль поставлен"}"#)
         else {
             panic!("сообщение владельцу не разобралось");
         };
         assert_eq!((n.seq, n.text.as_str()), (3, "профиль поставлен"));
+        // Историю окно больше не показывает: тема программы у часов до 0.5.4 пропускается, как незнакомая.
         let text = r#"{"t":"history","entries":[{"time":"2026-10-15T01:20:00.0000000+03:00","at":1,"act":"open","name":"csmart2","before":[53],"after":[52]}]}"#;
-        let Ok(Message::History(h)) = serde_json::from_str::<Message>(text) else {
-            panic!("история не разобралась");
-        };
-        assert_eq!(h.entries.len(), 1);
+        assert!(matches!(serde_json::from_str::<Message>(text), Ok(Message::Other)));
     }
 
     #[test]
     fn settings_topic_as_the_logon_program_writes_it() {
-        // Тема в том виде, в каком её пишет программа входа (rust/tray/src/app/auto.rs, Choice::topic).
-        let text = r#"{"t":"settings","auto":{"on":true,"limit":82,"depth":4,"stepUp":false,"limitRange":[60,95],"depthRange":[1,8]}}"#;
-        let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(text) else {
-            panic!("тема settings не разобралась");
-        };
-        let auto = s.auto.expect("выбор автомодуля");
-        assert_eq!((auto.on, auto.limit, auto.depth, auto.step_up), (true, 82, 4, false));
-        assert_eq!((auto.limit_range, auto.depth_range), ([60, 95], [1, 8]));
+        // Тема в том виде, в каком её пишет программа входа (rust/tray/src/app/auto.rs, Choice::topic); и в виде до
+        // 0.5.4 — с глубиной, которую окно больше не читает.
+        for text in [
+            r#"{"t":"settings","auto":{"on":true,"limit":82,"stepUp":false,"limitRange":[60,95]}}"#,
+            r#"{"t":"settings","auto":{"on":true,"limit":82,"depth":4,"stepUp":false,"limitRange":[60,95],"depthRange":[1,8]}}"#,
+        ] {
+            let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(text) else {
+                panic!("тема settings не разобралась: {text}");
+            };
+            let auto = s.auto.expect("выбор автомодуля");
+            assert_eq!((auto.on, auto.limit, auto.step_up), (true, 82, false));
+            assert_eq!(auto.limit_range, [60, 95]);
+        }
         // Поле другой формы не ломает сообщение: настроек просто нет.
         let Ok(Message::Settings(s)) = serde_json::from_str::<Message>(r#"{"t":"settings","auto":{"on":"да"}}"#)
         else {

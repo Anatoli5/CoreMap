@@ -2,29 +2,33 @@
 // команды, и то, что по нему ходит. Перевозка — pipe.rs; здесь — сообщения и команды.
 //
 // Сообщения — те же, что шлёт движок на C# (src/Feed.cs), чтобы окно работало с программой входа без переделки:
-// • hello — процессор, ядра, блоки, схема кристалла; limits — заводские потолки, «было», что можно поставить блоку;
-//   profiles — профиль запуска, сохранённые наборы, что из них стоит и было; notice — сообщение владельцу. Шлются при
-//   знакомстве и потом только когда изменились.
+// • hello — процессор, ядра, блоки, схема кристалла; limits — заводские потолки и что можно поставить блоку;
+//   profiles — профиль запуска, сохранённые наборы и какой из них совпадает с тем, что стоит; notice — сообщение
+//   владельцу. Шлются при знакомстве и потом только когда изменились.
 // • state — показания, дважды в секунду, пока окно подключено (пока пишется журнал срезов — из каждого второго его
 //   опроса, app/sense.rs), и сразу после исполненной команды; окна нет — нет ни таймера, ни чтения датчиков.
-// Новое, чего у движка не было: history — последние смены потолков (app/history.rs); settings — выбор владельца для
-// автомодуля и допустимые промежутки (по изменению); в state — доля работы ядер (busyShare), потолок автомодуля по
-// блокам (auto), потолки владельца под ним (intended) и отсечка автомодуля (autoLimit); bye — программа выходит:
-// окно запоминает себя и закрывается, программа выходит после него (`App::leave`; владелец 15.10: «чтобы трей сначала
-// закрывал окно… а потом закрывался сам»).
+// Новое, чего у движка не было: settings — выбор владельца для автомодуля и допустимая отсечка (по изменению); в state —
+// доля работы ядер (busyShare), потолок автомодуля по блокам (auto), потолки владельца под ним (intended) и отсечка
+// автомодуля (autoLimit); bye — программа выходит: окно запоминает себя и закрывается, программа выходит после него
+// (`App::leave`; владелец 15.10: «чтобы трей сначала закрывал окно… а потом закрывался сам»).
 //
-// Команды — тоже как у движка (src/Commands.cs): limit.set, profile.save/open/accept/revert/delete, max.reset,
-// notices.seen; новая — auto.set (настройки автомодуля из окна, app/auto.rs). Что окно помнит о себе (выбранные
+// Команды — тоже как у движка (src/Commands.cs): limit.set, profile.save/open/delete, max.reset, notices.seen; новые —
+// profile.startup (отметка профиля запуска) и auto.set (настройки автомодуля из окна, app/auto.rs). Что окно помнит о себе (выбранные
 // блоки, подсветку, размер и место), программа входа не получает и не хранит: это настройки окна, их держит оно само
 // (DECISIONS #36). Нагрузки и замеров в программе входа нет: их команды отклоняются одной фразой. Поднять потолок выше
 // заводского — только после «Да» владельца в окошке самой программы входа (у неё права администратора: в него не
 // щёлкнет другая программа). Пока работает прежнее окно или движок на C#, потолками владеют они: команды потолков и
 // профилей отклоняются с причиной, состояние идёт без показаний датчиков (их нельзя читать — DECISIONS #31).
 //
-// «Было» и «сейчас» (Core.cs в C#): «было» — потолки, принятые последними (после входа в Windows — то, что поставил
-// профиль запуска); «сейчас» — то, что стоит. Открыть набор, поставить потолок вручную — меняет «сейчас»; «принять»
-// и «сохранить» делают «сейчас» новым «было» и забирают поправки автомодуля в потолки владельца; «откатить»
-// возвращает «было».
+// Профили и текущее состояние (владелец 15.10, DECISIONS #38): текущее состояние — потолки, которые стоят в процессоре,
+// с поправками автомодуля; профили — сохранённые наборы и «заводские». Это разные вещи: выбор набора в окне ничего не
+// ставит, окно само показывает разницу выбранного с текущим. profile.open («применить» в окне) ставит набор — он
+// становится текущим состоянием, как щелчок по набору в меню значка; profile.save пишет текущее состояние в набор
+// (поправки автомодуля становятся потолками владельца). Профиль запуска (data\profile.json — что ставится при входе в
+// Windows) выбирается отдельно — profile.startup, отметка «загружать при старте Windows» у сохранённого профиля:
+// отмечен один или ни одного; ни применение, ни сохранение его не меняют, кроме того, что сохранение в отмеченный
+// профиль обновляет и его потолки при входе. Несохранённые правки при входе не ставятся. Ни «было», ни «принять», ни
+// «откатить» больше нет.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -38,7 +42,7 @@ use serde_json::{Map, Value, json};
 use super::auto::Choice;
 use super::history::Change;
 use super::meter::Watch;
-use super::{App, parts};
+use super::{App, Via, parts};
 use crate::layout::{self, Layout};
 use crate::pipe::{Happened, Server};
 use crate::shell::{self, Shell};
@@ -96,12 +100,11 @@ struct Session {
     /// Знакомство отклонено: после отправки ответа канал рвётся.
     closing: bool,
     watch: Watch,
-    /// Что из сообщений по изменению уже ушло.
-    sent_limits: Option<(Vec<i32>, Vec<i32>, Option<String>)>,
+    /// Что из сообщений по изменению уже ушло: заводские потолки и почему потолки не перечитались.
+    sent_limits: Option<(Vec<i32>, Option<String>)>,
     sent_profiles: Option<String>,
     seen_current: Vec<i32>,
     seen_version: u64,
-    sent_history: Option<u64>,
     /// Какой выбор автомодуля окно уже знает (тема settings).
     sent_settings: Option<Choice>,
     sent_notice: u64,
@@ -360,7 +363,6 @@ impl App {
             sent_profiles: None,
             seen_current: Vec::new(),
             seen_version: 0,
-            sent_history: None,
             sent_settings: None,
             sent_notice: 0,
             trouble: None,
@@ -694,25 +696,21 @@ impl App {
         .to_string()
     }
 
-    /// Что изменилось с прошлого раза: потолки и «было», профили, история, выбор автомодуля, сообщения владельцу.
+    /// Что изменилось с прошлого раза: потолки, профили, выбор автомодуля, сообщения владельцу.
     fn push_topics(&mut self, shell: &Shell) {
         // После «bye» окну больше ничего не шлётся: оно уже не читает канал.
         if !self.serving.attached() || self.serving.leaving.is_some() {
             return;
         }
         let mut out: Vec<String> = Vec::new();
-        let was = self.was_now();
         if let Some(limits) = &self.limits {
             let unread = self.serving.session.as_ref().and_then(|s| s.unread.clone());
-            let now = (limits.fused().to_vec(), was.clone().unwrap_or_default(), unread);
+            let now = (limits.fused().to_vec(), unread);
             if let Some(session) = self.serving.session.as_mut()
                 && session.sent_limits.as_ref() != Some(&now)
             {
                 let choices: Vec<Vec<i32>> = self.topology.blocks.iter().map(|b| limits.choices(b.first)).collect();
-                out.push(
-                    json!({ "t": "limits", "fused": now.0, "was": now.1, "unread": now.2, "choices": choices })
-                        .to_string(),
-                );
+                out.push(json!({ "t": "limits", "fused": now.0, "unread": now.1, "choices": choices }).to_string());
                 session.sent_limits = Some(now);
             }
             // Профили — только после команды, смены набора или когда потолки сдвинулись: больше им меняться не от
@@ -721,7 +719,7 @@ impl App {
                 s.sent_profiles.is_none() || s.seen_version != self.version || s.seen_current != limits.current()
             });
             if stale {
-                let profiles = profiles_topic(self, &self.listed_sets(), was.as_deref());
+                let profiles = profiles_topic(self, &self.listed_sets());
                 if let Some(session) = self.serving.session.as_mut() {
                     limits.current().clone_into(&mut session.seen_current);
                     session.seen_version = self.version;
@@ -731,13 +729,6 @@ impl App {
                     }
                 }
             }
-        }
-        let written = self.history.written;
-        if let Some(session) = self.serving.session.as_mut()
-            && session.sent_history != Some(written)
-        {
-            session.sent_history = Some(written);
-            out.push(self.history.topic());
         }
         // Выбор автомодуля — при знакомстве и после каждой смены (окно, меню значка).
         let choice = self.auto.choice;
@@ -760,13 +751,6 @@ impl App {
         for message in out {
             self.send(shell, &message);
         }
-    }
-
-    /// «Было» для окна: принятые последними; ещё не известны — что стоит.
-    fn was_now(&self) -> Option<Vec<i32>> {
-        self.was
-            .clone()
-            .or_else(|| self.limits.as_ref().map(|l| l.current().to_vec()))
     }
 
     /// Сообщение «состояние» (Feed.State): по ядрам — температура, наибольшая, множитель, средние под нагрузкой,
@@ -866,10 +850,12 @@ impl App {
                 _ => bad(),
             },
             "profile.save" => name_of(f).map_or_else(bad, |name| self.save_profile(name)),
-            "profile.open" => name_of(f).map_or_else(bad, |name| self.open_profile(name)),
-            "profile.accept" => self.accept(),
-            "profile.revert" => self.revert(),
+            "profile.open" => name_of(f).map_or_else(bad, |name| self.apply_profile(name)),
             "profile.delete" => name_of(f).map_or_else(bad, |name| self.delete_profile(name)),
+            "profile.startup" => match (name_of(f), f.get("on").and_then(Value::as_bool)) {
+                (Some(name), Some(on)) => self.mark_startup(name, on),
+                _ => bad(),
+            },
             "max.reset" => {
                 if let Some(session) = self.serving.session.as_mut() {
                     session.watch.reset();
@@ -1026,8 +1012,8 @@ impl App {
             .map_err(|spoiled| format!("список профилей не прочитан, профили не меняю: {spoiled}"))
     }
 
-    /// profile.save: то, что стоит (с поправками автомодуля), — набором с этим названием и профилем запуска; оно же
-    /// становится «было».
+    /// profile.save: текущее состояние (с поправками автомодуля) — в набор с этим названием (есть — перезаписывается).
+    /// Профиль запуска не меняется; если это он — при входе в Windows будут его новые потолки.
     fn save_profile(&mut self, name: &str) -> Option<String> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -1048,11 +1034,12 @@ impl App {
                 .write_sets(&sets)
                 .map_err(|e| format!("файл профилей не записан: {e}"))?;
             app.sets = sets;
-            let saved = profile::save(&app.store, limits, &name, Stamp::now())
-                .map_err(|e| format!("файл профиля не записан: {e}"))?;
-            app.profile = Some(saved);
-            app.note = None;
-            app.was = Some(current.clone());
+            if app.at_startup(&name) {
+                let saved = profile::save(&app.store, limits, &name, Stamp::now())
+                    .map_err(|e| format!("файл профиля не записан: {e}"))?;
+                app.profile = Some(saved);
+                app.note = None;
+            }
             app.intended = Some(current);
             app.preferred = Some(name.clone());
             app.auto_new_set();
@@ -1068,8 +1055,11 @@ impl App {
         }
     }
 
-    /// profile.open: ставит набор («» — заводские); «было» остаётся прежним — так видна разница.
-    fn open_profile(&mut self, name: &str) -> Option<String> {
+    /// profile.open — «применить» в окне: ставит набор («» — заводские), он становится текущим состоянием (тем же путём,
+    /// что щелчок по набору в меню значка, `App::apply_set`); профиль запуска не меняется. Набор с потолком выше
+    /// заводского — только после «Да» владельца.
+    fn apply_profile(&mut self, name: &str) -> Option<String> {
+        let name = name.trim();
         if let Some(other) = self.other() {
             return Some(other.menu_text().into());
         }
@@ -1079,132 +1069,78 @@ impl App {
         if let Ok(sets) = self.fresh_sets() {
             self.sets = sets;
         }
-        let ratios = if name.is_empty() {
-            self.limits.as_ref().map(|l| l.fused().to_vec())
-        } else {
-            self.listed_sets()
-                .into_iter()
-                .find(|s| same_name(&s.name, name))
-                .map(|s| s.ratios)
-        };
-        let Some(ratios) = ratios else {
+        let Some(ratios) = self.set_ratios(name) else {
             return Some(format!("профиля «{name}» нет"));
         };
         let what = if name.is_empty() {
-            "Открыть заводские потолки".to_string()
+            "Применить заводские потолки".to_string()
         } else {
-            format!("Открыть профиль «{name}»")
+            format!("Применить профиль «{name}»")
         };
         if !self.allowed(&ratios, &what) {
             return Some(UNCONFIRMED.into());
         }
-        let before = self.current();
-        let refusal = self.put_up(&ratios, "открыт набор");
-        if refusal.is_none() && !name.is_empty() {
-            self.preferred = Some(name.trim().to_string());
-        }
-        self.journal.note(&format!(
-            "из окна открыт {}{}",
-            if name.is_empty() { "заводские" } else { name },
-            refusal.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
-        ));
-        self.log_change("open", Some(name.trim()), &before, None, refusal.as_deref());
-        refusal
+        self.apply_set(name, Some(ratios), Via::Window).err()
     }
 
-    /// Ставит набор потолков (открыть, откатить): поправки автомодуля — назад, набор — в процессор; что встало, то и
-    /// должно стоять. None — встал целиком.
-    fn put_up(&mut self, ratios: &[i32], why: &str) -> Option<String> {
-        let done = self.with_ceilings(|app| {
-            app.put_back(why);
-            let topology = &app.topology;
-            let (limits, cpu) = parts(&mut app.limits, &mut app.device)?;
-            let refusal = limits.apply(cpu, topology, ratios);
-            app.intended = Some(limits.current().to_vec());
-            app.auto_new_set();
-            Some(refusal)
-        });
-        match done {
-            Ok(Some(refusal)) => refusal,
-            Ok(None) => Some("потолки множителей недоступны".into()),
-            Err(refusal) => Some(refusal),
+    /// profile.startup: отметка «загружать при старте Windows» у сохранённого профиля (владелец 15.10: «тот профиль,
+    /// который опрувнули для применения при загрузке… если профиль не сохранен… его нельзя поставить на автозагрузку»).
+    /// on — он становится профилем запуска (отмечен только один: прежняя отметка уходит), с правилами защиты при входе
+    /// (пробный срок для потолков выше заводского, отключение после сбоя); off у отмеченного — при входе ничего не
+    /// ставится. Потолки в процессоре не трогаются.
+    fn mark_startup(&mut self, name: &str, on: bool) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Some("при старте Windows загружается только сохранённый профиль — «заводские» им не бывают".into());
         }
-    }
-
-    /// profile.accept: то, что стоит (с поправками автомодуля), становится «было»; если это сохранённый набор — он же
-    /// профиль запуска, если заводские — профиля запуска больше нет (Core.Accept).
-    fn accept(&mut self) -> Option<String> {
         if let Some(other) = self.other() {
             return Some(other.menu_text().into());
         }
-        let before = self.current();
-        let done = self.with_ceilings(|app| -> Result<Option<String>, String> {
-            app.reread()?;
-            app.absorb("принято в окне");
-            let standing = app.named_now();
-            match standing.as_deref() {
-                Some("") => {
-                    app.store
-                        .forget_profile()
-                        .map_err(|e| format!("файл профиля не удалён: {e}"))?;
-                    app.profile = None;
-                }
-                Some(name) if !app.at_startup(name) || app.profile.as_ref().is_some_and(profile::Profile::disabled) => {
-                    let limits = app.limits.as_ref().ok_or("потолки множителей недоступны")?;
-                    let saved = profile::save(&app.store, limits, name, Stamp::now())
-                        .map_err(|e| format!("файл профиля не записан: {e}"))?;
-                    app.profile = Some(saved);
-                }
-                _ => {}
+        if !on {
+            if !self.at_startup(name) {
+                return Some(format!("«{name}» и так не загружается при старте Windows"));
             }
-            app.note = None;
-            app.was = Some(app.current());
-            app.intended = Some(app.current());
-            app.auto_new_set();
-            Ok(standing)
-        });
-        match done {
-            Ok(Ok(standing)) => {
-                self.journal.note(&format!(
-                    "из окна принято: {}",
-                    standing.as_deref().map_or("потолки не из набора".to_string(), |n| {
-                        if n.is_empty() {
-                            "заводские".to_string()
-                        } else {
-                            format!("«{n}»")
-                        }
-                    })
-                ));
-                self.log_change("accept", standing.as_deref(), &before, None, None);
-                None
+            if let Err(e) = self.store.forget_profile() {
+                return Some(format!("файл профиля не удалён: {e}"));
             }
-            Ok(Err(refusal)) | Err(refusal) => Some(refusal),
+            self.profile = None;
+            self.note = None;
+            self.journal
+                .note(&format!("из окна: «{name}» больше не загружается при старте Windows"));
+            return None;
         }
-    }
-
-    /// profile.revert: вернуть «было».
-    fn revert(&mut self) -> Option<String> {
-        if let Some(other) = self.other() {
-            return Some(other.menu_text().into());
+        match self.fresh_sets() {
+            Ok(sets) => self.sets = sets,
+            Err(refusal) => return Some(refusal),
         }
+        let Some(set) = self.listed_sets().into_iter().find(|s| same_name(&s.name, name)) else {
+            return Some(format!("профиля «{name}» нет — сначала сохрани его"));
+        };
+        // Уже отмечен и не отключён после сбоя — заново не пишется: это обнулило бы его испытательный срок.
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|p| same_name(&p.name, name) && !p.disabled())
+        {
+            return None;
+        }
+        // Пробный срок или нет — по заводским потолкам: они известны после первого чтения.
         if let Err(e) = self.ready() {
             return Some(e);
         }
-        let Some(was) = self.was_now() else {
+        let Some(limits) = self.limits.as_ref() else {
             return Some("потолки множителей недоступны".into());
         };
-        if !self.allowed(&was, "Вернуть потолки, которые были") {
-            return Some(UNCONFIRMED.into());
+        match profile::mark(&self.store, limits, &set.name, &set.ratios, Stamp::now()) {
+            Ok(marked) => {
+                self.profile = Some(marked);
+                self.note = None;
+                self.journal
+                    .note(&format!("из окна: при старте Windows загружается «{}»", set.name));
+                None
+            }
+            Err(e) => Some(format!("файл профиля не записан: {e}")),
         }
-        let before = self.current();
-        let refusal = self.put_up(&was, "откат");
-        let name = self.named(&was);
-        self.journal.note(&format!(
-            "из окна откат к тому, что было{}",
-            refusal.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
-        ));
-        self.log_change("revert", name.as_deref(), &before, None, refusal.as_deref());
-        refusal
     }
 
     /// profile.delete: убирает набор; если он был профилем запуска — при запуске ничего не ставится. Потолки, которые
@@ -1238,8 +1174,8 @@ impl App {
         None
     }
 
-    /// Перечитывает все потолки из процессора (сохранить и принять берут то, что стоит в процессоре, а не память
-    /// программы: опрос автомодуля перечитывает только первые ядра блоков).
+    /// Перечитывает все потолки из процессора (сохранить берёт то, что стоит в процессоре, а не память программы:
+    /// опрос автомодуля перечитывает только первые ядра блоков).
     fn reread(&mut self) -> Result<(), String> {
         let topology = &self.topology;
         let (limits, cpu) = parts(&mut self.limits, &mut self.device).ok_or("потолки множителей недоступны")?;
@@ -1249,7 +1185,7 @@ impl App {
         }
     }
 
-    /// Поправки автомодуля становятся потолками владельца: то, что стоит, — новые принятые (принять, сохранить).
+    /// Поправки автомодуля становятся потолками владельца: то, что стоит, — новые принятые (сохранить).
     fn absorb(&mut self, why: &str) {
         if !self.auto.active() {
             return;
@@ -1299,24 +1235,6 @@ impl App {
     fn named_now(&self) -> Option<String> {
         let current = self.current();
         self.named(&current)
-    }
-
-    /// Есть ли что принимать (Core.CanAccept).
-    fn can_accept(&self, was: Option<&[i32]>) -> bool {
-        let Some(limits) = &self.limits else {
-            return false;
-        };
-        let current = limits.current();
-        let differs =
-            was.is_some_and(|was| (0..current.len()).any(|i| limits.known(i) && was.get(i) != Some(&current[i])));
-        if differs || self.auto.active() {
-            return true;
-        }
-        match self.named_now().as_deref() {
-            None => false,
-            Some("") => self.profile.is_some(),
-            Some(name) => !self.at_startup(name) || self.profile.as_ref().is_some_and(profile::Profile::disabled),
-        }
     }
 
     // ----- выход -----
@@ -1448,8 +1366,8 @@ impl App {
     }
 }
 
-/// Сообщение «профили» (Feed.Profiles): профиль запуска, наборы, какой стоит, каким было «было», можно ли принять.
-fn profiles_topic(app: &App, sets: &[Set], was: Option<&[i32]>) -> String {
+/// Сообщение «профили» (Feed.Profiles): профиль запуска, наборы и какой из них совпадает с тем, что стоит.
+fn profiles_topic(app: &App, sets: &[Set]) -> String {
     let startup = match &app.profile {
         None => json!({
             "exists": false, "name": Value::Null, "state": Value::Null, "disabled": false,
@@ -1469,9 +1387,6 @@ fn profiles_topic(app: &App, sets: &[Set], was: Option<&[i32]>) -> String {
         "startup": startup,
         "sets": listed,
         "standing": app.named_now(),
-        "wasNamed": was.and_then(|w| app.named(w)),
-        "canAccept": app.can_accept(was),
-        "preferred": app.preferred,
     })
     .to_string()
 }

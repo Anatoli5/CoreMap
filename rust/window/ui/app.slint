@@ -35,7 +35,7 @@ export struct TileData {
     fill: color,       // по температуре
     pair: string,      // «52.4 / ×53» — множитель сейчас / потолок
     pair-color: color, // жёлтый — потолок ниже заводского, красный — выше
-    delta: string,     // разница с «было»: «−2»
+    delta: string,     // разница текущего с выбранным профилем (сейчас минус профиль): «−2»
     auto: string,      // поправка автомодуля: «авто −2»
     ban: bool,         // автомодулю нельзя поднимать обратно (память перегрева)
     strip: color,      // полоска слева — ▲ наибольшая цветом шкалы температуры
@@ -56,16 +56,15 @@ export struct LinkData {
 export struct MenuEntry {
     ratio: int,
     text: string,
-    hint: string,   // значки: ◆ заводской предел, ○ «было»
+    hint: string,   // значки: ◆ заводской предел, ○ в выбранном профиле
     checked: bool,
     above: bool,    // выше заводского — красным
 }
 
 export struct SetRow {
     name: string,       // «заводские» или название профиля
-    standing: bool,     // стоит сейчас
-    was: bool,          // «было»
-    startup: bool,      // ставится при входе в Windows
+    standing: bool,     // совпадает с текущим состоянием
+    startup: bool,      // загружается при старте Windows
     disabled: bool,     // профиль запуска отключён после сбоя
     selected: bool,
     p-mean: string,     // средний потолок набора по P-ядрам: «52.4»
@@ -188,6 +187,49 @@ component Btn inherits Rectangle {
                 root.clicked();
             }
         }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
+// Отметка «да / нет» у выбранного профиля: квадрат с галочкой и подпись; щелчок по любому месту строки.
+component CheckBox inherits Rectangle {
+    in property <string> text;
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback toggled();
+    callback hover(bool);
+    height: 22px;
+    Rectangle {
+        x: 0;
+        y: (root.height - self.height) / 2;
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: root.enabled ? (touch.has-hover ? Palette.text : Palette.dim) : Palette.line;
+        background: root.on && root.enabled ? Palette.line : transparent;
+        Text {
+            text: root.on ? "✓" : "";
+            color: root.enabled ? Palette.text : Palette.dim;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    Text {
+        x: 22px;
+        width: root.width - 22px;
+        height: root.height;
+        text: root.text;
+        color: root.enabled ? Palette.text : Palette.dim;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.toggled(); }
         changed has-hover => { root.hover(self.has-hover); }
     }
 }
@@ -834,24 +876,23 @@ export component AppWindow inherits Window {
     in property <length> die-nat-w: 356px;
     in property <length> die-nat-h: 580px;
 
-    // Профили
+    // Профили (DECISIONS #38): строка — выбранный профиль против текущего состояния; список; применить, сохранить,
+    // удалить; «загружать при старте Windows»; сохранить как.
     in property <bool> has-profiles;
-    in property <string> prof-was;
-    in property <string> prof-now;
+    in property <string> prof-status;
+    in property <string> prof-status-tip;
     in property <bool> prof-attention;
     in property <[SetRow]> sets;
     in-out property <string> prof-name;
-    in property <bool> can-open;
+    in property <bool> can-apply;
     in property <bool> can-save;
     in property <bool> can-save-as;
-    in property <bool> can-accept;
-    in property <bool> can-revert;
     in property <bool> can-delete;
+    in property <bool> can-startup;
+    in property <bool> startup-on;
     in property <string> save-tip;
     in property <string> save-as-text: "сохранить как";
     in property <string> save-note;
-    in property <[LineRow]> history;
-    in property <bool> has-history;
 
     // Статистика
     in property <string> stats-note;
@@ -875,9 +916,9 @@ export component AppWindow inherits Window {
     // Подсветка линий: false — под курсором, true — закреплённая (владелец 15.10: попробовать обе).
     in property <bool> pin-mode;
 
-    // Автомодуль: выбор владельца из темы settings программы у часов (у движка C# темы нет — блока нет). Ползунки
-    // показывают число, пока их тянут; Rust получает его в limit-moved (линия отсечки на графике) и применяет одной
-    // командой в limit-released / depth-released.
+    // Автомодуль: выбор владельца из темы settings программы у часов (у движка C# темы нет — блока нет). Ползунок
+    // показывает число, пока его тянут; Rust получает его в limit-moved (линия отсечки на графике) и применяет одной
+    // командой в limit-released.
     in property <bool> has-auto;
     in property <bool> auto-ready;    // связь есть — настройки можно менять
     in property <bool> auto-on;
@@ -885,15 +926,11 @@ export component AppWindow inherits Window {
     in property <int> auto-limit: 85;
     in property <int> auto-limit-min: 60;
     in property <int> auto-limit-max: 95;
-    in property <int> auto-depth: 4;
-    in property <int> auto-depth-min: 1;
-    in property <int> auto-depth-max: 8;
     callback auto-toggled();
     callback step-up-toggled();
     callback limit-moved(int);
     callback limit-released(int);
-    callback depth-released(int);
-    // Куда целится скрытая проверка: середины выключателей, дорожки ползунков.
+    // Куда целится скрытая проверка: середины выключателей, дорожка ползунка.
     out property <length> auto-switch-x: auto-switch.absolute-position.x + auto-switch.width / 2;
     out property <length> auto-switch-y: auto-switch.absolute-position.y + auto-switch.height / 2;
     out property <length> step-switch-x: step-switch.absolute-position.x + step-switch.width / 2;
@@ -901,11 +938,7 @@ export component AppWindow inherits Window {
     out property <length> limit-track-x: limit-slider.absolute-position.x + limit-slider.track-x;
     out property <length> limit-track-w: limit-slider.track-w;
     out property <length> limit-track-y: limit-slider.absolute-position.y + limit-slider.height / 2;
-    out property <length> depth-track-x: depth-slider.absolute-position.x + depth-slider.track-x;
-    out property <length> depth-track-w: depth-slider.track-w;
-    out property <length> depth-track-y: depth-slider.absolute-position.y + depth-slider.height / 2;
     out property <int> limit-shown: limit-slider.shown;
-    out property <int> depth-shown: depth-slider.shown;
     // Середины кнопок переключателя — по ним щёлкает скрытая проверка (src/check.rs).
     out property <length> hover-chip-x: hover-chip.absolute-position.x + hover-chip.width / 2;
     out property <length> hover-chip-y: hover-chip.absolute-position.y + hover-chip.height / 2;
@@ -964,12 +997,11 @@ export component AppWindow inherits Window {
     callback problem-dismissed();
     callback reset-max();
     callback set-clicked(int);
-    callback profile-open();
+    callback profile-apply();
     callback profile-save();
     callback profile-save-as();
-    callback profile-accept();
-    callback profile-revert();
     callback profile-delete();
+    callback startup-toggled();
     callback name-edited();
 
     // Подсказка — одна на окно: под элементом (над ним, если внизу нет места), в пределах окна, через 450 мс
@@ -1105,21 +1137,25 @@ export component AppWindow inherits Window {
     out property <length> stats-x: root.prof-x + root.prof-w + root.margin;
     out property <length> stats-w: root.width - root.stats-x - root.margin;
 
-    // Профили: где что лежит (скрытая проверка целится по этим же числам).
+    // Профили: где что лежит (скрытая проверка целится по этим же числам). Сверху вниз: строка «выбранный против
+    // текущего», строка значков, список (по числу профилей; больше, чем помещается, — прокручивается), сразу под ним
+    // применить / сохранить / удалить, «загружать при старте Windows», название и «сохранить как», что сохраняется.
     out property <length> btn-h: 26px;
     out property <length> btn-w: 88px;
     out property <length> btn-gap: 6px;
     out property <length> set-h: 26px;
     property <length> mean-w: 40px;  // столбец среднего потолка набора («52.4»)
-    out property <length> row-a-y: root.body-y + root.head-h + 40px;
-    out property <length> sets-y: root.row-a-y + root.btn-h + 26px;
-    property <length> below-sets: 6px + root.btn-h + 6px + root.btn-h + 4px + 18px + (root.has-history ? 30px + 3 * 18px : 0px) + root.pad;
+    property <length> check-h: 22px;
+    out property <length> status-y: root.body-y + root.head-h;
+    property <length> legend-y: root.status-y + 22px;
+    out property <length> sets-y: root.legend-y + 16px + 6px;
+    property <length> below-sets: 6px + root.btn-h + 6px + root.check-h + 6px + root.btn-h + 4px + 18px + root.pad;
     property <length> sets-room: root.body-y + root.body-h - root.sets-y - root.below-sets;
-    out property <length> sets-h: root.has-history ? max(min(3, root.sets.length) * root.set-h + 4px, min(root.sets.length * root.set-h + 4px, root.sets-room)) : root.sets-room;
+    out property <length> sets-h: min(root.sets.length * root.set-h + 4px, root.sets-room);
     out property <length> row-b-y: root.sets-y + root.sets-h + 6px;
-    out property <length> row-c-y: root.row-b-y + root.btn-h + 6px;
+    out property <length> startup-y: root.row-b-y + root.btn-h + 6px;
+    out property <length> row-c-y: root.startup-y + root.check-h + 6px;
     property <length> note-y: root.row-c-y + root.btn-h + 4px;
-    property <length> hist-y: root.note-y + 18px + 8px;
 
     // Статистика: заголовок, легенда блоков (сетка — блоков до двенадцати), переключатели вида (в строку или в две —
     // по ширине панели), график, под ним настройки автомодуля (три строки), под ними — его действия.
@@ -1146,7 +1182,7 @@ export component AppWindow inherits Window {
     property <length> g4-y: root.g4-fits ? root.g3-y : root.g3-y + root.ctl-row;
     property <length> controls-h: root.g4-y + root.ctl-row;
     property <length> actions-h: min(6, max(1, root.actions.length)) * 18px;
-    out property <length> auto-h: root.has-auto ? 92px : 0px;
+    out property <length> auto-h: root.has-auto ? 64px : 0px;
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.actions-h - 28px - root.auto-h;
     out property <length> chart-y: root.body-y + root.controls-top + root.controls-h;
     out property <length> chart-h: root.auto-y - root.chart-y;
@@ -1330,63 +1366,34 @@ export component AppWindow inherits Window {
             wrap: word-wrap;
         }
     }
+    // Строка: выбранный профиль против текущего состояния; обрезается по ширине панели, целиком — в подсказке.
     if root.has-profiles: Text {
         x: root.prof-x + root.pad;
-        y: root.body-y + root.head-h;
+        y: root.status-y;
         width: root.prof-w - 2 * root.pad;
-        text: root.prof-was;
-        color: Palette.dim;
-        font-size: 12px;
-        overflow: elide;
-    }
-    if root.has-profiles: Text {
-        x: root.prof-x + root.pad;
-        y: root.body-y + root.head-h + 18px;
-        width: root.prof-w - 2 * root.pad;
-        text: root.prof-now;
+        height: 18px;
+        text: root.prof-status;
         color: root.prof-attention ? Palette.accent : Palette.dim;
         font-size: 12px;
+        vertical-alignment: center;
         overflow: elide;
     }
-    // Строки «было / сейчас» обрезаются по ширине панели: целиком — в подсказке.
     if root.has-profiles: TouchArea {
         x: root.prof-x + root.pad;
-        y: root.body-y + root.head-h;
+        y: root.status-y;
         width: root.prof-w - 2 * root.pad;
-        height: 36px;
+        height: 18px;
         changed has-hover => {
-            root.tip(self.has-hover, "status", root.prof-was + "\n" + root.prof-now, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            root.tip(self.has-hover, "status", root.prof-status-tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
         }
-    }
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.pad;
-        y: root.row-a-y;
-        width: root.btn-w;
-        height: root.btn-h;
-        text: "принять";
-        enabled: root.can-accept;
-        tip: "Принять то, что стоит сейчас\nТекущие потолки становятся «было»: разница на плитках обнуляется, «откатить» будет возвращать к ним.\n• если стоит сохранённый профиль — он же будет ставиться при входе в Windows\n• если стоят заводские — при входе ничего ставиться не будет\n• несохранённые потолки тоже можно принять, но после перезагрузки их не будет — для этого «сохранить»";
-        clicked => { root.profile-accept(); }
-        hover(on) => { root.tip(on, "accept", self.tip, self.x, self.y, self.width, self.height); }
-    }
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
-        y: root.row-a-y;
-        width: root.btn-w;
-        height: root.btn-h;
-        text: "откатить";
-        enabled: root.can-revert;
-        tip: "Откатить к «было»\nВозвращает потолки, которые были приняты последними (или прочитаны при запуске).\n• всё, что менялось после этого, отменяется\n• сохранённые профили не меняются";
-        clicked => { root.profile-revert(); }
-        hover(on) => { root.tip(on, "revert", self.tip, self.x, self.y, self.width, self.height); }
     }
     // Значки списка — строкой над ним; справа — заголовки столбцов среднего потолка набора по P- и по E-ядрам.
     if root.has-profiles: Text {
         x: root.prof-x + root.pad;
-        y: root.row-a-y + root.btn-h + 6px;
+        y: root.legend-y;
         width: root.prof-w - 2 * root.pad - 2 * root.mean-w - 8px;
         height: 16px;
-        text: "● стоит   ○ было   ► при входе";
+        text: "● как сейчас   ► при старте";
         color: Palette.dim;
         font-size: 11px;
         vertical-alignment: center;
@@ -1394,7 +1401,7 @@ export component AppWindow inherits Window {
     }
     if root.has-profiles: Rectangle {
         x: root.prof-x + root.prof-w - root.pad - 2 * root.mean-w - 8px;
-        y: root.row-a-y + root.btn-h + 6px;
+        y: root.legend-y;
         width: 2 * root.mean-w;
         height: 16px;
         Text { x: 0; width: root.mean-w; height: parent.height; text: "ø P"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
@@ -1406,6 +1413,7 @@ export component AppWindow inherits Window {
         }
     }
 
+    // Список: щелчок выбирает профиль и ничего не ставит — строка и плитки показывают разницу с текущим.
     if root.has-profiles: Flickable {
         x: root.prof-x + root.pad;
         y: root.sets-y;
@@ -1419,11 +1427,10 @@ export component AppWindow inherits Window {
             border-radius: 4px;
             background: s.selected ? Palette.line : set-touch.has-hover ? Palette.cell : transparent;
             Text { x: 6px; width: 12px; text: s.standing ? "●" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
-            Text { x: 18px; width: 12px; text: s.was ? "○" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
-            Text { x: 30px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
+            Text { x: 18px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
             Text {
-                x: 46px;
-                width: parent.width - 46px - 2 * root.mean-w - 12px;
+                x: 34px;
+                width: parent.width - 34px - 2 * root.mean-w - 12px;
                 text: s.name;
                 color: Palette.text;
                 font-size: 13px;
@@ -1448,11 +1455,11 @@ export component AppWindow inherits Window {
         y: root.row-b-y;
         width: root.btn-w;
         height: root.btn-h;
-        text: "открыть";
-        enabled: root.can-open;
-        tip: "Открыть выбранный набор\nСтавит его потолки. «Было» остаётся прежним — разница видна на плитках (+N, −N).\n• оставить — «принять»; вернуться — «откатить»";
-        clicked => { root.profile-open(); }
-        hover(on) => { root.tip(on, "open", self.tip, self.x, self.y, self.width, self.height); }
+        text: "применить";
+        enabled: root.can-apply;
+        tip: "Применить выбранный профиль\nСтавит его потолки в процессор — он становится текущим состоянием.\n• выбор строки в списке сам ничего не ставит\n• поправки автомодуля возвращаются к потолкам профиля\n• загрузку при старте Windows не меняет";
+        clicked => { root.profile-apply(); }
+        hover(on) => { root.tip(on, "apply", self.tip, self.x, self.y, self.width, self.height); }
     }
     if root.has-profiles: Btn {
         x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
@@ -1472,9 +1479,22 @@ export component AppWindow inherits Window {
         height: root.btn-h;
         text: "удалить";
         enabled: root.can-delete;
-        tip: "Удалить выбранный профиль\n• если он ставился при входе в Windows — больше ничего ставиться не будет\n• потолки, которые стоят сейчас, остаются до перезагрузки";
+        tip: "Удалить выбранный профиль\n• если он загружался при старте Windows — больше ничего загружаться не будет\n• потолки, которые стоят сейчас, остаются до перезагрузки";
         clicked => { root.profile-delete(); }
         hover(on) => { root.tip(on, "delete", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles: CheckBox {
+        x: root.prof-x + root.pad;
+        y: root.startup-y;
+        width: root.prof-w - 2 * root.pad;
+        height: root.check-h;
+        text: "загружать при старте Windows";
+        on: root.startup-on;
+        enabled: root.can-startup;
+        toggled => { root.startup-toggled(); }
+        hover(on) => {
+            root.tip(on, "startup", "Загружать при старте Windows\nCoreMapTray ставит этот профиль при входе в Windows; отмечен может быть только один — в списке он со знаком ►.\n• только для сохранённого профиля: «заводские» и несохранённые изменения не загружаются\n• снять отметку — при входе ничего не ставится\n• профиль с потолком выше заводского сначала пробный: после сбоя он отключается", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+        }
     }
     if root.has-profiles: Rectangle {
         x: root.prof-x + root.pad;
@@ -1513,7 +1533,7 @@ export component AppWindow inherits Window {
         height: root.btn-h;
         text: root.save-as-text;
         enabled: root.can-save-as;
-        tip: "Сохранить как профиль с названием из поля\nЗаписывает то, что стоит сейчас, и принимает его: он становится «было» и ставится при входе в Windows.\n• название уже есть — тот профиль перезаписывается";
+        tip: "Сохранить как профиль с названием из поля\nЗаписывает текущее состояние новым профилем; он становится выбранным.\n• название уже есть — тот профиль перезаписывается\n• загрузку при старте Windows не меняет";
         clicked => { root.profile-save-as(); }
         hover(on) => { root.tip(on, "save-as", self.tip, self.x, self.y, self.width, self.height); }
     }
@@ -1527,23 +1547,6 @@ export component AppWindow inherits Window {
         font-size: 11px;
         overflow: elide;
         vertical-alignment: center;
-    }
-    if root.has-profiles && root.has-history: Text {
-        x: root.prof-x + root.pad;
-        y: root.hist-y;
-        text: "История";
-        color: Palette.dim;
-        font-weight: 600;
-        font-size: 12px;
-    }
-    if root.has-profiles && root.has-history: Lines {
-        x: root.prof-x + root.pad;
-        y: root.hist-y + 20px;
-        width: root.prof-w - 2 * root.pad;
-        height: root.body-y + root.body-h - root.pad - self.y;
-        rows: root.history;
-        empty: "смен профиля ещё не было";
-        tip(on, key, text, x, y, w, h) => { root.tip(on, key, text, x, y, w, h); }
     }
 
     // ----- Статистика -----
@@ -1726,8 +1729,8 @@ export component AppWindow inherits Window {
     }
     // ----- Автомодуль: настройки программы у часов (DECISIONS #36) -----
     // Под графиком, где его красная линия отсечки, над списком его действий: всё про автомодуль — в одном месте.
-    // Строки: выключатель и подтягивание; отсечка; глубина. Одинаковое дело — одинаковый элемент: числа — ползунками,
-    // «да / нет» — выключателями.
+    // Строки: выключатель и подтягивание; отсечка (глубины нет, DECISIONS #38). Одинаковое дело — одинаковый элемент:
+    // числа — ползунками, «да / нет» — выключателями.
     Rectangle {
         visible: root.has-auto;
         x: root.stats-x + root.pad;
@@ -1744,7 +1747,7 @@ export component AppWindow inherits Window {
             enabled: root.auto-ready;
             toggled => { root.auto-toggled(); }
             hover(on) => {
-                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• работает в CoreMapTray, окно для этого не нужно\n• выключен — CoreMapTray датчики для него не читает и потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "auto-on", "Автомодуль\nСнижает потолок горячего занятого блока, пока его средняя температура выше отсечки, и возвращает его, когда блок остынет под нагрузкой.\n• опускает сколько нужно, но не ниже нижней границы потолка (той же, что в меню потолка плитки)\n• работает в CoreMapTray, окно для этого не нужно\n• выключен — CoreMapTray датчики для него не читает и потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -1815,42 +1818,6 @@ export component AppWindow inherits Window {
             horizontal-alignment: right;
             vertical-alignment: center;
         }
-        Text {
-            x: 0;
-            y: 64px;
-            width: parent.label-w;
-            height: 24px;
-            text: "глубина";
-            color: Palette.dim;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-        depth-slider := ValueSlider {
-            x: parent.label-w;
-            y: 66px;
-            width: parent.width - parent.label-w - parent.value-w;
-            height: 20px;
-            minimum: root.auto-depth-min;
-            maximum: root.auto-depth-max;
-            value: root.auto-depth;
-            enabled: root.auto-ready;
-            lit: root.auto-on;
-            released(v) => { root.depth-released(v); }
-            hover(on) => {
-                root.tip(on, "depth", "Глубина, ступеней\nНа сколько ступеней ниже своего фактического множителя автомодуль может опустить блок.\n• \{root.auto-depth-min}–\{root.auto-depth-max}; ступень — 2–5 °C у занятого блока (замер)\n• защита на случай, когда охлаждение не справляется: ниже автомодуль не пойдёт", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-            }
-        }
-        Text {
-            x: parent.width - parent.value-w;
-            y: 64px;
-            width: parent.value-w;
-            height: 24px;
-            text: "−\{depth-slider.shown}";
-            color: root.auto-on ? Palette.text : Palette.dim;
-            font-size: 12px;
-            horizontal-alignment: right;
-            vertical-alignment: center;
-        }
     }
     Lines {
         x: root.stats-x + root.pad;
@@ -1910,7 +1877,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 10px;
                     Text { text: "◆ заводской"; color: Palette.dim; }
-                    Text { text: "○ было"; color: Palette.dim; }
+                    Text { text: "○ в профиле"; color: Palette.dim; }
                     Text { text: "выше заводского"; color: Palette.bad; }
                 }
             }

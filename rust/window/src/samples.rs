@@ -29,7 +29,6 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use serde::Deserialize;
-use serde_json::{Map, Value};
 
 /// Блок занят — доля работы не меньше этой (та же граница, что у автомодуля: `machine::auto::BUSY`). Только для
 /// сравнения с соседом: корзины графика берут строки при любой нагрузке.
@@ -941,85 +940,6 @@ pub fn actions_for(entries: &[AutoEntry], names: &[&str]) -> Vec<(usize, Action)
     out
 }
 
-// ----- журнал смен профиля -----
-
-/// Блок для журнала профилей: название и первое ядро (потолки в журнале — по ядрам).
-#[derive(Debug, Clone, Copy)]
-pub struct Named<'a> {
-    pub name: &'a str,
-    pub first: usize,
-}
-
-/// Строка журнала смен профиля (тема «history» программы входа или `data\profile-log.jsonl`; пишет
-/// `rust\tray\src\app\history.rs`): время и что сделано. Поля: time; act (logon, menu, open, save, accept, revert,
-/// delete, limit, wake, foreign); name (null — потолки не из набора, "" — заводские); before и after — потолки по
-/// ядрам; block — у ручной правки; note — почему постановка неполная. Незнакомое — показывается как есть, коротко.
-pub fn history_line(entry: &Map<String, Value>, blocks: &[Named]) -> (String, String) {
-    let text_of = |key: &str| entry.get(key).and_then(Value::as_str);
-    let time = text_of("time").map(short_time).unwrap_or_default();
-    let act = text_of("act").unwrap_or("");
-    let named = match entry.get("name") {
-        Some(Value::String(n)) if n.is_empty() => "заводские".to_string(),
-        Some(Value::String(n)) => format!("«{n}»"),
-        _ => String::new(),
-    };
-    let verb = match act {
-        "logon" => "при входе в Windows поставлен".to_string(),
-        "menu" => "выбран в меню значка".to_string(),
-        "open" => "открыт".to_string(),
-        "save" => "сохранён".to_string(),
-        "accept" => "принят".to_string(),
-        "revert" => "откат к «было»".to_string(),
-        "delete" => "удалён".to_string(),
-        "limit" => format!("потолок {} вручную", text_of("block").unwrap_or("")),
-        "wake" => "после сна поставлен заново".to_string(),
-        "foreign" => "чужая правка принята".to_string(),
-        other => other.to_string(),
-    };
-    let mut text = [verb.as_str(), named.as_str()]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    // Что изменилось: блоки, у которых потолок первого ядра до и после разный.
-    let ceilings = |key: &str| entry.get(key).and_then(Value::as_array);
-    if let (Some(before), Some(after)) = (ceilings("before"), ceilings("after")) {
-        let parts: Vec<String> = blocks
-            .iter()
-            .filter_map(|b| {
-                let was = before.get(b.first).and_then(Value::as_i64)?;
-                let now = after.get(b.first).and_then(Value::as_i64)?;
-                (was != now).then(|| format!("{} ×{was}→×{now}", b.name))
-            })
-            .collect();
-        if !parts.is_empty() {
-            text.push_str(": ");
-            text.push_str(&parts.join(", "));
-        }
-    }
-    if let Some(note) = text_of("note") {
-        let _ = write!(text, " ({note})"); // into a String
-    }
-    if text.is_empty() {
-        // Незнакомая запись: её поля как есть, без времени.
-        text = entry
-            .iter()
-            .filter(|(k, _)| k.as_str() != "time" && k.as_str() != "at")
-            .map(|(k, v)| format!("{k} {v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-    }
-    (time, text)
-}
-
-pub fn history_entries(text: &str, into: &mut Vec<Map<String, Value>>) {
-    into.extend(
-        text.lines()
-            .filter_map(|l| serde_json::from_str::<Map<String, Value>>(l).ok()),
-    );
-}
-
 // ----- время -----
 
 /// «2026-10-15T01:25:08.1234567+03:00» или «2026-10-15 01:25:08» → «15.10 01:25»; другое — как есть.
@@ -1442,41 +1362,6 @@ mod tests {
                 (1, "×46 → ×45")
             ]
         );
-    }
-
-    #[test]
-    fn history_lines_read_the_logon_program_shape() {
-        let entry = |text: &str| serde_json::from_str::<Map<String, Value>>(text).expect("json");
-        let blocks = [
-            Named { name: "0", first: 0 },
-            Named {
-                name: "2–5", first: 1
-            },
-        ];
-        // Строка в том виде, в каком её пишет rust\tray\src\app\history.rs.
-        let (time, text) = history_line(
-            &entry(
-                r#"{"time":"2026-10-15T01:20:00.0000000+03:00","at":1,"act":"open","name":"csmart2","before":[53,46,46,46,46],"after":[53,44,44,44,44]}"#,
-            ),
-            &blocks,
-        );
-        assert_eq!(time, "15.10 01:20");
-        assert_eq!(text, "открыт «csmart2»: 2–5 ×46→×44");
-        let (_, text) = history_line(
-            &entry(r#"{"act":"menu","name":"","before":[50,44],"after":[53,46]}"#),
-            &blocks,
-        );
-        assert_eq!(text, "выбран в меню значка заводские: 0 ×50→×53, 2–5 ×44→×46");
-        let (_, text) = history_line(
-            &entry(r#"{"act":"limit","name":null,"block":"0","before":[53,46],"after":[52,46]}"#),
-            &blocks,
-        );
-        assert_eq!(text, "потолок 0 вручную: 0 ×53→×52");
-        let (_, text) = history_line(
-            &entry(r#"{"act":"logon","name":"тихий","before":[53],"after":[53],"note":"блок 1 не ответил"}"#),
-            &blocks,
-        );
-        assert_eq!(text, "при входе в Windows поставлен «тихий» (блок 1 не ответил)");
     }
 
     #[test]

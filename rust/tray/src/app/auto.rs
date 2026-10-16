@@ -40,15 +40,12 @@ use crate::fans::{Fans, HpFans, SimFans};
 
 /// Таймер опроса.
 pub const AUTO: usize = 4;
-/// Пункты подменю: включено; подтягивание вверх; отсечка и глубина — открыть окно (там они настраиваются).
+/// Пункты подменю: включено; подтягивание вверх; отсечка — открыть окно (там она настраивается).
 pub const AUTO_ON: u32 = 10;
 pub const STEP_UP_ID: u32 = 11;
 pub const AUTO_WINDOW_ID: u32 = 12;
 /// Отсечка, °C, — ползунок в окне с шагом 1 °C (план DECISIONS #32, шаг 2; вместо пресетов 75–95 в меню).
 pub const LIMIT_RANGE: RangeInclusive<i32> = 60..=95;
-/// Глубина, ступеней вниз от фактического множителя: ступень — 2–5 °C у занятого блока (замер 14.10), 8 ступеней —
-/// 16–40 °C, больше защите не нужно. Пресеты меню были 2/4/6 — все внутри.
-pub const DEPTH_RANGE: RangeInclusive<i32> = 1..=8;
 /// Как часто писать в журнал цену опроса — так она измеряется на машине владельца.
 pub(super) const COST_EVERY: Duration = Duration::from_secs(60);
 /// Столько чтений подряд потолок блока должен расходиться с ожидаемым, чтобы считаться чужой правкой: одно чтение
@@ -94,12 +91,13 @@ impl AutoTiming {
     };
 }
 
-/// Выбор владельца, как он лежит в data\tray.json.
+/// Выбор владельца, как он лежит в data\tray.json. Глубины больше нет (владелец 15.10, DECISIONS #38): регулятор
+/// опускает блок сколько нужно, но не ниже нижней границы допустимого потолка; ключ «depth» файла прежней сборки
+/// читается молча и больше не пишется.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Choice {
     pub on: bool,
     pub limit: i32,
-    pub depth: i32,
     /// Подтягивать прохладные блоки выше принятого, до заводского (DECISIONS #32; по умолчанию выключено).
     pub step_up: bool,
 }
@@ -109,13 +107,12 @@ impl Default for Choice {
         Self {
             on: false,
             limit: 85,
-            depth: 4,
             step_up: false,
         }
     }
 }
 
-/// Целое из JSON в допустимом промежутке: 85.0, «85» и 96 — не годятся (шаг — 1 °C, ступень — целая).
+/// Целое из JSON в допустимом промежутке: 85.0, «85» и 96 — не годятся (шаг — 1 °C).
 fn whole(value: &Value, range: &RangeInclusive<i32>) -> Option<i32> {
     value
         .as_i64()
@@ -125,7 +122,7 @@ fn whole(value: &Value, range: &RangeInclusive<i32>) -> Option<i32> {
 
 impl Choice {
     /// Выбор из data\tray.json. Каждое поле — само по себе: негодное или пропавшее берёт значение по умолчанию, а
-    /// годные соседние остаются (файл прежней сборки с пресетами 75–95 и 2/4/6 читается как есть).
+    /// годные соседние остаются (файл прежней сборки с пресетами 75–95 читается как есть, его «depth» не замечается).
     #[must_use]
     pub fn read(map: &Map<String, Value>) -> Self {
         let default = Self::default();
@@ -135,16 +132,13 @@ impl Choice {
                 .get("limit")
                 .and_then(|v| whole(v, &LIMIT_RANGE))
                 .unwrap_or(default.limit),
-            depth: map
-                .get("depth")
-                .and_then(|v| whole(v, &DEPTH_RANGE))
-                .unwrap_or(default.depth),
             step_up: map.get("stepUp").and_then(Value::as_bool).unwrap_or(default.step_up),
         }
     }
 
     /// Команда окна «auto.set»: какие поля пришли — те и меняются, остальные прежние. Отказ, если хоть одно поле
-    /// негодно или незнакомо (опечатка в имени не должна молча ничего не сделать), или настроек в команде нет.
+    /// негодно или незнакомо (опечатка в имени не должна молча ничего не сделать; «depth» прежнего окна — тоже), или
+    /// настроек в команде нет.
     /// `id` и `c` — номер и имя самой команды, не настройки.
     pub fn changed(self, fields: &Map<String, Value>) -> Result<Self, String> {
         let mut next = self;
@@ -163,15 +157,6 @@ impl Choice {
                         )
                     })?;
                 }
-                "depth" => {
-                    next.depth = whole(value, &DEPTH_RANGE).ok_or_else(|| {
-                        format!(
-                            "глубина — целое число ступеней от {} до {}",
-                            DEPTH_RANGE.start(),
-                            DEPTH_RANGE.end()
-                        )
-                    })?;
-                }
                 other => return Err(format!("незнакомая настройка автомодуля «{other}»")),
             }
             any = true;
@@ -186,18 +171,17 @@ impl Choice {
     /// Как выбор лежит в data\tray.json.
     #[must_use]
     pub fn file_text(self) -> String {
-        json!({ "auto": self.on, "limit": self.limit, "depth": self.depth, "stepUp": self.step_up }).to_string()
+        json!({ "auto": self.on, "limit": self.limit, "stepUp": self.step_up }).to_string()
     }
 
-    /// Тема окну «settings»: выбор и допустимые промежутки — их держит эта программа, окно по ним строит ползунки.
+    /// Тема окну «settings»: выбор и допустимая отсечка — её держит эта программа, окно по ней строит ползунок.
     #[must_use]
     pub fn topic(self) -> String {
         json!({
             "t": "settings",
             "auto": {
-                "on": self.on, "limit": self.limit, "depth": self.depth, "stepUp": self.step_up,
+                "on": self.on, "limit": self.limit, "stepUp": self.step_up,
                 "limitRange": [LIMIT_RANGE.start(), LIMIT_RANGE.end()],
-                "depthRange": [DEPTH_RANGE.start(), DEPTH_RANGE.end()],
             },
         })
         .to_string()
@@ -362,7 +346,6 @@ impl App {
         Controller::new(
             Settings {
                 limit: f64::from(c.limit),
-                depth: c.depth,
                 step_up: c.step_up,
             },
             self.config.auto.control,
@@ -385,9 +368,8 @@ impl App {
             self.meter.forget();
             shell.set_timer(AUTO, self.config.auto.tick);
             self.journal.note(&format!(
-                "автомодуль включён: до {} °C, глубина {}{}",
+                "автомодуль включён: до {} °C{}",
                 self.auto.choice.limit,
-                self.auto.choice.depth,
                 if self.auto.choice.step_up {
                     ", с подтягиванием"
                 } else {
@@ -548,15 +530,15 @@ impl App {
             default: false,
             children: Vec::new(),
         };
-        // Отсечка и глубина — ползунками в окне (владелец 15.10: пресеты «место занимают только в меню»); здесь —
-        // что стоит, и пункт, который открывает окно. Включение и подтягивание остаются: ими владелец пользуется.
+        // Отсечка — ползунком в окне (владелец 15.10: пресеты «место занимают только в меню»); здесь — что стоит, и
+        // пункт, который открывает окно. Включение и подтягивание остаются: ими владелец пользуется.
         let children = vec![
             item(AUTO_ON, "Включено".into(), c.on),
             item(STEP_UP_ID, "Подтягивать вверх, до заводского".into(), c.step_up),
             super::separator(),
             item(
                 AUTO_WINDOW_ID,
-                format!("Отсечка {} °C, глубина {} — настроить в окне", c.limit, c.depth),
+                format!("Отсечка {} °C — настроить в окне", c.limit),
                 false,
             ),
         ];
@@ -641,10 +623,9 @@ impl App {
         }
         self.save_choice();
         self.journal.note(&format!(
-            "автомодуль ({by}): {}, до {} °C, глубина {}, подтягивание {}",
+            "автомодуль ({by}): {}, до {} °C, подтягивание {}",
             if next.on { "включён" } else { "выключен" },
             next.limit,
-            next.depth,
             if next.step_up { "вкл" } else { "выкл" }
         ));
     }
@@ -1035,6 +1016,8 @@ impl App {
         let intended = self.intended.as_deref()?;
         let ceilings: Vec<i32> = topology.blocks.iter().map(|b| limits.current()[b.first]).collect();
         let fused: Vec<i32> = topology.blocks.iter().map(|b| limits.fused()[b.first]).collect();
+        // Ниже этого регулятор блок не опускает: та же граница, что у ручного потолка (`Limits::set` ниже не пишет).
+        let floor: Vec<i32> = topology.blocks.iter().map(|b| limits.floor(b.first)).collect();
         // Возвращать регулятор может только то, что сдвинул сам: блок ниже принятого, но не в надстройке, опустил
         // кто-то другой — для регулятора его «принятый» — то, что стоит. Иначе прохладный блок поднимался бы поверх
         // чужой правки (найдено скрытой проверкой 14.10).
@@ -1065,6 +1048,7 @@ impl App {
             ceilings: &ceilings,
             accepted: &accepted,
             fused: &fused,
+            floor: &floor,
         };
         let Autopilot { controller, memory, .. } = &mut self.auto;
         let banned = |b: usize, to: i32| {
@@ -1297,8 +1281,8 @@ fn round(value: f64, digits: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    // Настройки автомодуля по плану (DECISIONS #32, шаг 2): отсечка 60–95 °C с шагом 1 °C, глубина — целые ступени,
-    // подтягивание по умолчанию выключено; негодное в файле — значение по умолчанию у этого поля, в команде — отказ.
+    // Настройки автомодуля по плану (DECISIONS #32, шаг 2; #38): отсечка 60–95 °C с шагом 1 °C, подтягивание по
+    // умолчанию выключено, глубины нет; негодное в файле — значение по умолчанию у этого поля, в команде — отказ.
     use super::*;
 
     fn map(text: &str) -> Map<String, Value> {
@@ -1306,43 +1290,56 @@ mod tests {
     }
 
     #[test]
-    fn file_of_the_previous_build_is_read_as_is() {
-        // Файл, записанный сборкой с пресетами меню: все значения внутри новых промежутков.
-        let c = Choice::read(&map(r#"{"auto":true,"limit":75,"depth":6,"stepUp":true}"#));
-        assert_eq!(
-            c,
-            Choice {
-                on: true,
-                limit: 75,
-                depth: 6,
-                step_up: true
-            }
-        );
+    fn file_of_the_previous_build_is_read_as_is_and_its_depth_ignored() {
+        // Файл, записанный сборкой с глубиной (0.5.3 и раньше): «depth» любого вида не мешает остальному.
+        for text in [
+            r#"{"auto":true,"limit":75,"depth":6,"stepUp":true}"#,
+            r#"{"auto":true,"limit":75,"depth":99,"stepUp":true}"#,
+            r#"{"auto":true,"limit":75,"depth":"глубоко","stepUp":true}"#,
+        ] {
+            assert_eq!(
+                Choice::read(&map(text)),
+                Choice {
+                    on: true,
+                    limit: 75,
+                    step_up: true
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_is_written_without_depth() {
+        let text = Choice {
+            on: true,
+            limit: 77,
+            step_up: false,
+        }
+        .file_text();
+        assert!(!text.contains("depth"), "{text}");
+        assert_eq!(text, r#"{"auto":true,"limit":77,"stepUp":false}"#);
     }
 
     #[test]
     fn a_bad_field_in_the_file_falls_back_alone() {
         let d = Choice::default();
-        for (text, limit, depth) in [
-            (r#"{"auto":true,"limit":59,"depth":4}"#, d.limit, 4),
-            (r#"{"auto":true,"limit":96,"depth":4}"#, d.limit, 4),
-            (r#"{"auto":true,"limit":85.5,"depth":4}"#, d.limit, 4),
-            (r#"{"auto":true,"limit":"80","depth":4}"#, d.limit, 4),
-            (r#"{"auto":true,"limit":70,"depth":0}"#, 70, d.depth),
-            (r#"{"auto":true,"limit":70,"depth":99}"#, 70, d.depth),
-            (r#"{"auto":true,"limit":70}"#, 70, d.depth),
+        for (text, limit) in [
+            (r#"{"auto":true,"limit":59}"#, d.limit),
+            (r#"{"auto":true,"limit":96}"#, d.limit),
+            (r#"{"auto":true,"limit":85.5}"#, d.limit),
+            (r#"{"auto":true,"limit":"80"}"#, d.limit),
+            (r#"{"auto":true,"limit":70}"#, 70),
         ] {
             let c = Choice::read(&map(text));
             assert!(c.on, "{text}: the good neighbour stays");
-            assert_eq!((c.limit, c.depth), (limit, depth), "{text}");
+            assert_eq!(c.limit, limit, "{text}");
         }
         // Ничего годного: всё по умолчанию, автомодуль выключен.
         assert_eq!(Choice::read(&map(r#"{"auto":"да","stepUp":1}"#)), d);
-        // Края промежутков — годные.
-        let edges = Choice::read(&map(r#"{"limit":60,"depth":1}"#));
-        assert_eq!((edges.limit, edges.depth), (60, 1));
-        let edges = Choice::read(&map(r#"{"limit":95,"depth":8}"#));
-        assert_eq!((edges.limit, edges.depth), (95, 8));
+        // Края промежутка — годные.
+        assert_eq!(Choice::read(&map(r#"{"limit":60}"#)).limit, 60);
+        assert_eq!(Choice::read(&map(r#"{"limit":95}"#)).limit, 95);
     }
 
     #[test]
@@ -1350,17 +1347,15 @@ mod tests {
         let was = Choice {
             on: true,
             limit: 80,
-            depth: 4,
             step_up: false,
         };
         let next = was.changed(&map(r#"{"id":7,"c":"auto.set","limit":82}"#));
         assert_eq!(next, Ok(Choice { limit: 82, ..was }));
-        let next = was.changed(&map(r#"{"depth":8,"stepUp":true,"on":false}"#));
+        let next = was.changed(&map(r#"{"stepUp":true,"on":false}"#));
         assert_eq!(
             next,
             Ok(Choice {
                 on: false,
-                depth: 8,
                 step_up: true,
                 ..was
             })
@@ -1376,11 +1371,10 @@ mod tests {
             r#"{"limit":85.5}"#,
             r#"{"limit":"85"}"#,
             r#"{"limit":null}"#,
-            r#"{"depth":0}"#,
-            r#"{"depth":9}"#,
-            r#"{"depth":2.5}"#,
             r#"{"on":1}"#,
             r#"{"stepUp":"нет"}"#,
+            // глубины больше нет: окно прежней сборки получает отказ, а не молчаливое «принято»
+            r#"{"depth":4}"#,
             // годное рядом с негодным не применяется частично
             r#"{"on":true,"limit":200}"#,
             // опечатка в имени не должна молча ничего не сделать
@@ -1396,30 +1390,19 @@ mod tests {
     }
 
     #[test]
-    fn the_topic_carries_the_choice_and_the_ranges() {
-        let topic: Value = serde_json::from_str(
-            &Choice {
-                on: true,
-                limit: 77,
-                depth: 3,
-                step_up: true,
-            }
-            .topic(),
-        )
-        .unwrap_or(Value::Null);
+    fn the_topic_carries_the_choice_and_the_range() {
+        let choice = Choice {
+            on: true,
+            limit: 77,
+            step_up: true,
+        };
+        let topic: Value = serde_json::from_str(&choice.topic()).unwrap_or(Value::Null);
         assert_eq!(topic["t"], "settings");
         assert_eq!(
             topic["auto"],
-            json!({ "on": true, "limit": 77, "depth": 3, "stepUp": true, "limitRange": [60, 95], "depthRange": [1, 8] })
+            json!({ "on": true, "limit": 77, "stepUp": true, "limitRange": [60, 95] })
         );
         // Файл и команда говорят одними именами: записанное читается обратно тем же.
-        let back = Choice::read(&map(&Choice {
-            on: true,
-            limit: 77,
-            depth: 3,
-            step_up: true,
-        }
-        .file_text()));
-        assert_eq!((back.on, back.limit, back.depth, back.step_up), (true, 77, 3, true));
+        assert_eq!(Choice::read(&map(&choice.file_text())), choice);
     }
 }

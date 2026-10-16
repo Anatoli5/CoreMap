@@ -1,14 +1,16 @@
-// Регулятор автомодуля (DECISIONS #31 «Auto module», #32): по показаниям блоков решает, какой блок опустить на ступень
-// и какой поднять. Окна, таймеров и вызовов Windows здесь нет: время и показания приходят снаружи, ответ — решение.
-// Поэтому правило проверяется тестами на многих минутах «времени» за миллисекунды.
+// Регулятор автомодуля (DECISIONS #31 «Auto module», #32, #38): по показаниям блоков решает, какой блок опустить на
+// ступень и какой поднять. Окна, таймеров и вызовов Windows здесь нет: время и показания приходят снаружи, ответ —
+// решение. Поэтому правило проверяется тестами на многих минутах «времени» за миллисекунды.
 //
 // Правило — как у регуляторов в Linux (thermald) и ACPI: снижать быстро, поднимать медленно и по одной ступени, с
 // зазором между порогами (без зазора, как у ThrottleStop, — скачки туда-сюда; outputs/auto-control-research-2026-10-14.md).
 // - Опустить: блок нагружен (доля работы ≥ 50 %), его средняя температура за окно (20 с) выше предела, после его
 //   прошлого изменения прошла пауза (15 с). Новый потолок — на ступень ниже фактического множителя, а не потолка:
-//   горячие ядра и так идут на 2–4 ступени ниже потолка (измерено), снижение потолка над ними ничего бы не дало. Не
-//   глубже «где работал при первом снижении минус глубина». За один шаг — один блок, самый горячий. Вместе с решением
-//   уходит ступень, на которой блок перегрелся (`Decision::ban`): выше неё память перегрева (memory.rs) не пустит.
+//   горячие ядра и так идут на 2–4 ступени ниже потолка (измерено), снижение потолка над ними ничего бы не дало. Ниже
+//   нижней границы допустимого потолка (`Frame::floor`, та же, что у ручного потолка, machine::limits) — никогда;
+//   выше неё — сколько нужно (владелец 15.10 убрал глубину: «функционально не очень понятно, для чего это сделано»).
+//   За один шаг — один блок, самый горячий. Вместе с решением уходит ступень, на которой блок перегрелся
+//   (`Decision::ban`): выше неё память перегрева (memory.rs) не пустит.
 // - Поднять: блок пробыл прохладным (ниже «предел − 5 °C») под нагрузкой 2 минуты — простой не считается и не
 //   сбрасывает счёт (DECISIONS #32: опущенный блок «остывал» в меню игры, поднимался и снова перегревался в игре).
 //   Поднимается на одну ступень, до следующей — снова 2 минуты; ступень, на которую запрещает память, — нет.
@@ -16,9 +18,6 @@
 //   работает на своём потолке (иначе более высокий потолок ничего не меняет).
 // - Между порогами — ничего. После любого изменения потолка окна всех блоков начинаются заново: прежние показания
 //   были до него, а сосед греет соседа (связь 21–48 %, KNOWLEDGE.md) — следующее решение только по свежему окну.
-// - Глубина считается от того, где блок работал при первом снижении (фактический множитель), а не от принятого
-//   потолка: горячие ядра и так идут на 3–4 ступени ниже потолка, и «принятый − 4» оставлял регулятору одну
-//   ступень или ни одной (ревизия, outputs/review-auto-2026-10-14.md H2).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -34,11 +33,10 @@ pub const AT_CEILING: f64 = 0.5;
 /// Больше этого между двумя показаниями «прохладен под нагрузкой» к счёту прохлады не прибавляется: был перерыв.
 const COOL_GAP: Duration = Duration::from_secs(10);
 
-/// Выбор владельца: предел температуры, насколько глубоко можно опускать и можно ли подтягивать выше принятого.
+/// Выбор владельца: предел температуры и можно ли подтягивать выше принятого.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub limit: f64,
-    pub depth: i32,
     pub step_up: bool,
 }
 
@@ -100,6 +98,8 @@ pub struct Frame<'a> {
     pub accepted: &'a [i32],
     /// Заводской предел блока: выше никогда.
     pub fused: &'a [i32],
+    /// Нижняя граница допустимого потолка блока (`Limits::floor` его первого ядра): ниже никогда.
+    pub floor: &'a [i32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,9 +118,6 @@ struct Track {
     cool: Duration,
     /// Когда было последнее показание «нагружен и прохладен»: следующее такое же прибавляет промежуток.
     cool_at: Option<Duration>,
-    /// Где блок работал при первом снижении (целый фактический множитель, не выше принятого): от него считается
-    /// глубина, пока блок не вернётся к принятому.
-    anchor: Option<i32>,
 }
 
 impl Track {
@@ -245,19 +242,20 @@ impl Controller {
         track.acted.is_none_or(|t| now.saturating_sub(t) >= self.timing.settle)
     }
 
-    /// Опустить: самый горячий из нагруженных и перегретых за всё окно.
+    /// Опустить: самый горячий из нагруженных и перегретых за всё окно — на ступень ниже фактического множителя, не
+    /// ниже нижней границы допустимого потолка.
     fn lower(&mut self, now: Duration, frame: &Frame<'_>) -> Option<Decision> {
-        let Settings { limit, depth, .. } = self.settings;
-        let mut hottest: Option<(usize, Window, i32, i32, i32)> = None; // блок, окно, куда, якорь, ступень перегрева
+        let limit = self.settings.limit;
+        let mut hottest: Option<(usize, Window, i32, i32)> = None; // блок, окно, куда, ступень перегрева
         for (block, track) in self.tracks.iter().enumerate() {
-            let (Some(&ceiling), Some(&base)) = (frame.ceilings.get(block), frame.accepted.get(block)) else {
+            let (Some(&ceiling), Some(&floor)) = (frame.ceilings.get(block), frame.floor.get(block)) else {
                 continue;
             };
             if !track.covered(now, self.timing.window) || !self.settled(track, now) {
                 continue;
             }
             let Some(window) = track.window() else { continue };
-            if window.mean <= limit || window.busy < BUSY {
+            if window.mean <= limit || window.busy < BUSY || ceiling <= floor {
                 continue;
             }
             // Множитель — целые ступени; дробный средний округляется вниз, а ступень перегрева — вверх: блок, шедший
@@ -266,23 +264,17 @@ impl Controller {
             let (actual, ran) = window.ratio.map_or((ceiling, ceiling), |r| {
                 ((r.floor() as i32).min(ceiling), (r.ceil() as i32).min(ceiling))
             });
-            let anchor = track.anchor.unwrap_or_else(|| actual.min(base));
-            let floor = anchor - depth;
-            if ceiling <= floor {
-                continue;
-            }
             let to = (actual - 1).min(ceiling - 1).max(floor);
             if hottest.is_none_or(|(_, w, ..)| window.mean > w.mean) {
-                hottest = Some((block, window, to, anchor, ran.max(to + 1)));
+                hottest = Some((block, window, to, ran.max(to + 1)));
             }
         }
-        let (block, window, to, anchor, ran) = hottest?;
+        let (block, window, to, ran) = hottest?;
         self.after_action();
         let track = &mut self.tracks[block];
         track.acted = Some(now);
         track.cool = Duration::ZERO;
         track.cool_at = None;
-        track.anchor = Some(anchor);
         Some(Decision {
             action: Action::Lower { block, to },
             window: Some(window),
@@ -321,9 +313,6 @@ impl Controller {
         track.acted = Some(now);
         track.cool = Duration::ZERO; // до следующей ступени — снова полный срок прохлады
         track.cool_at = None;
-        if frame.accepted.get(block).is_some_and(|&base| to >= base) {
-            track.anchor = None; // вернулся к принятому: следующее снижение считает глубину заново
-        }
         Some(Decision {
             action: Action::Raise { block, to },
             window,
@@ -354,21 +343,15 @@ mod tests {
 
     const LIMIT: f64 = 85.0;
     const FUSED: i32 = 54;
+    /// Нижняя граница допустимого потолка P-ядра 275HX: базовый множитель ×27 (`machine::limits`, DECISIONS #34).
+    const FLOOR: i32 = 27;
 
     fn controller(blocks: usize) -> Controller {
         with(blocks, false)
     }
 
     fn with(blocks: usize, step_up: bool) -> Controller {
-        Controller::new(
-            Settings {
-                limit: LIMIT,
-                depth: 4,
-                step_up,
-            },
-            Timing::REAL,
-            blocks,
-        )
+        Controller::new(Settings { limit: LIMIT, step_up }, Timing::REAL, blocks)
     }
 
     #[expect(
@@ -394,6 +377,7 @@ mod tests {
         banned: &dyn Fn(usize, i32) -> bool,
     ) -> Vec<(u64, Decision)> {
         let fused = vec![FUSED; ceilings.len()];
+        let floor = vec![FLOOR; ceilings.len()];
         let mut decisions = Vec::new();
         for t in (from..from + seconds).step_by(2) {
             let frame = Frame {
@@ -401,6 +385,7 @@ mod tests {
                 ceilings,
                 accepted,
                 fused: &fused,
+                floor: &floor,
             };
             if let Some(decision) = c.step(Duration::from_secs(t), &frame, banned) {
                 match decision.action {
@@ -458,31 +443,54 @@ mod tests {
     }
 
     #[test]
-    fn never_deeper_than_depth_below_where_it_ran_at_the_first_step() {
-        // Accepted x50, the block ran at x40 (far under the ceiling): depth 4 counts from x40, not from x50.
+    fn a_block_that_stays_hot_goes_down_to_the_range_bottom_and_not_below() {
+        // The owner removed the depth (15.10): a block that stays hot is lowered as far as needed - past the old
+        // "4 steps below where it ran" (x36 for a block that ran x40) - down to the bottom of the allowed range, as a
+        // manual ceiling, and never below it.
         let mut c = controller(1);
         let mut ceilings = [50];
-        let actions = run(&mut c, 0, 900, &[hot(99.0, 1.0, 40.0)], &mut ceilings, &[50]);
-        assert_eq!(ceilings[0], 36, "{actions:?}");
+        let actions = run(&mut c, 0, 1800, &[hot(99.0, 1.0, 40.0)], &mut ceilings, &[50]);
+        assert_eq!(ceilings[0], FLOOR, "{actions:?}");
+        assert!(ceilings[0] < 36, "deeper than the old depth limit");
         assert!(
             actions
                 .iter()
-                .all(|(_, a)| matches!(a, Action::Lower { to, .. } if *to >= 36))
+                .all(|(_, a)| matches!(a, Action::Lower { to, .. } if *to >= FLOOR)),
+            "{actions:?}"
         );
+        let more = run(
+            &mut c,
+            1800,
+            600,
+            &[hot(99.0, 1.0, f64::from(FLOOR))],
+            &mut ceilings,
+            &[50],
+        );
+        assert_eq!(more, [], "at the range bottom nothing more happens");
     }
 
     #[test]
-    fn a_hot_core_running_under_its_ceiling_still_has_the_whole_depth() {
-        // Measured on the 275HX: core 1 at ceiling x53 ran x49.87. Accepted x53, depth 4 -> down to x45, not x49.
+    fn a_step_that_would_cross_the_range_bottom_stops_at_it() {
+        // Ceiling x29, the block throttles to x20 under it: one step below the actual multiplier would be x19 - below
+        // the bottom (x27) - so the step is to x27 exactly.
+        let mut c = controller(1);
+        let mut ceilings = [29];
+        let actions = run(&mut c, 0, 20, &[hot(95.0, 1.0, 20.0)], &mut ceilings, &[50]);
+        let lowered: Vec<Action> = actions.iter().map(|&(_, a)| a).collect();
+        assert_eq!(lowered, [Action::Lower { block: 0, to: FLOOR }]);
+    }
+
+    #[test]
+    fn a_hot_core_running_under_its_ceiling_steps_from_where_it_runs() {
+        // Measured on the 275HX: core 1 at ceiling x53 ran x49.87 - the first step is to x48, not to x52.
         let mut c = controller(1);
         let mut ceilings = [53];
-        let actions = run(&mut c, 0, 900, &[hot(95.0, 1.0, 49.87)], &mut ceilings, &[53]);
+        let actions = run(&mut c, 0, 20, &[hot(95.0, 1.0, 49.87)], &mut ceilings, &[53]);
         assert_eq!(
             actions.first().map(|a| a.1),
             Some(Action::Lower { block: 0, to: 48 }),
             "the first step bites"
         );
-        assert_eq!(ceilings[0], 45, "{actions:?}");
     }
 
     #[test]

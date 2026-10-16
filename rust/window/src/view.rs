@@ -10,6 +10,11 @@
 // статистику или убрать его оттуда (сравнить можно любые блоки, хоть все, владелец 15.10: «почему только 4 ядра можно
 // выбирать»), и только; правая кнопка — меню потолка. Нагрузки у окна нет.
 //
+// Профили (владелец 15.10, DECISIONS #38): текущее состояние — то, что стоит, — и профили — разные вещи. Щелчок по
+// строке списка только выбирает профиль: окно показывает разницу выбранного с текущим (строкой панели и на плитках) и
+// ничего не шлёт. «Применить» ставит выбранный, «сохранить» пишет в него текущее, «загружать при старте Windows» —
+// отдельный выбор (команда profile.startup), видимый только знаком в списке.
+//
 // Настройки автомодуля (DECISIONS #36) — выбор программы у часов: окно показывает тему settings и шлёт изменения
 // командой auto.set; ползунок — одной командой, когда его отпустили. Пока его тянут и пока программа не подтвердила
 // новое число, ручка и линия отсечки стоят на числе под рукой (`limit_held`), а не прыгают назад.
@@ -30,7 +35,7 @@ use crate::pipe::{Event, Link};
 use crate::saved::{self, Remembered};
 use crate::store::Digest;
 use crate::wire::{AutoSettings, Hello, Limits, Message, Profiles, State};
-use crate::{AppWindow, CellData, LineRow, LinkData, MenuEntry, SetRow, TileData};
+use crate::{AppWindow, CellData, LinkData, MenuEntry, SetRow, TileData};
 
 const TEXT: [u8; 3] = [0xe6, 0xe8, 0xec];
 const ACCENT: [u8; 3] = [0xff, 0xd1, 0x66];
@@ -106,21 +111,14 @@ pub struct Changes {
     pub last: u32,
 }
 
-/// Число ползунка, которое ждёт подтверждения программы у часов.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    Limit,
-    Depth,
-}
-
 /// Команда, на которую ждём ответ: что сказать при отказе и что сделать при успехе.
 #[derive(Debug)]
 struct Pending {
     failure: &'static str,
     /// «Сохранить как»: название, которое станет выбранным, когда движок ответит «сделано».
     saved_as: Option<String>,
-    /// Число ползунка в этой команде: отказ — ручка возвращается к выбору программы.
-    held: Option<Held>,
+    /// Число ползунка отсечки в этой команде: отказ — ручка возвращается к выбору программы.
+    held: bool,
 }
 
 impl Pending {
@@ -128,7 +126,7 @@ impl Pending {
         Self {
             failure,
             saved_as: None,
-            held: None,
+            held: false,
         }
     }
 }
@@ -148,8 +146,6 @@ pub struct View {
     pub limits: Option<Limits>,
     pub state: Option<State>,
     pub profiles: Option<Profiles>,
-    /// Тема «history» программы входа; None — её не было, тогда история — из data\profile-log.jsonl.
-    history: Option<Vec<Map<String, Value>>>,
     pub digest: Option<Arc<Digest>>,
     geometry: Geometry,
     tiles: Rc<VecModel<TileData>>,
@@ -165,12 +161,11 @@ pub struct View {
     pub pin_mode: bool,
     pub pinned: Option<usize>,
     pub hovered: Option<usize>,
-    /// Выбранная строка списка наборов: "" — заводские; None — ничего.
-    chosen: Option<String>,
+    /// Выбранная строка списка наборов: "" — заводские; None — ничего (до первых профилей: тогда — профиль запуска).
+    pub chosen: Option<String>,
     shown_profiles: Option<ProfileShown>,
     pub shown_stats: Option<StatsShown>,
     shown_links: Vec<(LinkData, f64)>,
-    shown_history: Vec<(String, String)>,
     refused: Option<String>,
     up: bool,
     why: String,
@@ -186,8 +181,6 @@ pub struct View {
     /// состоянием); None — ручка и линия стоят на выборе программы.
     limit_held: Option<i32>,
     limit_dragging: bool,
-    /// Глубина после отпускания, пока программа не подтвердила её темой.
-    depth_held: Option<i32>,
     /// Сколько команд окно послало (скрытой проверке: движение ползунка — одна команда).
     pub sent: u32,
     /// Файл окна: что оно помнит о себе; запоминается при смене выбора и подсветки и при закрытии.
@@ -222,7 +215,6 @@ impl View {
             limits: None,
             state: None,
             profiles: None,
-            history: None,
             digest: None,
             geometry: Geometry::default(),
             tiles,
@@ -238,7 +230,6 @@ impl View {
             shown_profiles: None,
             shown_stats: None,
             shown_links: Vec::new(),
-            shown_history: Vec::new(),
             refused: None,
             up: false,
             why: "окно запускается".into(),
@@ -250,7 +241,6 @@ impl View {
             auto: None,
             limit_held: None,
             limit_dragging: false,
-            depth_held: None,
             sent: 0,
             memory,
             restore,
@@ -279,7 +269,6 @@ impl View {
                 // Ответов на посланное уже не будет: ручки — на последнем известном выборе программы.
                 self.limit_held = None;
                 self.limit_dragging = false;
-                self.depth_held = None;
                 self.show_link();
                 self.show_auto();
                 self.refresh_stats();
@@ -294,19 +283,18 @@ impl View {
                 self.refresh_stats();
             }
             Event::Message(Message::Profiles(profiles)) => {
+                // Выбор живёт, пока такой профиль есть; окно открылось или выбранного больше нет — профиль запуска.
                 let keep = self
                     .chosen
                     .as_deref()
                     .is_some_and(|c| c.is_empty() || profiles.sets.iter().any(|s| s.name == c));
                 if !keep {
-                    self.chosen = profiles.standing.clone().or_else(|| profiles.was_named.clone());
+                    self.chosen = Some(panels::default_choice(&profiles));
                 }
                 self.profiles = Some(profiles);
                 self.refresh_profiles();
-            }
-            Event::Message(Message::History(history)) => {
-                self.history = Some(history.entries);
-                self.refresh_history();
+                // Разница на плитках — с выбранным профилем: его потолки могли смениться («сохранить»).
+                self.refresh(false);
             }
             Event::Message(Message::Reply(reply)) => {
                 if reply.re == 0 {
@@ -320,16 +308,10 @@ impl View {
                     } else {
                         Some(format!("{}: {}", pending.failure, reply.why.unwrap_or_default()))
                     };
-                    if !reply.ok {
-                        match pending.held {
-                            Some(Held::Limit) => self.limit_held = None,
-                            Some(Held::Depth) => self.depth_held = None,
-                            None => {}
-                        }
-                        if pending.held.is_some() {
-                            self.show_auto();
-                            self.refresh_stats();
-                        }
+                    if !reply.ok && pending.held {
+                        self.limit_held = None;
+                        self.show_auto();
+                        self.refresh_stats();
                     }
                     if reply.ok
                         && let Some(name) = pending.saved_as
@@ -337,6 +319,7 @@ impl View {
                         self.ui().set_prof_name(SharedString::new());
                         self.chosen = Some(name);
                         self.refresh_profiles();
+                        self.refresh(false);
                     }
                     self.show_problem();
                 }
@@ -382,9 +365,6 @@ impl View {
         self.digest = Some(digest);
         self.refresh_stats();
         self.refresh_links();
-        if self.history.is_none() {
-            self.refresh_history();
-        }
     }
 
     fn ui(&self) -> AppWindow {
@@ -489,11 +469,14 @@ impl View {
             changed += 1;
         }
         self.changes.last += changed;
-        // Панель профилей зависит от потолков, надстройки автомодуля и хода измерения — больше ни от чего в состоянии.
-        let profiles_moved = self
-            .state
-            .as_ref()
-            .is_none_or(|old| old.limit != state.limit || old.auto != state.auto || old.busy != state.busy);
+        // Панель профилей зависит от потолков, надстройки автомодуля (и потолков владельца под ней) и хода измерения —
+        // больше ни от чего в состоянии.
+        let profiles_moved = self.state.as_ref().is_none_or(|old| {
+            old.limit != state.limit
+                || old.auto != state.auto
+                || old.intended != state.intended
+                || old.busy != state.busy
+        });
         // Статистика зависит от состояния только отсечкой автомодуля (линия на графике).
         let cutoff = self.cutoff();
         let first = self.state.is_none();
@@ -625,11 +608,12 @@ impl View {
         let c = panels::ceiling(
             block,
             s.limit.as_deref(),
-            self.limits.as_ref(),
+            self.chosen_ratios(),
             panels::Overlay::of(Some(s)),
         );
         let ratio = highest(&s.ratio, members);
         let fused = self.limits.as_ref().and_then(|l| l.fused.get(first).copied());
+        let chosen_title = self.chosen.as_deref().map(panels::titled);
         if let Some(limit) = c.now {
             data.pair = match ratio {
                 Some(r) => format!("{r:.1} / ×{limit}"),
@@ -643,7 +627,9 @@ impl View {
                     Ordering::Equal => TEXT,
                 });
             }
-            data.delta = panels::signed(c.owner_delta()).into();
+            // Разница текущего состояния с выбранным профилем (владелец 15.10: «в дельте… разницу между… параметрам
+            // профиля и параметрам текущего состояния»).
+            data.delta = panels::signed(c.delta()).into();
         }
         if c.auto != 0 {
             data.auto = format!("авто {}", panels::signed(c.auto)).into();
@@ -661,6 +647,7 @@ impl View {
             throttled: members.iter().any(|&i| thr(i)),
             ceiling: c,
             fused,
+            profile: chosen_title.as_deref(),
         })
         .into();
         Some(data)
@@ -787,6 +774,11 @@ impl View {
 
     // ----- профили -----
 
+    /// Потолки выбранного профиля по ядрам (`panels::chosen_ratios`).
+    fn chosen_ratios(&self) -> Option<&[i64]> {
+        panels::chosen_ratios(self.profiles.as_ref(), self.limits.as_ref(), self.chosen.as_deref())
+    }
+
     fn refresh_profiles(&mut self) {
         let (Some(hello), Some(profiles)) = (self.hello.as_ref(), self.profiles.as_ref()) else {
             return;
@@ -810,8 +802,10 @@ impl View {
         if !ui.get_has_profiles() {
             ui.set_has_profiles(true);
         }
-        set_text(&ui.get_prof_was(), &shown.was, |t| ui.set_prof_was(t));
-        set_text(&ui.get_prof_now(), &shown.now, |t| ui.set_prof_now(t));
+        set_text(&ui.get_prof_status(), &shown.status, |t| ui.set_prof_status(t));
+        set_text(&ui.get_prof_status_tip(), &shown.status_tip, |t| {
+            ui.set_prof_status_tip(t);
+        });
         set_text(&ui.get_save_tip(), &shown.save_tip, |t| ui.set_save_tip(t));
         set_text(&ui.get_save_as_text(), &shown.save_as_text, |t| ui.set_save_as_text(t));
         set_text(&ui.get_save_note(), &shown.save_note, |t| ui.set_save_note(t));
@@ -821,12 +815,12 @@ impl View {
                 shown.attention,
                 AppWindow::set_prof_attention as fn(&AppWindow, bool),
             ),
-            (ui.get_can_open(), shown.can_open, AppWindow::set_can_open),
+            (ui.get_can_apply(), shown.can_apply, AppWindow::set_can_apply),
             (ui.get_can_save(), shown.can_save, AppWindow::set_can_save),
             (ui.get_can_save_as(), shown.can_save_as, AppWindow::set_can_save_as),
-            (ui.get_can_accept(), shown.can_accept, AppWindow::set_can_accept),
-            (ui.get_can_revert(), shown.can_revert, AppWindow::set_can_revert),
             (ui.get_can_delete(), shown.can_delete, AppWindow::set_can_delete),
+            (ui.get_can_startup(), shown.can_startup, AppWindow::set_can_startup),
+            (ui.get_startup_on(), shown.startup_on, AppWindow::set_startup_on),
         ];
         for (now, want, set) in flags {
             if now != want {
@@ -851,29 +845,9 @@ impl View {
         self.shown_profiles = Some(shown);
     }
 
-    fn refresh_history(&mut self) {
-        let entries = self
-            .history
-            .as_deref()
-            .or_else(|| self.digest.as_ref().and_then(|d| d.history.as_deref()));
-        let rows: Vec<LineRow> = entries
-            .map(|e| panels::history_rows(e, self.hello.as_ref()))
-            .unwrap_or_default();
-        let key: Vec<(String, String)> = rows.iter().map(|r| (r.time.to_string(), r.text.to_string())).collect();
-        let ui = self.ui();
-        let has = entries.is_some();
-        if ui.get_has_history() != has {
-            ui.set_has_history(has);
-        }
-        if key != self.shown_history {
-            ui.set_history(ModelRc::new(VecModel::from(rows)));
-            self.shown_history = key;
-        }
-    }
-
-    /// Строк истории, как они показаны (скрытой проверке).
-    pub fn history_shown(&self) -> usize {
-        self.shown_history.len()
+    /// Панель профилей, как она показана (скрытой проверке).
+    pub fn profile_shown(&self) -> Option<&ProfileShown> {
+        self.shown_profiles.as_ref()
     }
 
     // ----- команды владельца -----
@@ -886,7 +860,7 @@ impl View {
     fn order_then(&mut self, command: &str, args: Map<String, Value>, pending: Pending) -> bool {
         // На эти команды программа может спросить владельца своим окошком (потолок выше заводского): пусть оно выйдет
         // на передний план, а не мигает под окном.
-        if matches!(command, "limit.set" | "profile.open" | "profile.revert") {
+        if matches!(command, "limit.set" | "profile.open") {
             self.link.allow_foreground();
         }
         if let Some(id) = self.link.ask(command, args) {
@@ -930,21 +904,6 @@ impl View {
                 slint_int(a.limit_range[1]),
                 AppWindow::set_auto_limit_max,
             ),
-            (
-                ui.get_auto_depth(),
-                self.depth_held.unwrap_or_else(|| slint_int(a.depth)),
-                AppWindow::set_auto_depth,
-            ),
-            (
-                ui.get_auto_depth_min(),
-                slint_int(a.depth_range[0]),
-                AppWindow::set_auto_depth_min,
-            ),
-            (
-                ui.get_auto_depth_max(),
-                slint_int(a.depth_range[1]),
-                AppWindow::set_auto_depth_max,
-            ),
         ];
         for (now, want, set) in ints {
             if now != want {
@@ -959,8 +918,8 @@ impl View {
         }
     }
 
-    /// Ручки, которые ждали подтверждения: отсечка — когда и тема, и состояние (линия) показывают её число (или
-    /// автомодуль выключен — линии нет); глубина — когда тема её показывает.
+    /// Ручка отсечки ждала подтверждения: отпускается, когда и тема, и состояние (линия) показывают её число (или
+    /// автомодуль выключен — линии нет).
     #[expect(
         clippy::float_cmp,
         reason = "both sides are whole degrees sent as JSON integers: exact in f64"
@@ -978,12 +937,9 @@ impl View {
         {
             self.limit_held = None;
         }
-        if self.depth_held.is_some_and(|held| i64::from(held) == a.depth) {
-            self.depth_held = None;
-        }
     }
 
-    fn set_auto(&mut self, field: &str, value: Value, failure: &'static str, held: Option<Held>) -> bool {
+    fn set_auto(&mut self, field: &str, value: Value, failure: &'static str, held: bool) -> bool {
         let mut args = Map::new();
         args.insert(field.into(), value);
         self.order_then(
@@ -999,13 +955,13 @@ impl View {
 
     pub fn auto_toggled(&mut self) {
         if let Some(on) = self.auto.as_ref().map(|a| a.on) {
-            self.set_auto("on", (!on).into(), "Автомодуль не переключён", None);
+            self.set_auto("on", (!on).into(), "Автомодуль не переключён", false);
         }
     }
 
     pub fn step_up_toggled(&mut self) {
         if let Some(up) = self.auto.as_ref().map(|a| a.step_up) {
-            self.set_auto("stepUp", (!up).into(), "Подтягивание не переключено", None);
+            self.set_auto("stepUp", (!up).into(), "Подтягивание не переключено", false);
         }
     }
 
@@ -1024,20 +980,11 @@ impl View {
         let cutoff = self.cutoff();
         self.limit_dragging = false;
         let same = self.auto.as_ref().is_none_or(|a| a.limit == i64::from(value));
-        self.limit_held =
-            (!same && self.set_auto("limit", value.into(), "Отсечка не изменена", Some(Held::Limit))).then_some(value);
+        self.limit_held = (!same && self.set_auto("limit", value.into(), "Отсечка не изменена", true)).then_some(value);
         self.show_auto();
         if self.cutoff() != cutoff {
             self.refresh_stats();
         }
-    }
-
-    /// Ползунок глубины отпустили: одна команда, если число другое.
-    pub fn depth_released(&mut self, value: i32) {
-        let same = self.auto.as_ref().is_none_or(|a| a.depth == i64::from(value));
-        self.depth_held =
-            (!same && self.set_auto("depth", value.into(), "Глубина не изменена", Some(Held::Depth))).then_some(value);
-        self.show_auto();
     }
 
     // ----- что окно помнит о себе -----
@@ -1203,6 +1150,7 @@ impl View {
     /// Правая кнопка: меню потолка; что предлагать, решает движок.
     pub fn menu(&mut self, block: i32) {
         let ui = self.ui();
+        let in_profile = |first: usize| self.chosen_ratios().and_then(|r| r.get(first).copied());
         let found = self
             .hello
             .as_ref()
@@ -1210,14 +1158,9 @@ impl View {
             .and_then(|(hello, limits)| {
                 let b = usize::try_from(block).ok().and_then(|i| hello.blocks.get(i))?;
                 let i = b.first;
-                Some((
-                    b,
-                    limits.choices.get(b.index)?,
-                    *limits.fused.get(i)?,
-                    limits.was.get(i).copied(),
-                ))
+                Some((b, limits.choices.get(b.index)?, *limits.fused.get(i)?, in_profile(i)))
             });
-        let Some((b, choices, fused, was)) = found else {
+        let Some((b, choices, fused, profile)) = found else {
             ui.set_menu_entries(ModelRc::default());
             self.menu_block = None;
             return;
@@ -1230,9 +1173,9 @@ impl View {
         let entries: Vec<MenuEntry> = choices
             .iter()
             .map(|&v| {
-                // Значки вместо слов (владелец 15.10): ◆ — заводской предел, ○ — «было», красным — выше заводского;
-                // расшифровка — строкой под заголовком меню. ↺ шрифт окна не рисует (снимок проверки 15.10).
-                let marks: Vec<&str> = [(v == fused, "◆"), (Some(v) == was, "○")]
+                // Значки вместо слов (владелец 15.10): ◆ — заводской предел, ○ — в выбранном профиле, красным — выше
+                // заводского; расшифровка — строкой под заголовком меню. ↺ шрифт окна не рисует (снимок проверки 15.10).
+                let marks: Vec<&str> = [(v == fused, "◆"), (Some(v) == profile, "○")]
                     .into_iter()
                     .filter_map(|(on, mark)| on.then_some(mark))
                     .collect();
@@ -1287,9 +1230,12 @@ impl View {
             .ok()
             .and_then(|i| self.shown_profiles.as_ref()?.rows.get(i))
             .map(|r| r.key.clone()); // one name per click
+        // Выбор ничего не ставит и ничего не шлёт (владелец 15.10: «когда… профиль выбираешь он автоматически не
+        // применяется»): меняется только то, с чем сравнивается текущее состояние — строка панели и плитки.
         if key.is_some() && key != self.chosen {
             self.chosen = key;
             self.refresh_profiles();
+            self.refresh(false);
         }
     }
 
@@ -1299,9 +1245,10 @@ impl View {
         args
     }
 
-    pub fn profile_open(&mut self) {
+    /// «Применить»: потолки выбранного профиля — в процессор (команда profile.open; «» — заводские).
+    pub fn profile_apply(&mut self) {
         if let Some(name) = self.chosen.clone() {
-            self.order("profile.open", Self::named(&name), "Профиль не открыт");
+            self.order("profile.open", Self::named(&name), "Профиль не применён");
         }
     }
 
@@ -1322,17 +1269,21 @@ impl View {
             Pending {
                 failure: "Профиль не сохранён",
                 saved_as: Some(name),
-                held: None,
+                held: false,
             },
         );
     }
 
-    pub fn profile_accept(&mut self) {
-        self.order("profile.accept", Map::new(), "Не принято");
-    }
-
-    pub fn profile_revert(&mut self) {
-        self.order("profile.revert", Map::new(), "Не откачено");
+    /// «Загружать при старте Windows» у выбранного сохранённого профиля: отметить — он ставится при входе в Windows (и
+    /// только он); снять у отмеченного — при входе ничего не ставится.
+    pub fn startup_toggled(&mut self) {
+        let Some(name) = self.chosen.clone().filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let on = !self.shown_profiles.as_ref().is_some_and(|p| p.startup_on);
+        let mut args = Self::named(&name);
+        args.insert("on".into(), on.into());
+        self.order("profile.startup", args, "Загрузка при старте Windows не изменена");
     }
 
     pub fn profile_delete(&mut self) {

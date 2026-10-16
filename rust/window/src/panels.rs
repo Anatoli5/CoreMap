@@ -3,29 +3,31 @@
 // Slint-окна, ни потоков: функции получают данные и возвращают, что показать, — их проверяют модульные тесты.
 use std::fmt::Write as _;
 
-use serde_json::{Map, Value};
-use slint::{Color, SharedString};
+use slint::Color;
 
 use crate::die::Geometry;
 use crate::samples;
 use crate::store::Digest;
 use crate::wire::{AutoMark, BlockInfo, Hello, Limits, Profiles, State};
-use crate::{LineRow, LinkData, SetRow};
+use crate::{LinkData, SetRow};
 
 pub fn rgb(hex: u32) -> Color {
     let [_, r, g, b] = hex.to_be_bytes();
     Color::from_rgb_u8(r, g, b)
 }
 
-const TEXT: u32 = 0x00e6_e8ec;
-
-/// Название набора для надписей: профиль в кавычках, заводские или несохранённый (как Titled у прежнего окна).
-pub fn titled(name: Option<&str>) -> String {
-    match name {
-        None => "не сохранено".into(),
-        Some("") => "заводские".into(),
-        Some(n) => format!("«{n}»"),
+/// Название набора для надписей: профиль в кавычках или «заводские».
+pub fn titled(key: &str) -> String {
+    if key.is_empty() {
+        "заводские".into()
+    } else {
+        format!("«{key}»")
     }
+}
+
+/// Одинаковые ли названия профилей (как сравнивает программа у часов: без учёта регистра).
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// «−2», «+1»; 0 — пусто.
@@ -46,29 +48,31 @@ pub fn whom(b: &BlockInfo) -> String {
     }
 }
 
-// ----- потолки блоков: сейчас, было, поправка автомодуля -----
+// ----- потолки блоков: сейчас, в выбранном профиле, поправка автомодуля -----
 
-/// Потолки блока: сейчас, «было», поправка автомодуля (на сколько ступеней он сдвинул блок от принятого).
+/// Потолки блока: сейчас (текущее состояние), в выбранном профиле, поправка автомодуля (на сколько ступеней он сдвинул
+/// блок от потолка владельца).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Ceiling {
     pub now: Option<i64>,
-    pub was: Option<i64>,
+    pub profile: Option<i64>,
     pub auto: i64,
     pub ban: Option<i64>,
 }
 
 impl Ceiling {
-    /// Разница с «было» без поправки автомодуля — то, что изменил владелец (или профиль); 0 — нет.
-    pub fn owner_delta(&self) -> i64 {
-        match (self.now, self.was) {
-            (Some(now), Some(was)) => now - self.auto - was,
+    /// Разница текущего состояния с выбранным профилем (сейчас минус профиль, с поправкой автомодуля); 0 — нет или не
+    /// известно.
+    pub fn delta(&self) -> i64 {
+        match (self.now, self.profile) {
+            (Some(now), Some(profile)) => now - profile,
             _ => 0,
         }
     }
 }
 
-/// Надстройка автомодуля из состояния (программа входа): что он держит по блокам и принятые потолки по ядрам —
-/// от них считается его поправка. Нет принятых — от «было».
+/// Надстройка автомодуля из состояния (программа входа): что он держит по блокам и потолки владельца по ядрам — от них
+/// считается его поправка.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Overlay<'a> {
     pub marks: Option<&'a [Option<AutoMark>]>,
@@ -84,24 +88,67 @@ impl<'a> Overlay<'a> {
     }
 }
 
-pub fn ceiling(b: &BlockInfo, limit: Option<&[i64]>, limits: Option<&Limits>, overlay: Overlay) -> Ceiling {
+/// Потолки блока: `limit` — что стоит по ядрам (состояние), `profile` — выбранный профиль по ядрам.
+pub fn ceiling(b: &BlockInfo, limit: Option<&[i64]>, profile: Option<&[i64]>, overlay: Overlay) -> Ceiling {
     let known = |v: i64| (v > 0).then_some(v);
     let now = limit.and_then(|l| l.get(b.first).copied()).and_then(known);
-    let was = limits.and_then(|l| l.was.get(b.first).copied()).and_then(known);
+    let in_profile = profile.and_then(|p| p.get(b.first).copied()).and_then(known);
     let mark = overlay.marks.and_then(|a| a.get(b.index)).and_then(Option::as_ref);
     let intended = overlay
         .intended
         .and_then(|i| i.get(b.first).copied().flatten())
         .and_then(known);
     let auto = mark
-        .and_then(|m| Some(m.ceiling()? - m.base().or(intended).or(was)?))
+        .and_then(|m| Some(m.ceiling()? - m.base().or(intended)?))
         .unwrap_or(0);
     Ceiling {
         now,
-        was,
+        profile: in_profile,
         auto,
         ban: mark.and_then(|m| m.ban().map(|(at, _)| at)),
     }
+}
+
+/// Потолки выбранного профиля по ядрам: «» — заводские (из потолков), иначе сохранённый набор; None — ничего не
+/// выбрано или такого нет.
+pub fn chosen_ratios<'a>(
+    profiles: Option<&'a Profiles>,
+    limits: Option<&'a Limits>,
+    chosen: Option<&str>,
+) -> Option<&'a [i64]> {
+    match chosen? {
+        "" => limits.map(|l| l.fused.as_slice()),
+        key => profiles?
+            .sets
+            .iter()
+            .find(|s| s.name == key)
+            .map(|s| s.ratios.as_slice()),
+    }
+}
+
+/// Выбор по умолчанию, когда окно открылось (или выбранного больше нет): профиль, который загружается при старте
+/// Windows; его нет — тот, что совпадает с текущим состоянием; и его нет — «заводские».
+pub fn default_choice(profiles: &Profiles) -> String {
+    let listed = |name: &str| {
+        profiles
+            .sets
+            .iter()
+            .find(|s| same_name(&s.name, name))
+            .map(|s| s.name.clone())
+    };
+    profiles
+        .startup
+        .exists
+        .then(|| profiles.startup.name.as_deref().and_then(listed))
+        .flatten()
+        .or_else(|| {
+            profiles
+                .standing
+                .as_deref()
+                .filter(|s| s.is_empty() || listed(s).is_some())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 // ----- профили -----
@@ -122,19 +169,22 @@ pub struct ProfileInput<'a> {
 #[derive(Debug, Default, Clone, PartialEq)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "one flag per button of the panel, read by name"
+    reason = "one flag per button and box of the panel, read by name"
 )]
 pub struct ProfileShown {
-    pub was: String,
-    pub now: String,
+    /// Строка: выбранный профиль и текущее состояние (владелец 15.10: «в дельте… разницу между… параметрам профиля и
+    /// параметрам текущего состояния»).
+    pub status: String,
+    pub status_tip: String,
     pub attention: bool,
     pub rows: Vec<SetShown>,
-    pub can_open: bool,
+    pub can_apply: bool,
     pub can_save: bool,
     pub can_save_as: bool,
-    pub can_accept: bool,
-    pub can_revert: bool,
     pub can_delete: bool,
+    /// «Загружать при старте Windows»: можно ли отметить (только сохранённый профиль) и отмечен ли выбранный.
+    pub can_startup: bool,
+    pub startup_on: bool,
     pub save_tip: String,
     pub save_as_text: String,
     pub save_note: String,
@@ -149,8 +199,9 @@ pub struct ProfileShown {
 pub struct SetShown {
     pub key: String,
     pub name: String,
+    /// Совпадает с текущим состоянием.
     pub standing: bool,
-    pub was: bool,
+    /// Загружается при старте Windows (знак в строке — единственное место, где это видно).
     pub startup: bool,
     pub disabled: bool,
     pub selected: bool,
@@ -165,7 +216,6 @@ impl SetShown {
         SetRow {
             name: self.name.as_str().into(),
             standing: self.standing,
-            was: self.was,
             startup: self.startup,
             disabled: self.disabled,
             selected: self.selected,
@@ -199,6 +249,26 @@ fn average(values: &[i64]) -> Option<f64> {
 /// Название длиннее не принимает движок (Commands.NameLength).
 pub const NAME_LENGTH: usize = 64;
 
+/// «23 ×46 → ×45 (авто −1)»: блок, в профиле, сейчас; поправка автомодуля — в скобках (она входит в текущее
+/// состояние). `now_word` — «сейчас» перед текущим (у первого блока строки).
+fn difference(b: &BlockInfo, c: &Ceiling, now_word: bool) -> Option<String> {
+    let (Some(profile), Some(now)) = (c.profile, c.now) else {
+        return None;
+    };
+    (profile != now).then(|| {
+        let auto = if c.auto == 0 {
+            String::new()
+        } else {
+            format!(" (авто {})", signed(c.auto))
+        };
+        format!(
+            "{} ×{profile} → {}×{now}{auto}",
+            b.name,
+            if now_word { "сейчас " } else { "" }
+        )
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the panel's rules read top to bottom: rows, status, buttons"
@@ -206,51 +276,58 @@ pub const NAME_LENGTH: usize = 64;
 pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
     let p = input.profiles;
     let blocks = &input.hello.blocks;
-    let ceilings: Vec<Ceiling> = blocks
-        .iter()
-        .map(|b| ceiling(b, input.limit, input.limits, input.auto))
-        .collect();
+    let fused = input.limits.map(|l| l.fused.as_slice());
     let startup_name = p
         .startup
         .exists
         .then(|| p.startup.name.as_deref().unwrap_or(""))
         .filter(|n| !n.is_empty());
-    let same_name = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
 
-    // Строки: заводские, затем сохранённые наборы в порядке движка.
-    let fused = input.limits.map(|l| l.fused.as_slice());
+    // Строки: заводские, затем сохранённые наборы в порядке программы у часов.
     let mut rows = Vec::with_capacity(p.sets.len() + 1);
     let entries =
         std::iter::once(("", fused)).chain(p.sets.iter().map(|s| (s.name.as_str(), Some(s.ratios.as_slice()))));
     for (key, ratios) in entries {
         let mut differ = Vec::new();
-        for (b, c) in blocks.iter().zip(&ceilings) {
-            let set = ratios.and_then(|r| r.get(b.first).copied()).filter(|&v| v > 0);
-            if let (Some(s), Some(n)) = (set, c.now)
-                && s != n
-            {
-                differ.push(format!("{} ×{s} (сейчас ×{n})", b.name));
+        for b in blocks {
+            let c = ceiling(b, input.limit, ratios, input.auto);
+            if let Some(d) = difference(b, &c, false) {
+                differ.push(d);
             }
         }
         let (p_mean, e_mean) = kind_means(blocks, ratios);
         let one = |m: Option<f64>| m.map_or_else(String::new, |m| format!("{m:.1}"));
-        let title = titled(Some(key));
+        let title = titled(key);
         let level = match (p_mean, e_mean) {
             (Some(p), Some(e)) => format!("\nсредний потолок: P-ядра ×{p:.1}, E-ядра ×{e:.1}"),
             (Some(p), None) => format!("\nсредний потолок P-ядер ×{p:.1}"),
             (None, Some(e)) => format!("\nсредний потолок E-ядер ×{e:.1}"),
             (None, None) => String::new(),
         };
-        let tip = if differ.is_empty() {
-            format!("{title}: то же, что стоит сейчас{level}")
+        let startup = startup_name.is_some_and(|s| same_name(s, key));
+        let mut tip = if differ.is_empty() {
+            format!("{title}: совпадает с текущим состоянием{level}")
         } else {
             format!(
-                "{title}: отличается от того, что стоит сейчас, у {} из {} блоков{level}\n• {}",
+                "{title}: отличается от текущего состояния у {} из {} блоков (в профиле → сейчас){level}\n• {}",
                 differ.len(),
                 blocks.len(),
                 differ.join("\n• ")
             )
         };
+        if startup {
+            // Профиль запуска виден только знаком в строке (владелец 15.10); его состояние — здесь, в подсказке строки.
+            tip.push_str("\n► загружается при старте Windows");
+            for extra in [p.startup.details.as_deref(), p.startup.note.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                for line in extra.lines().skip_while(|l| l.starts_with("Профиль запуска")) {
+                    tip.push_str("\n• ");
+                    tip.push_str(line.trim_start_matches("• ").trim());
+                }
+            }
+        }
         rows.push(SetShown {
             key: key.to_string(),
             name: if key.is_empty() {
@@ -259,8 +336,7 @@ pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
                 key.to_string()
             },
             standing: p.standing.as_deref() == Some(key),
-            was: p.was_named.as_deref() == Some(key),
-            startup: startup_name.is_some_and(|s| same_name(s, key)),
+            startup,
             disabled: p.startup.disabled,
             selected: input.chosen == Some(key),
             p_mean: one(p_mean),
@@ -269,99 +345,95 @@ pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
         });
     }
 
-    let was = format!(
-        "Было — {} · {}",
-        titled(p.was_named.as_deref()),
-        p.startup.describe.as_deref().unwrap_or("профиль запуска неизвестен")
-    );
-    let diffs: Vec<String> = blocks
+    // Строка: выбранный профиль против текущего состояния — по всем блокам, где известны оба.
+    let chosen = input.chosen;
+    let ratios = chosen_ratios(Some(p), input.limits, chosen);
+    let ceilings: Vec<Ceiling> = blocks
+        .iter()
+        .map(|b| ceiling(b, input.limit, ratios, input.auto))
+        .collect();
+    let compared = ceilings.iter().any(|c| c.now.is_some() && c.profile.is_some());
+    let differing: Vec<(&BlockInfo, &Ceiling)> = blocks
         .iter()
         .zip(&ceilings)
-        .filter_map(|(b, c)| {
-            let d = match (c.now, c.was) {
-                (Some(n), Some(w)) => n - w,
-                _ => 0,
-            };
-            (d != 0).then(|| format!("{} {}", b.name, signed(d)))
-        })
+        .filter(|(_, c)| matches!((c.profile, c.now), (Some(p), Some(n)) if p != n))
         .collect();
-    let (now, attention) = if input.busy {
-        ("Сейчас — измерение: потолки временные".to_string(), false)
-    } else if diffs.is_empty() {
-        ("Сейчас — то же".to_string(), false)
-    } else {
-        (
-            format!("Сейчас — {}: {}", titled(p.standing.as_deref()), diffs.join(", ")),
-            true,
-        )
+    let diffs: Vec<String> = differing.iter().filter_map(|(b, c)| difference(b, c, false)).collect();
+    let title = chosen.map(titled);
+    let (status, attention) = match (&title, compared) {
+        (None, _) => ("Выбери профиль в списке".to_string(), false),
+        (Some(t), _) if input.busy => (format!("{t} — идёт измерение: потолки временные"), false),
+        (Some(t), false) => (format!("{t} — текущие потолки неизвестны"), false),
+        (Some(t), true) if diffs.is_empty() => (format!("{t} — совпадает с текущим"), false),
+        (Some(t), true) => {
+            // «сейчас» — один раз, у первого блока: «23 ×46 → сейчас ×45, 2–5 ×44 → ×42 (авто −2)».
+            let items: Vec<String> = differing
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (b, c))| difference(b, c, i == 0))
+                .collect();
+            (format!("{t} — отличается: {}", items.join(", ")), true)
+        }
     };
-    let autos: Vec<String> = blocks
+    let autos = ceilings.iter().any(|c| c.auto != 0);
+    let mut status_tip = String::from(
+        "Выбранный профиль и текущее состояние\nТекущее состояние — потолки, которые стоят в процессоре сейчас; выбор строки в списке ничего не ставит.",
+    );
+    if !diffs.is_empty() {
+        let _ = write!(
+            status_tip,
+            "\n• отличается (в профиле → сейчас):\n   {}",
+            diffs.join("\n   ")
+        ); // into a String
+    }
+    if autos {
+        status_tip.push_str("\n• авто — поправка автомодуля, она входит в текущее состояние");
+    }
+    status_tip.push_str(
+        "\n• «применить» ставит потолки профиля, «сохранить» пишет текущее состояние в профиль\n• на плитках — та же разница: сейчас минус профиль",
+    );
+
+    let autos_named: Vec<String> = blocks
         .iter()
         .zip(&ceilings)
         .filter(|(_, c)| c.auto != 0)
         .map(|(b, c)| format!("{} {}", b.name, signed(c.auto)))
         .collect();
-    let save_note = if autos.is_empty() {
-        "Сохраняется то, что стоит сейчас".to_string()
+    let save_note = if autos_named.is_empty() {
+        "Сохраняется текущее состояние".to_string()
     } else {
         format!(
-            "Сохраняется то, что стоит сейчас, с поправками автомодуля: {}",
-            autos.join(", ")
+            "Сохраняется текущее состояние, с поправками автомодуля: {}",
+            autos_named.join(", ")
         )
     };
 
-    let chosen_saved = input
-        .chosen
-        .filter(|c| !c.is_empty() && p.sets.iter().any(|s| s.name == *c));
+    let chosen_saved = chosen.filter(|c| !c.is_empty() && p.sets.iter().any(|s| s.name == *c));
+    let differs = compared && !diffs.is_empty();
     let name = input.name.trim();
     let exists = p.sets.iter().any(|s| same_name(&s.name, name));
     ProfileShown {
-        was,
-        now,
+        status,
+        status_tip,
         attention,
         rows,
-        can_open: !input.busy && input.chosen.is_some_and(|c| p.standing.as_deref() != Some(c)),
-        can_save: !input.busy && chosen_saved.is_some(),
+        can_apply: !input.busy && chosen.is_some() && differs,
+        can_save: !input.busy && chosen_saved.is_some() && differs,
         can_save_as: !input.busy && !name.is_empty() && name.chars().count() <= NAME_LENGTH,
-        can_accept: p.can_accept && !input.busy,
-        can_revert: !input.busy && !diffs.is_empty(),
         can_delete: chosen_saved.is_some(),
+        can_startup: !input.busy && chosen_saved.is_some(),
+        startup_on: chosen_saved.is_some_and(|c| startup_name.is_some_and(|s| same_name(s, c))),
         save_tip: chosen_saved.map_or_else(
             || "Сохранить в выбранный профиль\nВыбери сохранённый профиль в списке (не «заводские»).".to_string(),
-            |c| format!("Сохранить в «{c}»\nЗаписывает в него то, что стоит сейчас, и принимает: он становится «было» и ставится при входе в Windows."),
+            |c| {
+                format!(
+                    "Сохранить в «{c}»\nЗаписывает в него текущее состояние — профиль перезаписывается.\n• поправки автомодуля становятся потолками профиля\n• загрузку при старте Windows не меняет; если «{c}» загружается при старте — при старте будет новое"
+                )
+            },
         ),
         save_as_text: if exists { "перезаписать".into() } else { "сохранить как".into() },
         save_note,
     }
-}
-
-/// История смен профиля: новые первыми.
-pub fn history_rows(entries: &[Map<String, Value>], hello: Option<&Hello>) -> Vec<LineRow> {
-    let blocks: Vec<samples::Named> = hello
-        .map(|h| {
-            h.blocks
-                .iter()
-                .map(|b| samples::Named {
-                    name: &b.name,
-                    first: b.first,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    entries
-        .iter()
-        .rev()
-        .map(|e| {
-            let (time, text) = samples::history_line(e, &blocks);
-            LineRow {
-                time: time.into(),
-                head: SharedString::new(),
-                text: text.into(),
-                color: rgb(TEXT),
-                mark: Color::default(),
-            }
-        })
-        .collect()
 }
 
 // ----- общие подписи -----
@@ -522,6 +594,8 @@ pub struct TileFacts<'a> {
     pub throttled: bool,
     pub ceiling: Ceiling,
     pub fused: Option<i64>,
+    /// Выбранный профиль: «csmart2» или «заводские»; None — ничего не выбрано.
+    pub profile: Option<&'a str>,
 }
 
 pub fn tile_tip(t: &TileFacts) -> String {
@@ -585,16 +659,16 @@ pub fn tile_tip(t: &TileFacts) -> String {
         if let Some(fused) = t.fused {
             let _ = write!(tip, ", заводской ×{fused}"); // into a String
         }
-        if let Some(was) = c.was
-            && was != now
+        if let (Some(in_profile), Some(profile)) = (c.profile, t.profile)
+            && in_profile != now
         {
-            let _ = write!(tip, "; было ×{was}"); // into a String
+            let _ = write!(tip, "; в {profile} ×{in_profile}"); // into a String
         }
     }
     if c.auto != 0 {
         let _ = write!(
             tip,
-            "\n• автомодуль сдвинул на {} {} от принятого",
+            "\n• автомодуль сдвинул на {} {} от потолка владельца",
             c.auto.abs(),
             if c.auto.abs() == 1 {
                 "ступень"
@@ -671,64 +745,204 @@ mod tests {
             startup: Startup {
                 exists: true,
                 name: Some("тихий".into()),
-                describe: Some("при входе ставится «тихий»".into()),
+                details: Some(
+                    "Профиль запуска «тихий», сохранён 15.10 22:00\n• пробный, потому что в нём есть потолки выше заводских: пережил перезапусков 1, часов 2.0"
+                        .into(),
+                ),
                 ..Startup::default()
             },
-            sets: vec![ProfileSet {
-                name: "тихий".into(),
-                ratios: vec![50, 44, 44, 44, 44],
-            }],
+            sets: vec![
+                ProfileSet {
+                    name: "тихий".into(),
+                    ratios: vec![50, 44, 44, 44, 44],
+                },
+                ProfileSet {
+                    name: "жара".into(),
+                    ratios: vec![48, 40, 40, 40, 40],
+                },
+            ],
             standing: None,
-            was_named: Some("тихий".into()),
-            can_accept: true,
         }
     }
 
-    #[test]
-    fn profile_panel_names_differences_and_what_save_keeps() {
-        let hello = hello();
-        let profiles = profiles();
-        let limits = Limits {
+    fn limits() -> Limits {
+        Limits {
             fused: vec![53, 46, 46, 46, 46],
-            was: vec![50, 44, 44, 44, 44],
             choices: Vec::new(),
-        };
-        // Сейчас: ядро 0 владелец поднял до ×52 (+2), кластер автомодуль опустил с ×44 на ×43.
-        let limit = [52, 43, 43, 43, 43];
-        let auto = [None, Some(AutoMark::Ceiling(43))];
-        let shown = profile_panel(&ProfileInput {
-            hello: &hello,
-            profiles: &profiles,
-            limits: Some(&limits),
-            limit: Some(&limit),
+        }
+    }
+
+    /// Панель при выбранном `chosen` и текущих потолках `limit` с надстройкой автомодуля `auto` (потолки владельца под
+    /// ней — `intended`).
+    fn panel(
+        profiles: &Profiles,
+        chosen: Option<&str>,
+        limit: Option<&[i64]>,
+        auto: &[Option<AutoMark>],
+        intended: Option<&[Option<i64>]>,
+    ) -> ProfileShown {
+        profile_panel(&ProfileInput {
+            hello: &hello(),
+            profiles,
+            limits: Some(&limits()),
+            limit,
             auto: Overlay {
-                marks: Some(&auto),
-                intended: None,
+                marks: Some(auto),
+                intended,
             },
-            chosen: Some("тихий"),
+            chosen,
             name: "",
             busy: false,
-        });
-        assert_eq!(shown.was, "Было — «тихий» · при входе ставится «тихий»");
-        assert_eq!(shown.now, "Сейчас — не сохранено: 0 +2, 2–5 −1");
-        assert!(shown.attention && shown.can_revert && shown.can_open && shown.can_save && shown.can_delete);
-        assert!(!shown.can_save_as, "без названия «сохранить как» недоступно");
-        assert!(
-            shown.save_note.contains("2–5 −1"),
-            "поправка автомодуля названа: {}",
-            shown.save_note
+        })
+    }
+
+    #[test]
+    fn the_status_line_compares_the_chosen_profile_with_the_current_state() {
+        let p = profiles();
+        let none = [None, None];
+        // Совпадает: ни применить, ни сохранить нечего.
+        let same = panel(&p, Some("тихий"), Some(&[50, 44, 44, 44, 44]), &none, None);
+        assert_eq!(same.status, "«тихий» — совпадает с текущим");
+        assert!(!same.attention && !same.can_apply && !same.can_save);
+        // Отличается: каждый блок «в профиле → сейчас», «сейчас» — у первого; поправка автомодуля помечена.
+        let intended = [Some(52), Some(44), Some(44), Some(44), Some(44)];
+        let auto = [None, Some(AutoMark::Ceiling(43))];
+        let moved = panel(&p, Some("тихий"), Some(&[52, 43, 43, 43, 43]), &auto, Some(&intended));
+        assert_eq!(
+            moved.status,
+            "«тихий» — отличается: 0 ×50 → сейчас ×52, 2–5 ×44 → ×43 (авто −1)"
         );
-        assert_eq!(shown.rows.len(), 2);
-        assert_eq!(shown.rows[0].name, "заводские");
-        let quiet = &shown.rows[1];
-        assert!(quiet.was && quiet.startup && quiet.selected && !quiet.standing);
-        assert!(quiet.tip.contains("у 2 из 2 блоков"), "{}", quiet.tip);
+        assert!(moved.attention && moved.can_apply && moved.can_save);
+        assert!(
+            moved.status_tip.contains("авто — поправка автомодуля"),
+            "{}",
+            moved.status_tip
+        );
+        // Только автомодуль сдвинул блок — это тоже отличие текущего состояния от профиля.
+        let auto_only = panel(
+            &p,
+            Some("тихий"),
+            Some(&[50, 42, 42, 42, 42]),
+            &[None, Some(AutoMark::Ceiling(42))],
+            Some(&[Some(50), Some(44), Some(44), Some(44), Some(44)]),
+        );
+        assert_eq!(auto_only.status, "«тихий» — отличается: 2–5 ×44 → сейчас ×42 (авто −2)");
+        assert!(auto_only.can_save, "the auto correction can be saved into the profile");
+        // Заводские: сравниваются заводские потолки; сохранить в них нельзя, применить — можно.
+        let factory = panel(&p, Some(""), Some(&[50, 44, 44, 44, 44]), &none, None);
+        assert_eq!(
+            factory.status,
+            "заводские — отличается: 0 ×53 → сейчас ×50, 2–5 ×46 → ×44"
+        );
+        assert!(factory.can_apply && !factory.can_save && !factory.can_delete);
+        let factory_same = panel(&p, Some(""), Some(&[53, 46, 46, 46, 46]), &none, None);
+        assert_eq!(factory_same.status, "заводские — совпадает с текущим");
+        // Текущих потолков нет (процессором владеет другая часть): сравнивать не с чем, кнопки серые.
+        let unknown = panel(&p, Some("тихий"), None, &none, None);
+        assert_eq!(unknown.status, "«тихий» — текущие потолки неизвестны");
+        assert!(!unknown.can_apply && !unknown.can_save);
+        // Ничего не выбрано.
+        assert_eq!(
+            panel(&p, None, Some(&[50, 44, 44, 44, 44]), &none, None).status,
+            "Выбери профиль в списке"
+        );
+    }
+
+    #[test]
+    fn the_startup_box_is_for_saved_profiles_only_and_shows_the_marked_one() {
+        let p = profiles();
+        let none = [None, None];
+        let now: &[i64] = &[50, 44, 44, 44, 44];
+        let marked = panel(&p, Some("тихий"), Some(now), &none, None);
+        assert!(marked.can_startup && marked.startup_on);
+        let other = panel(&p, Some("жара"), Some(now), &none, None);
+        assert!(other.can_startup && !other.startup_on);
+        let factory = panel(&p, Some(""), Some(now), &none, None);
+        assert!(
+            !factory.can_startup && !factory.startup_on,
+            "«заводские» is not a saved profile"
+        );
+        // Профиля запуска нет — ни один не отмечен, но отметить можно.
+        let mut unmarked = profiles();
+        unmarked.startup = Startup::default();
+        let shown = panel(&unmarked, Some("тихий"), Some(now), &none, None);
+        assert!(shown.can_startup && !shown.startup_on);
+        assert!(shown.rows.iter().all(|r| !r.startup));
+        // Знак в списке — только у профиля запуска; его состояние (пробный) — в подсказке строки.
+        let rows = &marked.rows;
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.startup)
+                .map(|r| r.key.as_str())
+                .collect::<Vec<_>>(),
+            ["тихий"]
+        );
+        let tip = &rows[1].tip;
+        assert!(
+            tip.contains("► загружается при старте Windows") && tip.contains("• пробный"),
+            "{tip}"
+        );
+        assert!(!tip.contains("Профиль запуска «тихий», сохранён"), "{tip}");
+    }
+
+    #[test]
+    fn the_list_marks_what_matches_the_current_state() {
+        let mut p = profiles();
+        p.standing = Some("жара".into());
+        let shown = panel(&p, Some("тихий"), Some(&[48, 40, 40, 40, 40]), &[None, None], None);
+        let standing: Vec<&str> = shown
+            .rows
+            .iter()
+            .filter(|r| r.standing)
+            .map(|r| r.key.as_str())
+            .collect();
+        assert_eq!(standing, ["жара"]);
+        assert!(shown.rows[1].selected && !shown.rows[2].selected);
+        assert!(shown.rows[1].tip.contains("у 2 из 2 блоков"), "{}", shown.rows[1].tip);
         // Средние потолки набора: P — одно ядро ×50, E — кластер ×44; у заводских — заводские.
-        assert_eq!((quiet.p_mean.as_str(), quiet.e_mean.as_str()), ("50.0", "44.0"));
+        assert_eq!(
+            (shown.rows[1].p_mean.as_str(), shown.rows[1].e_mean.as_str()),
+            ("50.0", "44.0")
+        );
         assert_eq!(
             (shown.rows[0].p_mean.as_str(), shown.rows[0].e_mean.as_str()),
             ("53.0", "46.0")
         );
+    }
+
+    #[test]
+    fn the_window_opens_on_the_startup_profile() {
+        let p = profiles();
+        assert_eq!(default_choice(&p), "тихий");
+        // Название в файле профиля — другим регистром: выбирается строка списка.
+        let mut cased = profiles();
+        cased.startup.name = Some("ТИХИЙ".into());
+        assert_eq!(default_choice(&cased), "тихий");
+        // Профиля запуска нет — то, что совпадает с текущим; и его нет — заводские.
+        let mut none = profiles();
+        none.startup = Startup::default();
+        none.standing = Some("жара".into());
+        assert_eq!(default_choice(&none), "жара");
+        none.standing = None;
+        assert_eq!(default_choice(&none), "");
+        none.standing = Some(String::new());
+        assert_eq!(default_choice(&none), "");
+    }
+
+    #[test]
+    fn busy_greys_apply_and_save() {
+        let p = profiles();
+        let shown = profile_panel(&ProfileInput {
+            hello: &hello(),
+            profiles: &p,
+            limits: Some(&limits()),
+            limit: Some(&[52, 44, 44, 44, 44]),
+            auto: Overlay::default(),
+            chosen: Some("тихий"),
+            name: "",
+            busy: true,
+        });
+        assert!(!shown.can_apply && !shown.can_save && !shown.can_startup);
     }
 
     #[test]
@@ -764,7 +978,7 @@ mod tests {
         assert!(shown.can_save_as);
         assert_eq!(shown.save_as_text, "перезаписать");
         assert!(
-            !shown.can_save && !shown.can_open && !shown.can_delete,
+            !shown.can_save && !shown.can_apply && !shown.can_delete && !shown.can_startup,
             "ничего не выбрано"
         );
         let long = "щ".repeat(NAME_LENGTH + 1);
@@ -785,14 +999,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_delta_excludes_the_auto_offset() {
+    fn the_tile_delta_is_the_current_state_minus_the_chosen_profile() {
         let b = block(1, "2–5", vec![1, 2, 3, 4]);
-        let limits = Limits {
-            fused: vec![53, 46, 46, 46, 46],
-            was: vec![50, 45, 45, 45, 45],
-            choices: Vec::new(),
-        };
         let limit = [50, 42, 42, 42, 42];
+        let profile = [50, 45, 45, 45, 45];
         let detail = [
             None,
             Some(AutoMark::Detail {
@@ -805,27 +1015,50 @@ mod tests {
         let c = ceiling(
             &b,
             Some(&limit),
-            Some(&limits),
+            Some(&profile),
             Overlay {
                 marks: Some(&detail),
                 intended: None,
             },
         );
-        // Принятый ×44 (владелец −1 от «было» ×45), автомодуль ещё −2.
-        assert_eq!((c.auto, c.owner_delta(), c.ban), (-2, -1, Some(44)));
-        // Программа входа шлёт только потолок надстройки и принятые потолки по ядрам — тот же ответ.
+        // В профиле ×45, владелец поставил ×44, автомодуль ещё −2: сейчас ×42 — разница −3, из них −2 автомодуля.
+        assert_eq!((c.delta(), c.auto, c.ban), (-3, -2, Some(44)));
+        // Программа входа шлёт только потолок надстройки и потолки владельца по ядрам — тот же ответ.
         let plain = [None, Some(AutoMark::Ceiling(42))];
         let intended = [Some(50), Some(44), Some(44), Some(44), Some(44)];
         let c = ceiling(
             &b,
             Some(&limit),
-            Some(&limits),
+            Some(&profile),
             Overlay {
                 marks: Some(&plain),
                 intended: Some(&intended),
             },
         );
-        assert_eq!((c.auto, c.owner_delta(), c.ban), (-2, -1, None));
+        assert_eq!((c.delta(), c.auto, c.ban), (-3, -2, None));
+        // Профиль не выбран — разницы нет.
+        assert_eq!(ceiling(&b, Some(&limit), None, Overlay::default()).delta(), 0);
+    }
+
+    #[test]
+    fn the_window_has_no_accept_revert_history_or_depth() {
+        // Владелец 15.10: «принять, откатить… вообще непонятно», «История… нахуй мне», глубину «убрать».
+        let ui = include_str!("../ui/app.slint");
+        for gone in [
+            "принять",
+            "откатить",
+            "История",
+            "глубина",
+            "Глубина",
+            "depth",
+            "«было»",
+            "было",
+        ] {
+            assert!(!ui.contains(gone), "app.slint still has «{gone}»");
+        }
+        for kept in ["применить", "сохранить", "загружать при старте Windows"] {
+            assert!(ui.contains(kept), "app.slint lacks «{kept}»");
+        }
     }
 
     #[test]

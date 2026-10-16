@@ -151,9 +151,11 @@ fn lease_free(name: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Прокручивает цикл, пока потолок ядра не перестанет меняться (1,5 с без изменений, не дольше 10 с); его значение.
+/// Прокручивает цикл, пока потолок ядра не перестанет меняться (1,5 с без изменений, не дольше 20 с); его значение.
+/// 20 с, а не 10: без глубины (DECISIONS #38) горячий блок имитации опускается до остывания — с ×54 до ×43 это
+/// 11 ступеней по 0,7 с (окно 0,4 с и пауза 0,3 с проверки).
 fn settle(shell: &mut Shell, app: &mut App, core: usize) -> i32 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = ceilings_now(app).get(core).copied().unwrap_or(0);
     let mut since = Instant::now();
     while Instant::now() < deadline && since.elapsed() < Duration::from_millis(1500) {
@@ -165,6 +167,11 @@ fn settle(shell: &mut Shell, app: &mut App, core: usize) -> i32 {
         }
     }
     last
+}
+
+/// Нижняя граница допустимого потолка ядра — последний (самый низкий) пункт того, что можно поставить.
+fn choices_floor(app: &App, core: usize) -> i32 {
+    app.limits_choices(core).last().copied().unwrap_or(0)
 }
 
 fn sets(items: &[Item]) -> Vec<&Item> {
@@ -319,8 +326,8 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
                     .is_some_and(|t| t.contains("Новое окно") || t.contains("прежнее окно"))
             });
             r.check(old.count() == 0, "в меню нет «Новое окно» и «Открыть прежнее окно»");
-            // Отсечка и глубина — в окне (DECISIONS #36): в подменю автомодуля только включение, подтягивание и пункт,
-            // который открывает окно; пресетов отсечки и глубины нет.
+            // Отсечка — в окне (DECISIONS #36), глубины нет (#38): в подменю автомодуля только включение, подтягивание
+            // и пункт, который открывает окно; пресетов нет, о глубине ни слова.
             let auto: Vec<u32> = seen
                 .iter()
                 .find(|i| {
@@ -330,21 +337,28 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
                 })
                 .map(|i| i.children.iter().filter(|c| c.text.is_some()).map(|c| c.id).collect())
                 .unwrap_or_default();
+            let texts: Vec<String> = seen
+                .iter()
+                .flat_map(|i| std::iter::once(i).chain(i.children.iter()))
+                .filter_map(|i| i.text.clone())
+                .collect();
             r.check(
-                auto == [AUTO_ON, STEP_UP_ID, AUTO_WINDOW_ID],
-                &format!("подменю автомодуля: включение, подтягивание, «настроить в окне» — без пресетов ({auto:?})"),
+                auto == [AUTO_ON, STEP_UP_ID, AUTO_WINDOW_ID] && !texts.iter().any(|t| t.contains("глубин")),
+                &format!("подменю автомодуля: включение, подтягивание, «настроить в окне» — без пресетов и без глубины ({auto:?})"),
             );
             r.check(seen.iter().any(|i| i.id == EXIT_ID && i.enabled), "«Выход» доступен");
         }
         Err(e) => r.check(false, &e),
     }
 
-    // 3. Щелчок по другому набору: он ставится и становится профилем запуска.
+    // 3. Щелчок по другому набору: он ставится; профиль запуска не меняется — его выбирают отдельно, отметкой
+    //    «загружать при старте Windows» в окне (DECISIONS #38).
     let target = sets(&items)
         .into_iter()
         .find(|i| !i.checked && i.id > FACTORY_ID)
         .map_or(FACTORY_ID, |i| i.id);
     let writes = app.sim().map_or(0, |s| s.writes);
+    let logon = fs::read_to_string(data.join("profile.json")).ok();
     app.command(shell, target);
     let after = app.menu();
     let now_checked = sets(&after).into_iter().find(|i| i.checked).map(|i| i.id);
@@ -354,21 +368,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     );
     let wrote = app.sim().map_or(0, |s| s.writes) > writes;
     r.check(wrote, "потолки записаны в процессор");
-    match app.store().read_profile() {
-        Ok(Some(p)) if target > FACTORY_ID => {
-            let text = after
-                .iter()
-                .find(|i| i.id == target)
-                .and_then(|i| i.text.clone())
-                .unwrap_or_default();
-            r.check(
-                text.starts_with(&p.name),
-                &format!("набор «{}» стал профилем запуска", p.name),
-            );
-        }
-        Ok(None) if target == FACTORY_ID => r.check(true, "«заводские»: профиля запуска больше нет"),
-        other => r.check(false, &format!("профиль запуска после щелчка: {other:?}")),
-    }
+    r.check(
+        fs::read_to_string(data.join("profile.json")).ok() == logon,
+        "профиль запуска тот же: profile.json не тронут",
+    );
     let back = sets(&items).into_iter().find(|i| i.checked).map(|i| i.id);
 
     // 4. Открыто прежнее окно: процессор не трогаем, наборы серые; закрылось — потолки снова наши, метка замера
@@ -646,8 +649,9 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         None => r.note("сон во время работы окна: профиля запуска нет — проверять нечего"),
     }
 
-    // 11. Автомодуль (DECISIONS #31, #32): нагруженный горячий блок опускается, пока не остынет до предела, но не
-    //     глубже выбранного, держа аренду и метку, и каждое снижение ставит запрет на ступень перегрева; стартующему
+    // 11. Автомодуль (DECISIONS #31, #32, #38): нагруженный горячий блок опускается, пока не остынет до предела, — не
+    //     ниже нижней границы допустимого потолка, держа аренду и метку, и каждое снижение ставит запрет на ступень
+    //     перегрева; стартующему
     //     прежнему окну возвращает принятые и отпускает аренду; простой прохладой не считается; прохладный под
     //     нагрузкой блок возвращается по одной ступени, когда выходят запреты. Журнал действий и срезы пишутся.
     let accepted = app.intended().map(<[i32]>::to_vec).unwrap_or_default();
@@ -666,22 +670,20 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     let first = block.first;
     let marker = data.join("auto-held.json");
     app.command(shell, AUTO_ON);
-    // Отсечка и глубина — тем же путём, что команда окна «auto.set» (пунктов меню для них больше нет).
-    let refused = app.set_auto(
-        shell,
-        &serde_json::from_str(r#"{"limit":75,"depth":4}"#).unwrap_or_default(),
-    );
+    // Отсечка — тем же путём, что команда окна «auto.set» (пункта меню для неё больше нет).
+    let refused = app.set_auto(shell, &serde_json::from_str(r#"{"limit":75}"#).unwrap_or_default());
     r.check(
         refused.is_none(),
-        &format!("автомодуль: отсечка 75 °C, глубина 4 приняты {refused:?}"),
+        &format!("автомодуль: отсечка 75 °C принята {refused:?}"),
     );
     let settings = fs::read_to_string(data.join("tray.json")).unwrap_or_default();
     r.check(
-        settings.contains("\"auto\":true") && settings.contains("\"limit\":75") && settings.contains("\"depth\":4"),
-        "автомодуль: выбор записан в tray.json",
+        settings.contains("\"auto\":true") && settings.contains("\"limit\":75") && !settings.contains("depth"),
+        &format!("автомодуль: выбор записан в tray.json, глубины в нём нет ({settings})"),
     );
     let base = accepted.get(first).copied().unwrap_or(0);
-    let floor = base - 4;
+    // Нижняя граница допустимого потолка блока — та же, что у ручного (меню потолка окна): её последний пункт.
+    let floor = choices_floor(app, first);
     if let Some(sim) = app.sim() {
         for &m in &block.members {
             sim.load[m] = 1.0;
@@ -696,7 +698,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     r.check(
         lowest < base && lowest >= floor && (heat <= 75.0 || lowest == floor),
         &format!(
-            "автомодуль: горячий блок {} опущен ×{base} → ×{lowest} ({heat:.1} °C при пределе 75, не глубже ×{floor})",
+            "автомодуль: горячий блок {} опущен ×{base} → ×{lowest}, пока не остыл ({heat:.1} °C при пределе 75; ниже ×{floor} нельзя)",
             block.name
         ),
     );

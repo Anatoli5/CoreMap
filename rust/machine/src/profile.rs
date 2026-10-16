@@ -392,17 +392,17 @@ pub fn startup(
 /// Делает то, что стоит в процессоре сейчас, профилем запуска с данным названием (Profile.Save в C#):
 /// новый испытательный срок, если в нём есть потолок выше заводского.
 pub fn save(store: &Store, limits: &Limits, name: &str, now: Stamp) -> io::Result<Profile> {
+    mark(store, limits, name, limits.current(), now)
+}
+
+/// Делает набор `ratios` профилем запуска с данным названием — отметка «загружать при старте Windows» (DECISIONS #38),
+/// не ставя его в процессор: новый испытательный срок, если в нём есть потолок выше заводского; время применения —
+/// сейчас (сбой с этой минуты относится к нему, как после `save`).
+pub fn mark(store: &Store, limits: &Limits, name: &str, ratios: &[i32], now: Stamp) -> io::Result<Profile> {
     let p = Profile {
         name: name.to_string(),
-        ratios: limits.current().to_vec(),
-        state: Some(
-            if limits.above_factory(limits.current()) {
-                TRIAL
-            } else {
-                TRUSTED
-            }
-            .into(),
-        ),
+        ratios: ratios.to_vec(),
+        state: Some(if limits.above_factory(ratios) { TRIAL } else { TRUSTED }.into()),
         failure: None,
         saved: now,
         applied: now,
