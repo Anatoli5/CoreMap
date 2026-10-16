@@ -784,6 +784,8 @@ fn series(frame: Frame, block: usize, rows: &[(i32, f64, f64)]) -> SeriesShown {
         faded: false,
         mean: Vec::new(),
         p95: Vec::new(),
+        model: String::new(),
+        model_dash: String::new(),
         points,
     }
 }

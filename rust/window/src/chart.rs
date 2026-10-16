@@ -12,11 +12,16 @@
 //   датчика. Наибольшая со строкой, где она была, — в подсказке столбца;
 // • точка тем бледнее, чем меньше времени за ней (`ink`), — корзины не отсекаются (владелец не принимает порогов);
 // • оси можно поменять местами (владелец: «возможность переключения осей. Посмотрим, какой вариант будет более
-//   оптимальным»): всё ниже считается в долях поля по `Frame`, который один знает, какая ось где.
+//   оптимальным»): всё ниже считается в долях поля по `Frame`, который один знает, какая ось где;
+// • кривая модели нагрева (model.rs, DECISIONS #39) — температура от фактического множителя при своей нагрузке 100 %,
+//   соседях и кристалле на их медианах; когда в журнале есть мощность — для одинаковой работы на всех блоках одного
+//   рода (`BlockModel::shown_curve`). Сплошная над наблюдёнными множителями, пунктир за ними; свой переключатель
+//   «модель», может идти вместе с ø и 95 %. «°C на ватт» и условия — в подсказке блока в легенде.
 use std::fmt::Write as _;
 
 use slint::{ModelRc, VecModel};
 
+use crate::model::{BlockModel, Model};
 use crate::panels::{capital, f, grouped, percent, rgb, span_of, whom};
 use crate::samples::{self, Bin, P95};
 use crate::store::Digest;
@@ -174,7 +179,13 @@ impl Frame {
     /// Середина столбца множителя — доля оси множителя.
     #[must_use]
     pub fn along(&self, ratio: i32) -> f64 {
-        (f64::from(ratio - self.lo) + 0.5) / f64::from(self.bands())
+        self.along_at(f64::from(ratio))
+    }
+
+    /// Дробный множитель — доля оси множителя (целый — середина своего столбца).
+    #[must_use]
+    pub fn along_at(&self, ratio: f64) -> f64 {
+        (ratio - f64::from(self.lo) + 0.5) / f64::from(self.bands())
     }
 
     /// Температура — доля оси температуры.
@@ -186,8 +197,13 @@ impl Frame {
     /// Точка (множитель, температура) на поле: (x, y), доли, y снизу вверх.
     #[must_use]
     pub fn place(&self, ratio: i32, temp: f64) -> (f64, f64) {
-        let (m, v) = (self.along(ratio), self.value(temp));
-        if self.swap { (v, m) } else { (m, v) }
+        self.turn(self.along(ratio), self.value(temp))
+    }
+
+    /// Доли (вдоль множителя, вдоль температуры) → (x, y) поля.
+    #[must_use]
+    pub fn turn(&self, along: f64, value: f64) -> (f64, f64) {
+        if self.swap { (value, along) } else { (along, value) }
     }
 
     /// Столбец множителя на поле: (x, y, ширина, высота) в долях, y снизу вверх.
@@ -220,6 +236,11 @@ const STEPS: [f64; 6] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
 const MAX_TICKS: f64 = 8.0;
 /// Курсор ближе этого к линии блока — она подсвечивается (пиксели поля графика).
 const NEAR_PX: f64 = 10.0;
+/// Шаг кривой модели по множителю: десятая ступени — излом кривой напряжения между целыми множителями виден.
+const MODEL_STEP: f64 = 0.1;
+/// Пунктир кривой модели за наблюдёнными множителями: штрих и промежуток в рамке 1000 × 1000.
+const DASH: f64 = 18.0;
+const DASH_GAP: f64 = 12.0;
 
 /// Что нужно панели статистики.
 #[derive(Debug)]
@@ -236,6 +257,8 @@ pub struct StatsInput<'a> {
     pub digest: Option<&'a Digest>,
     pub scale: Scale,
     pub curves: Curves,
+    /// Кривые модели нагрева (переключатель «модель»).
+    pub model: bool,
     pub swap: bool,
 }
 
@@ -257,6 +280,7 @@ pub struct StatsShown {
     pub value_title: String,
     pub swap: bool,
     pub curves: Curves,
+    pub model: bool,
     pub empty: String,
     pub actions: Vec<ActionShown>,
     pub actions_empty: String,
@@ -278,6 +302,9 @@ pub struct SeriesShown {
     /// Пути ø средней и 95 % в рамке 1000 × 1000 (y вниз) с густотой краски; скрытая кривая — пусто.
     pub mean: Vec<(f32, String)>,
     pub p95: Vec<(f32, String)>,
+    /// Кривая модели в той же рамке: сплошная (наблюдённые множители) и пунктир (за ними); нет кривой — пусто.
+    pub model: String,
+    pub model_dash: String,
     pub points: Vec<PointShown>,
 }
 
@@ -340,6 +367,8 @@ impl StatsShown {
             .map(|s| Series {
                 mean: runs(&s.mean),
                 p95: runs(&s.p95),
+                model: s.model.as_str().into(),
+                model_dash: s.model_dash.as_str().into(),
                 color: rgb(s.color),
                 faded: s.faded,
                 marks: ModelRc::new(VecModel::from(
@@ -450,13 +479,15 @@ pub fn axis(blocks: &[BlockInfo], fused: Option<&[i64]>, digest: Option<&Digest>
 }
 
 /// Ось температуры: (от, до, шаг подписей), °C — одна на все блоки (по всем блокам, от выбора и от показанных линий не
-/// зависит): абсолютная — 40–100 °C и шире, если ø или 95 % какого-нибудь блока за краями; над кристаллом — от
-/// наименьшего до наибольшего, 0 всегда на оси.
-fn value_range(scale: Scale, every: &[Vec<Stat>]) -> (f64, f64, f64) {
+/// зависит): абсолютная — 40–100 °C и шире, если ø, 95 % или сплошная часть кривой модели какого-нибудь блока за
+/// краями; над кристаллом — от наименьшего до наибольшего, 0 всегда на оси. Пунктир модели ось не растягивает — он
+/// обрезается её краями.
+fn value_range(scale: Scale, every: &[Vec<Stat>], models: &[f64]) -> (f64, f64, f64) {
     let values = every
         .iter()
         .flatten()
-        .flat_map(|s| [s.bin.mean().unwrap_or(s.p95), s.p95]);
+        .flat_map(|s| [s.bin.mean().unwrap_or(s.p95), s.p95])
+        .chain(models.iter().copied());
     let (mut lo, mut hi) = match scale {
         Scale::Absolute => (ABS_LOW, ABS_HIGH),
         Scale::AboveDie => (0.0, 0.0),
@@ -503,7 +534,8 @@ fn temp_text(scale: Scale, v: f64, decimals: usize) -> String {
     }
 }
 
-/// Подпись блока в легенде: короткое название (номер ядра или кластера, как на схеме), полное — в подсказке.
+/// Подпись блока в легенде: короткое название (номер ядра или кластера, как на схеме), полное — в подсказке; там же
+/// «°C на ватт» по модели нагрева.
 fn legend(blocks: &[BlockInfo], compared: &[&BlockInfo], digest: Option<&Digest>) -> Vec<LegendShown> {
     compared
         .iter()
@@ -521,12 +553,250 @@ fn legend(blocks: &[BlockInfo], compared: &[&BlockInfo], digest: Option<&Digest>
                 name: b.name.clone(),
                 color: color_of(blocks, b.index),
                 tip: format!(
-                    "{}{counted}\nЩелчок по плитке убирает блок из сравнения, щелчок по другой — добавляет.\n• цвет у блока свой: P-ядра — тёплые, кластеры E-ядер — холодные; обводка плитки — того же цвета",
-                    capital(&whom(b))
+                    "{}{counted}\nЩелчок по плитке убирает блок из сравнения, щелчок по другой — добавляет.\n• цвет у блока свой: P-ядра — тёплые, кластеры E-ядер — холодные; обводка плитки — того же цвета{}",
+                    capital(&whom(b)),
+                    digest
+                        .and_then(|d| d.model.as_deref())
+                        .map(|m| model_tip(m, b))
+                        .unwrap_or_default()
                 ),
             }
         })
         .collect()
+}
+
+// ----- кривая модели -----
+
+/// Модель блока по названию.
+fn model_of<'a>(model: &'a Model, block: &BlockInfo) -> Option<&'a BlockModel> {
+    model.blocks.iter().find(|m| m.name == block.name)
+}
+
+/// Кривая модели на шкале графика: абсолютная — как есть, над кристаллом — минус опорный уровень кристалла.
+fn model_value(m: &BlockModel, scale: Scale, ratio: f64) -> Option<f64> {
+    let t = m.shown_curve(ratio)?;
+    Some(match scale {
+        Scale::Absolute => t,
+        Scale::AboveDie => t - m.reference.as_ref()?.die,
+    })
+}
+
+/// Множители от `from` до `to` с шагом `MODEL_STEP`, оба края включены.
+fn ratios(from: f64, to: f64) -> impl Iterator<Item = f64> {
+    let steps = ((to - from) / MODEL_STEP).ceil().max(0.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the axis spans a few dozen multipliers: a few hundred steps"
+    )]
+    let steps = steps as u32;
+    (0..=steps).map(move |k| (from + f64::from(k) * MODEL_STEP).min(to))
+}
+
+/// Значения сплошной части кривой модели (наблюдённые множители) — для оси температуры; кривой нет — пусто.
+fn model_solid(m: &BlockModel, scale: Scale) -> Vec<f64> {
+    let Some(r) = m.reference.as_ref().filter(|_| m.drawn()) else {
+        return Vec::new();
+    };
+    ratios(r.lo, r.hi).filter_map(|x| model_value(m, scale, x)).collect()
+}
+
+/// Ломаная (доли поля: вдоль множителя, вдоль температуры), обрезанная краями оси температуры: куски внутри поля.
+fn clipped(points: &[(f64, f64)]) -> Vec<Vec<(f64, f64)>> {
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut open = false; // последний кусок кончился внутри поля в конце прошлого отрезка
+    for w in points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let dv = b.1 - a.1;
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        let mut inside = true;
+        for (p, q) in [(-dv, a.1), (dv, 1.0 - a.1)] {
+            if p.abs() < f64::EPSILON {
+                inside &= q >= 0.0;
+            } else if p < 0.0 {
+                t0 = t0.max(q / p);
+            } else {
+                t1 = t1.min(q / p);
+            }
+        }
+        if !inside || t0 > t1 {
+            open = false;
+            continue;
+        }
+        let at = |t: f64| (a.0 + (b.0 - a.0) * t, a.1 + dv * t);
+        if !(open && t0 <= 0.0) {
+            out.push(vec![at(t0)]);
+        }
+        if let Some(run) = out.last_mut() {
+            run.push(at(t1));
+        }
+        open = t1 >= 1.0;
+    }
+    out
+}
+
+/// Точка доли поля → рамка пути 1000 × 1000 (y вниз).
+fn frame_point(frame: &Frame, (along, value): (f64, f64)) -> (f64, f64) {
+    let (x, y) = frame.turn(along, value);
+    (x * 1000.0, (1.0 - y) * 1000.0)
+}
+
+/// Сплошная ломаная в путь.
+fn solid_path(run: &[(f64, f64)], frame: &Frame, out: &mut String) {
+    for (k, &p) in run.iter().enumerate() {
+        let (x, y) = frame_point(frame, p);
+        let _ = write!(out, "{} {x:.1} {y:.1} ", if k == 0 { "M" } else { "L" }); // into a String
+    }
+}
+
+/// Пунктир по ломаной: штрихи `DASH` через промежутки `DASH_GAP` по длине в рамке 1000 × 1000.
+fn dashed_path(run: &[(f64, f64)], frame: &Frame, out: &mut String) {
+    let points: Vec<(f64, f64)> = run.iter().map(|&p| frame_point(frame, p)).collect();
+    let (mut on, mut left, mut drawing) = (true, DASH, false);
+    for w in points.windows(2) {
+        let (mut a, b) = (w[0], w[1]);
+        let mut length = (b.0 - a.0).hypot(b.1 - a.1);
+        while length > 1e-9 {
+            let step = left.min(length);
+            let k = step / length;
+            let c = (a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k);
+            if on {
+                if !drawing {
+                    let _ = write!(out, "M {:.1} {:.1} ", a.0, a.1); // into a String
+                    drawing = true;
+                }
+                let _ = write!(out, "L {:.1} {:.1} ", c.0, c.1); // into a String
+            }
+            length -= step;
+            left -= step;
+            a = c;
+            if left <= 1e-9 {
+                on = !on;
+                left = if on { DASH } else { DASH_GAP };
+                drawing = false;
+            }
+        }
+    }
+}
+
+/// Пути кривой модели блока: сплошная над наблюдёнными множителями, пунктир от края оси до них и от них до края.
+fn model_paths(m: &BlockModel, scale: Scale, frame: &Frame) -> (String, String) {
+    let Some(r) = m.reference.as_ref().filter(|_| m.drawn()) else {
+        return (String::new(), String::new());
+    };
+    let (from, to) = (f64::from(frame.lo) - 0.5, f64::from(frame.hi) + 0.5);
+    let piece = |a: f64, b: f64| -> Vec<(f64, f64)> {
+        if b <= a {
+            return Vec::new();
+        }
+        ratios(a, b)
+            .filter_map(|x| Some((frame.along_at(x), frame.value(model_value(m, scale, x)?))))
+            .collect()
+    };
+    let (lo, hi) = (r.lo.clamp(from, to), r.hi.clamp(from, to));
+    let mut solid = String::new();
+    for run in clipped(&piece(lo, hi)) {
+        solid_path(&run, frame, &mut solid);
+    }
+    let mut dash = String::new();
+    for run in clipped(&piece(from, lo)).iter().chain(&clipped(&piece(hi, to))) {
+        dashed_path(run, frame, &mut dash);
+    }
+    (solid, dash)
+}
+
+/// Часть подсказки блока в легенде о модели нагрева: «°C на ватт» (тепловое сопротивление) или почему его нет, вид
+/// кривой (одинаковая работа или нагрузка этого ядра), условия, ошибка, сколько данных. «°C на ступень» по своей
+/// нагрузке здесь больше не показывается: занятость — это время бодрствования, а не тепло работы, и Windows даёт тяжёлые
+/// потоки верхним по рангу ядрам — число мерило тяжесть потока, а не ядро (DECISIONS #39).
+fn model_tip(model: &Model, block: &BlockInfo) -> String {
+    let Some(m) = model_of(model, block) else {
+        return String::new();
+    };
+    let e_note = if m.e {
+        "\n• нагрузка и мощность кластера — по первому ядру, за четыре ядра"
+    } else {
+        ""
+    };
+    let (Some(r), true) = (m.reference.as_ref(), m.drawn()) else {
+        return format!(
+            "\nМодели нагрева нет: годных срезов {}, нужно хотя бы {:.0} мин.\n• годный срез: известны его и соседей нагрузка и множитель, температура и кристалл вокруг; первые 16 с после перерыва журнала не в счёт{e_note}",
+            glued(&span_of(m.minutes * 60.0)),
+            crate::model::MIN_MINUTES
+        );
+    };
+    let powered = model
+        .power
+        .as_ref()
+        .map_or_else(|| "0 мин".to_string(), |p| glued(&span_of(p.minutes * 60.0)));
+    let head = match (m.resistance, m.power) {
+        (Some(rs), Some(pw)) => format!(
+            "\nМодель: {:.2} °C на ватт ({:.2}–{:.2} по частям данных)\nТепловое сопротивление: на сколько градусов теплее блок на ватт своей работы; меньше — лучше.\n• мощность блока по журналу: {:.1} Вт при полной нагрузке на ×{:.0} ({:.1}–{:.1})\n• кривая — для одинаковой работы на всех {}: {:.1} Вт на полную нагрузку на ×{:.0}",
+            rs.value,
+            rs.lo,
+            rs.hi,
+            pw.watts,
+            crate::model::REFERENCE,
+            pw.lo,
+            pw.hi,
+            if m.e {
+                "кластерах E-ядер"
+            } else {
+                "P-ядрах"
+            },
+            m.same_work.unwrap_or(pw.watts),
+            crate::model::REFERENCE,
+        ),
+        (_, Some(pw)) => {
+            let partner = pw
+                .partner
+                .filter(|(_, c)| c.abs() >= 0.5)
+                .and_then(|(j, _)| model.blocks.get(j))
+                .map(|b| format!(" — он нагружен вместе с {}, данные различают только их сумму", b.name))
+                .unwrap_or_default();
+            format!(
+                "\nМодель: «°C на ватт» нет — мощность этого блока по журналу не отделяется от остальных{partner}\n• срезов с мощностью процессора: {powered}\n• кривая — нагрузка этого ядра в этой игре, не одинаковая работа"
+            )
+        }
+        _ => format!(
+            "\nМодель: «°C на ватт» нет — в журнале нет мощности процессора\n• срезов с мощностью: {powered}; её пишет CoreMapTray с 0.5.3, мощность ядер — с 0.5.4\n• кривая — нагрузка этого ядра в этой игре, не одинаковая работа"
+        ),
+    };
+    let near: Vec<String> = r
+        .neighbours
+        .iter()
+        .filter_map(|&(j, p)| Some(format!("{} — {}", model.blocks.get(j)?.name, percent(p))))
+        .collect();
+    let near = if near.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; соседи: {} полной нагрузки на ×{:.0}",
+            near.join(", "),
+            crate::model::REFERENCE
+        )
+    };
+    let error = m
+        .errors
+        .map(|e| format!("\n• ошибка на отложенных данных {:.2} °C (средние за 10 с)", e.full))
+        .unwrap_or_default();
+    let fallback = if m.fallback > 0.0 {
+        format!(
+            "\n• без напряжения{}: множитель в мощность — по кубу множителя",
+            if m.fallback < 1.0 {
+                format!(" в {} срезов", percent(m.fallback))
+            } else {
+                String::new()
+            }
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{head}\n• условия кривой: своя нагрузка 100 %, кристалл {:.1} °C{near} (медианы, пока блок под нагрузкой){error}\n• данных {}{fallback}{e_note}",
+        r.die,
+        glued(&span_of(m.minutes * 60.0)),
+    )
 }
 
 /// Пути одной кривой: отрезки между соседними множителями (через пустую корзину линии нет — там только точки), каждый
@@ -627,6 +897,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             Scale::AboveDie => "°C над кристаллом".into(),
             Scale::Absolute => "°C".into(),
         },
+        model: input.model,
         ..StatsShown::default()
     };
     let compared: Vec<&BlockInfo> = input
@@ -732,7 +1003,18 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
     let Some((lo, hi)) = axis(input.blocks, input.fused, Some(digest)) else {
         return shown;
     };
-    let (t0, t1, step) = value_range(input.scale, &every);
+    let fitted = digest.model.as_deref();
+    let solid: Vec<f64> = fitted
+        .map(|m| {
+            input
+                .blocks
+                .iter()
+                .filter_map(|b| model_of(m, b))
+                .flat_map(|b| model_solid(b, input.scale))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (t0, t1, step) = value_range(input.scale, &every, &solid);
     let frame = Frame {
         lo,
         hi,
@@ -775,6 +1057,10 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             .map(|s| frame.place(s.ratio, s.bin.mean().unwrap_or(s.p95)))
             .collect();
         let highs: Vec<(f64, f64)> = stats.iter().map(|s| frame.place(s.ratio, s.p95)).collect();
+        let (model, model_dash) = match fitted.and_then(|m| model_of(m, b)) {
+            Some(m) if input.model => model_paths(m, input.scale, &frame),
+            _ => (String::new(), String::new()),
+        };
         shown.series.push(SeriesShown {
             block: b.index,
             color: color_of(input.blocks, b.index),
@@ -789,6 +1075,8 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             } else {
                 Vec::new()
             },
+            model,
+            model_dash,
             points: stats
                 .iter()
                 .zip(means.iter().zip(&highs))
@@ -950,6 +1238,7 @@ mod tests {
             digest: Some(digest),
             scale,
             curves: Curves::Both,
+            model: true,
             swap,
         })
     }
@@ -1021,6 +1310,7 @@ mod tests {
             digest: Some(&d),
             scale: Scale::AboveDie,
             curves: Curves::Both,
+            model: true,
             swap: false,
         });
         assert!(with_cutoff.cutoff < 0.0);
@@ -1108,6 +1398,7 @@ mod tests {
                 digest: Some(&d),
                 scale: Scale::Absolute,
                 curves,
+                model: true,
                 swap: false,
             })
         };
@@ -1170,6 +1461,7 @@ mod tests {
             digest: Some(&d),
             scale: Scale::Absolute,
             curves: Curves::Both,
+            model: true,
             swap: false,
         });
         assert!(
@@ -1247,5 +1539,115 @@ mod tests {
         assert_eq!(signed_temp(-3.06, 1), "−3.1");
         assert_eq!(signed_temp(0.01, 1), "0.0");
         assert_eq!(signed_temp(-0.01, 0), "0");
+    }
+
+    /// 13 минут строк по 0,25 с: ядро 0 занято на ×44…×48, его температура растёт с нагрузкой; у кластера множитель
+    /// есть только первые 5 минут (дальше пусто при нагрузке 0,3 — его мощность неизвестна): модели у него нет.
+    fn modelled() -> Digest {
+        let mut csv = String::from("time,0.ratio,0.busy,0.temp,2–5.ratio,2–5.busy,2–5.temp\n");
+        for k in 0..3200u32 {
+            let ms = k * 250;
+            let ratio = 44 + (k / 37) % 5;
+            let busy = 0.6 + 0.4 * f64::from((k / 11) % 3) / 2.0;
+            let die = 50 + (k / 101) % 5;
+            let p = busy * (f64::from(ratio) / 45.0).powi(3);
+            let temp = 20.0 + 0.5 * f64::from(die) + 12.0 * p;
+            let cluster = if k < 1200 { "40" } else { "" };
+            let _ = writeln!(
+                csv,
+                "2026-10-15 10:{:02}:{:02}.{:03},{ratio},{busy:.2},{temp:.3},{cluster},0.30,{die}",
+                ms / 60_000,
+                ms / 1000 % 60,
+                ms % 1000
+            );
+        }
+        let log = crate::model::log_from_csv(&csv);
+        let die = crate::model::Die {
+            names: vec!["0".into(), "2–5".into()],
+            e: vec![false, true],
+            neighbours: vec![Vec::new(), Vec::new()],
+        };
+        let (header, body) = csv.split_once('\n').expect("заголовок");
+        let columns = Columns::parse(header).expect("заголовок");
+        let mut tally = Tally::default();
+        Scratch::default().count(&columns, body, &mut None, &mut tally);
+        Digest {
+            tally,
+            model: Some(std::sync::Arc::new(crate::model::fit(&[&log], &die))),
+            ..Digest::default()
+        }
+    }
+
+    #[test]
+    fn the_model_curve_is_solid_over_observed_multipliers_and_dashed_beyond() {
+        let d = modelled();
+        let model = d.model.as_deref().expect("модель");
+        assert!(
+            model.blocks[0].drawn(),
+            "у ядра 0 больше 10 мин: {}",
+            model.blocks[0].minutes
+        );
+        assert!(
+            !model.blocks[1].drawn(),
+            "у кластера меньше: {}",
+            model.blocks[1].minutes
+        );
+        let fused = [50i64, 46, 46, 46, 46];
+        let s = stats_with(&d, &[0, 1], None, Some(&fused), Scale::AboveDie, false);
+        let core = &s.series[0];
+        assert!(!core.model.is_empty() && !core.model_dash.is_empty(), "{core:?}");
+        assert!(s.series[1].model.is_empty() && s.series[1].model_dash.is_empty());
+        // Сплошная — от ×44 до ×48 (наблюдённые под нагрузкой): её x — в столбцах 44…48 оси.
+        let frame_x = |r: f64| {
+            f64::from(s.columns[0].at)
+                + (r - f64::from(s.columns[0].ratio)) / f64::from(u16::try_from(s.columns.len()).unwrap_or(1))
+        };
+        let xs: Vec<f64> = core
+            .model
+            .split_whitespace()
+            .filter_map(|t| t.parse::<f64>().ok())
+            .step_by(2)
+            .collect();
+        let (lo, hi) = (
+            xs.iter().copied().fold(f64::MAX, f64::min),
+            xs.iter().copied().fold(f64::MIN, f64::max),
+        );
+        assert!(
+            (lo / 1000.0 - frame_x(44.0)).abs() < 0.01 && (hi / 1000.0 - frame_x(48.0)).abs() < 0.01,
+            "{lo} {hi}"
+        );
+        // Подсказки: мощности в журнале нет — у ядра «°C на ватт» нет и сказано почему, кривая — по нагрузке этого
+        // ядра; у кластера — сколько данных и что нужно 10 мин.
+        let core = &s.legend[0].tip;
+        assert!(
+            core.contains("«°C на ватт» нет — в журнале нет мощности процессора")
+                && core.contains("не одинаковая работа")
+                && !core.contains("°C на ступень"),
+            "{core}"
+        );
+        assert!(!s.legend[0].tip.contains("по первому ядру"));
+        let e = &s.legend[1].tip;
+        assert!(
+            e.contains("Модели нагрева нет")
+                && e.contains("нужно хотя бы 10 мин")
+                && e.contains("по первому ядру, за четыре ядра"),
+            "{e}"
+        );
+        // Выключатель «модель» прячет кривые.
+        let off = stats_panel(&StatsInput {
+            blocks: &blocks(),
+            compared: &[0, 1],
+            highlight: None,
+            fused: Some(&fused),
+            cutoff: None,
+            digest: Some(&d),
+            scale: Scale::AboveDie,
+            curves: Curves::Both,
+            model: false,
+            swap: false,
+        });
+        assert!(off.series.iter().all(|l| l.model.is_empty() && l.model_dash.is_empty()));
+        // У ядра 0 пять соседних множителей — его линия ø осталась (у кластера один множитель — линии и не было).
+        assert!(!off.series[0].mean.is_empty(), "линия ø осталась");
     }
 }

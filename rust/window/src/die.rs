@@ -138,6 +138,17 @@ pub fn geometry(hello: &Hello) -> Geometry {
     }
 }
 
+/// Соседние блоки (номера в `hello.blocks`) — те же пары, что у полос связи на схеме (`geometry`, `Link`): сбоку или
+/// сверху-снизу, по диагонали — не соседи. Ими же пользуется модель нагрева (model.rs) — правило одно.
+pub fn neighbours(hello: &Hello) -> Vec<(usize, usize)> {
+    let block_of = |tile: usize| hello.layout.tiles.get(tile).map(|t| t.block);
+    geometry(hello)
+        .links
+        .iter()
+        .filter_map(|l| Some((block_of(l.a)?, block_of(l.b)?)))
+        .collect()
+}
+
 /// Число столбцов или рядов (единицы) → пиксели.
 #[expect(clippy::cast_precision_loss, reason = "a die has a handful of columns, exact in f32")]
 fn units(v: usize) -> f32 {

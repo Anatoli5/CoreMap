@@ -60,6 +60,8 @@ pub struct Saved {
     pub above: Option<bool>,
     /// Какие линии на графике.
     pub curves: Option<Curves>,
+    /// Кривые модели нагрева на графике.
+    pub model: Option<bool>,
     /// Оси местами: температура по горизонтали (true).
     pub swap: Option<bool>,
     /// Обычный размер окна, логические точки (не зависят от масштаба экрана).
@@ -127,6 +129,7 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         pin: map.get("pin").and_then(Value::as_bool),
         above: map.get("above").and_then(Value::as_bool),
         curves,
+        model: map.get("model").and_then(Value::as_bool),
         swap: map.get("swap").and_then(Value::as_bool),
         size,
         position,
@@ -152,6 +155,9 @@ pub fn text(saved: &Saved) -> String {
             Curves::Both => "both",
         };
         map.insert("curves".into(), name.into());
+    }
+    if let Some(model) = saved.model {
+        map.insert("model".into(), model.into());
     }
     if let Some(swap) = saved.swap {
         map.insert("swap".into(), swap.into());
@@ -295,6 +301,7 @@ mod tests {
             pin: Some(true),
             above: Some(false),
             curves: Some(Curves::P95),
+            model: Some(false),
             swap: Some(true),
             size: Some((1500.0, 900.0)),
             position: Some((120, 80)),

@@ -30,6 +30,8 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
+use crate::model::Log;
+
 /// Блок занят — доля работы не меньше этой (та же граница, что у автомодуля: `machine::auto::BUSY`). Только для
 /// сравнения с соседом: корзины графика берут строки при любой нагрузке.
 pub const BUSY: f64 = 0.5;
@@ -484,10 +486,15 @@ pub fn effect(splits: &BTreeMap<i32, Split>) -> Option<Effect> {
 // ----- срезы: столбцы и строки -----
 
 /// Где в строке что лежит — по заголовку файла (а не по порядку): файл с другим набором блоков тоже читается.
+/// Мощность процессора и видеокарты (с 0.5.3), напряжение блоков (`<блок>.volts`) и мощность ядер (`power_cores`, с
+/// 0.5.4) нужны только модели нагрева (model.rs): статистика графика их не считает.
 #[derive(Clone, Debug)]
 pub struct Columns {
     width: usize,
     fan_cpu: Option<usize>,
+    power_cpu: Option<usize>,
+    power_gpu: Option<usize>,
+    power_cores: Option<usize>,
     blocks: Vec<BlockColumns>,
 }
 
@@ -497,6 +504,7 @@ struct BlockColumns {
     ratio: Option<usize>,
     busy: Option<usize>,
     temp: Option<usize>,
+    volts: Option<usize>,
 }
 
 impl Columns {
@@ -519,6 +527,7 @@ impl Columns {
                     ratio: None,
                     busy: None,
                     temp: None,
+                    volts: None,
                 });
                 blocks.len() - 1
             };
@@ -527,17 +536,21 @@ impl Columns {
                 "ratio" => b.ratio = Some(i),
                 "busy" => b.busy = Some(i),
                 "temp" => b.temp = Some(i),
+                "volts" => b.volts = Some(i),
                 _ => {}
             }
         }
         (!blocks.is_empty()).then(|| Columns {
             width: names.len(),
             fan_cpu: names.iter().position(|c| *c == "fan_cpu"),
+            power_cpu: names.iter().position(|c| *c == "power_cpu"),
+            power_gpu: names.iter().position(|c| *c == "power_gpu"),
+            power_cores: names.iter().position(|c| *c == "power_cores"),
             blocks,
         })
     }
 
-    #[cfg(test)]
+    /// Блоки файла по порядку столбцов.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.blocks.iter().map(|b| b.name.as_str())
     }
@@ -565,6 +578,7 @@ struct Cell {
     ratio: Option<f64>,
     busy: Option<f64>,
     temp: Option<f64>,
+    volts: Option<f64>,
 }
 
 fn number(text: &str) -> Option<f64> {
@@ -609,8 +623,23 @@ impl Scratch {
     }
 
     /// Строки срезов (полные, без заголовка) — в сводку файла. `previous` — время последней посчитанной строки этого
-    /// файла (мс, `row_time`): файл дочитывается порциями, и первая строка порции считает промежуток от неё.
+    /// файла (мс, `row_time`): файл дочитывается порциями, и первая строка порции считает промежуток от неё. Окно
+    /// читает через `count_keeping`; этот — тестам статистики.
+    #[cfg(test)]
     pub fn count(&mut self, columns: &Columns, text: &str, previous: &mut Option<i64>, into: &mut Tally) {
+        self.count_keeping(columns, text, previous, into, None);
+    }
+
+    /// То же, и строки журнала по 0,25 с — ещё и в `keep` (строки файла для модели нагрева, model.rs): тот же разбор
+    /// той же строки, второго чтения файла нет.
+    pub fn count_keeping(
+        &mut self,
+        columns: &Columns,
+        text: &str,
+        previous: &mut Option<i64>,
+        into: &mut Tally,
+        mut keep: Option<&mut Log>,
+    ) {
         let n = columns.blocks.len();
         self.reset(n);
         // Самая ранняя и самая поздняя строка по времени, не по месту в файле: часы могут отойти назад (сверка
@@ -618,7 +647,7 @@ impl Scratch {
         let mut earliest: Option<(i64, &str)> = None;
         let mut latest: Option<(i64, &str)> = None;
         for line in text.lines() {
-            if let Some((time, ms)) = self.row(columns, line.trim_end_matches('\r'), previous) {
+            if let Some((time, ms)) = self.row(columns, line.trim_end_matches('\r'), previous, keep.as_deref_mut()) {
                 if earliest.is_none_or(|(e, _)| ms < e) {
                     earliest = Some((ms, time));
                 }
@@ -633,7 +662,13 @@ impl Scratch {
     }
 
     /// Одна строка; Some((время, мс)) — строка принята.
-    fn row<'a>(&mut self, columns: &Columns, line: &'a str, previous: &mut Option<i64>) -> Option<(&'a str, i64)> {
+    fn row<'a>(
+        &mut self,
+        columns: &Columns,
+        line: &'a str,
+        previous: &mut Option<i64>,
+        keep: Option<&mut Log>,
+    ) -> Option<(&'a str, i64)> {
         self.fields.clear();
         let mut start = 0;
         for (i, b) in line.bytes().enumerate() {
@@ -666,7 +701,23 @@ impl Scratch {
                 ratio: field(b.ratio).and_then(number),
                 busy: field(b.busy).and_then(number),
                 temp: field(b.temp).and_then(number),
+                volts: field(b.volts).and_then(number),
             };
+        }
+        // Модели — только строки по 0,25 с: прежние (по 2 с) отстоят друг от друга больше секунды, каждая начинала бы
+        // скользящие средние заново, и ни одна не годилась бы в счёт (model.rs, GAP_MS).
+        if let Some(log) = keep
+            && at.step == STEP_MS
+        {
+            log.push(
+                at.ms,
+                self.cells.iter().map(|c| [c.ratio, c.busy, c.temp, c.volts]),
+                [
+                    field(columns.power_cpu).and_then(number),
+                    field(columns.power_gpu).and_then(number),
+                    field(columns.power_cores).and_then(number),
+                ],
+            );
         }
         let n = self.n;
         // Уровень кристалла в этой строке: сумма и число известных температур всех блоков (у блока — без него самого).

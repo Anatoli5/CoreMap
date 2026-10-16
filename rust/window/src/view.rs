@@ -23,17 +23,18 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use serde_json::{Map, Value};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::chart::{self, Curves, Scale, StatsShown};
 use crate::die::{self, Geometry};
+use crate::model::Die;
 use crate::panels::{self, ProfileInput, ProfileShown};
 use crate::pipe::{Event, Link};
 use crate::saved::{self, Remembered};
-use crate::store::Digest;
+use crate::store::{Digest, Order};
 use crate::wire::{AutoSettings, Hello, Limits, Message, Profiles, State};
 use crate::{AppWindow, CellData, LinkData, MenuEntry, SetRow, TileData};
 
@@ -155,7 +156,11 @@ pub struct View {
     /// Вид графика (src/chart.rs): шкала, линии, оси местами.
     pub scale: Scale,
     pub curves: Curves,
+    /// Кривые модели нагрева (переключатель «модель»).
+    pub model: bool,
     pub swap: bool,
+    /// Поток статистики: ему уходят блоки и соседи из знакомства — по ним считается модель.
+    stats: Option<mpsc::Sender<Order>>,
     /// Подсветка линий (владелец 15.10 не решил, какая удобнее, — переключатель в окне): false — под курсором (плитка
     /// или линия графика), true — закреплённая: последний добавленный блок или линия, по которой щёлкнули.
     pub pin_mode: bool,
@@ -205,6 +210,7 @@ impl View {
             None => Scale::default(),
         };
         let curves = memory.saved.curves.unwrap_or_default();
+        let model = memory.saved.model.unwrap_or(true);
         let swap = memory.saved.swap.unwrap_or(false);
         let restore = (!memory.saved.compared.is_empty()).then(|| memory.saved.compared.clone()); // a few names, once
         let problem = memory.trouble.clone(); // one line, once
@@ -222,7 +228,9 @@ impl View {
             compared: Vec::new(),
             scale,
             curves,
+            model,
             swap,
+            stats: None,
             pin_mode,
             pinned: None,
             hovered: None,
@@ -360,6 +368,19 @@ impl View {
         let _ = slint::quit_event_loop(); // see above: no Slint loop in the hidden check
     }
 
+    /// Поток статистики (store.rs): ему — блоки и соседи из знакомства, сейчас (если оно уже было) и при каждом новом.
+    pub fn stats_to(&mut self, stats: mpsc::Sender<Order>) {
+        self.stats = Some(stats);
+        self.send_die();
+    }
+
+    fn send_die(&self) {
+        if let (Some(stats), Some(hello)) = (&self.stats, &self.hello) {
+            // Поток кончился — статистики и модели нет, окно работает без них.
+            let _ = stats.send(Order::Die(Arc::new(Die::of(hello))));
+        }
+    }
+
     /// Новая сводка статистики (поток store.rs).
     pub fn on_digest(&mut self, digest: Arc<Digest>) {
         self.digest = Some(digest);
@@ -434,6 +455,7 @@ impl View {
             self.pinned = Some(first.index);
         }
         self.hello = Some(hello);
+        self.send_die();
         self.refresh(true);
         self.shown_stats = None;
         self.refresh_stats();
@@ -713,6 +735,7 @@ impl View {
             digest: self.digest.as_deref(),
             scale: self.scale,
             curves: self.curves,
+            model: self.model,
             swap: self.swap,
         });
         if self.shown_stats.as_ref() == Some(&shown) {
@@ -743,6 +766,9 @@ impl View {
         }
         if ui.get_chart_curves() != self.curves.code() {
             ui.set_chart_curves(self.curves.code());
+        }
+        if ui.get_chart_model() != self.model {
+            ui.set_chart_model(self.model);
         }
         if ui.get_chart_swap() != self.swap {
             ui.set_chart_swap(self.swap);
@@ -1005,6 +1031,7 @@ impl View {
         saved.pin = Some(self.pin_mode);
         saved.above = Some(self.scale == Scale::AboveDie);
         saved.curves = Some(self.curves);
+        saved.model = Some(self.model);
         saved.swap = Some(self.swap);
         saved.maximized = window.is_maximized();
         if !window.is_maximized() && !window.is_minimized() {
@@ -1113,6 +1140,13 @@ impl View {
             self.refresh_stats();
             self.remember();
         }
+    }
+
+    /// Кривые модели нагрева: показать или скрыть (свой выключатель, вместе с линиями ø и 95 %).
+    pub fn model_toggled(&mut self) {
+        self.model = !self.model;
+        self.refresh_stats();
+        self.remember();
     }
 
     /// Оси местами: температура по горизонтали (true).

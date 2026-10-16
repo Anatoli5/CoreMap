@@ -14,6 +14,9 @@
 //                                           CoreMapTray — против него самого (её запускает скрытая проверка
 //                                           CoreMapTray.exe)
 //   CoreMapWindow.exe --probe               ничего не делает и выходит: пустил ли Windows свежую сборку (tools\rust.ps1)
+//   CoreMapWindow.exe --model-report S O [--split "ГГГГ-ММ-ДД чч:мм:сс"]
+//                                           без окна: модель нагрева по срезам из папки S (её samples\ или она сама) —
+//                                           отчёт в файл O (src/model_report.rs)
 #![windows_subsystem = "windows"]
 
 // Код, который Slint строит из ui/app.slint. Его приведения типов задевают строгие проверки рабочего пространства
@@ -36,6 +39,11 @@ use ui::{
 mod chart;
 mod check;
 mod die;
+mod model;
+mod model_report;
+// Тесты модели нагрева по брифу, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
+#[cfg(test)]
+mod model_spec;
 mod panels;
 mod pipe;
 mod samples;
@@ -82,6 +90,8 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_scale_changed(move |above| v.borrow_mut().scale_changed(above));
     let v = Rc::clone(view);
     ui.on_curves_changed(move |code| v.borrow_mut().curves_changed(code));
+    let v = Rc::clone(view);
+    ui.on_model_toggled(move || v.borrow_mut().model_toggled());
     let v = Rc::clone(view);
     ui.on_axes_changed(move |swap| v.borrow_mut().axes_changed(swap));
     let v = Rc::clone(view);
@@ -162,6 +172,16 @@ fn main() {
     if args.iter().any(|a| a == "--probe") {
         return;
     }
+    if let Some(at) = args.iter().position(|a| a == "--model-report") {
+        let (Some(dir), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
+            std::process::exit(2);
+        };
+        std::process::exit(model_report::run(
+            &PathBuf::from(dir),
+            &PathBuf::from(out),
+            arg(&args, "--split").as_deref(),
+        ));
+    }
     let pipe = arg(&args, "--pipe").unwrap_or_else(pipe::server_pipe);
     if let Some(snapshot) = arg(&args, "--snapshot") {
         let size = arg(&args, "--size")
@@ -204,7 +224,8 @@ fn main() {
     let view = Rc::new(RefCell::new(view::View::new(&ui, link, memory)));
     VIEW.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&view)));
     connect(&ui, &view);
-    // Поток статистики живёт, пока жив его отправитель, — до конца окна.
-    let _stats = store::start(data, |digest| to_view(move |view| view.on_digest(digest)));
+    // Поток статистики живёт, пока жив его отправитель, — до конца окна; окно шлёт ему блоки и соседей для модели.
+    let stats = store::start(data, |digest| to_view(move |view| view.on_digest(digest)));
+    view.borrow_mut().stats_to(stats);
     ui.run().expect("окно");
 }

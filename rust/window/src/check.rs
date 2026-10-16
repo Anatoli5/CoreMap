@@ -37,7 +37,7 @@ use crate::chart::{self, Curves, E_COLORS, P_COLORS, Scale};
 use crate::panels::{self, f};
 use crate::pipe::{Event, Link};
 use crate::samples;
-use crate::store::Digest;
+use crate::store::{Digest, Order};
 use crate::view::View;
 use crate::wire::{BlockInfo, Hello, Limits};
 
@@ -82,7 +82,7 @@ struct Check {
     view: Rc<RefCell<View>>,
     events: mpsc::Receiver<Event>,
     digests: Option<mpsc::Receiver<Arc<Digest>>>,
-    stats: Option<mpsc::Sender<()>>,
+    stats: Option<mpsc::Sender<Order>>,
     size: (u32, u32),
     buffer: Vec<Rgb8Pixel>,
     snapshot: String,
@@ -310,6 +310,7 @@ impl Check {
         self.idle();
         self.select(&p_block, &e_block, expected.as_ref());
         self.chart_views(&p_block, &e_block, expected.as_ref());
+        self.model_curves(&p_block, &e_block);
         self.means_and_reset(&p_block);
         self.limit_menu(&limits, &e_block);
         self.profiles(&limits, &e_block);
@@ -362,6 +363,10 @@ impl Check {
     /// Придуманные срезы и журналы в папке проверки; поток статистики над ней; первая сводка. Полный проход пишет
     /// полный день (цена разбора), проход --settings — короткий (график для линии отсечки), --reopened — читает то,
     /// что записал проход --settings.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario: files, first digest, the model's digest, a quiet pass, links - read top to bottom"
+    )]
     fn statistics(&mut self, hello: &Hello, limits: &Limits, e_block: &BlockInfo) -> Option<Synthetic> {
         let synthesized = match self.mode {
             Mode::Full => self.own_data,
@@ -383,10 +388,13 @@ impl Check {
         let (send, digests) = mpsc::channel();
         self.digests = Some(digests);
         let started = Instant::now();
-        self.stats = Some(crate::store::start(dir, move |d| {
+        let stats = crate::store::start(dir, move |d| {
             // Приёмник живёт до конца проверки.
             let _ = send.send(d);
-        }));
+        });
+        // Блоки и соседи для модели — тем же путём, что у окна (знакомство уже пришло).
+        self.view.borrow_mut().stats_to(stats.clone());
+        self.stats = Some(stats);
         let arrived = self.pump(|v| v.digest.is_some(), 30.0);
         self.check(
             arrived,
@@ -425,18 +433,39 @@ impl Check {
                     digest.tally.secs
                 ),
             );
-            // Повторный проход по неизменившимся файлам ничего не присылает (статистика не пересчитывается зря).
+            // Модель нагрева: окно отдало потоку блоки и соседей — следующая сводка несёт модель по всем строкам.
+            let modelled = self.pump(|v| v.digest.as_ref().is_some_and(|d| d.model.is_some()), 60.0);
+            let latest = self.view.borrow().digest.clone();
+            let model = latest.as_ref().and_then(|d| d.model.clone());
+            let usable: Vec<String> = model
+                .as_ref()
+                .map(|m| {
+                    m.blocks
+                        .iter()
+                        .map(|b| format!("{} {:.0} мин", b.name, b.minutes))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.check(
+                modelled && model.as_ref().is_some_and(|m| m.blocks.iter().all(crate::model::BlockModel::drawn)),
+                format!(
+                    "модель нагрева посчитана по {} строкам за {:.0} мс (в потоке статистики), кривая есть у каждого блока; годных срезов: {}; строки для модели держат {:.1} МБ",
+                    model.as_ref().map_or(0, |m| m.rows),
+                    model.as_ref().map_or(0.0, |m| m.time.as_secs_f64() * 1000.0),
+                    usable.join(", "),
+                    to_mb(latest.as_ref().map_or(0, |d| d.kept_bytes) as u64)
+                ),
+            );
+            // Повторный проход по неизменившимся файлам ничего не присылает (статистика и модель не пересчитываются
+            // зря).
             if let Some(stats) = &self.stats {
-                let _ = stats.send(()); // поток жив, пока жива проверка
+                let _ = stats.send(Order::Scan); // поток жив, пока жива проверка
             }
             let again = self.pump(|_| false, 1.0);
             let quiet = !again
-                && self
-                    .view
-                    .borrow()
-                    .digest
+                && latest
                     .as_ref()
-                    .is_some_and(|d| Arc::ptr_eq(d, &digest));
+                    .is_some_and(|l| self.view.borrow().digest.as_ref().is_some_and(|d| Arc::ptr_eq(d, l)));
             self.check(quiet, "повторный проход по тем же файлам новой сводки не дал");
         }
         let (count, deltas) = self.view.borrow().links_shown();
@@ -1152,6 +1181,80 @@ impl Check {
         }
         let plain_at = (self.ui.get_plain_chip_x(), self.ui.get_plain_chip_y());
         self.chip(plain_at, |v| !v.swap, "щелчок по «×» — множитель снова по горизонтали");
+    }
+
+    /// Шаг 2в: кривые модели нагрева (DECISIONS #39). У каждого выбранного блока — кривая его цвета: сплошная над
+    /// наблюдёнными множителями, пунктир за ними, температура не падает с множителем; в подсказке блока в легенде —
+    /// «°C на ватт» (в придуманных срезах есть мощность ядер); выключатель «модель» прячет и возвращает кривые, не
+    /// трогая линий ø и 95 %. Картинка F-model.png.
+    fn model_curves(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
+        let pair = [p_block.index, e_block.index];
+        let paths = |view: &View, block: usize| {
+            view.shown_stats
+                .as_ref()
+                .and_then(|shown| shown.series.iter().find(|l| l.block == block))
+                .map(|l| (l.model.clone(), l.model_dash.clone(), !l.mean.is_empty())) // two path texts, a few times
+                .unwrap_or_default()
+        };
+        let shown = |view: &View| {
+            pair.iter().all(|&block| {
+                let (solid, dash, _) = paths(view, block);
+                !solid.is_empty() && !dash.is_empty()
+            })
+        };
+        let on = self.pump(shown, 2.0) && self.ui.get_chart_model();
+        let (solid, dash, _) = paths(&self.view.borrow(), p_block.index);
+        // Точки путей в рамке 1000 × 1000 (y вниз): при обычных осях вдоль кривой x растёт, а y не растёт —
+        // температура не падает с множителем.
+        let numbers = |d: &str| -> Vec<(f64, f64)> {
+            let v: Vec<f64> = d.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            v.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect()
+        };
+        let line = numbers(&solid);
+        let monotone = line.len() >= 2 && line.windows(2).all(|w| w[1].0 >= w[0].0 && w[1].1 <= w[0].1 + 1e-6);
+        self.check(
+            on && monotone,
+            format!(
+                "кривые модели у {} и {}: сплошная ({} точек) и пунктир ({} штрихов); температура вдоль сплошной не падает: {monotone}",
+                p_block.name,
+                e_block.name,
+                line.len(),
+                dash.matches('M').count()
+            ),
+        );
+        let tips: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.tip.to_string()).collect();
+        let figure = tips
+            .iter()
+            .all(|t| t.contains(" °C на ватт (") && t.contains("одинаковой работы") && !t.contains("°C на ступень"));
+        let e_note = tips.iter().any(|t| t.contains("по первому ядру, за четыре ядра"));
+        self.check(
+            figure && e_note,
+            format!(
+                "в подсказке каждого блока в легенде — «°C на ватт» и кривая для одинаковой работы; у кластера — что нагрузка по первому ядру: {}",
+                tips.first().map(|t| t.lines().skip(3).collect::<Vec<_>>().join(" / ")).unwrap_or_default()
+            ),
+        );
+        let shot = self.shot("model");
+        self.check(
+            shot,
+            "картинка: кривые модели у кластера и P-ядра, шкала над кристаллом",
+        );
+        let at = (self.ui.get_model_chip_x(), self.ui.get_model_chip_y());
+        self.chip(at, |v| !v.model, "щелчок по «модель» — кривые модели скрыты");
+        let hidden = {
+            let view = self.view.borrow();
+            pair.iter().all(|&block| {
+                let (solid, dash, mean) = paths(&view, block);
+                solid.is_empty() && dash.is_empty() && mean
+            })
+        };
+        self.check(
+            hidden && !self.ui.get_chart_model(),
+            "кривых модели нет, линии ø остались",
+        );
+        self.chip(at, |v| v.model, "второй щелчок по «модель» — кривые снова видны");
+        let back = shown(&self.view.borrow());
+        self.check(back, "кривые модели вернулись");
     }
 
     /// Шаг 3: ø под нагрузкой на плитке; кнопка «▲ ø» сбрасывает наибольшую и средние. Нагрузку даёт команда
@@ -2180,6 +2283,14 @@ struct Stretch<'a> {
 
 /// Строки отрезка. s — куда считать ожидаемое; None — эти строки не должны войти.
 #[expect(clippy::cast_precision_loss, reason = "small synthetic numbers; a test generator")]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "a synthetic generator: s, n, i, j, k, b are the row, block and counters"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one synthetic row, field by field in the file's order"
+)]
 fn rows(
     text: &mut String,
     stretch: Stretch,
@@ -2286,6 +2397,23 @@ fn rows(
                 }
             }
         }
+        // Напряжение блоков (с 0.5.4) — в конце строки: растёт с множителем; изредка пусто (не прочиталось) — там модель
+        // берёт кубический закон. За ним — мощность ядер: 4 Вт + по блоку его p (нагрузка × r/45 × (V/V45)², записанный
+        // множитель на 0,3 ниже корзины) × 9 Вт у P-ядра и × 4 × 2,5 Вт у кластера.
+        let mut power = 4.0;
+        for (j, (b, &(_, ratio, share, _))) in hello.blocks.iter().zip(cells.iter()).enumerate() {
+            let volts = 0.55 + 0.0135 * ratio as f64;
+            if (i + j as u64).is_multiple_of(61) {
+                text.push(',');
+            } else {
+                let _ = write!(text, ",{volts:.3}"); // into a String
+            }
+            let written = ratio as f64 - 0.3;
+            let v45 = 0.55 + 0.0135 * 45.3;
+            let p = share.parse::<f64>().unwrap_or(0.0) * written / 45.0 * (volts / v45).powi(2);
+            power += if b.kind == "E" { 4.0 * 2.5 * p } else { 9.0 * p };
+        }
+        let _ = write!(text, ",{power:.1}"); // into a String
         text.push('\n');
         if let Some(s) = counted.as_deref_mut() {
             s.rows += 1;
@@ -2310,6 +2438,10 @@ fn exact_quantile(rows: &[(f64, u64)], share: (u64, u64)) -> Option<f64> {
     None
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the synthetic files and the auto log, one after another"
+)]
 fn synthesize(
     dir: &Path,
     hello: &Hello,
@@ -2337,7 +2469,10 @@ fn synthesize(
         let n = &b.name;
         let _ = write!(header, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String
     }
-    header.push('\n');
+    for b in &hello.blocks {
+        let _ = write!(header, ",{}.volts", b.name); // into a String
+    }
+    header.push_str(",power_cores\n");
     let mut s = Synthetic {
         focus: e_block.name.clone(),
         ..Synthetic::default()

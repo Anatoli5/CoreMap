@@ -98,10 +98,13 @@ export struct Run {
     a: float,
 }
 
-// Линия блока на графике статистики: куски ø средней и 95 %, цвет блока, бледная — подсвечен другой.
+// Линия блока на графике статистики: куски ø средней и 95 %, кривая модели нагрева (сплошная — над наблюдёнными
+// множителями, пунктир — за ними; "" — нет), цвет блока, бледная — подсвечен другой.
 export struct Series {
     mean: [Run],
     p95: [Run],
+    model: string,
+    model-dash: string,
     color: color,
     faded: bool,
     marks: [Mark],
@@ -308,6 +311,28 @@ component Chip inherits Rectangle {
         width: 5px;
         height: 5px;
         border-radius: 2.5px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    // Кривая модели: сплошная, за ней пунктир.
+    if root.glyph == 3: Rectangle {
+        x: 6px;
+        y: (root.height - 2px) / 2;
+        width: 7px;
+        height: 2px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 3: Rectangle {
+        x: 15px;
+        y: (root.height - 2px) / 2;
+        width: 2px;
+        height: 2px;
+        background: root.on ? Palette.text : Palette.dim;
+    }
+    if root.glyph == 3: Rectangle {
+        x: 19px;
+        y: (root.height - 2px) / 2;
+        width: 2px;
+        height: 2px;
         background: root.on ? Palette.text : Palette.dim;
     }
     label := Text {
@@ -538,7 +563,8 @@ component TileView inherits Rectangle {
 }
 
 // График «температура от фактического множителя» выбранных блоков (src/chart.rs): у каждого блока своя линия своего
-// цвета — толстая ø средняя и тонкая 95 % (температура, ниже которой блок был 95 % времени на этом множителе). Оси общие
+// цвета — толстая ø средняя и тонкая 95 % (температура, ниже которой блок был 95 % времени на этом множителе) и кривая
+// модели нагрева (средней толщины, без точек; за наблюдёнными множителями — пунктиром). Оси общие
 // для всех блоков (владелец 15.10): множитель — столбец на каждый, подпись через 1, 2 или 5 ступеней, сколько
 // помещается; температура — над остальным кристаллом (по умолчанию) или абсолютная. swap — оси меняются местами:
 // множитель по вертикали, температура по горизонтали; места точек Rust уже повернул, здесь поворачиваются только оси,
@@ -679,6 +705,32 @@ component Chart inherits Rectangle {
             stroke-width: 3px;
             stroke-line-join: round;
             opacity: r.a;
+        }
+        // Кривая модели: Rust отдаёт пустые пути, когда переключатель «модель» выключен или кривой нет.
+        if s.model != "": Path {
+            x: -1px;
+            y: -1px;
+            width: parent.width + 2px;
+            height: parent.height + 2px;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: s.model;
+            stroke: s.color;
+            stroke-width: 2px;
+            stroke-line-join: round;
+        }
+        if s.model-dash != "": Path {
+            x: -1px;
+            y: -1px;
+            width: parent.width + 2px;
+            height: parent.height + 2px;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: s.model-dash;
+            stroke: s.color;
+            stroke-width: 2px;
         }
         // Точка 95 % — маленькая сплошная.
         for m in s.marks: Rectangle {
@@ -910,6 +962,7 @@ export component AppWindow inherits Window {
     // 2 — обе), оси местами.
     in property <bool> chart-above: true;
     in property <int> chart-curves: 2;
+    in property <bool> chart-model: true;   // кривые модели нагрева
     in property <bool> chart-swap;
     in property <[LineRow]> actions;
     in property <string> actions-empty;
@@ -954,6 +1007,8 @@ export component AppWindow inherits Window {
     out property <length> p95-chip-y: p95-chip.absolute-position.y + p95-chip.height / 2;
     out property <length> both-chip-x: both-chip.absolute-position.x + both-chip.width / 2;
     out property <length> both-chip-y: both-chip.absolute-position.y + both-chip.height / 2;
+    out property <length> model-chip-x: model-chip.absolute-position.x + model-chip.width / 2;
+    out property <length> model-chip-y: model-chip.absolute-position.y + model-chip.height / 2;
     out property <length> plain-chip-x: plain-chip.absolute-position.x + plain-chip.width / 2;
     out property <length> plain-chip-y: plain-chip.absolute-position.y + plain-chip.height / 2;
     out property <length> swap-chip-x: swap-chip.absolute-position.x + swap-chip.width / 2;
@@ -991,6 +1046,7 @@ export component AppWindow inherits Window {
     callback mode-changed(bool);
     callback scale-changed(bool);   // true — над кристаллом
     callback curves-changed(int);
+    callback model-toggled();       // кривые модели — показать или скрыть
     callback axes-changed(bool);    // true — температура по горизонтали
     callback tile-menu(int);      // Rust заполняет menu-title и menu-entries, затем меню открывается
     callback limit-chosen(int);
@@ -1640,6 +1696,17 @@ export component AppWindow inherits Window {
                 clicked => { root.curves-changed(2); }
                 hover(on) => {
                     root.tip(on, "curve-both", "Обе линии\nø средняя — толстая, 95 % — тонкая, у каждого блока своего цвета.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            // Свой выключатель, не третья из линий: модель идёт вместе с ø и 95 %.
+            Rectangle { width: 4px; }
+            model-chip := Chip {
+                text: "модель";
+                glyph: 3;
+                on: root.chart-model;
+                clicked => { root.model-toggled(); }
+                hover(on) => {
+                    root.tip(on, "curve-model", "Модель нагрева\nСредняя линия без точек: температура блока от фактического множителя при его полной нагрузке, соседях и кристалле на их медианах — по регрессии из журнала срезов.\n• есть в журнале мощность процессора — кривая для одинаковой работы на всех ядрах одного рода, их можно сравнивать; нет — для нагрузки этого ядра в этой игре\n• сплошная — множители, на которых блок работал под нагрузкой; пунктир — за ними\n• «°C на ватт», условия и ошибка модели — в подсказке блока над графиком\n• кривой нет, пока у блока меньше 10 минут годных срезов\n• щелчок — показать или скрыть, вместе с линиями ø и 95 %", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
