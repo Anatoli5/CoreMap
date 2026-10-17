@@ -546,9 +546,9 @@ fn usual(k: usize, b: usize) -> Cell {
 }
 
 #[test]
-fn log_keeps_only_rows_with_milliseconds() {
-    // Ловит: строки старого журнала (время до секунды, шаг 2 с) в модели — каждая начинала бы средние заново, ни одна не
-    // была бы пригодна, а счёт строк врал бы; пустой журнал (только заголовок) — паника вместо нуля строк и пустой модели.
+fn log_keeps_old_and_millisecond_rows() {
+    // Полные прежние строки нужны общей истории; пригодность шага для конкретного расчёта определяет потребитель.
+    // Пустой журнал (только заголовок) не должен давать панику вместо нуля строк и пустой модели.
     let blocks = names(&["0", "1"]);
     let mut text = header(&blocks, false);
     for second in ["57", "58", "59"] {
@@ -563,7 +563,7 @@ fn log_keeps_only_rows_with_milliseconds() {
         text.push_str(&plain_line(ms, &cells));
     }
     text.push('\n');
-    assert_eq!(log_from_csv(&text).rows(), 5, "только строки с миллисекундами");
+    assert_eq!(log_from_csv(&text).rows(), 8, "все строки с корректным временем");
     let empty = log_from_csv(&(header(&blocks, false) + "\n"));
     assert_eq!(empty.rows(), 0);
     let die = Die {

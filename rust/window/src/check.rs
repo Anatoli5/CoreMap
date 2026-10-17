@@ -342,6 +342,79 @@ impl Check {
         self.profiles(&limits, &e_block);
         self.sizes(&p_block, &e_block);
         self.time_view(&p_block, &e_block, expected.as_ref());
+        self.conditional_preview(&p_block);
+    }
+
+    fn conditional_preview(&mut self, block: &BlockInfo) {
+        if !self.own_data {
+            return;
+        }
+        let points: Vec<_> = (25..=50)
+            .map(|r| {
+                let heat = 3.0 + f64::from(r - 25) * 0.25;
+                serde_json::json!({"ratio":r,"heat":heat,"alternate_heat":heat * 1.2})
+            })
+            .collect();
+        let snapshot = serde_json::json!({
+            "version":1,"source":"Проверочный вымышленный журнал","conditions":"GPU 60 °C; вентилятор 3000 об/мин; две подгонки",
+            "blocks":[{"name":block.name,"temperature_test_mae":0.4,"points":points}]
+        });
+        if let Err(error) = std::fs::write(self.data.join(crate::conditional_snapshot::FILE), snapshot.to_string()) {
+            self.check(false, format!("сохранённая проверочная модель: {error}"));
+            return;
+        }
+        if let Some(stats) = &self.stats {
+            let _ = stats.send(Order::Scan);
+        } // Поток жив, пока жива проверка.
+        let arrived = self.pump(|v| v.digest.as_ref().is_some_and(|d| d.conditional.is_some()), 10.0);
+        self.check(arrived, "сохранённая условная модель прочитана в потоке статистики");
+        let blocks = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
+        self.chip(
+            blocks,
+            |v| !v.timeline,
+            "выход из вида по времени перед условной моделью",
+        );
+        if !self.view.borrow().compared.contains(&block.index) {
+            let (x, y) = self.tile_center(block.index);
+            self.click(x, y, PointerEventButton::Left);
+        }
+        if !self.view.borrow().model {
+            self.chip(
+                (self.ui.get_model_chip_x(), self.ui.get_model_chip_y()),
+                |v| v.model,
+                "модель включена для условного вида",
+            );
+        }
+        let efficiency = (self.ui.get_conditional_chip_x(), self.ui.get_conditional_chip_y());
+        self.chip(
+            efficiency,
+            |v| v.scale == Scale::ConditionalEfficiency,
+            "условная эффективность открывается щелчком",
+        );
+        self.view.borrow_mut().axes_changed(true);
+        self.pump(|_| true, 0.0);
+        let drawn = self.view.borrow().shown_stats.as_ref().is_some_and(|s| {
+            s.series
+                .iter()
+                .any(|line| !line.model.is_empty() && !line.model_dash.is_empty())
+        });
+        self.check(
+            drawn && self.ui.get_chart_swap(),
+            "две подгонки видны при множителе по вертикали",
+        );
+        let shot = self.shot("conditional");
+        self.check(shot, "картинка условной эффективности по вымышленной модели");
+        let heat = (
+            self.ui.get_conditional_heat_chip_x(),
+            self.ui.get_conditional_heat_chip_y(),
+        );
+        self.chip(
+            heat,
+            |v| v.scale == Scale::ConditionalHeat,
+            "собственный нагрев открывается щелчком",
+        );
+        let shot = self.shot("conditional-heat");
+        self.check(shot, "картинка условного собственного нагрева");
     }
 
     /// Обход ошибки Slint 1.18.1 (src/restore.rs): путь восстановления из свёрнутого меняет прозрачный слой во всё окно —

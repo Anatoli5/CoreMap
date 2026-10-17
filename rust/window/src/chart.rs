@@ -44,6 +44,8 @@ pub enum Scale {
     /// Блок минус средняя остальных блоков в той же строке (`samples::above_die`).
     AboveDie,
     Absolute,
+    ConditionalEfficiency,
+    ConditionalHeat,
 }
 
 impl Scale {
@@ -54,6 +56,8 @@ impl Scale {
             Scale::Efficiency => 0,
             Scale::AboveDie => 1,
             Scale::Absolute => 2,
+            Scale::ConditionalEfficiency => 3,
+            Scale::ConditionalHeat => 4,
         }
     }
 
@@ -62,6 +66,8 @@ impl Scale {
         match index {
             1 => Scale::AboveDie,
             2 => Scale::Absolute,
+            3 => Scale::ConditionalEfficiency,
+            4 => Scale::ConditionalHeat,
             _ => Scale::Efficiency,
         }
     }
@@ -492,7 +498,7 @@ fn stats_of(digest: &Digest, block: &BlockInfo, scale: Scale) -> Vec<Stat> {
     let (bins, hists) = match scale {
         Scale::Absolute => (&t.bins, &t.hist),
         Scale::AboveDie => (&t.above, &t.above_hist),
-        Scale::Efficiency => return Vec::new(),
+        Scale::Efficiency | Scale::ConditionalEfficiency | Scale::ConditionalHeat => return Vec::new(),
     };
     bins.iter()
         .filter(|(_, b)| b.n > 0 && b.secs > 0.0)
@@ -541,7 +547,7 @@ fn value_range(scale: Scale, every: &[Vec<Stat>], models: &[f64]) -> (f64, f64, 
         .chain(models.iter().copied());
     let (mut lo, mut hi) = match scale {
         Scale::Absolute => (ABS_LOW, ABS_HIGH),
-        Scale::AboveDie | Scale::Efficiency => (0.0, 0.0),
+        Scale::AboveDie | Scale::Efficiency | Scale::ConditionalEfficiency | Scale::ConditionalHeat => (0.0, 0.0),
     };
     for v in values.filter(|v| v.is_finite()) {
         lo = lo.min(v);
@@ -588,7 +594,9 @@ fn signed_temp(v: f64, decimals: usize) -> String {
 /// Температура для подписи: абсолютная и эффективность — как есть, над кристаллом — со знаком.
 fn temp_text(scale: Scale, v: f64, decimals: usize) -> String {
     match scale {
-        Scale::Absolute | Scale::Efficiency => format!("{v:.decimals$}"),
+        Scale::Absolute | Scale::Efficiency | Scale::ConditionalEfficiency | Scale::ConditionalHeat => {
+            format!("{v:.decimals$}")
+        }
         Scale::AboveDie => signed_temp(v, decimals),
     }
 }
@@ -643,7 +651,7 @@ fn model_value(m: &BlockModel, scale: Scale, ratio: f64) -> Option<f64> {
     Some(match scale {
         Scale::AboveDie => t - m.reference.as_ref()?.die,
         Scale::Absolute => t,
-        Scale::Efficiency => return None,
+        Scale::Efficiency | Scale::ConditionalEfficiency | Scale::ConditionalHeat => return None,
     })
 }
 
@@ -1075,6 +1083,8 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             Scale::Efficiency => "производительность на °C".into(),
             Scale::AboveDie => "°C над кристаллом".into(),
             Scale::Absolute => "°C".into(),
+            Scale::ConditionalEfficiency => "множитель / собственный нагрев, 1/°C".into(),
+            Scale::ConditionalHeat => "собственный нагрев, °C".into(),
         },
         model: input.model,
         ..StatsShown::default()
@@ -1084,6 +1094,10 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         .iter()
         .filter_map(|&b| input.blocks.iter().find(|x| x.index == b))
         .collect();
+    if matches!(input.scale, Scale::ConditionalEfficiency | Scale::ConditionalHeat) {
+        snapshot_panel(input, &compared, &mut shown);
+        return shown;
+    }
     shown.legend = legend(input.blocks, &compared, input.digest, input.scale);
     let Some(digest) = input.digest else {
         shown.empty = "Статистика читается…".into();
@@ -1317,6 +1331,188 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         });
     }
     shown
+}
+
+fn snapshot_value(point: &crate::conditional_snapshot::CurvePoint, scale: Scale, alternate: bool) -> f64 {
+    let heat = if alternate { point.alternate_heat } else { point.heat };
+    if scale == Scale::ConditionalHeat {
+        heat
+    } else {
+        point.ratio / heat
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "validated CPU multiplier axis, rounded to integer bands"
+)]
+fn snapshot_panel(input: &StatsInput, compared: &[&BlockInfo], shown: &mut StatsShown) {
+    let Some(digest) = input.digest else {
+        shown.empty = "Сохранённый расчёт читается…".into();
+        return;
+    };
+    let Some(snapshot) = digest.conditional.as_deref() else {
+        shown.empty = digest.conditional_trouble.clone().unwrap_or_else(|| {
+            "Сохранённой условной модели пока нет. Сбор статистики продолжает работать независимо от графика.".into()
+        });
+        return;
+    };
+    if let Err(message) = snapshot.validate() {
+        shown.empty = message;
+        return;
+    }
+    shown.note = format!(
+        "Эксперимент · {} · {} · сплошная / пунктир: две подгонки, одинаковое окружение; сбор новых срезов независим",
+        snapshot.source, snapshot.conditions
+    );
+    let available: Vec<_> = compared
+        .iter()
+        .filter_map(|&block| {
+            snapshot
+                .blocks
+                .iter()
+                .find(|curve| curve.name == block.name)
+                .map(|curve| (block, curve))
+        })
+        .collect();
+    shown.legend = compared.iter().map(|block| {
+        let model = snapshot.blocks.iter().find(|curve| curve.name == block.name);
+        LegendShown {
+            block: block.index, name: block.name.clone(), color: color_of(input.blocks, block.index),
+            tip: model.map_or_else(|| "Для этого блока сохранённой условной кривой пока нет. Кривая другого ядра вместо неё не подставляется.".into(), |curve| format!("Ядро {} · экспериментальная модель\nСплошная — основная подгонка, пунктир — альтернативная при том же окружении.\n• расхождение — чувствительность к подгонке, не влияние вентиляторов / GPU и не доверительный интервал\n• средняя абсолютная ошибка температуры на отложенных данных {:.2} °C; это не ошибка собственного нагрева\n• полная занятость ядра, собственная история установившаяся; окружение — записанная траектория\n• {}\n• модель сохранена по журналу и автоматически не переобучается; ранжирование и подбор потолков пока не подтверждены", curve.name, curve.temperature_test_mae, snapshot.conditions)),
+        }
+    }).collect();
+    if available.is_empty() {
+        let names = snapshot
+            .blocks
+            .iter()
+            .map(|curve| curve.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        shown.empty =
+            format!("Выбери ядро с сохранённым расчётом: {names}. Остальная статистика доступна в прежних видах.");
+        return;
+    }
+    let low = available
+        .iter()
+        .flat_map(|(_, curve)| &curve.points)
+        .map(|p| p.ratio)
+        .fold(f64::INFINITY, f64::min);
+    let high = available
+        .iter()
+        .flat_map(|(_, curve)| &curve.points)
+        .map(|p| p.ratio)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if low < 0.0 || high > 255.0 {
+        shown.empty = "Множители сохранённого расчёта вне диапазона процессора.".into();
+        return;
+    }
+    let values: Vec<f64> = available
+        .iter()
+        .flat_map(|(_, curve)| &curve.points)
+        .flat_map(|p| {
+            [
+                snapshot_value(p, input.scale, false),
+                snapshot_value(p, input.scale, true),
+            ]
+        })
+        .collect();
+    let (t0, t1, step) = value_range(Scale::Efficiency, &[], &values);
+    let frame = Frame {
+        lo: low.floor() as i32,
+        hi: high.ceil() as i32,
+        t0,
+        t1,
+        swap: input.swap,
+    };
+    let mut tick = t0;
+    while tick <= t1 + 1e-9 {
+        shown.ticks.push((f(frame.value(tick)), format!("{tick:.1}")));
+        tick += step;
+    }
+    let mut ordered = available;
+    ordered.sort_by_key(|(block, _)| input.highlight == Some(block.index));
+    snapshot_series(input, &frame, &ordered, shown);
+    snapshot_columns(&frame, &ordered, shown);
+}
+type SnapshotCurve<'a> = (&'a BlockInfo, &'a crate::conditional_snapshot::BlockCurve);
+
+fn snapshot_series(input: &StatsInput, frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsShown) {
+    for (block, curve) in ordered {
+        let points: Vec<_> = curve
+            .points
+            .iter()
+            .map(|p| {
+                (
+                    frame.along_at(p.ratio),
+                    frame.value(snapshot_value(p, input.scale, false)),
+                )
+            })
+            .collect();
+        let alternate: Vec<_> = curve
+            .points
+            .iter()
+            .map(|p| {
+                (
+                    frame.along_at(p.ratio),
+                    frame.value(snapshot_value(p, input.scale, true)),
+                )
+            })
+            .collect();
+        let mut series = SeriesShown {
+            block: block.index,
+            color: color_of(input.blocks, block.index),
+            faded: input.highlight.is_some_and(|h| h != block.index),
+            ..SeriesShown::default()
+        };
+        if input.model {
+            solid_path(&points, frame, &mut series.model);
+            dashed_path(&alternate, frame, &mut series.model_dash);
+            series.model_line = vec![
+                points
+                    .iter()
+                    .map(|&(r, v)| {
+                        let (x, y) = frame.turn(r, v);
+                        (f(x), f(y))
+                    })
+                    .collect(),
+            ];
+        }
+        shown.series.push(series);
+    }
+}
+
+fn snapshot_columns(frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsShown) {
+    for ratio in frame.lo..=frame.hi {
+        let mut tip = format!(
+            "×{ratio} · сохранённый экспериментальный расчёт\nСплошная и пунктир — разные подгонки при одном окружении; между узлами — линейная интерполяция."
+        );
+        for (block, curve) in ordered {
+            let r = f64::from(ratio);
+            let pair = curve.points.windows(2).find(|w| w[0].ratio <= r && r <= w[1].ratio);
+            if let Some(w) = pair {
+                let alpha = (r - w[0].ratio) / (w[1].ratio - w[0].ratio);
+                let heat = w[0].heat + alpha * (w[1].heat - w[0].heat);
+                let other = w[0].alternate_heat + alpha * (w[1].alternate_heat - w[0].alternate_heat);
+                let _ = write!(
+                    tip,
+                    "\nЯдро {}: свой нагрев {:.2} / {:.2} °C; эффективность {:.2} / {:.2} 1/°C",
+                    block.name,
+                    heat,
+                    other,
+                    r / heat,
+                    r / other
+                ); // String не отказывает.
+            } else {
+                let _ = write!(tip, "\nЯдро {}: вне диапазона сохранённой кривой", block.name);
+            }
+        }
+        shown.columns.push(ColumnShown {
+            ratio,
+            at: f(frame.along(ratio)),
+            tip,
+        });
+    }
 }
 
 /// Вид «эффективность» (бриф 16.10): у каждого выбранного блока — точки по целым множителям (производительность на

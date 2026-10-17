@@ -1436,6 +1436,10 @@ export component AppWindow inherits Window {
     out property <length> above-chip-y: above-chip.absolute-position.y + above-chip.height / 2;
     out property <length> abs-chip-x: abs-chip.absolute-position.x + abs-chip.width / 2;
     out property <length> abs-chip-y: abs-chip.absolute-position.y + abs-chip.height / 2;
+    out property <length> conditional-chip-x: conditional-chip.absolute-position.x + conditional-chip.width / 2;
+    out property <length> conditional-chip-y: conditional-chip.absolute-position.y + conditional-chip.height / 2;
+    out property <length> conditional-heat-chip-x: conditional-heat-chip.absolute-position.x + conditional-heat-chip.width / 2;
+    out property <length> conditional-heat-chip-y: conditional-heat-chip.absolute-position.y + conditional-heat-chip.height / 2;
     out property <length> mean-chip-x: mean-chip.absolute-position.x + mean-chip.width / 2;
     out property <length> mean-chip-y: mean-chip.absolute-position.y + mean-chip.height / 2;
     out property <length> p95-chip-x: p95-chip.absolute-position.x + p95-chip.width / 2;
@@ -2183,6 +2187,22 @@ export component AppWindow inherits Window {
                     root.tip(on, "scale-abs", "Абсолютная температура\nКак её показывает датчик.\n• почти вся она — общий уровень кристалла: столбец множителя показывает больше то, когда набралось время, чем сам множитель\n• красные линии — отсечка и аварийная отсечка автомодуля", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
+            conditional-chip := Chip {
+                text: "условная η";
+                on: root.chart-view == 3;
+                clicked => { root.view-changed(3); }
+                hover(on) => {
+                    root.tip(on, "conditional-eff", "Условная эффективность · эксперимент\nОткрывает сохранённый расчёт по журналу: множитель / собственный нагрев при записанном окружении.\n• сплошная — основная подгонка, пунктир — альтернативная; окружение у них одинаковое\n• расхождение не является диапазоном оборотов или нагрева GPU и не является доверительным интервалом\n• дата данных, условия и ошибка температуры — в подсказке ядра\n• сбор статистики независим; этот расчёт автоматически не переобучается и не управляет множителями", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+            conditional-heat-chip := Chip {
+                text: "условный нагрев";
+                on: root.chart-view == 4;
+                clicked => { root.view-changed(4); }
+                hover(on) => {
+                    root.tip(on, "conditional-heat", "Собственный нагрев · эксперимент\nТот же сохранённый расчёт, но в градусах собственного вклада модели вместо эффективности.\n• сплошная и пунктир — две подгонки при одинаковом окружении\n• абсолютная температура ядра и собственный вклад — разные величины\n• оценка пока не устанавливает надёжный рейтинг ядер или безопасные потолки", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
         }
         // День вида «по времени»: раньше, позже, весь день.
         day-group := HorizontalLayout {
@@ -2306,7 +2326,7 @@ export component AppWindow inherits Window {
                 text: "ø";
                 glyph: 1;
                 on: root.chart-mean;
-                enabled: root.chart-view != 0;
+                enabled: root.chart-view == 1 || root.chart-view == 2;
                 clicked => { root.mean-toggled(); }
                 hover(on) => {
                     root.tip(on, "curve-mean", "ø средняя\nТолстая линия: средняя температура по времени на каждом фактическом множителе.\n• заливка точки — ø нагрузка: пустая — 0 %, полная — 100 %\n• бледнее — меньше времени за точкой: от одной строки (0,25 с) до самой полной корзины, по логарифму\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
@@ -2316,7 +2336,7 @@ export component AppWindow inherits Window {
                 text: "95 %";
                 glyph: 2;
                 on: root.chart-p95;
-                enabled: root.chart-view != 0;
+                enabled: root.chart-view == 1 || root.chart-view == 2;
                 clicked => { root.p95-toggled(); }
                 hover(on) => {
                     root.tip(on, "curve-p95", "95 % времени ниже\nТонкая линия: температура, выше которой блок был только 5 % времени на этом множителе.\n• в отличие от наибольшей не зависит от одной строки и от того, сколько строк в корзине\n• наибольшая — в подсказке столбца: ▲ со множителем, нагрузкой и временем\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
@@ -2326,7 +2346,7 @@ export component AppWindow inherits Window {
                 text: "макс";
                 glyph: 4;
                 on: root.chart-max;
-                enabled: root.chart-view != 0;
+                enabled: root.chart-view == 1 || root.chart-view == 2;
                 clicked => { root.max-toggled(); }
                 hover(on) => {
                     root.tip(on, "curve-max", "Наибольшая\nТонкая линия с квадратами: самое высокое одно показание на каждом множителе.\n• в подсказке столбца — условия той строки: время, множитель и потолок, нагрузка, кристалл, соседи, видеокарта, вентиляторы\n• щелчок — показать или скрыть; другие линии не меняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
@@ -2360,11 +2380,11 @@ export component AppWindow inherits Window {
                 }
             }
             swap-chip := Chip {
-                text: "°C";
+                text: root.chart-view == 0 || root.chart-view == 3 ? "η" : "°C";
                 on: root.chart-swap;
                 clicked => { root.axes-changed(true); }
                 hover(on) => {
-                    root.tip(on, "axes-swap", "Температура — по горизонтали\nМножитель — по вертикали: строка на каждый множитель, подсказка — у строки.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "axes-swap", "Значение — по горизонтали\nМножитель — по вертикали; эффективность или температура выбранного вида — по горизонтали.\n• выбор осей сохраняется между запусками\n• подсказка — у строки множителя", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }

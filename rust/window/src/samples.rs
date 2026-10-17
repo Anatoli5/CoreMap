@@ -533,6 +533,7 @@ pub fn effect(splits: &BTreeMap<i32, Split>) -> Option<Effect> {
 #[derive(Clone, Debug)]
 pub struct Columns {
     width: usize,
+    package: Option<usize>,
     fan_cpu: Option<usize>,
     fan_gpu: Option<usize>,
     power_cpu: Option<usize>,
@@ -610,6 +611,7 @@ impl Columns {
         let at = |name: &str| names.iter().position(|c| *c == name);
         (!blocks.is_empty()).then(|| Columns {
             width: names.len(),
+            package: at("package"),
             fan_cpu: at("fan_cpu"),
             fan_gpu: at("fan_gpu"),
             power_cpu: at("power_cpu"),
@@ -801,7 +803,7 @@ impl Scratch {
         *previous = carry.previous;
     }
 
-    /// То же, и строки журнала по 0,25 с — ещё и в `keep` (строки файла для модели нагрева, model.rs): тот же разбор
+    /// То же, и все полные строки журнала с корректным временем — ещё и в `keep` (model.rs): тот же разбор
     /// той же строки, второго чтения файла нет. `carry` — что передала прошлая порция того же файла.
     pub fn count_keeping(
         &mut self,
@@ -961,18 +963,20 @@ impl Scratch {
             };
         }
         self.readings(columns, line, at.ms, carry, into);
-        // Модели — только строки по 0,25 с: прежние (по 2 с) отстоят друг от друга больше секунды, каждая начинала бы
-        // скользящие средние заново, и ни одна не годилась бы в счёт (model.rs, GAP_MS).
-        if let Some(log) = keep
-            && at.step == STEP_MS
-        {
-            log.push(
+        // Храним исходные показания всех схем: допустимый шаг и удержание редких датчиков решает модель истории.
+        if let Some(log) = keep {
+            log.push_with_environment(
                 at.ms,
                 self.cells.iter().map(|c| [c.ratio, c.busy, c.temp, c.ceiling]),
                 [
                     field(line, &self.fields, columns.power_cpu).and_then(number),
                     field(line, &self.fields, columns.power_gpu).and_then(number),
                     field(line, &self.fields, columns.power_cores).and_then(number),
+                    field(line, &self.fields, columns.package).and_then(number),
+                    columns.shared(line, &self.fields, Shared::FanCpu),
+                    columns.shared(line, &self.fields, Shared::FanGpu),
+                    columns.shared(line, &self.fields, Shared::TempGpu),
+                    columns.shared(line, &self.fields, Shared::BusyGpu),
                 ],
             );
         }

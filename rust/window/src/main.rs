@@ -39,8 +39,22 @@ use ui::{
 
 mod chart;
 mod check;
+mod conditional;
+mod conditional_data;
+#[cfg(test)]
+mod conditional_data_spec;
+mod conditional_report;
+mod conditional_snapshot;
+#[cfg(test)]
+mod conditional_surface_spec;
 mod die;
 mod events;
+mod gam_solver;
+#[cfg(test)]
+mod gam_solver_spec;
+mod history;
+#[cfg(test)]
+mod history_spec;
 mod model;
 mod model_report;
 // Тесты модели нагрева по брифу, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
@@ -52,6 +66,8 @@ mod restore;
 mod samples;
 mod saved;
 mod screen;
+#[cfg(test)]
+mod snapshot_spec;
 // Тесты модуля samples по спецификации, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
 #[cfg(test)]
 mod samples_spec;
@@ -207,6 +223,25 @@ fn main() {
     // Пробный запуск после сборки (tools\rust.ps1): пустил ли Windows файл. Ничего не делает и выходит.
     if args.iter().any(|a| a == "--probe") {
         return;
+    }
+    if let Some(at) = args.iter().position(|a| a == "--conditional-report") {
+        let (Some(input), Some(output)) = (args.get(at + 1), args.get(at + 2)) else {
+            std::process::exit(2);
+        };
+        std::process::exit(conditional_report::run(
+            PathBuf::from(input).as_path(),
+            PathBuf::from(output).as_path(),
+        ));
+    }
+    if let Some(at) = args.iter().position(|a| a == "--conditional-prepare") {
+        let (Some(input), Some(output), Some(block)) = (args.get(at + 1), args.get(at + 2), args.get(at + 3)) else {
+            std::process::exit(2);
+        };
+        std::process::exit(conditional_report::prepare(
+            PathBuf::from(input).as_path(),
+            PathBuf::from(output).as_path(),
+            block,
+        ));
     }
     if let Some(at) = args.iter().position(|a| a == "--model-report") {
         let (Some(dir), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {

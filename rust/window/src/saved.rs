@@ -147,6 +147,8 @@ pub fn parse(text: &str) -> Result<Saved, String> {
             Some("eff" | "own") => Some(Scale::Efficiency),
             Some("above") => Some(Scale::AboveDie),
             Some("abs") => Some(Scale::Absolute),
+            Some("conditional-eff") => Some(Scale::ConditionalEfficiency),
+            Some("conditional-heat") => Some(Scale::ConditionalHeat),
             _ => match map.get("above").and_then(Value::as_bool) {
                 Some(true) => Some(Scale::AboveDie),
                 Some(false) => Some(Scale::Absolute),
@@ -191,6 +193,8 @@ pub fn text(saved: &Saved) -> String {
             Scale::Efficiency => "eff",
             Scale::AboveDie => "above",
             Scale::Absolute => "abs",
+            Scale::ConditionalEfficiency => "conditional-eff",
+            Scale::ConditionalHeat => "conditional-heat",
         };
         map.insert("view".into(), name.into());
     }

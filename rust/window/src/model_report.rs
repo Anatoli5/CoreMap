@@ -205,7 +205,7 @@ fn mb(bytes: usize) -> f64 {
 
 /// Блоки и соседи по схеме кристалла, чьи плитки — ровно блоки файла (названия: номер процессора Windows или
 /// «первый–последний» у кластера, как у программы входа, machine/topology.rs).
-fn die_for(names: &[String]) -> Result<Die, String> {
+pub(crate) fn die_for(names: &[String]) -> Result<Die, String> {
     let mut folders: Vec<PathBuf> = Vec::new();
     if let Some(exe) = std::env::current_exe()
         .ok()

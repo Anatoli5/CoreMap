@@ -154,24 +154,24 @@ impl Averages {
 
 // ----- строки файла -----
 
-const RATIO: usize = 0;
-const BUSY: usize = 1;
-const TEMP: usize = 2;
-/// Мощности строки в `Log::package`: процессор целиком (MSR 0x611), видеокарта, только ядра (MSR 0x639, с 0.5.4).
+pub const RATIO: usize = 0;
+pub const BUSY: usize = 1;
+pub const TEMP: usize = 2;
+/// Общие показания строки в `Log`: мощности процессора, видеокарты и ядер, температура корпуса, вентиляторы и GPU.
 pub const POWER_CPU: usize = 0;
 pub const POWER_GPU: usize = 1;
-/// Столбец читается и хранится, но в модели не используется: ватт в ней нет (бриф 16.10 «эффективность»).
-#[expect(
-    dead_code,
-    reason = "the column stays in Log::package for a later layer; no watts in the model since 16.10"
-)]
 pub const POWER_CORES: usize = 2;
+pub const PACKAGE_TEMP: usize = 3;
+pub const FAN_CPU: usize = 4;
+pub const FAN_GPU: usize = 5;
+pub const TEMP_GPU: usize = 6;
+pub const BUSY_GPU: usize = 7;
 
 /// Строки одного файла срезов по порядку файла — как их оставляет разбор (`samples::Scratch::count_keeping`), второго
-/// чтения файла нет. Только строки по 0,25 с (время с миллисекундами): прежние по 2 с отстоят друг от друга больше
-/// `GAP_MS`, каждая начинала бы средние заново, и ни одна не годилась бы в счёт. Числа — f32 (в файле у них 2–3 знака),
-/// пусто — NaN: множитель, занятость и температура блока и мощности процессора, видеокарты и ядер строки; потолок блока
-/// — байт (целые ×8…×80, 0 — неизвестен): из потолков P-ядер строки — их ранг (`ranks`). У 275HX — 176 байт на строку.
+/// чтения файла нет. Все полные строки с корректным временем сохраняются, включая прежний шаг 2 с; пригодность
+/// промежутков определяет потребитель истории. Числа — f32 (в файле у них 2–3 знака), пусто — NaN: множитель, занятость
+/// и температура блока, восемь общих показаний строки; потолок блока — байт (целые ×1…×255, 0 — неизвестен). Пропуски
+/// общих датчиков не заполняются: возраст показания и допустимое удержание определяет потребитель истории.
 /// Напряжение журналов 0.5.4 разбор не берёт: модель его не использует.
 #[derive(Clone, Debug, Default)]
 pub struct Log {
@@ -179,7 +179,7 @@ pub struct Log {
     times: Vec<i64>,
     cells: Vec<[f32; 3]>,
     ceilings: Vec<u8>,
-    package: Vec<[f32; 3]>,
+    environment: Vec<[f32; 8]>,
 }
 
 #[expect(
@@ -226,7 +226,6 @@ impl Log {
     }
 
     /// Время строк (мс, `samples::row_time`) по порядку файла.
-    #[cfg(test)]
     #[must_use]
     pub fn times(&self) -> &[i64] {
         &self.times
@@ -235,12 +234,24 @@ impl Log {
     /// Сколько памяти держат строки, байт.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.times.len() * 8 + self.cells.len() * 12 + self.ceilings.len() + self.package.len() * 12
+        self.times.len() * 8 + self.cells.len() * 12 + self.ceilings.len() + self.environment.len() * 32
     }
 
     /// Строка: время (мс, `samples::row_time`), по блоку — множитель, занятость, температура, потолок; мощность процессора
     /// (корпус), видеокарты и ядер процессора (`POWER_CPU`, `POWER_GPU`, `POWER_CORES`).
+    #[cfg(test)]
     pub fn push(&mut self, at: i64, cells: impl Iterator<Item = [Option<f64>; 4]>, package: [Option<f64>; 3]) {
+        let [cpu, gpu, cores] = package;
+        self.push_with_environment(at, cells, [cpu, gpu, cores, None, None, None, None, None]);
+    }
+
+    /// Полная строка: общие показания по индексам `POWER_CPU`…`BUSY_GPU`; только измеренное в этот момент.
+    pub fn push_with_environment(
+        &mut self,
+        at: i64,
+        cells: impl Iterator<Item = [Option<f64>; 4]>,
+        shared: [Option<f64>; 8],
+    ) {
         let before = self.cells.len();
         for [ratio, busy, temp, ceiling] in cells {
             self.cells.push([ratio, busy, temp].map(stored));
@@ -253,7 +264,7 @@ impl Log {
             "блоков в строке — как в заголовке"
         );
         self.times.push(at);
-        self.package.push(package.map(stored));
+        self.environment.push(shared.map(stored));
     }
 
     /// Оставить только строки, у которых `keep` — true (порядок тот же); `keep` — по строке.
@@ -264,28 +275,33 @@ impl Log {
         for (row, _) in keep.iter().enumerate().filter(|(_, k)| **k) {
             if kept != row {
                 self.times[kept] = self.times[row];
-                self.package[kept] = self.package[row];
+                self.environment[kept] = self.environment[row];
                 self.cells.copy_within(row * width..(row + 1) * width, kept * width);
                 self.ceilings.copy_within(row * width..(row + 1) * width, kept * width);
             }
             kept += 1;
         }
         self.times.truncate(kept);
-        self.package.truncate(kept);
+        self.environment.truncate(kept);
         self.cells.truncate(kept * width);
         self.ceilings.truncate(kept * width);
     }
 
-    fn get(&self, row: usize, block: usize, what: usize) -> Option<f64> {
+    pub fn get(&self, row: usize, block: usize, what: usize) -> Option<f64> {
         loaded(self.cells[row * self.names.len() + block][what])
     }
 
-    fn ceiling(&self, row: usize, block: usize) -> Option<u8> {
+    pub fn ceiling(&self, row: usize, block: usize) -> Option<u8> {
         Some(self.ceilings[row * self.names.len() + block]).filter(|&c| c > 0)
     }
 
-    fn power(&self, row: usize, which: usize) -> Option<f64> {
-        loaded(self.package[row][which])
+    pub fn power(&self, row: usize, which: usize) -> Option<f64> {
+        self.environment(row, which)
+    }
+
+    /// Общее показание исходной строки; пустое поле остаётся неизвестным, без удержания прошлого значения.
+    pub fn environment(&self, row: usize, which: usize) -> Option<f64> {
+        loaded(self.environment[row][which])
     }
 }
 
@@ -302,6 +318,102 @@ pub fn log_from_csv(text: &str) -> Log {
     let mut carry = samples::Carry::default();
     samples::Scratch::default().count_keeping(&columns, body, &mut carry, &mut tally, Some(&mut log));
     log
+}
+
+#[cfg(test)]
+#[path = "raw_log_spec.rs"]
+mod raw_log_spec;
+
+#[cfg(test)]
+mod raw_log_tests {
+    use super::*;
+
+    #[test]
+    fn old_schema_preserves_available_fields_and_unknown_environment() {
+        let log = log_from_csv(
+            "time,package,fan_cpu,fan_gpu,0.ceiling,0.ratio,0.busy,0.temp\n\
+             2026-10-15 10:00:00,68,3000,,48,45,1,72\n",
+        );
+        assert_eq!(log.rows(), 1);
+        assert_eq!(log.environment(0, PACKAGE_TEMP), Some(68.0));
+        assert_eq!(log.environment(0, FAN_CPU), Some(3000.0));
+        for which in [POWER_CPU, POWER_GPU, POWER_CORES, FAN_GPU, TEMP_GPU, BUSY_GPU] {
+            assert_eq!(log.environment(0, which), None);
+        }
+        assert_eq!(log.get(0, 0, RATIO), Some(45.0));
+        assert_eq!(log.get(0, 0, BUSY), Some(1.0));
+        assert_eq!(log.get(0, 0, TEMP), Some(72.0));
+        assert_eq!(log.ceiling(0, 0), Some(48));
+    }
+
+    #[test]
+    fn shuffled_columns_preserve_shared_values_and_sparse_points() {
+        let log = log_from_csv(
+            "time,temp_gpu,0.temp,fan_gpu,power_cores,0.busy,package,busy_gpu,0.ceiling,power_cpu,fan_cpu,0.ratio,power_gpu\n\
+             2026-10-15 10:00:00,62,74,3200,36,1,70,80,48,55,3000,45,120\n\
+             2026-10-15 10:00:02,,75,,37,1,71,,48,56,,46,\n\
+             2026-10-15 10:00:02.250,63,76,3300,38,1,72,82,48,57,3100,47,121\n",
+        );
+        assert_eq!(log.rows(), 3);
+        assert_eq!(log.times()[1] - log.times()[0], 2000);
+        assert_eq!(log.times()[2] - log.times()[1], 250);
+        for (which, expected) in [55.0, 120.0, 36.0, 70.0, 3000.0, 3200.0, 62.0, 80.0]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(log.environment(0, which), Some(expected));
+        }
+        for which in [FAN_CPU, FAN_GPU, TEMP_GPU, POWER_GPU, BUSY_GPU] {
+            assert_eq!(log.environment(1, which), None, "редкое показание не удерживается");
+        }
+        assert_eq!(log.power(1, POWER_CORES), Some(37.0));
+        assert_eq!(log.environment(2, FAN_CPU), Some(3100.0));
+        assert_eq!(log.get(2, 0, RATIO), Some(47.0));
+    }
+
+    #[test]
+    fn compaction_keeps_shared_values_aligned_with_blocks_and_time() {
+        let mut log = Log::new(vec!["0".to_string()]);
+        for i in 0..4 {
+            let n = f64::from(i);
+            log.push_with_environment(
+                i64::from(i) * 250,
+                std::iter::once([Some(n + 40.0), Some(1.0), Some(n + 70.0), Some(n + 48.0)]),
+                [Some(n); 8],
+            );
+        }
+        assert_eq!(log.bytes(), 4 * (8 + 12 + 1 + 32));
+        log.keep(&[false, true, false, true]);
+        assert_eq!(log.times(), &[250, 750]);
+        assert_eq!(log.bytes(), 2 * (8 + 12 + 1 + 32));
+        for (row, n) in [1.0, 3.0].into_iter().enumerate() {
+            assert_eq!(log.get(row, 0, RATIO), Some(n + 40.0));
+            assert_eq!(log.get(row, 0, TEMP), Some(n + 70.0));
+            assert_eq!(log.ceiling(row, 0).map(f64::from), Some(n + 48.0));
+            for which in 0..8 {
+                assert_eq!(log.environment(row, which), Some(n));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_push_shares_power_storage_without_inventing_metadata() {
+        let mut log = Log::new(vec!["0".to_string()]);
+        log.push(
+            250,
+            std::iter::once([None, Some(0.0), None, None]),
+            [Some(20.0), None, Some(15.0)],
+        );
+        assert_eq!(log.power(0, POWER_CPU), Some(20.0));
+        assert_eq!(log.environment(0, POWER_CPU), Some(20.0));
+        assert_eq!(log.power(0, POWER_GPU), None);
+        assert_eq!(log.power(0, POWER_CORES), Some(15.0));
+        for which in PACKAGE_TEMP..=BUSY_GPU {
+            assert_eq!(log.environment(0, which), None);
+        }
+        assert_eq!(log.get(0, 0, BUSY), Some(0.0), "измеренный ноль остаётся нулём");
+        assert_eq!(log.get(0, 0, TEMP), None);
+    }
 }
 
 // ----- кристалл -----

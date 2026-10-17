@@ -43,6 +43,8 @@ pub const DAY_REFRESH: Duration = Duration::from_secs(30);
 /// Что окно получает из потока статистики.
 #[derive(Debug, Default)]
 pub struct Digest {
+    pub conditional: Option<Arc<crate::conditional_snapshot::Snapshot>>,
+    pub conditional_trouble: Option<String>,
     pub tally: Tally,
     pub files: usize,
     /// События, новые первыми: файлы data\events\<день>.jsonl (с 0.5.6) и прежний журнал автомодуля
@@ -110,6 +112,9 @@ struct SampleFile {
     reason = "independent facts of the reading thread (waits for blocks, refit due, rows stale, day stale), not one state machine"
 )]
 struct Worker {
+    conditional: Option<Arc<crate::conditional_snapshot::Snapshot>>,
+    conditional_stamp: Option<SystemTime>,
+    conditional_trouble: Option<String>,
     dir: PathBuf,
     /// Папка срезов: у окна — samples в папке данных, у отчёта — та, что ему дали.
     samples: PathBuf,
@@ -226,7 +231,7 @@ impl Worker {
     /// Один проход; Some — что-то изменилось (или это первый проход).
     fn scan(&mut self, first: bool) -> Option<Digest> {
         let started = Instant::now();
-        let mut changed = first;
+        let mut changed = first | self.read_conditional(first);
         let mut trouble = None;
         let mut parsed_bytes = 0;
         let mut parsed_rows = 0;
@@ -297,6 +302,8 @@ impl Worker {
             .collect();
         days.dedup();
         Some(Digest {
+            conditional: self.conditional.as_ref().map(Arc::clone),
+            conditional_trouble: self.conditional_trouble.clone(),
             tally,
             model: self.model.as_ref().map(Arc::clone),
             retained: self.retained,
@@ -309,6 +316,26 @@ impl Worker {
             parse_time: started.elapsed(),
             trouble,
         })
+    }
+
+    fn read_conditional(&mut self, first: bool) -> bool {
+        let path = self.dir.join(crate::conditional_snapshot::FILE);
+        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok(); // Отказ чтения самого файла ниже имеет видимую причину.
+        if !first && stamp == self.conditional_stamp {
+            return false;
+        }
+        self.conditional_stamp = stamp;
+        match crate::conditional_snapshot::read(&path) {
+            Ok(snapshot) => {
+                self.conditional = snapshot.map(Arc::new);
+                self.conditional_trouble = None;
+            }
+            Err(message) => {
+                self.conditional = None;
+                self.conditional_trouble = Some(message);
+            }
+        }
+        true
     }
 
     /// Журнал автомодуля и файлы событий не старше `cutoff`: только дописываются. Что-то дописано — события для окна
