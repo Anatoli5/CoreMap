@@ -57,8 +57,8 @@ pub struct Saved {
     pub compared: Vec<String>,
     /// Подсветка закреплённая (true) или под курсором (false).
     pub pin: Option<bool>,
-    /// Вид графика: нагрев ядра, над кристаллом или абсолютная. Файл сборок до 0.5.6 писал «above» (true — над
-    /// кристаллом, false — абсолютная): он читается в тот же вид; нет ни того, ни другого — нагрев ядра (бриф 16.10).
+    /// Вид графика: эффективность, над кристаллом или абсолютная. Файл сборок до 0.5.6 писал «above» (true — над
+    /// кристаллом, false — абсолютная): он читается в тот же вид; нет ни того, ни другого — эффективность (бриф 16.10).
     pub view: Option<Scale>,
     /// Какие линии на графике.
     pub curves: Option<Curves>,
@@ -143,7 +143,8 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         compared,
         pin: map.get("pin").and_then(Value::as_bool),
         view: match map.get("view").and_then(Value::as_str) {
-            Some("own") => Some(Scale::OwnHeat),
+            // «own» — вид «нагрев ядра» сборок 0.5.6–0.5.7, место которого занял вид «эффективность».
+            Some("eff" | "own") => Some(Scale::Efficiency),
             Some("above") => Some(Scale::AboveDie),
             Some("abs") => Some(Scale::Absolute),
             _ => match map.get("above").and_then(Value::as_bool) {
@@ -187,7 +188,7 @@ pub fn text(saved: &Saved) -> String {
     }
     if let Some(view) = saved.view {
         let name = match view {
-            Scale::OwnHeat => "own",
+            Scale::Efficiency => "eff",
             Scale::AboveDie => "above",
             Scale::Absolute => "abs",
         };
@@ -426,20 +427,21 @@ mod tests {
     }
 
     #[test]
-    fn an_old_scale_maps_to_the_same_raw_view_and_none_to_own_heating() {
-        // Бриф 16.10: «an old saved value maps to the same raw view; a missing value maps to «нагрев ядра»». Ловит:
-        // прежний файл, открывшийся не в том виде; новый ключ, не переживший запись.
+    fn an_old_scale_maps_to_the_same_raw_view_and_none_to_efficiency() {
+        // Бриф 16.10: «an old saved value maps to the same raw view; a missing value maps to» the default view —
+        // «эффективность» (бриф 16.10 «эффективность», на месте «нагрева ядра»; его ключ «own» читается в тот же вид).
+        // Ловит: прежний файл, открывшийся не в том виде; новый ключ, не переживший запись.
         assert_eq!(parse(r#"{"above":true}"#).map(|s| s.view), Ok(Some(Scale::AboveDie)));
         assert_eq!(parse(r#"{"above":false}"#).map(|s| s.view), Ok(Some(Scale::Absolute)));
         assert_eq!(parse("{}").map(|s| s.view), Ok(None));
         assert_eq!(parse(r#"{"above":"да"}"#).map(|s| s.view), Ok(None));
-        assert_eq!(Scale::default(), Scale::OwnHeat, "нет записи — нагрев ядра");
-        // Новый ключ сильнее прежнего (файл, записанный новой сборкой поверх прежнего).
+        assert_eq!(Scale::default(), Scale::Efficiency, "нет записи — эффективность");
+        // Новый ключ сильнее прежнего (файл, записанный новой сборкой поверх прежнего); «own» сборок 0.5.6–0.5.7 — тот же вид.
         assert_eq!(
             parse(r#"{"view":"own","above":true}"#).map(|s| s.view),
-            Ok(Some(Scale::OwnHeat))
+            Ok(Some(Scale::Efficiency))
         );
-        for view in [Scale::OwnHeat, Scale::AboveDie, Scale::Absolute] {
+        for view in [Scale::Efficiency, Scale::AboveDie, Scale::Absolute] {
             let saved = Saved {
                 view: Some(view),
                 ..Saved::default()

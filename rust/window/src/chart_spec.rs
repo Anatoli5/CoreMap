@@ -1225,6 +1225,6 @@ fn ink_is_a_log_share_from_one_row_to_the_fullest_bin_and_never_vanishes() {
 fn defaults_show_temperature_above_the_die_with_both_curves() {
     // Ловит возврат к абсолютной шкале или к одной кривой по умолчанию. Бриф 16.10: вид по умолчанию — «нагрев ядра»
     // (сырые виды — «над кристаллом» и «абсолютная» — выбираются).
-    assert_eq!(Scale::default(), Scale::OwnHeat);
+    assert_eq!(Scale::default(), Scale::Efficiency);
     assert_eq!(Curves::default(), Curves::Both);
 }

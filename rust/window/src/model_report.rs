@@ -43,11 +43,11 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     let _ = writeln!(text, "samples folder: {}", folder.display());
     let _ = writeln!(
         text,
-        "own fast term: learned shape g(r) (hinge: busy*1, busy*(r-lo), busy*max(0, r-k), knots every 2 steps over the p5-p95 solid range, all weights >= 0: increasing and convex)"
+        "own fast term: one coefficient per (block, whole multiplier) bin - cumulative bin indicators * busy, all weights >= 0: own heating g(r) is a non-decreasing step function with no imposed shape (brief 16.10 'efficiency'); efficiency = r / (g(r) + history at full load)"
     );
     let _ = writeln!(
         text,
-        "history terms, neighbours, power split: p = busy*(r/45)^3 - the power shape is ASSUMED cubic, not measured; no voltage input (removed 16.10)"
+        "history terms and neighbours: p = busy*(r/45)^3 - the power shape is ASSUMED cubic, not measured; no voltage input (removed 16.10); no watts in the model"
     );
     let _ = writeln!(
         text,
@@ -79,7 +79,7 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     let fitted = model::fit(&logs, &die);
     let _ = writeln!(
         text,
-        "fit time on all rows (L3 with the shape, the shared P-core rank, the proxy form, all blocks, 4 folds, ablations, halves, three passes): {:.0} ms",
+        "fit time on all rows (L3 with the steps, the shared P-core rank, the proxy form, all blocks, 4 folds, ablations, halves, three passes): {:.0} ms",
         fitted.time.as_secs_f64() * 1000.0
     );
     retention_section(&logs, &die, &fitted, text);
@@ -89,7 +89,6 @@ fn report(dir: &Path, split: Option<&str>, text: &mut String) -> i32 {
     rank_section(&fitted, text);
     influence_section(&fitted, text);
     shape_tables(&logs, &die, &fitted, text);
-    split_power_section(&fitted, text);
     equal_load_section(&fitted, text);
     if let Some(at) = split {
         split_section(&logs, &die, at, text);
@@ -291,7 +290,7 @@ fn blocks(fitted: &Model, die: &Die, text: &mut String) {
     let _ = writeln!(text, "== L3 per block ==");
     let _ = writeln!(
         text,
-        "errors: held-out RMSE of 10-s means of T-D, 4 contiguous folds; (a) offset + beta*D, (b) + own, (c) + neighbours - with the learned shape; (c) old = the proxy form K*p for the own fast term"
+        "errors: held-out RMSE of 10-s means of T-D, 4 contiguous folds; (a) offset + beta*D, (b) + own, (c) + neighbours - with the learned steps; (c) old = the proxy form K*p for the own fast term"
     );
     for (i, b) in fitted.blocks.iter().enumerate() {
         let near: Vec<&str> = die.neighbours[i].iter().map(|&j| die.names[j].as_str()).collect();
@@ -309,36 +308,53 @@ fn blocks(fitted: &Model, die: &Die, text: &mut String) {
     }
 }
 
-/// Выученная форма: узлы, веса, излом.
-fn shape_line(c: &model::Coef, text: &mut String) {
-    let h = &c.shape;
-    let bends: Vec<String> = h
-        .knots
+/// Выученные ступени: нагрев при полной нагрузке по корзинам (с весом корзины) и эффективность с разбросом и данными.
+fn shape_line(b: &model::BlockModel, c: &model::Coef, text: &mut String) {
+    let s = &c.shape;
+    let steps: Vec<String> = s
+        .bins
         .iter()
-        .zip(h.weights.iter().skip(2))
-        .map(|(k, w)| format!("x{k:.0} {w:.2}"))
+        .zip(&s.weights)
+        .map(|(&r, w)| format!("x{r} {:.2} (+{w:.2})", s.at(count(r))))
         .collect();
     let _ = writeln!(
         text,
-        "  shape g(r): lo x{:.2}, base {:.2} °C, slope {:.3} °C/step, bends [{}]; g(lo) {:.2}, g(x45) {:.2}",
-        h.lo,
-        h.weights.first().copied().unwrap_or(0.0),
-        h.weights.get(1).copied().unwrap_or(0.0),
-        bends.join(", "),
-        h.at(h.lo),
-        h.at(model::REFERENCE)
+        "  steps g(r) at full load, °C (weight of the bin): [{}]; g(x45) {:.2}",
+        steps.join(", "),
+        s.at(model::REFERENCE)
     );
-    let _ = match h.knee() {
-        Some(k) => writeln!(
-            text,
-            "  knee at x{:.0}: slope {:.3} -> {:.3} °C per step at full load",
-            k.at, k.before, k.after
-        ),
-        None => writeln!(
-            text,
-            "  knee: none (rule: largest bend >= 0.1 °C/step and slope after >= 2x before)"
-        ),
-    };
+    let points: Vec<String> = b
+        .efficiency()
+        .iter()
+        .map(|e| {
+            format!(
+                "x{} {:.2} ({:.2}..{:.2}; heat {:.1} °C; {:.1} min at busy {:.2})",
+                e.ratio,
+                e.value,
+                e.lo,
+                e.hi,
+                e.heat,
+                e.secs / 60.0,
+                e.load
+            )
+        })
+        .collect();
+    let _ = writeln!(
+        text,
+        "  efficiency r / own heating (folds min..max): {}",
+        if points.is_empty() {
+            "none (no bin with a minute of full load and heating > 0 in every fold, or fewer than 10 min)".to_string()
+        } else {
+            points.join(", ")
+        }
+    );
+}
+
+/// Целое как f64 (множители, 0..80).
+fn count(r: i64) -> f64 {
+    #[expect(clippy::cast_precision_loss, reason = "a multiplier, 0..80")]
+    let v = r as f64;
+    v
 }
 
 /// Коэффициенты блока и ошибки на отложенных данных.
@@ -357,7 +373,7 @@ fn coef_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
             c.own[6],
             c.own_total()
         );
-        shape_line(c, text);
+        shape_line(b, c, text);
         let near: Vec<String> = c
             .neighbours
             .iter()
@@ -369,7 +385,7 @@ fn coef_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
         Some(c) => {
             let _ = writeln!(
                 text,
-                "  proxy-form L3 (for °C/W): a {:.2}, beta {:.3}, own [fast {:.2}; ema 0.5s {:.2}, 1s {:.2}, 2s {:.2}, 4s {:.2}, 8s {:.2}, 16s {:.2}] total K {:.2}",
+                "  proxy-form L3 (old form, for comparison): a {:.2}, beta {:.3}, own [fast {:.2}; ema 0.5s {:.2}, 1s {:.2}, 2s {:.2}, 4s {:.2}, 8s {:.2}, 16s {:.2}] total K {:.2}",
                 c.a,
                 c.beta,
                 c.own[0],
@@ -426,7 +442,7 @@ fn coef_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
     }
 }
 
-/// Опорные условия, кривая, «°C на ступень», стабильность.
+/// Опорные условия, кривая, стабильность.
 fn physics_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
     if let Some(r) = &b.reference {
         let near: Vec<String> = r
@@ -454,29 +470,13 @@ fn physics_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
             curve.join(", ")
         );
     }
-    // «°C на ватт» = K/c прежнего вида: K — его свой нагрев при полной нагрузке на ×45 (там p = 1); выученная форма в
-    // него не входит — рядом её нагрев на ×45.
+    // Свой нагрев при полной нагрузке на ×45: прежний вид (K, там p = 1) и ступени с историей.
     if let (Some(old), Some(new)) = (&b.coef, &b.shaped) {
         let _ = writeln!(
             text,
-            "  own heating at full load at x45: proxy form K = {:.2} °C (this K enters °C/W = K/c), learned shape g(45) + history = {:.2} °C",
+            "  own heating at full load at x45: proxy form K = {:.2} °C, learned steps g(45) + history = {:.2} °C",
             b.heat(old, model::REFERENCE),
             b.heat(new, model::REFERENCE)
-        );
-    }
-    if let Some(s) = b.slope {
-        let _ = writeln!(
-            text,
-            "  slope: {:.3} °C per step at x{:.1} (folds {:.3}..{:.3}), {}",
-            s.value,
-            s.at,
-            s.lo,
-            s.hi,
-            if s.value > 1e-9 {
-                format!("{:.2} steps per °C", 1.0 / s.value)
-            } else {
-                "flat".into()
-            }
         );
     }
     match b.halves {
@@ -486,54 +486,6 @@ fn physics_lines(b: &model::BlockModel, die: &Die, text: &mut String) {
         None => {
             let _ = writeln!(text, "  proxy-form K between halves: not comparable (a half has none)");
         }
-    }
-}
-
-/// Слой разделения мощности и «°C на ватт» по блокам.
-fn split_power_section(fitted: &Model, text: &mut String) {
-    let _ = writeln!(
-        text,
-        "\n== power split: P = c0 + sum_j c_j * p_j (E-cluster p x4), NNLS, 4 contiguous folds; degrees per watt = K_own,total / watts =="
-    );
-    let Some(split) = &fitted.power else {
-        let _ = writeln!(
-            text,
-            "not computed: no rows with power_cores or power_cpu where every block's p is known (or fewer than 4 folds' worth)"
-        );
-        return;
-    };
-    let _ = writeln!(
-        text,
-        "column {}: rows {}, {:.1} min; c0 {:.2} W; held-out RMSE {:.2} W per row",
-        split.column, split.rows, split.minutes, split.c0, split.rmse
-    );
-    for b in &fitted.blocks {
-        let Some(pw) = b.power else { continue };
-        let partner = pw.partner.map_or_else(
-            || "-".into(),
-            |(j, r)| format!("{} (r = {r:+.2})", fitted.blocks[j].name),
-        );
-        let figure = match b.resistance {
-            Some(r) => format!(
-                "{:.3} °C/W ({:.3}..{:.3}), same-work reference {:.2} W",
-                r.value,
-                r.lo,
-                r.hi,
-                b.same_work.unwrap_or(f64::NAN)
-            ),
-            None if !pw.determined => "no figure: watts not determined separately".into(),
-            None => "no figure: no L3 coefficients".into(),
-        };
-        let _ = writeln!(
-            text,
-            "block {:>5}: {:.2} W per unit p (folds {:.2}..{:.2}), {}; R² on the others {:.2}, most linked {partner}; {figure}",
-            b.name,
-            pw.watts,
-            pw.lo,
-            pw.hi,
-            if pw.determined { "determined" } else { "NOT determined" },
-            pw.collinear
-        );
     }
 }
 
@@ -629,28 +581,15 @@ fn equal_load_section(fitted: &Model, text: &mut String) {
         }
     };
     compare(
-        "degrees per watt (new figure)",
-        &|b| b.resistance.map(|r| r.value),
+        "own heating at full load at x45, steps + history (new figure; hotter = larger)",
+        &|b| b.own_heat(model::REFERENCE),
         text,
     );
     compare(
-        "K_own,total per unit busy (rejected figure, for contrast)",
+        "K_own,total per unit busy (old proxy form, for contrast)",
         &|b| b.coef.as_ref().map(model::Coef::own_total),
         text,
     );
-    if fitted.blocks.iter().all(|b| b.resistance.is_none()) {
-        let _ = writeln!(
-            text,
-            "needed for the new figure: play rows with power_cores (CoreMapTray 0.5.4) where the P-cores' loads are not locked together; {}",
-            fitted.power.as_ref().map_or_else(
-                || "today: no rows with power at all".to_string(),
-                |p| format!(
-                    "today: {:.1} min of rows with {} (0.5.3 desktop and the analysis agents' runs, not play)",
-                    p.minutes, p.column
-                )
-            )
-        );
-    }
 }
 
 fn acceptance(fitted: &Model, text: &mut String) {
@@ -876,11 +815,11 @@ fn power_section(logs: &[&Log], die: &Die, text: &mut String) {
 fn shape_tables(logs: &[&Log], die: &Die, fitted: &Model, text: &mut String) {
     let _ = writeln!(
         text,
-        "\n== learned shape vs raw bins (T - mean of the other blocks, rows with own busy >= 0.9) =="
+        "\n== learned steps vs raw bins (T - mean of the other blocks, rows with own busy >= 0.9) =="
     );
     let _ = writeln!(
         text,
-        "columns: x | raw T-D, minutes, mean D of the bin | model T-D at the reference D (shaped / old proxy form) | model at the bin's D (shaped) | die part (beta-1)*(D_bin - D_ref) | g(r), slope of g"
+        "columns: x | raw T-D, minutes, mean D of the bin | model T-D at the reference D (steps / old proxy form) | model at the bin's D (steps) | die part (beta-1)*(D_bin - D_ref) | g(r), step from x-1"
     );
     for name in ["0", "10", "22", "12"] {
         let Some(index) = die.names.iter().position(|n| n == name) else {
@@ -888,7 +827,7 @@ fn shape_tables(logs: &[&Log], die: &Die, fitted: &Model, text: &mut String) {
         };
         let b = &fitted.blocks[index];
         let (Some(c), Some(r)) = (&b.shaped, &b.reference) else {
-            let _ = writeln!(text, "\nblock {name}: no shaped fit");
+            let _ = writeln!(text, "\nblock {name}: no stepped fit");
             continue;
         };
         let _ = writeln!(
@@ -917,7 +856,7 @@ fn shape_tables(logs: &[&Log], die: &Die, fitted: &Model, text: &mut String) {
                 new - r.die + die_part,
                 die_part,
                 c.shape.at(x),
-                c.shape.slope_at(x + 0.5)
+                c.shape.at(x) - c.shape.at(x - 1.0)
             );
         }
     }

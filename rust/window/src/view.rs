@@ -211,7 +211,7 @@ pub struct View {
     sets: Rc<VecModel<SetRow>>,
     /// Блоки в статистике (номера) по порядку добавления; цвет — у блока (`chart::color_of`).
     pub compared: Vec<usize>,
-    /// Вид графика (src/chart.rs): нагрев ядра, над кристаллом или абсолютная; линии, оси местами.
+    /// Вид графика (src/chart.rs): эффективность, над кристаллом или абсолютная; линии, оси местами.
     pub scale: Scale,
     pub curves: Curves,
     /// Линия наибольших (переключатель «макс»).
@@ -1362,7 +1362,7 @@ impl View {
         }
     }
 
-    /// Вид графика: 0 — нагрев ядра, 1 — над кристаллом, 2 — абсолютная (`Scale::of`).
+    /// Вид графика: 0 — эффективность, 1 — над кристаллом, 2 — абсолютная (`Scale::of`).
     pub fn view_changed(&mut self, index: i32) {
         let scale = Scale::of(index);
         if self.scale != scale {
@@ -1409,11 +1409,11 @@ impl View {
         }
     }
 
-    /// Линия под курсором: в «нагреве ядра» — точки частных остатков и кривая модели, в остальных видах — показанные
-    /// линии (ø, 95 %, наибольшие) и кривая модели.
+    /// Линия под курсором: в «эффективности» — точки и линия между ними, в остальных видах — показанные линии (ø, 95 %,
+    /// наибольшие) и кривая модели.
     fn near(&self, x: f32, y: f32, w: f32, h: f32) -> Option<usize> {
         let series = self.shown_stats.as_ref().map(|s| s.series.as_slice())?;
-        let own = self.scale == Scale::OwnHeat;
+        let own = self.scale == Scale::Efficiency;
         chart::nearest_with(
             series,
             (f64::from(x), f64::from(y)),

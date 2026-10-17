@@ -1253,8 +1253,8 @@ impl Check {
 
     /// Шаг 2в: кривые модели нагрева (DECISIONS #39). У каждого выбранного блока — кривая его цвета: сплошная над
     /// наблюдёнными множителями, пунктир за ними, температура не падает с множителем; в подсказке блока в легенде —
-    /// «°C на ватт» (в придуманных срезах есть мощность ядер); выключатель «модель» прячет и возвращает кривые, не
-    /// трогая линий ø и 95 %. Картинка F-model.png.
+    /// модель, условия и ошибка (без ватт — бриф 16.10 «эффективность»); выключатель «модель» прячет и возвращает
+    /// кривые, не трогая линий ø и 95 %. Картинка F-model.png.
     fn model_curves(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
         let pair = [p_block.index, e_block.index];
         let paths = |view: &View, block: usize| {
@@ -1291,14 +1291,18 @@ impl Check {
             ),
         );
         let tips: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.tip.to_string()).collect();
-        let figure = tips
-            .iter()
-            .all(|t| t.contains(" °C на ватт (") && t.contains("одинаковой работы") && !t.contains("°C на ступень"));
+        let figure = tips.iter().all(|t| {
+            t.contains("Модель нагрева: регрессия")
+                && t.contains("условия кривой")
+                && t.contains("ошибка на отложенных данных")
+                && !t.contains("ватт")
+                && !t.contains("°C на ступень")
+        });
         let e_note = tips.iter().any(|t| t.contains("по первому ядру, за четыре ядра"));
         self.check(
             figure && e_note,
             format!(
-                "в подсказке каждого блока в легенде — «°C на ватт» и кривая для одинаковой работы; у кластера — что нагрузка по первому ядру: {}",
+                "в подсказке каждого блока в легенде — модель нагрева, условия кривой и ошибка, без ватт; у кластера — что нагрузка по первому ядру: {}",
                 tips.first().map(|t| t.lines().skip(3).collect::<Vec<_>>().join(" / ")).unwrap_or_default()
             ),
         );
@@ -2526,26 +2530,26 @@ fn rounded(v: f32) -> u32 {
     v.max(1.0).ceil() as u32
 }
 
-// ----- нагрев ядра, «макс», отсечки, вид «по времени» (бриф W) -----
+// ----- эффективность, «макс», отсечки, вид «по времени» (бриф W) -----
 
 impl Check {
-    /// Шаг 1б: вид «нагрев ядра» (бриф 16.10) — по умолчанию (файла окна нет): у блока — кривая модели и точки частных
-    /// остатков, ø, 95 % и «макс» недоступны (щелчок по «ø» ничего не меняет), ось — «°C своего нагрева» от нуля; в
-    /// подсказке столбца — нагрев, °C на ступень и производительность на градус, в подсказке блока — что влияет на
-    /// температуру ядра. Картинки F-own.png, F-own-tip.png. В конце — «над кристаллом» и снова один P-блок: дальше идут
-    /// шаги сырых корзин.
+    /// Шаг 1б: вид «эффективность» (бриф 16.10) — по умолчанию (файла окна нет): у блока — точки по целым множителям
+    /// (производительность на градус) с линией между соседними и усами разброса, ø, 95 % и «макс» недоступны (щелчок по
+    /// «ø» ничего не меняет), ось — «производительность на °C» от нуля; в подсказке столбца — эффективность с разбросом,
+    /// свой нагрев и данные, в подсказке блока — что влияет на температуру ядра. Картинки F-own.png, F-own-tip.png. В
+    /// конце — «над кристаллом» и снова один P-блок: дальше идут шаги сырых корзин.
     #[expect(
         clippy::too_many_lines,
         reason = "one scenario of clicks, hovers and pictures, read top to bottom"
     )]
     fn own_view(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
         let (p, e) = (p_block.index, e_block.index);
-        let default = self.view.borrow().scale == Scale::OwnHeat && self.ui.get_chart_view() == 0;
+        let default = self.view.borrow().scale == Scale::Efficiency && self.ui.get_chart_view() == 0;
         let ready = |v: &View| {
             v.shown_stats
                 .as_ref()
                 .and_then(|s| s.series.iter().find(|l| l.block == p))
-                .is_some_and(|l| !l.points.is_empty() && !l.model.is_empty())
+                .is_some_and(|l| !l.points.is_empty() && !l.whiskers.is_empty())
         };
         let drawn = self.pump(ready, 30.0);
         let series = self
@@ -2556,7 +2560,7 @@ impl Check {
             .and_then(|s| s.series.iter().find(|l| l.block == p).cloned());
         let plain = series
             .as_ref()
-            .is_some_and(|l| l.mean.is_empty() && l.p95.is_empty() && l.max.is_empty());
+            .is_some_and(|l| l.p95.is_empty() && l.max.is_empty() && l.model.is_empty() && !l.mean.is_empty());
         let ticks: Vec<String> = self.ui.get_chart_ticks().iter().map(|t| t.text.to_string()).collect();
         let from_zero = self
             .ui
@@ -2564,27 +2568,42 @@ impl Check {
             .iter()
             .map(|t| t.f)
             .fold(f32::INFINITY, f32::min)
-            <= self.ui.get_chart_zero() + 1e-6;
+            <= 1e-6;
         self.check(
             default
                 && drawn
                 && plain
                 && from_zero
-                && self.ui.get_chart_value_title().contains("своего нагрева"),
+                && self.ui.get_chart_value_title().contains("производительность на °C"),
             format!(
-                "по умолчанию — «нагрев ядра»: у {} кривая модели и {} точек частных остатков, линий ø, 95 % и наибольших нет; ось от нуля (или ниже): {ticks:?}",
+                "по умолчанию — «эффективность»: у {} {} точек с усами и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; ось от нуля: {ticks:?}",
                 p_block.name,
                 series.as_ref().map_or(0, |l| l.points.len())
             ),
         );
-        // Кривая не падает с множителем (путь в рамке 1000 × 1000, y вниз).
+        // Усы: по отрезку на точку, оба конца на её множителе (x одинаков), точка между концами.
         let numbers: Vec<f64> = series
             .as_ref()
-            .map(|l| l.model.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+            .map(|l| l.whiskers.split_whitespace().filter_map(|t| t.parse().ok()).collect())
             .unwrap_or_default();
-        let points: Vec<(f64, f64)> = numbers.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect();
-        let rising = points.len() >= 2 && points.windows(2).all(|w| w[1].0 >= w[0].0 && w[1].1 <= w[0].1 + 1e-6);
-        self.check(rising, "кривая нагрева ядра не падает с множителем");
+        let segments: Vec<[f64; 4]> = numbers.as_chunks::<4>().0.to_vec();
+        let whiskers_ok = series.as_ref().is_some_and(|l| {
+            segments.len() == l.points.len()
+                && l.points.iter().zip(&segments).all(|(pt, s)| {
+                    let (x, y) = (f64::from(pt.x) * 1000.0, (1.0 - f64::from(pt.y)) * 1000.0);
+                    (s[0] - x).abs() < 1.0
+                        && (s[2] - x).abs() < 1.0
+                        && s[1].min(s[3]) <= y + 1.0
+                        && y <= s[1].max(s[3]) + 1.0
+                })
+        });
+        self.check(
+            whiskers_ok,
+            format!(
+                "у каждой точки эффективности — усы на её множителе, точка между концами: отрезков {}",
+                segments.len()
+            ),
+        );
         // ø, 95 % и «макс» в этом виде недоступны: настоящий щелчок по «ø» ничего не меняет.
         let curves = self.view.borrow().curves;
         let (x, y) = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
@@ -2594,7 +2613,7 @@ impl Check {
         let still = self.view.borrow().curves == curves && !self.view.borrow().max;
         self.check(
             still,
-            "щелчки по серым «ø» и «макс» в «нагреве ядра» ничего не изменили",
+            "щелчки по серым «ø» и «макс» в «эффективности» ничего не изменили",
         );
         // Второй блок — кластер: две линии.
         let (ex, ey) = self.tile_center(e);
@@ -2606,8 +2625,8 @@ impl Check {
             format!("кластер {} добавлен: линий {lines}", e_block.name),
         );
         let shot = self.shot("own");
-        self.check(shot, "картинка: нагрев ядра у P-ядра и кластера");
-        // Подсказка столбца: у столбца с точкой P-ядра — точка, нагрев, °C на ступень, производительность на градус.
+        self.check(shot, "картинка: эффективность у P-ядра и кластера");
+        // Подсказка столбца: у столбца с точкой P-ядра — эффективность с разбросом, свой нагрев, данные и нагрузка.
         let (column, tip) = self
             .view
             .borrow()
@@ -2617,21 +2636,22 @@ impl Check {
                 s.columns
                     .iter()
                     .enumerate()
-                    .find(|(_, c)| c.tip.contains("точка") && c.tip.contains("на ступень"))
+                    .find(|(_, c)| c.tip.contains("на °C") && c.tip.contains(&p_block.name))
                     .map(|(i, c)| (i, c.tip.replace('\u{a0}', " ")))
             })
             .unwrap_or_default();
-        let tip_ok = tip.contains("нагрев ядра при полной нагрузке")
-            && tip.contains("°C на ступень")
-            && tip.contains("производительность на градус")
+        let tip_ok = tip.contains("производительность на градус")
+            && tip.contains("на °C")
+            && tip.contains("свой нагрев")
+            && tip.contains("данных")
             && tip.contains("нагрузка ø");
         self.check(
             tip_ok,
-            format!("подсказка столбца нагрева ядра: «{}»", tip.replace('\n', " / ")),
+            format!("подсказка столбца эффективности: «{}»", tip.replace('\n', " / ")),
         );
-        self.chart_tip(column, 0.5, "нагрев ядра: подсказка столбца");
+        self.chart_tip(column, 0.5, "эффективность: подсказка столбца");
         let shot = self.shot("own-tip");
-        self.check(shot, "картинка: подсказка столбца нагрева ядра");
+        self.check(shot, "картинка: подсказка столбца эффективности");
         self.leave();
         let legend: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.tip.to_string()).collect();
         let influence = legend.iter().all(|t| {
@@ -2641,12 +2661,12 @@ impl Check {
                 && t.contains("соседи")
                 && t.contains("предыдущие секунды")
                 && t.contains("действуют через кристалл")
-                && t.contains("все прочие равны: соседи, кристалл, видеокарта, история вынесены")
+                && t.contains("эффективность: множитель / свой нагрев")
         });
         self.check(
             influence,
             format!(
-                "в подсказке блока — что влияет на температуру ядра и условия нагрева ядра: {}",
+                "в подсказке блока — что влияет на температуру ядра и что такое эффективность: {}",
                 legend
                     .first()
                     .map(|t| t
