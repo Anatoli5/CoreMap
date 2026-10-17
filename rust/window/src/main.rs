@@ -33,8 +33,8 @@ mod ui {
     slint::include_modules!();
 }
 use ui::{
-    AppWindow, CellData, Column, Cut, LegendItem, LineRow, LinkData, Mark, MenuEntry, Run, Series, SetRow, Tick,
-    TileData, TimeDot, TimeMark, TimeRef, TimeStrip,
+    AppWindow, CellData, Column, Cut, LegendItem, LineRow, LinkData, Mark, MenuEntry, MetricChoice, Run, Series,
+    SetRow, Tick, TileData, TimeDot, TimeMark, TimeRef, TimeStrip,
 };
 
 mod chart;
@@ -57,6 +57,7 @@ mod history;
 mod history_spec;
 mod model;
 mod model_report;
+mod plot;
 // Тесты модели нагрева по брифу, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
 #[cfg(test)]
 mod model_spec;
@@ -85,6 +86,33 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
+
+fn connect_ranges(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
+    let v = Rc::clone(view);
+    ui.on_range_auto(move |argument, auto| v.borrow_mut().range_auto(argument, auto));
+    let v = Rc::clone(view);
+    ui.on_range_fit(move |argument| v.borrow_mut().range_fit(argument));
+    let v = Rc::clone(view);
+    ui.on_range_edited(move |argument, min, max| v.borrow_mut().range_edited(argument, &min, &max));
+    let v = Rc::clone(view);
+    ui.on_range_zoom(move |argument, factor| v.borrow_mut().range_zoom(argument, factor));
+    let v = Rc::clone(view);
+    ui.on_range_unit_changed(move |index| v.borrow_mut().range_unit_changed(index));
+    let v = Rc::clone(view);
+    ui.on_metric_toggled(move |index| v.borrow_mut().metric_toggled(index));
+    let v = Rc::clone(view);
+    ui.on_normalized_changed(move |on| v.borrow_mut().normalized_changed(on));
+    let v = Rc::clone(view);
+    ui.on_range_parameter_changed(move |index| v.borrow_mut().range_parameter_changed(index));
+    let v = Rc::clone(view);
+    ui.on_metric_zoom(move |index, delta| v.borrow_mut().metric_zoom(index, delta));
+    let v = Rc::clone(view);
+    ui.on_metric_reset(move |index| v.borrow_mut().metric_reset(index));
+    let v = Rc::clone(view);
+    ui.on_time_scroll(move |start| v.borrow_mut().time_scroll(start));
+    let v = Rc::clone(view);
+    ui.on_time_end(move || v.borrow_mut().time_end());
+}
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -129,7 +157,14 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_time_release(move || v.borrow_mut().time_release());
     let v = Rc::clone(view);
-    ui.on_time_hover(move |x, _y, w, _h| v.borrow().time_hover(x, w).into());
+    ui.on_time_hover(move |x, y, w, h| {
+        let view = v.borrow();
+        if view.swap {
+            view.time_hover(h - y, h).into()
+        } else {
+            view.time_hover(x, w).into()
+        }
+    });
     let v = Rc::clone(view);
     ui.on_layout_changed(move |layout| v.borrow_mut().layout_changed(layout));
     let v = Rc::clone(view);
@@ -142,6 +177,7 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_model_toggled(move || v.borrow_mut().model_toggled());
     let v = Rc::clone(view);
     ui.on_axes_changed(move |swap| v.borrow_mut().axes_changed(swap));
+    connect_ranges(ui, view);
     let v = Rc::clone(view);
     ui.on_tile_menu(move |block| v.borrow_mut().menu(block));
     let v = Rc::clone(view);

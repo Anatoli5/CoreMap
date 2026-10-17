@@ -666,6 +666,7 @@ fn frame_normal_and_swapped_geometry_by_hand() {
         t0: 40.0,
         t1: 80.0,
         swap: false,
+        argument_range: None,
     };
     let swapped = Frame { swap: true, ..normal };
     for f in [normal, swapped] {
@@ -697,6 +698,7 @@ fn frame_normal_and_swapped_geometry_by_hand() {
         t0: -5.0,
         t1: 25.0,
         swap: false,
+        argument_range: None,
     };
     assert_eq!(wide.bands(), 24);
     assert!(close(wide.along(32), 0.5 / 24.0) && close(wide.along(55), 23.5 / 24.0));
@@ -709,6 +711,7 @@ fn frame_normal_and_swapped_geometry_by_hand() {
         t0: 50.0,
         t1: 90.0,
         swap: false,
+        argument_range: None,
     };
     assert_eq!(single.bands(), 1);
     assert!(close(single.along(45), 0.5));
@@ -726,6 +729,7 @@ fn frame_swap_exchanges_axes_and_bands_tile_the_multiplier_axis() {
         t0: 35.0,
         t1: 100.0,
         swap: false,
+        argument_range: None,
     };
     let swapped = Frame { swap: true, ..normal };
     let mut edge = 0.0;
@@ -803,6 +807,7 @@ fn frame(swap: bool) -> Frame {
         t0: 40.0,
         t1: 80.0,
         swap,
+        argument_range: None,
     }
 }
 

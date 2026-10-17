@@ -27,8 +27,13 @@
 // события, момент посередине.
 // Что окно помнит о себе (сравниваемые блоки, подсветка, вид графика, размер и место) — его собственный файл
 // (src/saved.rs).
+#[path = "view_navigation.rs"]
+mod navigation;
+#[path = "view_ranges.rs"]
+mod ranges;
+
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
@@ -41,9 +46,10 @@ use crate::events::{self, Event as Happened};
 use crate::model::Die;
 use crate::panels::{self, ProfileInput, ProfileShown};
 use crate::pipe::{Event, Link};
+use crate::plot::Range;
 use crate::saved::{self, Remembered};
 use crate::store::{DayOrder, Digest, Order};
-use crate::timeline::{self, Act, Day, Layout, Quantity, TimeInput, TimeShown, Under};
+use crate::timeline::{self, Act, Day, Layout, Quantity, TimeInput, TimeShown, Under, Unit};
 use crate::wire::{AutoSettings, Hello, Limits, Message, Profiles, State};
 use crate::{
     AppWindow, CellData, LineRow, LinkData, MenuEntry, SetRow, Tick, TileData, TimeDot, TimeMark, TimeRef, TimeStrip,
@@ -224,6 +230,12 @@ pub struct View {
     /// Раскладка по времени и величина раскладки «блоки».
     pub layout: Layout,
     pub quantity: Quantity,
+    pub selected: Vec<Quantity>,
+    ranges: BTreeMap<String, Range>,
+    range_unit: Unit,
+    pub normalized: bool,
+    pub time_follow: bool,
+    range_parameter: Quantity,
     /// Список событий: все блоки или выбранные.
     pub events_all: bool,
     /// Что список событий показывает: события (указатель сводки), выбранные блоки, переключатель — не пересобирать
@@ -300,8 +312,16 @@ impl View {
         let model = memory.saved.model.unwrap_or(true);
         let swap = memory.saved.swap.unwrap_or(false);
         let timeline = memory.saved.timeline.unwrap_or(false);
-        let layout = memory.saved.layout.unwrap_or_default();
+        let layout = match memory.saved.layout {
+            Some(Layout::Params) => Layout::Params,
+            _ => Layout::Overlay,
+        };
         let quantity = memory.saved.quantity.unwrap_or_default();
+        let selected = saved::selected_metrics(&memory.saved);
+        let normalized = memory.saved.normalized.unwrap_or(true);
+        let time_follow = memory.saved.time_follow.unwrap_or(true);
+        let range_parameter = Quantity::of(memory.saved.range_parameter.unwrap_or(quantity.index()));
+        let ranges = memory.saved.ranges.clone(); // настройки диапазонов, один раз при открытии
         let events_all = memory.saved.events_all.unwrap_or(false);
         let restore = (!memory.saved.compared.is_empty()).then(|| memory.saved.compared.clone()); // a few names, once
         let problem = memory.trouble.clone(); // one line, once
@@ -325,6 +345,12 @@ impl View {
             timeline,
             layout,
             quantity,
+            selected,
+            ranges,
+            range_unit: quantity.unit(),
+            normalized,
+            time_follow,
+            range_parameter,
             events_all,
             events_key: None,
             listed: Vec::new(),
@@ -513,16 +539,8 @@ impl View {
         if self.asked.as_ref().is_none_or(|a| !answers(a, &day)) {
             return;
         }
-        let was_whole = match (&self.day_data, self.span) {
-            (Some(old), Some(span)) => old.date == day.date && old.bounds() == Some(span),
-            _ => true,
-        };
-        let same_day = self.day_data.as_ref().is_some_and(|old| old.date == day.date);
-        self.span = match (day.bounds(), self.span) {
-            (Some(bounds), Some(span)) if same_day && !was_whole => Some(timeline::pan(span, bounds, 0.0)),
-            (bounds, _) => bounds,
-        };
         self.day_data = Some(day);
+        self.refresh_ranges();
         self.apply_centre();
         self.refresh_time();
     }
@@ -880,7 +898,6 @@ impl View {
             blocks: &hello.blocks,
             compared: &self.compared,
             highlight: self.highlight(),
-            fused: self.limits.as_ref().map(|l| l.fused.as_slice()),
             cutoff,
             emergency,
             digest: self.digest.as_deref(),
@@ -889,6 +906,8 @@ impl View {
             max: self.max,
             model: self.model,
             swap: self.swap,
+            argument_range: self.ranges.get("ratio").copied(),
+            value_range: self.ranges.get(&format!("ratio-value:{}", self.scale.index())).copied(),
         });
         if self.shown_stats.as_ref() == Some(&shown) {
             return;
@@ -953,6 +972,7 @@ impl View {
             ui.set_stats_legend(ModelRc::new(VecModel::from(shown.legend_rows())));
         }
         self.shown_stats = Some(shown);
+        self.show_ranges();
     }
 
     // ----- профили -----
@@ -1270,6 +1290,11 @@ impl View {
         saved.timeline = Some(self.timeline);
         saved.layout = Some(self.layout);
         saved.quantity = Some(self.quantity);
+        saved.normalized = Some(self.normalized);
+        saved.time_follow = Some(self.time_follow);
+        saved.range_parameter = Some(self.range_parameter.index());
+        saved.metrics = Some(self.selected.iter().map(|q| q.index()).collect());
+        saved.ranges.clone_from(&self.ranges);
         saved.events_all = Some(self.events_all);
         saved.maximized = window.is_maximized();
         if !window.is_maximized() && !window.is_minimized() {
@@ -1405,6 +1430,8 @@ impl View {
         if self.swap != swap {
             self.swap = swap;
             self.refresh_stats();
+            self.refresh_time();
+            self.show_ranges();
             self.remember();
         }
     }
@@ -1440,7 +1467,10 @@ impl View {
 
     /// Раскладка по времени: 0 — «блоки», 1 — «параметры».
     pub fn layout_changed(&mut self, layout: i32) {
-        let layout = if layout == 1 { Layout::Params } else { Layout::Blocks };
+        let layout = match layout {
+            1 => Layout::Params,
+            _ => Layout::Overlay,
+        };
         if self.layout == layout {
             return;
         }
@@ -1458,6 +1488,8 @@ impl View {
             return;
         }
         self.quantity = quantity;
+        self.selected = vec![quantity];
+        self.range_unit = quantity.unit();
         self.show_mode();
         self.ask_day();
         self.refresh_time();
@@ -1470,7 +1502,11 @@ impl View {
         if ui.get_chart_time() != self.timeline {
             ui.set_chart_time(self.timeline);
         }
-        let layout = i32::from(self.layout == Layout::Params);
+        let layout = match self.layout {
+            Layout::Blocks => 0,
+            Layout::Params => 1,
+            Layout::Overlay => 2,
+        };
         if ui.get_time_layout() != layout {
             ui.set_time_layout(layout);
         }
@@ -1480,6 +1516,31 @@ impl View {
         if ui.get_events_all() != self.events_all {
             ui.set_events_all(self.events_all);
         }
+        let labels = [
+            "ядра: °C",
+            "множитель",
+            "потолок",
+            "нагрузка %",
+            "кристалл °C",
+            "GPU °C",
+            "GPU Вт",
+            "GPU %",
+            "CPU об/мин",
+            "GPU об/мин",
+        ];
+        ui.set_metric_rows(ModelRc::new(VecModel::from(
+            Quantity::ALL
+                .iter()
+                .zip(labels)
+                .map(|(q, text)| crate::MetricChoice {
+                    index: q.index(),
+                    text: text.into(),
+                    on: self.selected.contains(q),
+                    tip: self.metric_tip(*q).into(),
+                })
+                .collect::<Vec<_>>(),
+        )));
+        self.show_ranges();
     }
 
     /// Дни со срезами (по возрастанию) и показанный: выбранный, если он ещё есть, иначе самый новый.
@@ -1495,11 +1556,7 @@ impl View {
 
     /// Блоки по времени (номера): «блоки» — все выбранные, «параметры» — первые два.
     fn time_indices(&self) -> Vec<usize> {
-        let take = match self.layout {
-            Layout::Blocks => self.compared.len(),
-            Layout::Params => 2,
-        };
-        self.compared.iter().take(take).copied().collect()
+        self.compared.clone() // выбранные номера, только при смене вида или запросе дня
     }
 
     /// Просьба к потоку статистики: день, блоки и их ряды, пока ось x — время; иначе день не нужен. Та же просьба
@@ -1512,10 +1569,7 @@ impl View {
                 .iter()
                 .filter_map(|&b| Some(self.hello.as_ref()?.blocks.get(b)?.name.clone()))
                 .collect(); // up to twelve names per request
-            let quantities = match self.layout {
-                Layout::Blocks => vec![self.quantity],
-                Layout::Params => Quantity::ALL.to_vec(),
-            };
+            let quantities = self.selected.clone(); // запрос владеет набором рядов до ответа потока
             chosen.map(|date| DayOrder {
                 date: date.to_string(),
                 blocks,
@@ -1551,6 +1605,7 @@ impl View {
         let Some(date) = next.and_then(|k| days.get(k)).cloned() else {
             return;
         };
+        self.time_follow = false;
         self.choose_day(date);
         self.ask_day();
         self.refresh_time();
@@ -1569,18 +1624,16 @@ impl View {
     }
 
     /// Колесо над полем «по времени»: масштаб вокруг курсора (`timeline::zoom`).
-    pub fn time_wheel(&mut self, x: f32, width: f32, delta: f32) {
+    pub fn time_wheel(&mut self, _x: f32, _width: f32, delta: f32) {
         let (Some(day), Some(span)) = (self.day_data.as_ref(), self.span) else {
             return;
         };
         let Some(bounds) = day.bounds() else { return };
-        self.span = Some(timeline::zoom(
-            span,
-            bounds,
-            f64::from(x) / f64::from(width.max(1.0)),
-            f64::from(delta),
-        ));
+        self.span = Some(timeline::zoom(span, bounds, 1.0, f64::from(delta)));
+        self.time_follow = self.span.is_some_and(|s| s.1 == bounds.1);
+        self.remember_time_span();
         self.refresh_time();
+        self.remember();
     }
 
     pub fn time_press(&mut self, x: f32) {
@@ -1593,17 +1646,21 @@ impl View {
             return;
         };
         let Some(bounds) = day.bounds() else { return };
+        self.time_follow = false;
         self.span = Some(timeline::pan(
             span,
             bounds,
             f64::from(x - last) / f64::from(width.max(1.0)),
         ));
+        self.time_follow = self.span.is_some_and(|s| s.1 == bounds.1);
         self.drag_x = Some(x);
+        self.remember_time_span();
         self.refresh_time();
     }
 
     pub fn time_release(&mut self) {
         self.drag_x = None;
+        self.remember();
     }
 
     /// Подсказка под курсором поля «по времени» (курсор и ширина поля — точки).
@@ -1634,6 +1691,7 @@ impl View {
                 near,
                 layout: self.layout,
                 quantity: self.quantity,
+                selected: Some(&self.selected),
                 blocks: &shown,
                 events: &self.time_acts(),
             },
@@ -1733,6 +1791,11 @@ impl View {
                     view: span,
                     layout: self.layout,
                     quantity: self.quantity,
+                    normalized: self.normalized,
+                    parameter_ranges: Some(&self.parameter_ranges()),
+                    selected: Some(&self.selected),
+                    manual_ranges: Some(&self.time_ranges()),
+                    swap: self.swap,
                     columns,
                     height,
                     scale,
@@ -1760,6 +1823,7 @@ impl View {
                 .map(|s| TimeStrip {
                     title: s.title.as_str().into(),
                     ticks: ModelRc::new(VecModel::from(tick_rows(&s.ticks))),
+                    right_ticks: ModelRc::new(VecModel::from(tick_rows(&s.right_ticks))),
                     picture: Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
                         &s.picture.rgba,
                         s.picture.width,
@@ -1812,6 +1876,7 @@ impl View {
             ui.set_time_gaps(ModelRc::new(VecModel::from(shown.gaps.clone()))); // a few gap marks
         }
         self.shown_time = Some(shown);
+        self.show_ranges();
     }
 
     // ----- события -----
@@ -1937,7 +2002,9 @@ impl View {
             Some(s) if s != bounds => s.1 - s.0,
             _ => CENTRE_SPAN,
         };
+        self.time_follow = false;
         self.span = Some(timeline::centred(x, width, bounds));
+        self.remember_time_span();
         self.centre = None;
     }
 

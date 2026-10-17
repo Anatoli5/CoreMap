@@ -26,6 +26,7 @@ use slint::{ModelRc, VecModel};
 use crate::events::{Event, Kind};
 use crate::model::{BlockModel, Efficiency, Model};
 use crate::panels::{capital, f, grouped, percent, rgb, span_of, whom};
+use crate::plot::{Range, Viewport};
 use crate::samples::{self, Bin, P95};
 use crate::store::Digest;
 use crate::wire::BlockInfo;
@@ -204,6 +205,7 @@ pub struct Frame {
     pub t0: f64,
     pub t1: f64,
     pub swap: bool,
+    pub argument_range: Option<Range>,
 }
 
 impl Frame {
@@ -222,7 +224,10 @@ impl Frame {
     /// Дробный множитель — доля оси множителя (целый — середина своего столбца).
     #[must_use]
     pub fn along_at(&self, ratio: f64) -> f64 {
-        (ratio - f64::from(self.lo) + 0.5) / f64::from(self.bands())
+        self.argument_range.map_or_else(
+            || (ratio - f64::from(self.lo) + 0.5) / f64::from(self.bands()),
+            |range| range.normal(ratio).unwrap_or(f64::NAN),
+        )
     }
 
     /// Температура — доля оси температуры.
@@ -246,8 +251,18 @@ impl Frame {
     /// Столбец множителя на поле: (x, y, ширина, высота) в долях, y снизу вверх.
     #[must_use]
     pub fn band(&self, ratio: i32) -> (f64, f64, f64, f64) {
-        let size = 1.0 / f64::from(self.bands());
-        let start = f64::from(ratio - self.lo) * size;
+        let (size, start) = self.argument_range.map_or_else(
+            || {
+                let size = 1.0 / f64::from(self.bands());
+                (size, f64::from(ratio - self.lo) * size)
+            },
+            |_| {
+                (
+                    self.along_at(f64::from(ratio) + 0.5) - self.along_at(f64::from(ratio) - 0.5),
+                    self.along_at(f64::from(ratio) - 0.5),
+                )
+            },
+        );
         if self.swap {
             (0.0, start, 1.0, size)
         } else {
@@ -258,18 +273,12 @@ impl Frame {
 
 // ----- что нужно и что показать -----
 
-/// Ось множителя одна на все блоки (владелец 15.10: «общую числовую ось вообще для всех ядер»): от заводского +1
-/// (выше программа не ставит) до самого низкого заводского −14 — ниже ядра под нагрузкой не ходят. Срезы за краями
-/// расширяют ось для всех блоков сразу, поэтому от выбора она не зависит.
+/// Старые заводские края сохранены только в тесте, сравнивающем прежний вид с автодиапазоном данных.
+#[cfg(test)]
 const AXIS_OVER: i64 = 1;
+#[cfg(test)]
 const AXIS_BELOW: i64 = 14;
-/// Абсолютная температура: 40–100 °C, как шкала цвета плиток; срезы за краями расширяют её.
-const ABS_LOW: f64 = 40.0;
-const ABS_HIGH: f64 = 100.0;
-/// Над кристаллом: от 0 (уровень кристалла всегда на оси) хотя бы на 5 °C.
-const ABOVE_SPAN: f64 = 5.0;
-/// Шаг подписей оси температуры — первый из этих, при котором делений не больше восьми.
-const STEPS: [f64; 6] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
+/// Целевое число делений оси значения.
 const MAX_TICKS: f64 = 8.0;
 /// Курсор ближе этого к линии блока — она подсвечивается (пиксели поля графика).
 const NEAR_PX: f64 = 10.0;
@@ -287,8 +296,6 @@ pub struct StatsInput<'a> {
     pub compared: &'a [usize],
     /// Подсвеченный блок: его линия поверх остальных, остальные бледнее; None — все одинаковы.
     pub highlight: Option<usize>,
-    /// Заводские потолки по ядрам — края оси множителя.
-    pub fused: Option<&'a [i64]>,
     /// Отсечка автомодуля, °C — линией на графике абсолютной температуры.
     pub cutoff: Option<f64>,
     pub digest: Option<&'a Digest>,
@@ -301,10 +308,14 @@ pub struct StatsInput<'a> {
     pub swap: bool,
     /// Аварийная отсечка автомодуля, °C — второй линией на «абсолютной».
     pub emergency: Option<f64>,
+    pub argument_range: Option<Range>,
+    pub value_range: Option<Range>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StatsShown {
+    pub argument_range: Option<Range>,
+    pub value_range: Option<Range>,
     pub note: String,
     pub legend: Vec<LegendShown>,
     /// Линии в порядке рисования: подсвеченная — последней, поверх.
@@ -512,6 +523,7 @@ fn stats_of(digest: &Digest, block: &BlockInfo, scale: Scale) -> Vec<Stat> {
 }
 
 /// Ось множителя: (наименьший, наибольший) — одна на все блоки, от выбора не зависит; None — ни заводских, ни срезов.
+#[cfg(test)]
 pub fn axis(blocks: &[BlockInfo], fused: Option<&[i64]>, digest: Option<&Digest>) -> Option<(i32, i32)> {
     let mut lo: Option<i64> = None;
     let mut hi: Option<i64> = None;
@@ -535,42 +547,94 @@ pub fn axis(blocks: &[BlockInfo], fused: Option<&[i64]>, digest: Option<&Digest>
     Some((i32::try_from(lo?).ok()?, i32::try_from(hi?).ok()?))
 }
 
-/// Ось температуры: (от, до, шаг подписей), °C — одна на все блоки (по всем блокам, от выбора и от показанных линий не
-/// зависит): абсолютная — 40–100 °C и шире, если ø, 95 % или сплошная часть кривой модели какого-нибудь блока за
-/// краями; над кристаллом — от наименьшего до наибольшего, 0 всегда на оси. Пунктир модели ось не растягивает — он
-/// обрезается её краями.
-fn value_range(scale: Scale, every: &[Vec<Stat>], models: &[f64]) -> (f64, f64, f64) {
-    let values = every
+/// Шаг подписей ограничивает число делений и при ручных очень широких границах.
+fn tick_step(range: Range) -> f64 {
+    let raw = (range.max - range.min) / MAX_TICKS;
+    let power = 10.0_f64.powf(raw.log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|v| v * power)
+        .find(|v| *v >= raw)
+        .unwrap_or(raw)
+}
+
+fn resolve_frame(input: &StatsInput, ratios: &[f64], values: &[f64], shown: &mut StatsShown) -> Option<Frame> {
+    let argument = input
+        .argument_range
+        .and_then(|r| Range::new(r.min, r.max))
+        .or_else(|| Range::fit(ratios.iter().copied()))?;
+    let value = input
+        .value_range
+        .and_then(|r| Range::new(r.min, r.max))
+        .or_else(|| Range::fit(values.iter().copied()))?;
+    // Столбцы ограничены реальными множителями, а не произвольными ручными границами.
+    let low = ratios
         .iter()
-        .flatten()
-        .flat_map(|s| [s.bin.mean().unwrap_or(s.p95), s.p95])
-        .chain(models.iter().copied());
-    let (mut lo, mut hi) = match scale {
-        Scale::Absolute => (ABS_LOW, ABS_HIGH),
-        Scale::AboveDie | Scale::Efficiency | Scale::ConditionalEfficiency | Scale::ConditionalHeat => (0.0, 0.0),
-    };
-    for v in values.filter(|v| v.is_finite()) {
-        lo = lo.min(v);
-        hi = hi.max(v);
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let high = ratios
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !low.is_finite() || !high.is_finite() {
+        return None;
     }
-    if scale == Scale::AboveDie && hi - lo < ABOVE_SPAN {
-        hi = lo + ABOVE_SPAN;
-    }
-    // Эффективность — от нуля до наибольшей с запасом сверху; шаг делений от величины (единицы или доли).
-    if scale == Scale::Efficiency {
-        hi += (hi - lo) * 0.08;
-        if hi <= lo {
-            hi = lo + 1.0;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "CPU ratios bounded by data, not manual display bounds"
+    )]
+    let (lo, hi) = (low.floor() as i32, high.ceil() as i32);
+    shown.argument_range = Some(argument);
+    shown.value_range = Some(value);
+    Some(Frame {
+        lo,
+        hi,
+        t0: value.min,
+        t1: value.max,
+        swap: input.swap,
+        argument_range: Some(argument),
+    })
+}
+
+fn fill_ticks(frame: &Frame, scale: Scale, shown: &mut StatsShown) {
+    let step = tick_step(Range {
+        min: frame.t0,
+        max: frame.t1,
+    });
+    let first = (frame.t0 / step).ceil() * step;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "decimal count is clamped to 0..=12"
+    )]
+    let decimals = (-step.log10().floor()).clamp(0.0, 12.0) as usize;
+    for k in 0..=10 {
+        let tick = first + f64::from(k) * step;
+        if tick > frame.t1 || !tick.is_finite() {
+            break;
         }
+        let text = temp_text(scale, tick, decimals);
+        let unit = if matches!(scale, Scale::Absolute | Scale::AboveDie | Scale::ConditionalHeat) {
+            "°"
+        } else {
+            ""
+        };
+        shown.ticks.push((f(frame.value(tick)), format!("{text}{unit}")));
     }
-    let fine = scale == Scale::Efficiency && hi - lo < MAX_TICKS;
-    let step = STEPS
-        .iter()
-        .map(|s| if fine { s / 10.0 } else { *s })
-        .find(|s| (hi - lo) / s <= MAX_TICKS)
-        .unwrap_or(STEPS[STEPS.len() - 1]);
-    let (lo, hi) = ((lo / step).floor() * step, (hi / step).ceil() * step);
-    (lo, if hi > lo { hi } else { lo + step }, step)
+}
+
+fn inside((x, y): (f64, f64)) -> bool {
+    x.is_finite() && y.is_finite() && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)
+}
+
+fn unit_viewport() -> Viewport {
+    Viewport {
+        argument: Range { min: 0.0, max: 1.0 },
+        value: Range { min: 0.0, max: 1.0 },
+        swap: false,
+    }
 }
 
 /// Самая полная корзина любого блока на шкале, с (бледность точек — от неё; от выбора не зависит).
@@ -663,7 +727,7 @@ fn ratios(from: f64, to: f64) -> impl Iterator<Item = f64> {
         clippy::cast_sign_loss,
         reason = "the axis spans a few dozen multipliers: a few hundred steps"
     )]
-    let steps = steps as u32;
+    let steps = steps.min(10_000.0) as u32;
     (0..=steps).map(move |k| (from + f64::from(k) * MODEL_STEP).min(to))
 }
 
@@ -678,33 +742,19 @@ fn model_solid(m: &BlockModel, scale: Scale) -> Vec<f64> {
 /// Ломаная (доли поля: вдоль множителя, вдоль температуры), обрезанная краями оси температуры: куски внутри поля.
 fn clipped(points: &[(f64, f64)]) -> Vec<Vec<(f64, f64)>> {
     let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut open = false; // последний кусок кончился внутри поля в конце прошлого отрезка
-    for w in points.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let dv = b.1 - a.1;
-        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
-        let mut inside = true;
-        for (p, q) in [(-dv, a.1), (dv, 1.0 - a.1)] {
-            if p.abs() < f64::EPSILON {
-                inside &= q >= 0.0;
-            } else if p < 0.0 {
-                t0 = t0.max(q / p);
-            } else {
-                t1 = t1.min(q / p);
+    let mut previous = None;
+    for pair in points.windows(2) {
+        if let Some((a, b)) = unit_viewport().segment(pair[0], pair[1]) {
+            if previous != Some(a) {
+                out.push(vec![a]);
             }
+            if let Some(run) = out.last_mut() {
+                run.push(b);
+            }
+            previous = Some(b);
+        } else {
+            previous = None;
         }
-        if !inside || t0 > t1 {
-            open = false;
-            continue;
-        }
-        let at = |t: f64| (a.0 + (b.0 - a.0) * t, a.1 + dv * t);
-        if !(open && t0 <= 0.0) {
-            out.push(vec![at(t0)]);
-        }
-        if let Some(run) = out.last_mut() {
-            run.push(at(t1));
-        }
-        open = t1 >= 1.0;
     }
     out
 }
@@ -879,21 +929,22 @@ fn influence_tip(m: &BlockModel) -> String {
 /// с краской слабейшей из двух точек; отрезки одной густоты подряд — одной ломаной.
 fn runs(ratios: &[i32], at: &[(f64, f64)], inks: &[f64]) -> Vec<(f32, String)> {
     let mut paths: [String; 5] = Default::default();
-    let mut last: Option<(usize, usize)> = None; // (густота, точка, на которой кончился отрезок)
-    let xy = |i: usize| (at[i].0 * 1000.0, (1.0 - at[i].1) * 1000.0);
     for i in 1..ratios.len() {
-        if ratios[i] - ratios[i - 1] != 1 {
+        if ratios[i].checked_sub(ratios[i - 1]) != Some(1) {
             continue;
         }
-        let level = ink_level(inks[i].min(inks[i - 1]));
-        let (x, y) = xy(i);
-        let path = &mut paths[level];
-        if last != Some((level, i - 1)) {
-            let (x0, y0) = xy(i - 1);
-            let _ = write!(path, "M {x0:.1} {y0:.1} "); // into a String
-        }
-        let _ = write!(path, "L {x:.1} {y:.1} "); // into a String
-        last = Some((level, i));
+        let Some((a, b)) = unit_viewport().segment(at[i - 1], at[i]) else {
+            continue;
+        };
+        let path = &mut paths[ink_level(inks[i].min(inks[i - 1]))];
+        let _ = write!(
+            path,
+            "M {:.1} {:.1} L {:.1} {:.1} ",
+            a.0 * 1000.0,
+            (1.0 - a.1) * 1000.0,
+            b.0 * 1000.0,
+            (1.0 - b.1) * 1000.0
+        );
     }
     paths
         .into_iter()
@@ -1146,19 +1197,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         efficiency_panel(input, digest, &compared, &mut shown);
         return shown;
     }
-    // Корзины всех блоков — для осей и бледности (от выбора они не зависят); выбранных — для линий.
-    let every: Vec<Vec<Stat>> = input.blocks.iter().map(|b| stats_of(digest, b, input.scale)).collect();
-    let all: Vec<Vec<Stat>> = compared
-        .iter()
-        .map(|b| {
-            input
-                .blocks
-                .iter()
-                .position(|x| x.index == b.index)
-                .map(|i| every[i].clone()) // a few dozen bins of the compared blocks, per refresh
-                .unwrap_or_default()
-        })
-        .collect();
+    let all: Vec<Vec<Stat>> = compared.iter().map(|b| stats_of(digest, b, input.scale)).collect();
     if all.iter().all(Vec::is_empty) {
         let whose = if several {
             "У выбранных блоков".to_string()
@@ -1180,43 +1219,51 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         };
         return shown;
     }
-    let Some((lo, hi)) = axis(input.blocks, input.fused, Some(digest)) else {
-        return shown;
-    };
     let fitted = digest.model.as_deref();
-    let solid: Vec<f64> = fitted
-        .map(|m| {
-            input
-                .blocks
-                .iter()
-                .filter_map(|b| model_of(m, b))
-                .flat_map(|b| model_solid(b, input.scale))
-                .collect()
-        })
-        .unwrap_or_default();
-    // Наибольшие растягивают ось, только когда их линия показана: с ней ось — по всем блокам, как у ø и 95 %.
-    let peaks: Vec<f64> = if input.max {
-        every.iter().flatten().map(|s| s.bin.peak.temp).collect()
+    let solid: Vec<f64> = if input.model {
+        fitted
+            .map(|m| {
+                compared
+                    .iter()
+                    .filter_map(|b| model_of(m, b))
+                    .flat_map(|b| model_solid(b, input.scale))
+                    .collect()
+            })
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
-    let (t0, t1, step) = value_range(input.scale, &every, &[solid, peaks].concat());
-    let frame = Frame {
-        lo,
-        hi,
-        t0,
-        t1,
-        swap: input.swap,
+    let ratio_values: Vec<f64> = all.iter().flatten().map(|s| f64::from(s.ratio)).collect();
+    let values: Vec<f64> = all
+        .iter()
+        .flatten()
+        .flat_map(|s| {
+            [
+                input.curves.mean().then(|| s.bin.mean().unwrap_or(s.p95)),
+                input.curves.p95().then_some(s.p95),
+                input.max.then_some(s.bin.peak.temp),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .chain(solid)
+        .collect();
+    // Скрытые линии не растягивают шкалу; при полностью пустом рисунке оставляем оси по данным.
+    let fallback: Vec<f64> = if values.is_empty() {
+        all.iter().flatten().filter_map(|s| s.bin.mean()).collect()
+    } else {
+        Vec::new()
     };
-    let mut t = t0;
-    while t <= t1 + 1e-9 {
-        let text = match input.scale {
-            Scale::Absolute => format!("{t:.0}°"),
-            _ => format!("{}°", signed_temp(t, 0)),
-        };
-        shown.ticks.push((f(frame.value(t)), text));
-        t += step;
-    }
+    let Some(frame) = resolve_frame(
+        input,
+        &ratio_values,
+        if values.is_empty() { &fallback } else { &values },
+        &mut shown,
+    ) else {
+        return shown;
+    };
+    let (lo, hi, t0, t1) = (frame.lo, frame.hi, frame.t0, frame.t1);
+    fill_ticks(&frame, input.scale, &mut shown);
     match input.scale {
         // Отсечки автомодуля — абсолютная температура: на шкале «над кристаллом» им места нет.
         Scale::Absolute => {
@@ -1233,10 +1280,11 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
                 shown.emergency_text = format!("{e:.0}°");
             }
         }
-        _ => shown.zero = f(frame.value(0.0)),
+        _ if (t0..=t1).contains(&0.0) => shown.zero = f(frame.value(0.0)),
+        _ => {}
     }
 
-    let most = fullest(&every);
+    let most = fullest(&all);
     // Подсвеченная линия рисуется последней — поверх остальных (порядок остальных — порядок добавления).
     let mut order: Vec<usize> = (0..compared.len()).collect();
     order.sort_by_key(|&i| input.highlight == Some(compared[i].index));
@@ -1273,6 +1321,9 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
                 let ratio = a.ratio.map(f64::round)?;
                 #[expect(clippy::cast_possible_truncation, reason = "a rounded multiplier, a few dozen")]
                 let (x, y) = line_at(ratio as i32)?;
+                if !inside((x, y)) {
+                    return None;
+                }
                 Some(CutShown {
                     x: f(x),
                     y: f(y),
@@ -1323,7 +1374,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         });
     }
 
-    for ratio in lo..=hi {
+    for ratio in (lo..=hi).filter(|&r| (0.0..=1.0).contains(&frame.along(r))) {
         shown.columns.push(ColumnShown {
             ratio,
             at: f(frame.along(ratio)),
@@ -1342,10 +1393,6 @@ fn snapshot_value(point: &crate::conditional_snapshot::CurvePoint, scale: Scale,
     }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "validated CPU multiplier axis, rounded to integer bands"
-)]
 fn snapshot_panel(input: &StatsInput, compared: &[&BlockInfo], shown: &mut StatsShown) {
     let Some(digest) = input.digest else {
         shown.empty = "Сохранённый расчёт читается…".into();
@@ -1417,19 +1464,14 @@ fn snapshot_panel(input: &StatsInput, compared: &[&BlockInfo], shown: &mut Stats
             ]
         })
         .collect();
-    let (t0, t1, step) = value_range(Scale::Efficiency, &[], &values);
-    let frame = Frame {
-        lo: low.floor() as i32,
-        hi: high.ceil() as i32,
-        t0,
-        t1,
-        swap: input.swap,
+    let ratio_values: Vec<f64> = available
+        .iter()
+        .flat_map(|(_, c)| c.points.iter().map(|p| p.ratio))
+        .collect();
+    let Some(frame) = resolve_frame(input, &ratio_values, &values, shown) else {
+        return;
     };
-    let mut tick = t0;
-    while tick <= t1 + 1e-9 {
-        shown.ticks.push((f(frame.value(tick)), format!("{tick:.1}")));
-        tick += step;
-    }
+    fill_ticks(&frame, input.scale, shown);
     let mut ordered = available;
     ordered.sort_by_key(|(block, _)| input.highlight == Some(block.index));
     snapshot_series(input, &frame, &ordered, shown);
@@ -1466,24 +1508,27 @@ fn snapshot_series(input: &StatsInput, frame: &Frame, ordered: &[SnapshotCurve],
             ..SeriesShown::default()
         };
         if input.model {
-            solid_path(&points, frame, &mut series.model);
-            dashed_path(&alternate, frame, &mut series.model_dash);
-            series.model_line = vec![
-                points
-                    .iter()
-                    .map(|&(r, v)| {
-                        let (x, y) = frame.turn(r, v);
-                        (f(x), f(y))
-                    })
-                    .collect(),
-            ];
+            for run in clipped(&points) {
+                solid_path(&run, frame, &mut series.model);
+                series.model_line.push(
+                    run.iter()
+                        .map(|&(r, v)| {
+                            let (x, y) = frame.turn(r, v);
+                            (f(x), f(y))
+                        })
+                        .collect(),
+                );
+            }
+            for run in clipped(&alternate) {
+                dashed_path(&run, frame, &mut series.model_dash);
+            }
         }
         shown.series.push(series);
     }
 }
 
 fn snapshot_columns(frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsShown) {
-    for ratio in frame.lo..=frame.hi {
+    for ratio in (frame.lo..=frame.hi).filter(|&r| (0.0..=1.0).contains(&frame.along(r))) {
         let mut tip = format!(
             "×{ratio} · сохранённый экспериментальный расчёт\nСплошная и пунктир — разные подгонки при одном окружении; между узлами — линейная интерполяция."
         );
@@ -1515,9 +1560,22 @@ fn snapshot_columns(frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsS
     }
 }
 
+fn uncertainty_path(frame: &Frame, ratio: i32, low: f64, high: f64, out: &mut String) {
+    if let Some(((x0, y0), (x1, y1))) = unit_viewport().segment(frame.place(ratio, low), frame.place(ratio, high)) {
+        let _ = write!(
+            out,
+            "M {:.1} {:.1} L {:.1} {:.1} ",
+            x0 * 1000.0,
+            (1.0 - y0) * 1000.0,
+            x1 * 1000.0,
+            (1.0 - y1) * 1000.0
+        );
+    }
+}
+
 /// Вид «эффективность» (бриф 16.10): у каждого выбранного блока — точки по целым множителям (производительность на
 /// градус) своим цветом, соединённые линией между соседними множителями, с усами разброса по четырём частям данных;
-/// ось — от нуля до наибольшей с запасом; ось множителя — общая. Заливка точки — ø нагрузка корзины, бледность — её
+/// шкалы охватывают выбранные точки с усами. Заливка точки — ø нагрузка корзины, бледность — её
 /// время, как у сырых корзин.
 fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo], shown: &mut StatsShown) {
     let fitted = digest.model.as_deref();
@@ -1538,24 +1596,13 @@ fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo]
         };
         return;
     }
-    let Some((lo, hi)) = axis(input.blocks, input.fused, Some(digest)) else {
+    let values: Vec<f64> = points.iter().flatten().flat_map(|p| [p.value, p.lo, p.hi]).collect();
+    let ratio_values: Vec<f64> = points.iter().flatten().map(|p| f64::from(p.ratio)).collect();
+    let Some(frame) = resolve_frame(input, &ratio_values, &values, shown) else {
         return;
     };
-    let values: Vec<f64> = points.iter().flatten().flat_map(|p| [p.value, p.lo, p.hi]).collect();
-    let (t0, t1, step) = value_range(Scale::Efficiency, &[], &values);
-    let frame = Frame {
-        lo,
-        hi,
-        t0,
-        t1,
-        swap: input.swap,
-    };
-    let decimals = usize::from(step < 1.0);
-    let mut t = t0;
-    while t <= t1 + 1e-9 {
-        shown.ticks.push((f(frame.value(t)), format!("{t:.decimals$}")));
-        t += step;
-    }
+    let (lo, hi) = (frame.lo, frame.hi);
+    fill_ticks(&frame, Scale::Efficiency, shown);
     let most = points.iter().flatten().map(|p| p.secs).fold(0.0, f64::max);
     let mut order: Vec<usize> = (0..compared.len()).collect();
     order.sort_by_key(|&i| input.highlight == Some(compared[i].index));
@@ -1567,16 +1614,7 @@ fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo]
         let ratios: Vec<i32> = pts.iter().map(|p| p.ratio).collect();
         let mut whiskers = String::new();
         for p in pts {
-            let (x, y0) = frame.place(p.ratio, p.lo);
-            let (_, y1) = frame.place(p.ratio, p.hi);
-            let _ = write!(
-                whiskers,
-                "M {:.1} {:.1} L {:.1} {:.1} ",
-                x * 1000.0,
-                (1.0 - y0) * 1000.0,
-                x * 1000.0,
-                (1.0 - y1) * 1000.0
-            );
+            uncertainty_path(&frame, p.ratio, p.lo, p.hi, &mut whiskers);
         }
         shown.series.push(SeriesShown {
             block: b.index,
@@ -1588,6 +1626,7 @@ fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo]
                 .iter()
                 .zip(&at)
                 .zip(&inks)
+                .filter(|((_, at), _)| inside(**at))
                 .map(|((p, &(x, y)), &a)| PointShown {
                     ratio: p.ratio,
                     x: f(x),
@@ -1600,7 +1639,7 @@ fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo]
             ..SeriesShown::default()
         });
     }
-    for ratio in lo..=hi {
+    for ratio in (lo..=hi).filter(|&r| (0.0..=1.0).contains(&frame.along(r))) {
         shown.columns.push(ColumnShown {
             ratio,
             at: f(frame.along(ratio)),
@@ -1755,7 +1794,7 @@ mod tests {
         digest: &Digest,
         compared: &[usize],
         highlight: Option<usize>,
-        fused: Option<&[i64]>,
+        _fused: Option<&[i64]>,
         scale: Scale,
         swap: bool,
     ) -> StatsShown {
@@ -1763,7 +1802,6 @@ mod tests {
             blocks: &blocks(),
             compared,
             highlight,
-            fused,
             cutoff: None,
             digest: Some(digest),
             scale,
@@ -1803,8 +1841,8 @@ mod tests {
                 && tip.contains("ø 80.0 °C · 95 % ниже 80 °C · ▲ 80 °C: ×50.0, нагрузка 100 %, 15.10 10:00:19"),
             "{tip}"
         );
-        assert_eq!(s.ticks.first().map(|t| t.1.as_str()), Some("40°"));
-        assert_eq!(s.ticks.last().map(|t| t.1.as_str()), Some("100°"));
+        let range = s.value_range.expect("диапазон выбранных данных");
+        assert!(range.min > 60.0 && range.min < 70.0 && range.max > 80.0 && range.max < 90.0);
         let e = stats(&d, &[1], None, None);
         assert!(
             e.series.is_empty() && e.empty.contains("нет ни одного среза"),
@@ -1826,16 +1864,17 @@ mod tests {
             tip.contains("над остальным кристаллом") && tip.contains("ø +20.0 °C"),
             "{tip}"
         );
-        // Ось: 0…+20 с шагом 5, ноль — на оси, подписи со знаком.
+        // Шкала охватывает выбранные +10…+20; ноль вне неё не добавляется.
         let ticks: Vec<&str> = s.ticks.iter().map(|t| t.1.as_str()).collect();
-        assert_eq!(ticks, ["0°", "+5°", "+10°", "+15°", "+20°"]);
-        assert!((s.zero - 0.0).abs() < 1e-6);
+        assert!(ticks.iter().all(|s| s.starts_with('+')));
+        let range = s.value_range.expect("автодиапазон");
+        assert!(range.min > 0.0 && range.min < 10.0 && range.max > 20.0);
+        assert!(s.zero < 0.0);
         // Отсечка автомодуля (абсолютная) на этой шкале не рисуется.
         let with_cutoff = stats_panel(&StatsInput {
             blocks: &blocks(),
             compared: &[0],
             highlight: None,
-            fused: None,
             cutoff: Some(85.0),
             digest: Some(&d),
             scale: Scale::AboveDie,
@@ -1868,19 +1907,29 @@ mod tests {
     }
 
     #[test]
-    fn the_multiplier_axis_is_one_for_all_blocks_whatever_is_compared() {
+    fn auto_axes_follow_selected_blocks_and_manual_axes_are_shared() {
         let d = thirty(true);
         let fused = [53, 46, 46, 46, 46];
         assert_eq!(axis(&blocks(), Some(&fused), Some(&d)), Some((32, 54)));
         let p = stats(&d, &[0], None, Some(&fused));
         let e = stats(&d, &[1], None, Some(&fused));
         let both = stats(&d, &[0, 1], None, Some(&fused));
-        let columns = |s: &StatsShown| s.columns.iter().map(|c| (c.ratio, c.at)).collect::<Vec<_>>();
-        assert_eq!(columns(&p), columns(&e), "P и E — на одной оси");
-        assert_eq!(columns(&p), columns(&both));
-        assert_eq!(p.ticks, e.ticks, "и температура — на одной");
-        let low = digest(&["2026-10-15 10:00:00,60,,,53,30,1,70,46,44,0,60".to_string()]);
-        assert_eq!(axis(&blocks(), Some(&fused), Some(&low)), Some((30, 54)));
+        assert!(p.argument_range.expect("P").min > e.argument_range.expect("E").max);
+        let all = both.argument_range.expect("общая шкала");
+        assert!(all.min < 44.0 && all.max > 50.0 && all.max < 53.0);
+        for compared in [&[0][..], &[1][..], &[0, 1][..]] {
+            let s = stats_panel(&StatsInput {
+                blocks: &blocks(),
+                compared,
+                digest: Some(&d),
+                scale: Scale::Absolute,
+                argument_range: Range::new(40.0, 55.0),
+                value_range: Range::new(50.0, 90.0),
+                ..StatsInput::default()
+            });
+            assert_eq!(s.argument_range, Range::new(40.0, 55.0));
+            assert_eq!(s.value_range, Range::new(50.0, 90.0));
+        }
     }
 
     #[test]
@@ -1924,7 +1973,6 @@ mod tests {
                 blocks: &blocks(),
                 compared: &[0],
                 highlight: None,
-                fused: None,
                 cutoff: None,
                 digest: Some(&d),
                 scale: Scale::Absolute,
@@ -1940,13 +1988,13 @@ mod tests {
         assert!(!mean.series[0].mean.is_empty() && mean.series[0].p95.is_empty());
         let p95 = with(Curves::P95);
         assert!(p95.series[0].mean.is_empty() && !p95.series[0].p95.is_empty());
-        assert_eq!(both.ticks, mean.ticks, "ось температуры от выбора линий не зависит");
+        assert!(mean.value_range.expect("среднее").max <= both.value_range.expect("обе").max);
         // Оба выключены — пустой график с осями: ни одной линии, оси и столбцы те же, надписи «нет данных» нет.
         let neither = with(Curves::Neither);
         assert!(neither.series[0].mean.is_empty() && neither.series[0].p95.is_empty());
         assert_eq!(
-            (&neither.ticks, neither.columns.len(), &neither.empty),
-            (&both.ticks, both.columns.len(), &both.empty)
+            (neither.columns.len(), &neither.empty),
+            (both.columns.len(), &both.empty)
         );
     }
 
@@ -2008,8 +2056,8 @@ mod tests {
             blocks: &blocks(),
             compared: &[0],
             highlight: None,
-            fused: None,
             cutoff: Some(85.0),
+            value_range: Range::new(40.0, 100.0),
             digest: Some(&d),
             scale: Scale::Absolute,
             curves: Curves::Both,
@@ -2051,6 +2099,7 @@ mod tests {
             t0: 40.0,
             t1: 100.0,
             swap: false,
+            argument_range: None,
         };
         let swapped = Frame { swap: true, ..normal };
         let (x, y) = normal.place(45, 70.0);
@@ -2058,6 +2107,66 @@ mod tests {
         assert_eq!(swapped.place(45, 70.0), (y, x));
         assert_eq!(normal.band(45), (0.5, 0.0, 0.1, 1.0));
         assert_eq!(swapped.band(45), (0.0, 0.5, 1.0, 0.1));
+    }
+
+    #[test]
+    fn uncertainty_transposes_both_endpoints_and_clips_both_axes() {
+        let normal = Frame {
+            lo: 40,
+            hi: 50,
+            t0: 60.0,
+            t1: 80.0,
+            swap: false,
+            argument_range: Range::new(40.0, 50.0),
+        };
+        let swapped = Frame { swap: true, ..normal };
+        let mut a = String::new();
+        let mut b = String::new();
+        uncertainty_path(&normal, 45, 55.0, 85.0, &mut a);
+        uncertainty_path(&swapped, 45, 55.0, 85.0, &mut b);
+        assert_eq!(a, "M 500.0 1000.0 L 500.0 0.0 ");
+        assert_eq!(b, "M 0.0 500.0 L 1000.0 500.0 ");
+        let mut outside = String::new();
+        uncertainty_path(&normal, 60, 55.0, 85.0, &mut outside);
+        assert_eq!(outside, "");
+    }
+
+    #[test]
+    fn fractional_manual_argument_clips_lines_and_does_not_expand_column_loop() {
+        let rows: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    "2026-10-15 10:00:{i:02},60,,,53,{},1,{},46,44,0.5,60",
+                    48 + i / 10,
+                    70 + i % 4
+                )
+            })
+            .collect();
+        let d = digest(&rows);
+        let s = stats_panel(&StatsInput {
+            blocks: &blocks(),
+            compared: &[0],
+            digest: Some(&d),
+            scale: Scale::Absolute,
+            argument_range: Range::new(48.2, 48.8),
+            value_range: Range::new(65.0, 80.0),
+            ..StatsInput::default()
+        });
+        assert_eq!(s.columns, [] as [ColumnShown; 0]);
+        let path = &s.series[0].mean[0].1;
+        let values: Vec<f64> = path.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[2], 1000.0);
+        let wide = stats_panel(&StatsInput {
+            blocks: &blocks(),
+            compared: &[0],
+            digest: Some(&d),
+            scale: Scale::Absolute,
+            argument_range: Range::new(-1e100, 1e100),
+            value_range: Range::new(-1e100, 1e100),
+            ..StatsInput::default()
+        });
+        assert!(wide.columns.len() <= 2 && wide.ticks.len() <= 11);
     }
 
     #[test]
@@ -2151,10 +2260,7 @@ mod tests {
         assert!(!core.model.is_empty() && !core.model_dash.is_empty(), "{core:?}");
         assert!(s.series[1].model.is_empty() && s.series[1].model_dash.is_empty());
         // Сплошная — от ×44 до ×48 (наблюдённые под нагрузкой): её x — в столбцах 44…48 оси.
-        let frame_x = |r: f64| {
-            f64::from(s.columns[0].at)
-                + (r - f64::from(s.columns[0].ratio)) / f64::from(u16::try_from(s.columns.len()).unwrap_or(1))
-        };
+        let frame_x = |r: f64| s.argument_range.expect("множители").normal(r).expect("доля");
         let xs: Vec<f64> = core
             .model
             .split_whitespace()
@@ -2193,7 +2299,6 @@ mod tests {
             blocks: &blocks(),
             compared: &[0, 1],
             highlight: None,
-            fused: Some(&fused),
             cutoff: None,
             digest: Some(&d),
             scale: Scale::AboveDie,

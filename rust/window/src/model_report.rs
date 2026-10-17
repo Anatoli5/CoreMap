@@ -323,6 +323,7 @@ fn shape_line(b: &model::BlockModel, c: &model::Coef, text: &mut String) {
         steps.join(", "),
         s.at(model::REFERENCE)
     );
+    efficiency_support(b, text);
     let points: Vec<String> = b
         .efficiency()
         .iter()
@@ -348,6 +349,34 @@ fn shape_line(b: &model::BlockModel, c: &model::Coef, text: &mut String) {
             points.join(", ")
         }
     );
+}
+
+fn efficiency_support(b: &model::BlockModel, text: &mut String) {
+    let mut bins = Vec::with_capacity(b.own_bins.len());
+    for bin in &b.own_bins {
+        let ratio = f64::from(bin.ratio);
+        let heat = b.own_heat(ratio);
+        let range = b.own_heat_range(ratio);
+        let exposure = bin.secs * bin.load;
+        let why = if !b.drawn() {
+            "model-not-ready"
+        } else if b.folds.len() != 4 {
+            "missing-fold"
+        } else if exposure < model::MIN_BIN_SECS {
+            "insufficient-busy-time"
+        } else if range.is_none_or(|(lo, _)| lo <= 0.0) {
+            "own-heat-not-separated-from-zero"
+        } else {
+            "shown"
+        };
+        let heat = heat.map_or_else(|| "?".into(), |v| format!("{v:.6}"));
+        let range = range.map_or_else(|| "?".into(), |(lo, hi)| format!("{lo:.6}..{hi:.6}"));
+        bins.push(format!(
+            "x{} busy-seconds={exposure:.3} heat={heat} folds={range} {why}",
+            bin.ratio
+        ));
+    }
+    let _ = writeln!(text, "  efficiency support: {}", bins.join("; ")); // Запись в String не отказывает.
 }
 
 /// Целое как f64 (множители, 0..80).

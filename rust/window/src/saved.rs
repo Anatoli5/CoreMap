@@ -11,6 +11,7 @@
 // Негодная часть файла заменяется значением по умолчанию только у себя (владелец: наследовать, умолчание — только
 // когда родителя нет): блока больше нет — он выпадает, остальные остаются; место, где заголовок не виден ни на одном
 // экране, — окно ставит Windows, размер прежний; размер меньше наименьшего — наименьший.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -18,10 +19,25 @@ use slint::{ComponentHandle, LogicalSize, PhysicalPosition};
 
 use crate::AppWindow;
 use crate::chart::{Curves, Scale};
+use crate::plot::Range;
 use crate::timeline::{Layout, Quantity};
 use crate::wire::BlockInfo;
 
 pub const FILE: &str = "window.json";
+
+pub fn selected_metrics(saved: &Saved) -> Vec<Quantity> {
+    saved.metrics.as_ref().map_or_else(
+        || {
+            if saved.layout == Some(Layout::Params) {
+                Quantity::ALL.into_iter().filter(|q| *q != Quantity::GpuBusy).collect()
+            } else {
+                vec![saved.quantity.unwrap_or_default()]
+            }
+        },
+        |items| items.iter().copied().map(Quantity::of).collect(),
+    )
+}
+
 /// Размер больше этого (логические точки) — испорченное число, а не окно.
 const LARGEST: f32 = 16_384.0;
 /// Полоса заголовка от левого верхнего угла окна (физические точки): за неё окно берут мышью.
@@ -53,6 +69,11 @@ impl Rect {
 /// Что лежит в файле. None у поля — его нет или оно негодно: берётся значение по умолчанию.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Saved {
+    pub ranges: BTreeMap<String, Range>,
+    pub metrics: Option<Vec<i32>>,
+    pub normalized: Option<bool>,
+    pub time_follow: Option<bool>,
+    pub range_parameter: Option<i32>,
     /// Блоки в сравнении по порядку добавления: названия (как в знакомстве).
     pub compared: Vec<String>,
     /// Подсветка закреплённая (true) или под курсором (false).
@@ -89,6 +110,42 @@ pub struct Placement {
     pub size: Option<(f32, f32)>,
     pub position: Option<(i32, i32)>,
     pub maximized: bool,
+}
+
+fn ranges_of(map: &Map<String, Value>) -> BTreeMap<String, Range> {
+    map.get("ranges")
+        .and_then(Value::as_object)
+        .map(|ranges| {
+            ranges
+                .iter()
+                .filter_map(|(key, value)| {
+                    let pair = value.as_array()?;
+                    let [min, max] = pair.as_slice() else {
+                        return None;
+                    };
+                    let range = Range::new(min.as_f64()?, max.as_f64()?)?;
+                    if key.starts_with("time:") && range.milliseconds().is_none() {
+                        return None;
+                    }
+                    Some((key.clone(), range))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn metrics_of(map: &Map<String, Value>) -> Option<Vec<i32>> {
+    let items = map.get("metrics")?.as_array()?;
+    let mut kept = Vec::with_capacity(items.len().min(Quantity::ALL.len()));
+    for index in items
+        .iter()
+        .filter_map(|v| i32::try_from(v.as_i64()?).ok().filter(|n| (0..10).contains(n)))
+    {
+        if !kept.contains(&index) {
+            kept.push(index);
+        }
+    }
+    Some(kept)
 }
 
 /// Разбор файла. Err — это не объект JSON (файл испорчен целиком); поля разбираются каждое само по себе.
@@ -140,6 +197,15 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         _ => None,
     };
     Ok(Saved {
+        ranges: ranges_of(&map),
+        metrics: metrics_of(&map),
+        normalized: map.get("normalized").and_then(Value::as_bool),
+        time_follow: map.get("timeFollow").and_then(Value::as_bool),
+        range_parameter: map
+            .get("rangeParameter")
+            .and_then(Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|v| (0..10).contains(v)),
         compared,
         pin: map.get("pin").and_then(Value::as_bool),
         view: match map.get("view").and_then(Value::as_str) {
@@ -161,6 +227,7 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         layout: match map.get("layout").and_then(Value::as_str) {
             Some("blocks") => Some(Layout::Blocks),
             Some("params") => Some(Layout::Params),
+            Some("overlay") => Some(Layout::Overlay),
             _ => None,
         },
         quantity: match map.get("quantity").and_then(Value::as_str) {
@@ -169,6 +236,11 @@ pub fn parse(text: &str) -> Result<Saved, String> {
             Some("ceiling") => Some(Quantity::Ceiling),
             Some("busy") => Some(Quantity::Busy),
             Some("die") => Some(Quantity::Level),
+            Some("gpu-temp") => Some(Quantity::GpuTemp),
+            Some("gpu-power") => Some(Quantity::GpuPower),
+            Some("gpu-busy") => Some(Quantity::GpuBusy),
+            Some("fan-cpu") => Some(Quantity::FanCpu),
+            Some("fan-gpu") => Some(Quantity::FanGpu),
             _ => None,
         },
         events_all: map.get("eventsAll").and_then(Value::as_bool),
@@ -184,6 +256,30 @@ pub fn parse(text: &str) -> Result<Saved, String> {
 #[must_use]
 pub fn text(saved: &Saved) -> String {
     let mut map = Map::new();
+    if let Some(value) = saved.time_follow {
+        map.insert("timeFollow".into(), value.into());
+    }
+    if let Some(value) = saved.normalized {
+        map.insert("normalized".into(), value.into());
+    }
+    if let Some(value) = saved.range_parameter {
+        map.insert("rangeParameter".into(), value.into());
+    }
+    if !saved.ranges.is_empty() {
+        map.insert(
+            "ranges".into(),
+            Value::Object(
+                saved
+                    .ranges
+                    .iter()
+                    .map(|(key, range)| (key.clone(), json!([range.min, range.max])))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(metrics) = &saved.metrics {
+        map.insert("metrics".into(), json!(metrics));
+    }
     map.insert("compared".into(), json!(saved.compared));
     if let Some(pin) = saved.pin {
         map.insert("pin".into(), pin.into());
@@ -208,6 +304,7 @@ pub fn text(saved: &Saved) -> String {
         let name = match layout {
             Layout::Blocks => "blocks",
             Layout::Params => "params",
+            Layout::Overlay => "overlay",
         };
         map.insert("layout".into(), name.into());
     }
@@ -218,6 +315,11 @@ pub fn text(saved: &Saved) -> String {
             Quantity::Ceiling => "ceiling",
             Quantity::Busy => "busy",
             Quantity::Level => "die",
+            Quantity::GpuTemp => "gpu-temp",
+            Quantity::GpuPower => "gpu-power",
+            Quantity::GpuBusy => "gpu-busy",
+            Quantity::FanCpu => "fan-cpu",
+            Quantity::FanGpu => "fan-gpu",
         };
         map.insert("quantity".into(), name.into());
     }
@@ -374,6 +476,11 @@ mod tests {
     #[test]
     fn what_was_written_comes_back() {
         let saved = Saved {
+            ranges: BTreeMap::new(),
+            metrics: None,
+            normalized: None,
+            time_follow: None,
+            range_parameter: None,
             compared: vec!["2–5".into(), "0".into()],
             pin: Some(true),
             view: Some(Scale::Absolute),
@@ -412,6 +519,73 @@ mod tests {
                 maximized: false
             }
         );
+    }
+
+    #[test]
+    fn chart_ranges_metrics_and_layout_roundtrip_without_losing_independent_settings() {
+        let ranges = BTreeMap::from([
+            ("ratio".into(), Range::new(41.25, 47.5).expect("множители")),
+            ("ratio-value:3".into(), Range::new(0.75, 4.25).expect("эффективность")),
+            ("time:2026-10-17".into(), Range::new(10.25, 62.5).expect("минуты")),
+            ("parameter:5".into(), Range::new(35.0, 80.0).expect("GPU")),
+            ("time-value:4".into(), Range::new(1200.0, 5100.0).expect("обороты")),
+        ]);
+        for normalized in [false, true] {
+            let saved = Saved {
+                ranges: ranges.clone(),
+                metrics: Some(vec![0, 2, 5, 8, 9]),
+                normalized: Some(normalized),
+                range_parameter: Some(8),
+                swap: Some(true),
+                timeline: Some(true),
+                layout: Some(Layout::Overlay),
+                view: Some(Scale::ConditionalEfficiency),
+                ..Saved::default()
+            };
+            assert_eq!(parse(&text(&saved)).expect("свой файл"), saved);
+        }
+    }
+
+    #[test]
+    fn bad_range_is_dropped_alone_and_missing_metrics_differs_from_explicit_empty() {
+        let saved=parse(r#"{"ranges":{"ratio":[41.5,49.25],"time-value:0":[80,60],"parameter:5":[5,5],"broken":[1],"wrong":["1",2]},"metrics":[5,"bad",-1,10,0,5,9],"normalized":true,"rangeParameter":8,"layout":"overlay","swap":true}"#).expect("объект");
+        assert_eq!(
+            saved.ranges,
+            BTreeMap::from([("ratio".into(), Range::new(41.5, 49.25).expect("диапазон"))])
+        );
+        assert_eq!(
+            saved.metrics,
+            Some(vec![5, 0, 9]),
+            "повторы не создают неотключаемый ряд"
+        );
+        assert_eq!(
+            (saved.normalized, saved.range_parameter, saved.layout, saved.swap),
+            (Some(true), Some(8), Some(Layout::Overlay), Some(true))
+        );
+        assert_eq!(
+            parse(r#"{"layout":"params","quantity":"busy"}"#)
+                .expect("прежний файл")
+                .metrics,
+            None
+        );
+        assert_eq!(
+            parse(r#"{"metrics":[]}"#).expect("пустой выбор").metrics,
+            Some(Vec::new())
+        );
+        let bad = parse(r#"{"normalized":"yes","rangeParameter":99,"metrics":"all","ranges":[],"swap":false}"#)
+            .expect("поля независимы");
+        assert!(
+            bad.ranges.is_empty() && bad.metrics.is_none() && bad.normalized.is_none() && bad.range_parameter.is_none()
+        );
+        assert_eq!(bad.swap, Some(false));
+    }
+
+    #[test]
+    fn time_ranges_reject_unrepresentable_or_submillisecond_intervals_alone() {
+        let s=parse(r#"{"ranges":{"time:overflow":[0,1e100],"time:collapsed":[0,0.0000000001],"time:valid":[-1,1500],"ratio":[1,1e100]},"swap":true}"#).expect("объект");
+        assert_eq!(s.ranges.len(), 2);
+        assert!(s.ranges.contains_key("time:valid") && s.ranges.contains_key("ratio"));
+        assert_eq!(s.swap, Some(true));
     }
 
     #[test]

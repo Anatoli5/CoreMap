@@ -155,8 +155,16 @@ export struct TimeRef {
 export struct TimeStrip {
     title: string,
     ticks: [Tick],
+    right-ticks: [Tick],
     picture: image,
     refs: [TimeRef],
+}
+
+export struct MetricChoice {
+    index: int,
+    text: string,
+    on: bool,
+    tip: string,
 }
 
 export struct TimeMark {
@@ -243,6 +251,7 @@ component CheckBox inherits Rectangle {
     in property <bool> enabled: true;
     callback toggled();
     callback hover(bool);
+    callback wheel(float);
     height: 22px;
     Rectangle {
         x: 0;
@@ -276,6 +285,7 @@ component CheckBox inherits Rectangle {
         mouse-cursor: root.enabled ? pointer : default;
         clicked => { root.toggled(); }
         changed has-hover => { root.hover(self.has-hover); }
+        scroll-event(event) => { root.wheel(event.delta-y / 1px); accept }
     }
 }
 
@@ -414,6 +424,77 @@ component Chip inherits Rectangle {
         }
         changed has-hover => { root.hover(self.has-hover); }
     }
+}
+
+component RangeRow inherits Rectangle {
+    in property <string> title;
+    in property <string> minimum;
+    in property <string> maximum;
+    in property <bool> auto;
+    callback auto-changed(bool);
+    callback edited(string, string);
+    callback zoom(float);
+    callback fit();
+    out property <length> auto-x: auto-check.x + auto-check.width / 2;
+    out property <length> low-x: low.absolute-position.x + low.width / 2;
+    out property <length> high-x: high.absolute-position.x + high.width / 2;
+    out property <length> field-y: low.absolute-position.y + low.height / 2;
+    out property <length> fit-x: fit-button.absolute-position.x + fit-button.width / 2;
+    out property <length> fit-y: fit-button.absolute-position.y + fit-button.height / 2;
+    property <bool> dirty;
+    height: 26px;
+    function commit() {
+        if (root.dirty) {
+            root.dirty = false;
+            root.edited(low.text, high.text);
+        }
+    }
+    Text {
+        x: 0; width: 88px; height: root.height;
+        text: root.title; color: Palette.dim; font-size: 11px;
+        vertical-alignment: center; overflow: elide;
+    }
+    auto-check := CheckBox {
+        x: 92px; y: 2px; width: 60px;
+        text: "Авто"; on: root.auto;
+        toggled => { root.auto-changed(!root.auto); }
+    }
+    Rectangle {
+        x: 156px; y: 2px; width: max(32px, (root.width - 282px) / 2); height: 22px;
+        background: Palette.bg; border-radius: 3px;
+        border-width: 1px; border-color: low.has-focus ? Palette.accent : Palette.cell;
+        low := TextInput {
+            x: 5px; width: parent.width - 10px; height: parent.height;
+            text: root.minimum; single-line: true; enabled: !root.auto;
+            color: root.auto ? Palette.dim : Palette.text; font-size: 11px;
+            vertical-alignment: center;
+            edited => { root.dirty = true; }
+            accepted => { root.commit(); }
+            changed has-focus => { if (!self.has-focus) { root.commit(); } }
+        }
+    }
+    Text {
+        x: 156px + max(32px, (root.width - 282px) / 2); width: 14px; height: root.height;
+        text: "…"; color: Palette.dim; horizontal-alignment: center; vertical-alignment: center;
+    }
+    Rectangle {
+        x: 170px + max(32px, (root.width - 282px) / 2);
+        y: 2px; width: max(32px, (root.width - 282px) / 2); height: 22px;
+        background: Palette.bg; border-radius: 3px;
+        border-width: 1px; border-color: high.has-focus ? Palette.accent : Palette.cell;
+        high := TextInput {
+            x: 5px; width: parent.width - 10px; height: parent.height;
+            text: root.maximum; single-line: true; enabled: !root.auto;
+            color: root.auto ? Palette.dim : Palette.text; font-size: 11px;
+            vertical-alignment: center;
+            edited => { root.dirty = true; }
+            accepted => { root.commit(); }
+            changed has-focus => { if (!self.has-focus) { root.commit(); } }
+        }
+    }
+    fit-button := Chip { x: root.width - 108px; y: 2px; width: 56px; text: "Вписать"; clicked => { root.fit(); } }
+    Chip { x: root.width - 48px; y: 2px; width: 22px; text: "−"; clicked => { root.zoom(1.25); } }
+    Chip { x: root.width - 22px; y: 2px; width: 22px; text: "+"; clicked => { root.zoom(0.8); } }
 }
 
 // Ползунок целого числа. Пока его тянут, число под ручкой видно сразу (shown, moved — для показа), а применяется оно
@@ -666,12 +747,13 @@ component Chart inherits Rectangle {
     out property <length> plot-w: root.width - root.left - 10px;
     out property <length> plot-h: root.height - root.plot-y - root.axis-h;
     // Столбец множителя: по горизонтали — ширина, по вертикали (swap) — высота.
-    out property <length> band: (root.swap ? root.plot-h : root.plot-w) / max(1, root.columns);
+    out property <length> band: (root.swap ? root.plot-h : root.plot-w)
+        * (root.cols.length > 1 ? max(0, root.cols[1].f - root.cols[0].f) : 1);
     // Подпись каждого множителя, каждого второго или каждого пятого — по размеру столбца.
     property <int> step: root.swap
         ? (root.band >= 14px ? 1 : root.band >= 7px ? 2 : 5)
         : (root.band >= 20px ? 1 : root.band >= 10px ? 2 : 5);
-    property <bool> drawn: root.empty == "" && root.cols.length > 0;
+    property <bool> drawn: root.empty == "" && (root.series.length > 0 || root.cols.length > 0);
     property <string> ratio-title: "множитель, ×";
 
     if root.empty != "": Text {
@@ -712,15 +794,6 @@ component Chart inherits Rectangle {
         width: root.swap ? 1px : root.plot-w;
         height: root.swap ? root.plot-h : 1px;
         background: Palette.dim;
-    }
-
-    // Столбец под курсором — подсветка (подсказка с числами — у окна).
-    if plot-touch.has-hover && root.cols[plot-touch.at-col].tip != "": Rectangle {
-        x: root.swap ? root.plot-x : root.plot-x + plot-touch.at-col * root.band;
-        y: root.swap ? root.plot-y + root.plot-h - (plot-touch.at-col + 1) * root.band : root.plot-y;
-        width: root.swap ? root.plot-w : root.band;
-        height: root.swap ? root.band : root.plot-h;
-        background: #ffffff0c;
     }
 
     // Отсечка автомодуля.
@@ -764,6 +837,7 @@ component Chart inherits Rectangle {
         y: root.plot-y;
         width: root.plot-w;
         height: root.plot-h;
+        clip: true;
         opacity: s.faded ? 0.3 : 1;
         for r in s.p95: Path {
             x: -1px;
@@ -955,282 +1029,339 @@ component Chart inherits Rectangle {
         vertical-alignment: center;
     }
 
-    // Одна область касания на всё поле: столбец под курсором (подсказка), ближайшая линия (Rust), щелчок.
-    plot-touch := TouchArea {
-        x: root.plot-x;
-        y: root.plot-y;
-        width: root.plot-w;
-        height: root.plot-h;
+    // Границы выбора — середины между фактическими координатами соседних множителей.
+    // Ручной диапазон может обрезать крайние столбцы или вовсе не содержать целых множителей.
+    for c[i] in root.cols: Rectangle {
+        width: root.width; height: root.height;
+        column-hit := Rectangle {
+            property <float> lo: max(0, min(1, i > 0
+                ? (root.cols[i - 1].f + c.f) / 2 : 0));
+            property <float> hi: max(0, min(1, i + 1 < root.cols.length
+                ? (c.f + root.cols[i + 1].f) / 2 : 1));
+            x: root.swap ? root.plot-x : root.plot-x + self.lo * root.plot-w;
+            y: root.swap ? root.plot-y + (1 - self.hi) * root.plot-h : root.plot-y;
+            width: root.swap ? root.plot-w : max(0px, (self.hi - self.lo) * root.plot-w);
+            height: root.swap ? max(0px, (self.hi - self.lo) * root.plot-h) : root.plot-h;
+            background: column-touch.has-hover && c.tip != "" ? #ffffff0c : transparent;
+            column-touch := TouchArea {
+                enabled: root.drawn;
+                function show() {
+                    root.tip(true, "col" + i, c.tip,
+                        self.absolute-position.x, self.absolute-position.y, self.width, self.height,
+                        self.absolute-position.x - column-hit.x + root.plot-x,
+                        self.absolute-position.y - column-hit.y + root.plot-y,
+                        root.plot-w, root.plot-h,
+                        self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                    root.pointer(self.mouse-x + column-hit.x - root.plot-x,
+                        self.mouse-y + column-hit.y - root.plot-y, root.plot-w, root.plot-h);
+                }
+                changed has-hover => {
+                    if (self.has-hover) { self.show(); }
+                    else {
+                        root.tip(false, "col" + i, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                        root.exited();
+                    }
+                }
+                changed mouse-x => { if (self.has-hover) { self.show(); } }
+                changed mouse-y => { if (self.has-hover) { self.show(); } }
+                clicked => {
+                    root.clicked-at(self.mouse-x + column-hit.x - root.plot-x,
+                        self.mouse-y + column-hit.y - root.plot-y, root.plot-w, root.plot-h);
+                }
+            }
+        }
+    }
+    // Линия видна и между целыми множителями: подсветка блоков остаётся доступной.
+    if root.cols.length == 0: TouchArea {
+        x: root.plot-x; y: root.plot-y; width: root.plot-w; height: root.plot-h;
         enabled: root.drawn;
-        out property <int> at-col: max(0, min(root.cols.length - 1,
-            floor((root.swap ? root.plot-h - self.mouse-y : self.mouse-x) / root.band)));
-        function show() {
-            root.tip(true, "col" + self.at-col, root.cols[self.at-col].tip,
-                self.absolute-position.x + (root.swap ? 0 : self.at-col * root.band),
-                self.absolute-position.y + (root.swap ? root.plot-h - (self.at-col + 1) * root.band : 0),
-                root.swap ? root.plot-w : root.band,
-                root.swap ? root.band : root.plot-h,
-                self.absolute-position.x, self.absolute-position.y, root.plot-w, root.plot-h,
-                self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
-        }
-        changed at-col => {
-            if (self.has-hover) {
-                self.show();
-            }
-        }
-        changed has-hover => {
-            if (self.has-hover) {
-                self.show();
-            } else {
-                root.tip(false, "col" + self.at-col, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                root.exited();
-            }
-        }
-        changed mouse-x => {
-            if (self.has-hover) {
-                self.show();
-                root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
-            }
-        }
-        changed mouse-y => {
-            if (self.has-hover) {
-                self.show();
-                root.pointer(self.mouse-x, self.mouse-y, self.width, self.height);
-            }
-        }
+        changed mouse-x => { if (self.has-hover) { root.pointer(self.mouse-x, self.mouse-y, self.width, self.height); } }
+        changed mouse-y => { if (self.has-hover) { root.pointer(self.mouse-x, self.mouse-y, self.width, self.height); } }
+        changed has-hover => { if (!self.has-hover) { root.exited(); } }
         clicked => { root.clicked-at(self.mouse-x, self.mouse-y, self.width, self.height); }
     }
 }
 
 // Вид «по времени» (src/timeline.rs, бриф W): полосы одна под другой на общей оси времени, отметки действий автомодуля
-// под полосами, подписи времени внизу. Колесо — масштаб вокруг курсора, перетаскивание — сдвиг (Rust пересчитывает
+// под полосами, подписи времени внизу. Колесо — масштаб от конца видимого окна, перетаскивание — сдвиг (Rust пересчитывает
 // показ и прореживание); курсор — подсказка со значениями всех рядов в ближайшей строке.
+// Обзор записанного дня: положение и длина окна приходят из общего состояния Rust.
+component TimeOverview inherits Rectangle {
+    in property <float> start;
+    in property <float> end: 1;
+    in property <bool> vertical;
+    callback moved(float);
+    callback hover(bool);
+    property <float> first: max(0, min(1, root.start));
+    property <float> last: max(root.first, min(1, root.end));
+    property <float> span: root.last - root.first;
+    background: Palette.bg;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Palette.line;
+    Rectangle {
+        x: root.vertical ? 2px : root.first * root.width;
+        y: root.vertical ? (1 - root.last) * root.height : 2px;
+        width: root.vertical ? root.width - 4px : max(2px, root.span * root.width);
+        height: root.vertical ? max(2px, root.span * root.height) : root.height - 4px;
+        border-radius: 3px;
+        background: touch.held ? Palette.accent : touch.has-hover ? Palette.text : Palette.dim;
+    }
+    touch := TouchArea {
+        mouse-cursor: self.held ? MouseCursor.grabbing : MouseCursor.pointer;
+        property <bool> held;
+        property <float> grab;
+        property <float> at: root.vertical ? 1 - self.mouse-y / max(1px, self.height)
+            : self.mouse-x / max(1px, self.width);
+        function move() { root.moved(max(0, min(1 - root.span, self.at - self.grab))); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.grab = self.at >= root.first && self.at <= root.last
+                    ? self.at - root.first : root.span / 2;
+                self.held = true;
+                self.move();
+            } else if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                self.held = false;
+            }
+        }
+        changed mouse-x => { if (self.held && !root.vertical) { self.move(); } }
+        changed mouse-y => { if (self.held && root.vertical) { self.move(); } }
+        changed pressed => { if (!self.pressed) { self.held = false; } }
+        changed has-hover => { root.hover(self.has-hover); }
+    }
+}
+
 component TimeChart inherits Rectangle {
     in property <[TimeStrip]> strips;
-    in property <[Tick]> ticks;      // ось времени: доля ширины и подпись
+    in property <[Tick]> ticks;
     in property <[TimeMark]> marks;
-    in property <[TimeDot]> dots;    // события на линиях блоков (раскладка «блоки», одна полоса)
-    in property <[float]> gaps;      // перерывы записи: доля ширины
+    in property <[TimeDot]> dots;
+    in property <[float]> gaps;
     in property <string> head;
     in property <string> empty;
-    callback wheel(length, length, float);                       // курсор от левого края поля, ширина поля, сдвиг колеса
-    callback press(length);                                      // кнопка нажата: курсор от левого края поля
-    callback drag(length, length);                               // курсор от левого края поля, ширина поля
+    in property <bool> swap;
+    in property <float> scroll-start;
+    in property <float> scroll-end: 1;
+    callback scroll(float);
+    callback overview-hover(bool);
+    callback wheel(length, length, float);
+    callback press(length);
+    callback drag(length, length);
     callback release();
-    callback hover(length, length, length, length) -> string;    // курсор и размер поля → текст подсказки
+    callback hover(length, length, length, length) -> string;
     callback tip(bool, string, string, length, length, length, length, length, length, length, length, length, length);
 
-    property <length> left: 44px;
-    property <length> head-h: 18px;
-    property <length> axis-h: 18px;
-    property <length> mark-h: 12px;
-    property <length> gap: 4px;
+    property <length> left: root.swap ? 80px : 44px;
+    property <length> right: root.swap ? 28px : 44px;
+    property <length> head-h: 20px;
+    property <length> gap: root.swap ? 14px : 6px;
+    property <length> mark-h: root.swap ? 0px : 12px;
     out property <length> plot-x: root.left;
-    out property <length> plot-y: root.head-h;
-    out property <length> plot-w: root.width - root.left - 10px;
-    out property <length> plot-h: root.height - root.head-h - root.axis-h - root.mark-h;
-    property <length> strip-h: (root.plot-h - (root.strips.length - 1) * root.gap) / max(1, root.strips.length);
+    out property <length> plot-y: root.head-h + (root.swap ? 16px : 0px);
+    out property <length> plot-w: max(1px, root.width - root.left - root.right);
+    out property <length> plot-h: max(1px, root.height - root.plot-y - (root.swap ? 24px : 42px) - root.mark-h);
+    out property <length> scroll-x: overview.x;
+    out property <length> scroll-y: overview.y;
+    out property <length> scroll-w: overview.width;
+    out property <length> scroll-h: overview.height;
+    property <length> strip-h: root.swap ? root.plot-h
+        : max(1px, (root.plot-h - (root.strips.length - 1) * root.gap) / max(1, root.strips.length));
+    property <length> strip-w: root.swap
+        ? max(1px, (root.plot-w - (root.strips.length - 1) * root.gap) / max(1, root.strips.length))
+        : root.plot-w;
     property <bool> drawn: root.empty == "" && root.strips.length > 0;
 
     if root.empty != "": Text {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
-        text: root.empty;
-        color: Palette.dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        wrap: word-wrap;
+        width: root.width; height: root.height;
+        text: root.empty; color: Palette.dim;
+        horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap;
     }
     if root.drawn: Text {
-        x: root.plot-x;
-        y: 0;
-        width: root.plot-w;
-        height: root.head-h - 2px;
-        text: root.head;
-        color: Palette.dim;
-        font-size: 11px;
-        vertical-alignment: center;
-        overflow: elide;
+        x: root.plot-x; width: root.plot-w; height: root.head-h - 2px;
+        text: root.head; color: Palette.dim; font-size: 11px;
+        vertical-alignment: center; overflow: elide;
     }
     for s[i] in root.strips: Rectangle {
         visible: root.drawn;
-        x: root.plot-x;
-        y: root.plot-y + i * (root.strip-h + root.gap);
-        width: root.plot-w;
-        height: root.strip-h;
-        background: #ffffff06;
-        clip: true;
+        x: root.plot-x + (root.swap ? i * (root.strip-w + root.gap) : 0px);
+        y: root.plot-y + (root.swap ? 0px : i * (root.strip-h + root.gap));
+        width: root.strip-w; height: root.strip-h;
+        background: #ffffff06; clip: true;
         for t in s.ticks: Rectangle {
-            x: 0;
-            y: (1 - t.f) * parent.height;
-            width: parent.width;
-            height: 1px;
+            x: root.swap ? t.f * parent.width : 0px;
+            y: root.swap ? 0px : (1 - t.f) * parent.height;
+            width: root.swap ? 1px : parent.width;
+            height: root.swap ? parent.height : 1px;
             background: Palette.line;
         }
+        for t in root.ticks: Rectangle {
+            x: root.swap ? 0px : t.f * parent.width;
+            y: root.swap ? (1 - t.f) * parent.height : 0px;
+            width: root.swap ? parent.width : 1px;
+            height: root.swap ? 1px : parent.height;
+            background: Palette.line.transparentize(0.45);
+        }
         for r in s.refs: Rectangle {
-            x: 0;
-            y: (1 - r.f) * parent.height;
-            width: parent.width;
-            height: 1px;
+            x: root.swap ? r.f * parent.width : 0px;
+            y: root.swap ? 0px : (1 - r.f) * parent.height;
+            width: root.swap ? 1px : parent.width;
+            height: root.swap ? parent.height : 1px;
             background: r.color;
         }
-        for r in s.refs: Text {
-            x: 0;
-            width: parent.width - 4px;
-            y: (1 - r.f) * parent.height - 13px;
-            text: r.text;
-            color: r.color;
-            font-size: 10px;
-            horizontal-alignment: right;
-        }
+        // Изображение уже повёрнуто в Rust вместе с его данными.
         Image {
-            x: 0;
-            y: 0;
-            width: parent.width;
-            height: parent.height;
-            source: s.picture;
-            image-fit: fill;
+            width: parent.width; height: parent.height;
+            source: s.picture; image-fit: fill;
         }
-        Text {
-            x: 4px;
-            y: 1px;
-            text: s.title;
-            color: Palette.dim;
-            font-size: 10px;
+        for r in s.refs: Text {
+            x: root.swap ? r.f * parent.width + 3px : 0px;
+            y: root.swap ? 16px : (1 - r.f) * parent.height - 13px;
+            width: root.swap ? 100px : parent.width - 4px;
+            text: r.text; color: r.color; font-size: 10px;
+            horizontal-alignment: root.swap ? TextHorizontalAlignment.left : TextHorizontalAlignment.right;
         }
+        Text { x: 4px; y: 1px; text: s.title; color: Palette.dim; font-size: 10px; }
     }
-    // Подписи делений полос — слева от поля (поле полосы обрезает своё содержимое).
+    // Основная шкала значений: слева либо снизу каждой полосы.
     for s[i] in root.strips: Rectangle {
         visible: root.drawn;
-        x: 0;
-        y: root.plot-y + i * (root.strip-h + root.gap);
-        width: root.left - 4px;
-        height: root.strip-h;
+        x: root.swap ? root.plot-x + i * (root.strip-w + root.gap) : 0px;
+        y: root.swap ? root.plot-y + root.plot-h + 3px
+            : root.plot-y + i * (root.strip-h + root.gap);
+        width: root.swap ? root.strip-w : root.left - 4px;
+        height: root.swap ? 18px : root.strip-h;
         for t in s.ticks: Text {
-            x: 0;
-            width: parent.width;
-            y: (1 - t.f) * parent.height - 7px;
-            height: 14px;
-            text: t.text;
-            color: Palette.dim;
-            font-size: 10px;
-            horizontal-alignment: right;
+            x: root.swap ? t.f * parent.width - 24px : 0px;
+            y: root.swap ? 0px : (1 - t.f) * parent.height - 7px;
+            width: root.swap ? 48px : parent.width; height: 14px;
+            text: t.text; color: Palette.dim; font-size: 10px;
+            horizontal-alignment: root.swap ? TextHorizontalAlignment.center : TextHorizontalAlignment.right;
             vertical-alignment: center;
         }
     }
-    // Перерывы записи — тонкие пунктирные отметки через все полосы (их длительность — в подсказке курсора).
+    // Вторая единица совместной полосы: справа либо сверху.
+    for s[i] in root.strips: Rectangle {
+        visible: root.drawn;
+        x: root.swap ? root.plot-x + i * (root.strip-w + root.gap)
+            : root.plot-x + root.plot-w + 4px;
+        y: root.swap ? root.plot-y - 16px
+            : root.plot-y + i * (root.strip-h + root.gap);
+        width: root.swap ? root.strip-w : root.right - 4px;
+        height: root.swap ? 14px : root.strip-h;
+        for t in s.right-ticks: Text {
+            x: root.swap ? t.f * parent.width - 24px : 0px;
+            y: root.swap ? 0px : (1 - t.f) * parent.height - 7px;
+            width: root.swap ? 48px : parent.width; height: 14px;
+            text: t.text; color: Palette.dim; font-size: 10px;
+            horizontal-alignment: root.swap ? TextHorizontalAlignment.center : TextHorizontalAlignment.left;
+            vertical-alignment: center;
+        }
+    }
     for g in root.gaps: Path {
         visible: root.drawn;
-        x: root.plot-x + g * root.plot-w - 1px;
-        y: root.plot-y;
-        width: 3px;
-        height: root.plot-h;
-        viewbox-width: 3;
-        viewbox-height: 100;
+        x: root.plot-x + (root.swap ? 0px : g * root.plot-w - 1px);
+        y: root.plot-y + (root.swap ? (1 - g) * root.plot-h - 1px : 0px);
+        width: root.swap ? root.plot-w : 3px;
+        height: root.swap ? 3px : root.plot-h;
+        viewbox-width: root.swap ? 100 : 3;
+        viewbox-height: root.swap ? 3 : 100;
         fit: fill;
-        commands: "M 1.5 0 L 1.5 100";
-        stroke: Palette.dim;
-        stroke-width: 1px;
-        opacity: 0.7;
+        commands: root.swap ? "M 0 1.5 L 100 1.5" : "M 1.5 0 L 1.5 100";
+        stroke: Palette.dim; stroke-width: 1px; opacity: 0.7;
     }
-    // События на линиях блоков: опускающие потолок — треугольник остриём вниз, остальные — кружок.
     for d in root.dots: Path {
         visible: root.drawn && root.strips.length == 1;
         x: root.plot-x + d.x * root.plot-w - 5px;
-        y: root.plot-y + (1 - d.y) * root.strip-h - 5px;
-        width: 10px;
-        height: 10px;
-        viewbox-width: 10;
-        viewbox-height: 10;
-        commands: d.kind == 1 ? "M 0 1 L 10 1 L 5 10 Z" : "M 5 1 A 4 4 0 1 1 4.99 1 Z";
-        fill: d.color;
-        stroke: Palette.bg;
-        stroke-width: 1px;
+        y: root.plot-y + (1 - d.y) * root.plot-h - 5px;
+        width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10;
+        commands: d.kind == 1
+            ? (root.swap ? "M 1 0 L 1 10 L 10 5 Z" : "M 0 1 L 10 1 L 5 10 Z")
+            : "M 5 1 A 4 4 0 1 1 4.99 1 Z";
+        fill: d.color; stroke: Palette.bg; stroke-width: 1px;
     }
-    // События без места на линии (раскладка «параметры», события без блока) — треугольники над осью времени.
     for m in root.marks: Path {
         visible: root.drawn;
-        x: root.plot-x + m.f * root.plot-w - 5px;
-        y: root.plot-y + root.plot-h + 1px;
-        width: 10px;
-        height: 10px;
-        viewbox-width: 10;
-        viewbox-height: 10;
-        commands: "M 5 0 L 10 10 L 0 10 Z";
+        x: root.swap ? root.plot-x - 11px : root.plot-x + m.f * root.plot-w - 5px;
+        y: root.swap ? root.plot-y + (1 - m.f) * root.plot-h - 5px
+            : root.plot-y + root.plot-h + 1px;
+        width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10;
+        commands: root.swap ? "M 10 5 L 0 0 L 0 10 Z" : "M 5 0 L 10 10 L 0 10 Z";
         fill: m.color;
     }
     if root.drawn: Rectangle {
-        x: root.plot-x;
-        y: root.plot-y + root.plot-h + root.mark-h;
-        width: root.plot-w;
-        height: 1px;
-        background: Palette.dim;
+        x: root.swap ? root.plot-x - 12px : root.plot-x;
+        y: root.swap ? root.plot-y : root.plot-y + root.plot-h + root.mark-h;
+        width: root.swap ? 1px : root.plot-w;
+        height: root.swap ? root.plot-h : 1px; background: Palette.dim;
     }
     for t in root.ticks: Text {
         visible: root.drawn;
-        x: root.plot-x + t.f * root.plot-w - 34px;
-        width: 68px;
-        y: root.plot-y + root.plot-h + root.mark-h + 3px;
-        height: 14px;
-        text: t.text;
-        color: Palette.text;
-        font-size: 11px;
-        horizontal-alignment: center;
+        x: root.swap ? 0px : root.plot-x + t.f * root.plot-w - 34px;
+        y: root.swap ? root.plot-y + (1 - t.f) * root.plot-h - 7px
+            : root.plot-y + root.plot-h + root.mark-h + 3px;
+        width: 68px; height: 14px;
+        text: t.text; color: Palette.text; font-size: 11px;
+        horizontal-alignment: root.swap ? TextHorizontalAlignment.right : TextHorizontalAlignment.center;
+        vertical-alignment: center;
     }
     touch := TouchArea {
-        x: root.plot-x;
-        y: root.plot-y;
-        width: root.plot-w;
-        height: root.plot-h + root.mark-h;
+        x: root.plot-x; y: root.plot-y;
+        width: root.plot-w; height: root.plot-h;
         enabled: root.drawn;
         mouse-cursor: self.held ? MouseCursor.grabbing : MouseCursor.crosshair;
         property <bool> held;
+        property <length> time-at: root.swap ? self.height - self.mouse-y : self.mouse-x;
+        property <length> time-span: root.swap ? self.height : self.width;
         function show() {
             root.tip(true, "time", root.hover(self.mouse-x, self.mouse-y, self.width, self.height),
-                self.absolute-position.x + self.mouse-x, self.absolute-position.y, 1px, self.height,
+                self.absolute-position.x + (root.swap ? 0px : self.mouse-x),
+                self.absolute-position.y + (root.swap ? self.mouse-y : 0px),
+                root.swap ? self.width : 1px, root.swap ? 1px : self.height,
                 self.absolute-position.x, self.absolute-position.y, self.width, self.height,
                 self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
         }
         scroll-event(event) => {
-            root.wheel(self.mouse-x, self.width, event.delta-y / 1px);
-            if (self.has-hover) {
-                self.show();
-            }
+            root.wheel(self.time-at, self.time-span, event.delta-y / 1px);
+            if (self.has-hover) { self.show(); }
             accept
         }
         pointer-event(event) => {
             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                 self.held = true;
                 root.tip(false, "time", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                root.press(self.mouse-x);
+                root.press(self.time-at);
             } else if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up && self.held) {
-                self.held = false;
-                root.release();
+                self.held = false; root.release();
             }
         }
         changed mouse-x => {
-            if (self.held) {
-                root.drag(self.mouse-x, self.width);
-            } else if (self.has-hover) {
-                self.show();
-            }
+            if (self.held && !root.swap) { root.drag(self.time-at, self.time-span); }
+            else if (self.has-hover && !self.held) { self.show(); }
+        }
+        changed mouse-y => {
+            if (self.held && root.swap) { root.drag(self.time-at, self.time-span); }
+            else if (self.has-hover && !self.held) { self.show(); }
         }
         changed pressed => {
-            if (!self.pressed && self.held) {
-                self.held = false;
-                root.release();
-            }
+            if (!self.pressed && self.held) { self.held = false; root.release(); }
         }
         changed has-hover => {
-            if (!self.has-hover) {
-                root.tip(false, "time", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            }
+            if (!self.has-hover) { root.tip(false, "time", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
         }
     }
+    overview := TimeOverview {
+        visible: root.drawn;
+        x: root.swap ? root.width - 16px : root.plot-x;
+        y: root.swap ? root.plot-y : root.height - 14px;
+        width: root.swap ? 12px : root.plot-w;
+        height: root.swap ? root.plot-h : 12px;
+        vertical: root.swap;
+        start: root.scroll-start;
+        end: root.scroll-end;
+        moved(start) => { root.scroll(start); }
+        hover(on) => { root.overview-hover(on); }
+    }
 }
-
 // Список строк (события): время, заголовок, текст; подробности — в подсказке; щелчок — строка выбрана; прокручивается.
 component Lines inherits Flickable {
     in property <[LineRow]> rows;
@@ -1337,11 +1468,34 @@ export component AppWindow inherits Window {
     in property <bool> chart-max;
     in property <bool> chart-model: true;   // кривые модели нагрева
     in property <bool> chart-swap;
+    in property <bool> range-auto-arg: true;
+    in property <bool> range-auto-value: true;
+    in property <string> range-min-arg;
+    in property <string> range-max-arg;
+    in property <string> range-min-value;
+    in property <string> range-max-value;
+    in property <string> range-title-arg: "Множитель, ×";
+    in property <string> range-title-value: "Значение";
+    in property <string> range-error;
+    in property <int> range-unit;
+    in property <[MetricChoice]> metric-rows;
+    in property <bool> normalized: true;
+    in property <int> range-parameter;
+    callback range-auto(bool, bool);
+    callback range-edited(bool, string, string);
+    callback range-zoom(bool, float);
+    callback range-fit(bool);
+    callback range-unit-changed(int);
+    callback metric-toggled(int);
+    callback normalized-changed(bool);
+    callback range-parameter-changed(int);
+    callback metric-zoom(int, float);
+    callback metric-reset(int);
     in property <float> chart-emergency: -1;
     in property <string> chart-emergency-text;
     // Вид «по времени» (src/timeline.rs, бриф W): вместо графика блоков — полосы дня.
     in property <bool> chart-time;
-    in property <int> time-layout;           // 0 — «блоки», 1 — «параметры»
+    in property <int> time-layout;           // 1 — панели, 2 — вместе; старое 0 отображается как «вместе»
     in property <int> time-quantity;         // величина «блоков»: 0 °C, 1 ×, 2 потолок, 3 нагрузка, 4 кристалл
     in property <[TimeStrip]> time-strips;
     in property <[Tick]> time-ticks;
@@ -1353,6 +1507,11 @@ export component AppWindow inherits Window {
     in property <string> day-text;
     in property <bool> can-day-prev;
     in property <bool> can-day-next;
+    in property <float> time-scroll-start;
+    in property <float> time-scroll-end: 1;
+    in property <bool> time-follow;
+    callback time-scroll(float);
+    callback time-end();
     in property <[LineRow]> events;
     in property <string> events-empty;
     in property <bool> events-all;
@@ -1412,16 +1571,22 @@ export component AppWindow inherits Window {
     out property <length> day-prev-y: day-prev.absolute-position.y + day-prev.height / 2;
     out property <length> day-next-x: day-next.absolute-position.x + day-next.width / 2;
     out property <length> day-next-y: day-next.absolute-position.y + day-next.height / 2;
-    out property <length> whole-chip-x: whole-chip.absolute-position.x + whole-chip.width / 2;
-    out property <length> whole-chip-y: whole-chip.absolute-position.y + whole-chip.height / 2;
+    out property <length> time-end-x: time-end-button.absolute-position.x + time-end-button.width / 2;
+    out property <length> time-end-y: time-end-button.absolute-position.y + time-end-button.height / 2;
+    out property <length> time-scroll-x: time-chart.x + time-chart.scroll-x;
+    out property <length> time-scroll-y: time-chart.y + time-chart.scroll-y;
+    out property <length> time-scroll-w: time-chart.scroll-w;
+    out property <length> time-scroll-h: time-chart.scroll-h;
+    out property <length> whole-chip-x: argument-range.absolute-position.x + argument-range.auto-x;
+    out property <length> whole-chip-y: argument-range.absolute-position.y + argument-range.height / 2;
     out property <length> lay-blocks-x: lay-blocks.absolute-position.x + lay-blocks.width / 2;
     out property <length> lay-blocks-y: lay-blocks.absolute-position.y + lay-blocks.height / 2;
     out property <length> lay-params-x: lay-params.absolute-position.x + lay-params.width / 2;
     out property <length> lay-params-y: lay-params.absolute-position.y + lay-params.height / 2;
-    out property <length> q-ceiling-x: q-ceiling.absolute-position.x + q-ceiling.width / 2;
-    out property <length> q-ceiling-y: q-ceiling.absolute-position.y + q-ceiling.height / 2;
-    out property <length> q-temp-x: q-temp.absolute-position.x + q-temp.width / 2;
-    out property <length> q-temp-y: q-temp.absolute-position.y + q-temp.height / 2;
+    out property <length> q-ceiling-x: quantity-group.absolute-position.x + Math.mod(2, root.metric-cols) * root.metric-cell + root.metric-cell / 2;
+    out property <length> q-ceiling-y: quantity-group.absolute-position.y + floor(2 / root.metric-cols) * root.ctl-row + 11px;
+    out property <length> q-temp-x: quantity-group.absolute-position.x + root.metric-cell / 2;
+    out property <length> q-temp-y: quantity-group.absolute-position.y + 11px;
     out property <length> ev-all-x: ev-all.absolute-position.x + ev-all.width / 2;
     out property <length> ev-all-y: ev-all.absolute-position.y + ev-all.height / 2;
     out property <length> ev-mine-x: ev-mine.absolute-position.x + ev-mine.width / 2;
@@ -1446,10 +1611,31 @@ export component AppWindow inherits Window {
     out property <length> p95-chip-y: p95-chip.absolute-position.y + p95-chip.height / 2;
     out property <length> model-chip-x: model-chip.absolute-position.x + model-chip.width / 2;
     out property <length> model-chip-y: model-chip.absolute-position.y + model-chip.height / 2;
-    out property <length> plain-chip-x: plain-chip.absolute-position.x + plain-chip.width / 2;
-    out property <length> plain-chip-y: plain-chip.absolute-position.y + plain-chip.height / 2;
+    out property <length> plain-chip-x: root.swap-chip-x;
+    out property <length> plain-chip-y: root.swap-chip-y;
     out property <length> swap-chip-x: swap-chip.absolute-position.x + swap-chip.width / 2;
     out property <length> swap-chip-y: swap-chip.absolute-position.y + swap-chip.height / 2;
+    out property <length> normalized-chip-x: normalized-chip.absolute-position.x + normalized-chip.width / 2;
+    out property <length> normalized-chip-y: normalized-chip.absolute-position.y + normalized-chip.height / 2;
+    out property <length> metric-grid-x: quantity-group.absolute-position.x;
+    out property <length> metric-grid-y: quantity-group.absolute-position.y;
+    out property <length> metric-cell-width: root.metric-cell;
+    out property <length> metric-cell-height: root.ctl-row;
+    out property <int> metric-columns: root.metric-cols;
+    out property <length> range-arg-auto-x: argument-range.absolute-position.x + argument-range.auto-x;
+    out property <length> range-arg-auto-y: argument-range.absolute-position.y + argument-range.height / 2;
+    out property <length> range-value-auto-x: value-range.absolute-position.x + value-range.auto-x;
+    out property <length> range-value-auto-y: value-range.absolute-position.y + value-range.height / 2;
+    out property <length> range-arg-min-x: argument-range.low-x;
+    out property <length> range-arg-max-x: argument-range.high-x;
+    out property <length> range-arg-field-y: argument-range.field-y;
+    out property <length> range-value-min-x: value-range.low-x;
+    out property <length> range-value-max-x: value-range.high-x;
+    out property <length> range-value-field-y: value-range.field-y;
+    out property <length> range-arg-fit-x: argument-range.fit-x;
+    out property <length> range-arg-fit-y: argument-range.fit-y;
+    out property <length> range-value-fit-x: value-range.fit-x;
+    out property <length> range-value-fit-y: value-range.fit-y;
     // Поле графика в координатах окна и размер столбца множителя — по ним скрытая проверка ведёт мышь и проверяет, где
     // легла подсказка.
     out property <length> plot-x: chart.x + chart.plot-x;
@@ -1488,7 +1674,7 @@ export component AppWindow inherits Window {
     callback model-toggled();       // кривые модели — показать или скрыть
     callback axes-changed(bool);    // true — температура по горизонтали
     callback time-changed(bool);    // true — ось x время, false — множитель
-    callback layout-changed(int);   // 0 — «блоки», 1 — «параметры»
+    callback layout-changed(int);   // 1 — панели, 2 — вместе
     callback quantity-changed(int); // величина «блоков»
     callback events-filter(bool);   // true — все блоки, false — выбранные
     callback event-clicked(int);    // строка списка событий
@@ -1672,8 +1858,8 @@ export component AppWindow inherits Window {
     property <length> key-h: ceil(root.stats-legend.length / root.key-cols) * root.key-row;
     property <length> controls-top: root.head-h - 4px + root.key-h + (root.key-h > 0 ? 4px : 0px);
     // Переключатели вида — четыре группы слева направо; не помещается — с новой строки.
-    // Подсказка графика с осями местами — над или под строкой множителя; у вида «по времени» осей местами нет.
-    property <bool> tip-swap: root.chart-swap && !root.chart-time;
+    // Подсказка графика с осями местами — над или под строкой аргумента.
+    property <bool> tip-swap: root.chart-swap;
     property <length> ctl-w: root.stats-w - 2 * root.pad;
     property <length> ctl-gap: 14px;
     property <length> ctl-row: 26px;
@@ -1693,19 +1879,20 @@ export component AppWindow inherits Window {
     property <bool> gl-fits: root.gl-at + layout-group.preferred-width <= root.ctl-w;
     property <length> gl-x: root.gl-fits ? root.gl-at : 0;
     property <length> gl-y: root.gl-fits ? root.gd-y : root.gd-y + root.ctl-row;
-    property <length> gq-at: root.gl-x + layout-group.preferred-width + root.ctl-gap;
-    property <bool> gq-fits: root.gq-at + quantity-group.preferred-width <= root.ctl-w;
-    property <length> gq-x: root.gq-fits ? root.gq-at : 0;
-    property <length> gq-y: root.gq-fits ? root.gl-y : root.gl-y + root.ctl-row;
-    property <length> g3-at: root.g2-x + curve-group.preferred-width + root.ctl-gap;
-    property <bool> g3-fits: root.g3-at + axes-group.preferred-width <= root.ctl-w;
-    property <length> g3-x: root.g3-fits ? root.g3-at : 0;
-    property <length> g3-y: root.g3-fits ? root.g2-y : root.g2-y + root.ctl-row;
+    property <int> metric-cols: max(1, floor(root.ctl-w / 150px));
+    property <length> metric-cell: root.ctl-w / root.metric-cols;
+    property <length> metrics-h: ceil(root.metric-rows.length / root.metric-cols) * root.ctl-row;
+    property <length> gq-x: 0px;
+    property <length> gq-y: root.gl-y + root.ctl-row;
+    property <length> g3-x: 0px;
+    property <length> g3-y: root.chart-time ? root.gq-y + root.metrics-h : root.g2-y + root.ctl-row;
     property <length> g4-at: root.g3-x + axes-group.preferred-width + root.ctl-gap;
     property <bool> g4-fits: root.g4-at + mode-group.preferred-width <= root.ctl-w;
     property <length> g4-x: root.g4-fits ? root.g4-at : 0;
     property <length> g4-y: root.g4-fits ? root.g3-y : root.g3-y + root.ctl-row;
-    property <length> controls-h: (!root.chart-time ? root.g4-y : root.time-layout == 0 ? root.gq-y : root.gl-y) + root.ctl-row;
+    property <length> base-controls-h: (root.chart-time ? root.g3-y : root.g4-y) + root.ctl-row;
+    property <length> ranges-y: root.controls-top + root.base-controls-h + (root.chart-time ? root.ctl-row : 0px);
+    property <length> controls-h: root.base-controls-h + (root.chart-time ? root.ctl-row : 0px) + 52px + (root.range-error != "" ? 18px : 0px);
     out property <length> events-h: min(6, max(1, root.events.length)) * 18px;
     out property <length> auto-h: !root.has-auto ? 0px : root.has-emergency ? 90px : 64px;
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.events-h - 28px - root.auto-h;
@@ -2151,7 +2338,7 @@ export component AppWindow inherits Window {
                 on: root.chart-time;
                 clicked => { root.time-changed(true); }
                 hover(on) => {
-                    root.tip(on, "kind-time", "По времени\nОдин день журнала на оси времени: только записанное время, перерывы записи сжаты в тонкие отметки.\n• «блоки» — выбранные блоки своими цветами, одна величина; «параметры» — первые два блока, все величины полосами\n• события — отметками на линии блока или под полосами, подсказка — у курсора\n• колесо — масштаб вокруг курсора, перетаскивание — сдвиг", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "kind-time", "По времени\nОдин день журнала с выбранными блоками и величинами; перерывы записи сжаты в тонкие отметки.\n• величины выбираются независимо в обеих раскладках\n• «Вместе» совмещает ряды; «Панели» разделяет их на полосы\n• колесо над именем величины меняет её масштаб; ↺ возвращает автоматические границы\n• колесо над графиком меняет масштаб от конца текущего видимого окна, перетаскивание сдвигает его\n• у конца записи новые данные автоматически остаются в окне", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
@@ -2204,7 +2391,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // День вида «по времени»: раньше, позже, весь день.
+        // День вида «по времени»: раньше, позже и переход к последним данным.
         day-group := HorizontalLayout {
             visible: root.chart-time;
             x: root.pad + root.gd-x;
@@ -2229,11 +2416,11 @@ export component AppWindow inherits Window {
                     root.tip(on, "day-next", "День позже\nСледующий день, за который есть срезы; последний — сегодняшний.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
-            whole-chip := Chip {
-                text: "весь день";
-                clicked => { root.day-whole(); }
+            time-end-button := Chip {
+                text: "В конец";
+                clicked => { root.time-end(); }
                 hover(on) => {
-                    root.tip(on, "day-whole", "Весь день\nПоказать день целиком — от первого среза до последнего.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "time-end", "В конец записи\nПоказать последние записанные данные, сохранив длительность видимого окна.\n• при обычных осях конец справа, после перестановки — вверху\n• у конца записи новые данные автоматически остаются в окне\n• масштаб всегда меняется от конца текущего видимого окна", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
@@ -2246,68 +2433,50 @@ export component AppWindow inherits Window {
             height: 22px;
             spacing: 4px;
             lay-blocks := Chip {
-                text: "блоки";
-                on: root.time-layout == 0;
-                clicked => { root.layout-changed(0); }
+                text: "Вместе";
+                on: root.time-layout == 2 || root.time-layout == 0;
+                clicked => { root.layout-changed(2); }
                 hover(on) => {
-                    root.tip(on, "layout-blocks", "Блоки\nВсе выбранные блоки своими цветами на одной полосе — одна величина, её выбирают справа.\n• видно, какое ядро когда и в каком порядке менялось\n• события блока — на его линии: треугольник — потолок опущен, кружок — остальное", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "layout-overlay", "Вместе\nСовместить выбранные величины на общем поле; каждая сохраняет выбранную шкалу.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
             lay-params := Chip {
-                text: "параметры";
+                text: "Панели";
                 on: root.time-layout == 1;
                 clicked => { root.layout-changed(1); }
                 hover(on) => {
-                    root.tip(on, "layout-params", "Параметры\nПервые два выбранных блока — все величины полосами одна под другой.\n• температура с целью и аварийной отсечкой, множитель с потолком ступенями, нагрузка, кристалл, видеокарта (°C и Вт), вентиляторы\n• события — треугольниками под полосами", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "layout-params", "Панели\nПоказать выбранные величины отдельными полосами; блоки сравниваются внутри каждой величины.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
-        // Величина раскладки «блоки».
-        quantity-group := HorizontalLayout {
-            visible: root.chart-time && root.time-layout == 0;
+        // Независимый выбор величин одинаков для всех раскладок.
+        quantity-group := Rectangle {
+            visible: root.chart-time;
             x: root.pad + root.gq-x;
             y: root.controls-top + root.gq-y;
-            width: self.preferred-width;
-            height: 22px;
-            spacing: 4px;
-            q-temp := Chip {
-                text: "°C";
-                on: root.time-quantity == 0;
-                clicked => { root.quantity-changed(0); }
-                hover(on) => {
-                    root.tip(on, "q-temp", "Температура\nТемпература блока по датчику; цель и аварийная отсечка — линиями.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            width: root.ctl-w;
+            height: root.metrics-h;
+            for metric[i] in root.metric-rows: Rectangle {
+                x: Math.mod(i, root.metric-cols) * root.metric-cell;
+                y: floor(i / root.metric-cols) * root.ctl-row;
+                width: root.metric-cell - 6px; height: 22px;
+                CheckBox {
+                    width: parent.width - 24px;
+                    text: metric.text; on: metric.on;
+                    toggled => { root.metric-toggled(metric.index); }
+                    wheel(delta) => { root.metric-zoom(metric.index, delta); }
+                    hover(on) => {
+                        root.tip(on, "metric" + metric.index, metric.tip,
+                            self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
                 }
-            }
-            Chip {
-                text: "×";
-                on: root.time-quantity == 1;
-                clicked => { root.quantity-changed(1); }
-                hover(on) => {
-                    root.tip(on, "q-ratio", "Фактический множитель\nСредний множитель блока за промежуток строки.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                }
-            }
-            q-ceiling := Chip {
-                text: "потолок";
-                on: root.time-quantity == 2;
-                clicked => { root.quantity-changed(2); }
-                hover(on) => {
-                    root.tip(on, "q-ceiling", "Потолок\nПотолок множителя блока ступенями — журнал смены потолков: кто, когда и в каком порядке.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                }
-            }
-            Chip {
-                text: "нагрузка";
-                on: root.time-quantity == 3;
-                clicked => { root.quantity-changed(3); }
-                hover(on) => {
-                    root.tip(on, "q-busy", "Нагрузка\nДоля времени, когда блок не спал, за промежуток строки, %.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                }
-            }
-            Chip {
-                text: "кристалл";
-                on: root.time-quantity == 4;
-                clicked => { root.quantity-changed(4); }
-                hover(on) => {
-                    root.tip(on, "q-die", "Кристалл\nСредняя температура остальных блоков в тот же момент — общий нагрев вокруг блока.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                Chip {
+                    x: parent.width - 22px; width: 22px; text: "↺";
+                    clicked => { root.metric-reset(metric.index); }
+                    hover(on) => {
+                        root.tip(on, "metric-reset" + metric.index, "Автоматическая шкала\nВернуть границы этой величины к выбранным видимым данным.",
+                            self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
                 }
             }
         }
@@ -2362,29 +2531,28 @@ export component AppWindow inherits Window {
                 }
             }
         }
-        // Какая ось по горизонтали.
+        // Одна перестановка осей для обоих представлений.
         axes-group := HorizontalLayout {
-            visible: !root.chart-time;
             x: root.pad + root.g3-x;
             y: root.controls-top + root.g3-y;
             width: self.preferred-width;
             height: 22px;
             spacing: 4px;
-            Text { text: "по горизонтали:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
-            plain-chip := Chip {
-                text: "×";
-                on: !root.chart-swap;
-                clicked => { root.axes-changed(false); }
+            swap-chip := CheckBox {
+                width: 186px;
+                text: "Поменять оси местами";
+                on: root.chart-swap;
+                toggled => { root.axes-changed(!root.chart-swap); }
                 hover(on) => {
-                    root.tip(on, "axes-plain", "Множитель — по горизонтали\nСтолбец на каждый множитель, температура — по вертикали.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "axes-swap", "Поменять оси местами\nПереставляет геометрию графика вместе с точками, интервалами и шкалами.\n• действует по времени и по множителю\n• границы и выбранные величины сохраняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
-            swap-chip := Chip {
-                text: root.chart-view == 0 || root.chart-view == 3 ? "η" : "°C";
-                on: root.chart-swap;
-                clicked => { root.axes-changed(true); }
+            normalized-chip := Chip {
+                visible: root.chart-time;
+                text: root.normalized ? "По единицам" : "Раздельные шкалы";
+                clicked => { root.normalized-changed(!root.normalized); }
                 hover(on) => {
-                    root.tip(on, "axes-swap", "Значение — по горизонтали\nМножитель — по вертикали; эффективность или температура выбранного вида — по горизонтали.\n• выбор осей сохраняется между запусками\n• подсказка — у строки множителя", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "relative-scales", "Относительные шкалы\nУ каждой величины собственный диапазон; выбранные ряды можно совместить.\n• колесо над именем величины плавно меняет только её масштаб\n• ↺ у имени возвращает автоматические границы", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
         }
@@ -2414,6 +2582,60 @@ export component AppWindow inherits Window {
                     root.tip(on, "mode-pin", "Закреплённая подсветка\nПоверх остальных всегда одна линия: последнего добавленного блока или та, по которой щёлкнули на графике; остальные бледнее.", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
+        }
+        HorizontalLayout {
+            visible: root.chart-time && !root.normalized;
+            x: root.pad;
+            y: root.controls-top + root.base-controls-h;
+            width: self.preferred-width;
+            height: 22px;
+            spacing: 4px;
+            Text { text: "Шкала значений:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Chip { text: "°C"; on: root.range-unit == 0; clicked => { root.range-unit-changed(0); } }
+            Chip { text: "×"; on: root.range-unit == 1; clicked => { root.range-unit-changed(1); } }
+            Chip { text: "%"; on: root.range-unit == 2; clicked => { root.range-unit-changed(2); } }
+            Chip { text: "Вт"; on: root.range-unit == 3; clicked => { root.range-unit-changed(3); } }
+            Chip { text: "об/мин"; on: root.range-unit == 4; clicked => { root.range-unit-changed(4); } }
+        }
+        HorizontalLayout {
+            visible: root.chart-time && root.normalized;
+            x: root.pad; y: root.controls-top + root.base-controls-h;
+            width: self.preferred-width; height: 22px; spacing: 6px;
+            Text { text: "Границы величины:"; color: Palette.dim; font-size: 11px; vertical-alignment: center; }
+            Chip {
+                text: "‹";
+                clicked => { root.range-parameter-changed(Math.mod(root.range-parameter + 9, 10)); }
+            }
+            Text { text: root.range-title-value; color: Palette.text; font-size: 11px; vertical-alignment: center; }
+            Chip {
+                text: "›";
+                clicked => { root.range-parameter-changed(Math.mod(root.range-parameter + 1, 10)); }
+            }
+        }
+        argument-range := RangeRow {
+            x: root.pad; y: root.ranges-y; width: root.ctl-w;
+            title: root.range-title-arg;
+            minimum: root.range-min-arg; maximum: root.range-max-arg;
+            auto: root.range-auto-arg;
+            auto-changed(auto) => { root.range-auto(true, auto); }
+            edited(lo, hi) => { root.range-edited(true, lo, hi); }
+            zoom(factor) => { root.range-zoom(true, factor); }
+            fit() => { root.range-fit(true); }
+        }
+        value-range := RangeRow {
+            x: root.pad; y: root.ranges-y + 26px; width: root.ctl-w;
+            title: root.range-title-value;
+            minimum: root.range-min-value; maximum: root.range-max-value;
+            auto: root.range-auto-value;
+            auto-changed(auto) => { root.range-auto(false, auto); }
+            edited(lo, hi) => { root.range-edited(false, lo, hi); }
+            zoom(factor) => { root.range-zoom(false, factor); }
+            fit() => { root.range-fit(false); }
+        }
+        if root.range-error != "": Text {
+            x: root.pad; y: root.ranges-y + 52px; width: root.ctl-w; height: 18px;
+            text: root.range-error; color: Palette.bad; font-size: 11px;
+            overflow: elide; vertical-alignment: center;
         }
         // Список событий: заголовок и переключатель «все блоки / выбранные».
         HorizontalLayout {
@@ -2482,6 +2704,13 @@ export component AppWindow inherits Window {
         gaps: root.time-gaps;
         head: root.time-head;
         empty: root.time-empty;
+        swap: root.chart-swap;
+        scroll-start: root.time-scroll-start;
+        scroll-end: root.time-scroll-end;
+        scroll(start) => { root.time-scroll(start); }
+        overview-hover(on) => {
+            root.tip(on, "time-overview", "Обзор дня\nСветлая ручка показывает положение и длительность видимого окна во всей записи дня.\n• перетащи ручку для прокрутки; щелчок по дорожке переносит окно туда\n• прокрути к концу записи — новые данные будут автоматически оставаться в окне\n• ручка во всю дорожку — видна вся запись", root.time-scroll-x, root.time-scroll-y, root.time-scroll-w, root.time-scroll-h);
+        }
         wheel(x, w, delta) => { root.time-wheel(x, w, delta); }
         press(x) => { root.time-press(x); }
         drag(x, w) => { root.time-drag(x, w); }

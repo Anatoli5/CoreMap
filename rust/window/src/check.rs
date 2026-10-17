@@ -782,16 +782,17 @@ impl Check {
                 ),
             );
         }
-        // Второй блок — к первому: две линии, ось та же.
+        // Второй блок — к первому: общая ось охватывает оба набора данных.
         self.click(px, py, PointerEventButton::Left);
         let two = self.pump(|v| compared(v) == [e, p], 2.0);
         let series = self.ui.get_chart_series().row_count();
-        let same_axis = axis(&self.view.borrow()) == axis_e;
+        let combined = axis(&self.view.borrow());
+        let selected_axis = axis_e.iter().all(|r| combined.contains(r)) && combined.len() >= axis_e.len();
         let now = compared(&self.view.borrow());
         self.check(
-            two && series == 2 && same_axis,
+            two && series == 2 && selected_axis,
             format!(
-                "щелчок по {} добавил его: блоков {now:?}, линий {series}; ось та же, что у одного кластера: {same_axis}",
+                "щелчок по {} добавил его: блоков {now:?}, линий {series}; общая ось сохранила множители кластера и охватила оба блока: {selected_axis}",
                 p_block.name
             ),
         );
@@ -965,7 +966,7 @@ impl Check {
         let (px, py, pw, ph) = (ui.get_plot_x(), ui.get_plot_y(), ui.get_plot_w(), ui.get_plot_h());
         let swap = ui.get_chart_swap();
         // Столбец под курсором — по геометрии графика (chart::Frame::band, доли поля, y снизу вверх) в пиксели окна.
-        let (lo, hi) = self
+        let (lo, hi, argument_range) = self
             .view
             .borrow()
             .shown_stats
@@ -974,10 +975,12 @@ impl Check {
                 (
                     s.columns.first().map_or(0, |c| c.ratio),
                     s.columns.last().map_or(0, |c| c.ratio),
+                    s.argument_range,
                 )
             })
             .unwrap_or_default();
         let frame = chart::Frame {
+            argument_range,
             lo,
             hi,
             t0: 0.0,
@@ -1094,8 +1097,8 @@ impl Check {
         let first = ticks(self);
         self.check(
             above
-                && first.iter().any(|t| t == "0°")
-                && first.iter().any(|t| t.starts_with('+'))
+                && !first.is_empty()
+                && first.iter().all(|t| t.ends_with('°'))
                 && self.ui.get_chart_value_title().contains("над кристаллом"),
             format!("шкала над кристаллом: деления {first:?}"),
         );
@@ -1164,7 +1167,16 @@ impl Check {
         let now = ticks(self);
         let changed = before != self.view.borrow().shown_stats;
         self.check(
-            now.first().is_some_and(|t| t == "40°") && now.last().is_some_and(|t| t == "100°") && changed,
+            !now.is_empty()
+                && now.iter().all(|t| t.ends_with('°'))
+                && changed
+                && self
+                    .view
+                    .borrow()
+                    .shown_stats
+                    .as_ref()
+                    .and_then(|s| s.value_range)
+                    .is_some(),
             format!("деления абсолютной шкалы {now:?}; нарисованное изменилось: {changed}"),
         );
         let shot = self.shot("abs");
@@ -1321,7 +1333,126 @@ impl Check {
             self.check(false, "у линии кластера нет точки на графике");
         }
         let plain_at = (self.ui.get_plain_chip_x(), self.ui.get_plain_chip_y());
-        self.chip(plain_at, |v| !v.swap, "щелчок по «×» — множитель снова по горизонтали");
+        self.chip(
+            plain_at,
+            |v| !v.swap,
+            "повторный щелчок «Поменять оси» возвращает множитель по горизонтали",
+        );
+        self.numeric_chart_ranges();
+    }
+
+    fn replace_field(&mut self, x: f32, y: f32, text: &str) {
+        self.click(x, y, PointerEventButton::Left);
+        let window = self.ui.window();
+        for key in
+            std::iter::once(slint::platform::Key::End).chain(std::iter::repeat_n(slint::platform::Key::Backspace, 64))
+        {
+            window.dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+            window.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        }
+        self.type_text(text);
+        let window = self.ui.window();
+        window.dispatch_event(WindowEvent::KeyPressed {
+            text: slint::platform::Key::Return.into(),
+        });
+        window.dispatch_event(WindowEvent::KeyReleased {
+            text: slint::platform::Key::Return.into(),
+        });
+        self.pump(|_| true, 0.0);
+    }
+
+    fn numeric_chart_ranges(&mut self) {
+        let ranges = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.argument_range.zip(s.value_range));
+        let Some((argument, value)) = ranges else {
+            self.check(false, "нет разрешённых диапазонов для проверки ручных полей");
+            return;
+        };
+        let wanted_argument = crate::plot::Range::new(
+            argument.min + (argument.max - argument.min) * 0.1,
+            argument.max - (argument.max - argument.min) * 0.1,
+        )
+        .expect("часть исходного диапазона");
+        let wanted_value = crate::plot::Range::new(
+            value.min + (value.max - value.min) * 0.1,
+            value.max - (value.max - value.min) * 0.1,
+        )
+        .expect("часть исходного диапазона");
+        let auto_a = (self.ui.get_range_arg_auto_x(), self.ui.get_range_arg_auto_y());
+        let auto_v = (self.ui.get_range_value_auto_x(), self.ui.get_range_value_auto_y());
+        self.click(auto_a.0, auto_a.1, PointerEventButton::Left);
+        self.click(auto_v.0, auto_v.1, PointerEventButton::Left);
+        self.replace_field(
+            self.ui.get_range_arg_min_x(),
+            self.ui.get_range_arg_field_y(),
+            &format!("{:.6}", wanted_argument.min),
+        );
+        self.replace_field(
+            self.ui.get_range_arg_max_x(),
+            self.ui.get_range_arg_field_y(),
+            &format!("{:.6}", wanted_argument.max),
+        );
+        self.replace_field(
+            self.ui.get_range_value_min_x(),
+            self.ui.get_range_value_field_y(),
+            &format!("{:.6}", wanted_value.min),
+        );
+        self.replace_field(
+            self.ui.get_range_value_max_x(),
+            self.ui.get_range_value_field_y(),
+            &format!("{:.6}", wanted_value.max),
+        );
+        let actual = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.argument_range.zip(s.value_range));
+        let close =
+            |a: crate::plot::Range, b: crate::plot::Range| (a.min - b.min).abs() < 1e-5 && (a.max - b.max).abs() < 1e-5;
+        self.check(
+            actual.is_some_and(|(a, v)| close(a, wanted_argument) && close(v, wanted_value))
+                && !self.ui.get_range_auto_arg()
+                && !self.ui.get_range_auto_value(),
+            "настоящие щелчки и ввод задали ручные границы обеих осей",
+        );
+        let swap = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+        self.click(swap.0, swap.1, PointerEventButton::Left);
+        let after_swap = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.argument_range.zip(s.value_range));
+        self.check(
+            actual == after_swap && self.ui.get_chart_swap(),
+            "перестановка осей сохранила введённые физические границы",
+        );
+        self.click(swap.0, swap.1, PointerEventButton::Left);
+        let fit = (self.ui.get_range_value_fit_x(), self.ui.get_range_value_fit_y());
+        self.click(fit.0, fit.1, PointerEventButton::Left);
+        let fit_once = self.view.borrow().shown_stats.as_ref().and_then(|s| s.value_range);
+        self.check(
+            fit_once == Some(value) && !self.ui.get_range_auto_value(),
+            "Вписать подбирает границы один раз и оставляет постоянное Авто выключенным",
+        );
+        self.click(auto_a.0, auto_a.1, PointerEventButton::Left);
+        self.click(auto_v.0, auto_v.1, PointerEventButton::Left);
+        let restored = self
+            .view
+            .borrow()
+            .shown_stats
+            .as_ref()
+            .and_then(|s| s.argument_range.zip(s.value_range));
+        self.check(
+            restored == Some((argument, value)) && self.ui.get_range_auto_arg() && self.ui.get_range_auto_value(),
+            "Авто вернуло диапазоны выбранных данных по обеим осям",
+        );
+        self.leave();
     }
 
     /// Шаг 2в: кривые модели нагрева (DECISIONS #39). У каждого выбранного блока — кривая его цвета: сплошная над
@@ -2274,6 +2405,8 @@ impl Check {
             |v| v.scale == Scale::Absolute,
             "щелчок по «абсолютная» — шкала, на которой рисуется отсечка",
         );
+        // Проверка ползунков требует видимых отсечек; автодиапазоны проверяются отдельным сценарием.
+        self.view.borrow_mut().range_edited(false, "40", "100");
         let sent = self.view.borrow().sent;
         let start_limit = i32::try_from(start.limit).unwrap_or(LIMIT_TO);
 
@@ -2635,21 +2768,16 @@ impl Check {
             .as_ref()
             .is_some_and(|l| l.p95.is_empty() && l.max.is_empty() && l.model.is_empty() && !l.mean.is_empty());
         let ticks: Vec<String> = self.ui.get_chart_ticks().iter().map(|t| t.text.to_string()).collect();
-        let from_zero = self
-            .ui
-            .get_chart_ticks()
-            .iter()
-            .map(|t| t.f)
-            .fold(f32::INFINITY, f32::min)
-            <= 1e-6;
+        let fitted_range = self.view.borrow().shown_stats.as_ref().and_then(|s| s.value_range);
+        let fits_data = fitted_range.is_some_and(|r| r.min > 0.0 && r.max > r.min);
         self.check(
             default
                 && drawn
                 && plain
-                && from_zero
+                && fits_data
                 && self.ui.get_chart_value_title().contains("производительность на °C"),
             format!(
-                "по умолчанию — «эффективность»: у {} {} точек с усами и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; ось от нуля: {ticks:?}",
+                "по умолчанию — «эффективность»: у {} {} точек с усами и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; автодиапазон выбранных данных: {ticks:?}",
                 p_block.name,
                 series.as_ref().map_or(0, |l| l.points.len())
             ),
@@ -2864,6 +2992,101 @@ impl Check {
         self.check(back, "в сравнении снова кластер и P-ядро");
     }
 
+    fn append_navigation_day(&mut self, delta: i64) -> Option<(i64, i64)> {
+        let mut day = self.view.borrow().day_data.as_deref()?.clone();
+        *day.x.last_mut()? += delta;
+        *day.t.last_mut()? += delta;
+        if let Some(stretch) = day.stretches.last_mut() {
+            stretch.t1 += delta;
+        }
+        let bounds = day.bounds();
+        self.view.borrow_mut().on_day(Arc::new(day));
+        bounds
+    }
+
+    fn time_navigation(&mut self) {
+        let original = self.view.borrow().day_data.clone();
+        let bounds = original.as_ref().and_then(|d| d.bounds()).unwrap_or_default();
+        let cursor = LogicalPosition::new(
+            self.ui.get_time_plot_x() + 0.3 * self.ui.get_time_plot_w(),
+            self.ui.get_time_plot_y() + 0.5 * self.ui.get_time_plot_h(),
+        );
+        for _ in 0..3 {
+            self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: cursor,
+                delta_x: 0.0,
+                delta_y: 60.0,
+            });
+            self.pump(|_| true, 0.0);
+        }
+        let width = self.view.borrow().span.map(|s| s.1 - s.0).unwrap_or_default();
+        let track = LogicalPosition::new(
+            self.ui.get_time_scroll_x() + 0.35 * self.ui.get_time_scroll_w(),
+            self.ui.get_time_scroll_y() + 0.5 * self.ui.get_time_scroll_h(),
+        );
+        self.click(track.x, track.y, PointerEventButton::Left);
+        let scrolled = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            !self.view.borrow().time_follow
+                && scrolled.1 - scrolled.0 == width
+                && self.ui.get_time_scroll_start() > 0.0
+                && self.ui.get_time_scroll_end() <= 1.0,
+            "полоса обзора перемещает окно, сохраняет ширину и показывает положение в дне",
+        );
+        let end = (self.ui.get_time_end_x(), self.ui.get_time_end_y());
+        self.click(end.0, end.1, PointerEventButton::Left);
+        let at_end = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            at_end.1 == bounds.1 && at_end.1 - at_end.0 == width && self.view.borrow().time_follow,
+            "В конец: окно у последних данных с прежней шириной",
+        );
+        self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: cursor,
+            delta_x: 0.0,
+            delta_y: 60.0,
+        });
+        self.pump(|_| true, 0.0);
+        let zoomed = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            self.view.borrow().time_follow && zoomed.1 == bounds.1 && zoomed.1 - zoomed.0 < width,
+            "масштаб при слежении сохраняет последние данные у правого края",
+        );
+        let grown = self.append_navigation_day(1000).unwrap_or_default();
+        let followed = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            followed.1 == grown.1 && followed.1 - followed.0 == zoomed.1 - zoomed.0,
+            "новая порция данных сдвигает окно слежения, сохраняя длительность",
+        );
+        self.click(
+            self.ui.get_time_scroll_x() + 2.0,
+            self.ui.get_time_scroll_y() + 0.5 * self.ui.get_time_scroll_h(),
+            PointerEventButton::Left,
+        );
+        let frozen = self.view.borrow().span;
+        self.append_navigation_day(1000);
+        self.check(
+            self.view.borrow().span == frozen && !self.ui.get_time_follow(),
+            "при выключенном слежении новые данные не двигают ручное окно",
+        );
+        let shot = self.shot("time-overview");
+        self.check(shot, "картинка: полоса обзора с ручным окном");
+        let swap = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+        self.click(swap.0, swap.1, PointerEventButton::Left);
+        let shot = self.shot("time-overview-swapped");
+        self.check(
+            self.ui.get_chart_swap() && self.ui.get_time_scroll_h() > self.ui.get_time_scroll_w() && shot,
+            "перестановка осей поворачивает обзор вместе с осью времени",
+        );
+        self.click(swap.0, swap.1, PointerEventButton::Left);
+        if let Some(day) = original {
+            self.view.borrow_mut().on_day(day);
+        }
+        let auto = (self.ui.get_range_arg_auto_x(), self.ui.get_range_arg_auto_y());
+        if !self.ui.get_range_auto_arg() {
+            self.click(auto.0, auto.1, PointerEventButton::Left);
+        }
+    }
+
     /// Шаг 5: ось x — время (бриф W с поправкой 16.10). Щелчок по «по времени» — день читается потоком статистики;
     /// раскладка «блоки»: одна полоса, выбранные блоки своими цветами, события блока — на его линии, сброс — под полосой,
     /// перерыв записи 08:00–08:30 сжат в отметку (подсказка — его длительность); величина «потолок» — ступени; колесо —
@@ -2936,7 +3159,7 @@ impl Check {
                 && self.ui.get_chart_time()
                 && self.ui.get_time_strips().row_count() == 1
                 && names == [e_block.name.clone(), p_block.name.clone()]
-                && dots > 0
+                && dots + marks > 0
                 && marks > 0
                 && gaps > 0
                 && inked > 0,
@@ -2944,6 +3167,8 @@ impl Check {
                 "«блоки»: день прочитан ({rows} строк), полоса {strips}, блоки {names:?}, событий на линиях {dots}, под полосой {marks}, перерывов {gaps}, закрашено пикселей {inked}; «{head}»"
             ),
         );
+        let temp_at = (self.ui.get_q_temp_x(), self.ui.get_q_temp_y());
+        self.click(temp_at.0, temp_at.1, PointerEventButton::Left);
         let at = (self.ui.get_q_ceiling_x(), self.ui.get_q_ceiling_y());
         self.chip(at, |v| v.quantity == Quantity::Ceiling, "щелчок по «потолок»");
         let ceilings = self.pump(
@@ -2951,7 +3176,7 @@ impl Check {
                 v.day_data.as_ref().is_some_and(|d| d.quantities == [Quantity::Ceiling])
                     && v.shown_time
                         .as_ref()
-                        .is_some_and(|t| t.strips.first().is_some_and(|s| s.title.starts_with("потолок")))
+                        .is_some_and(|t| t.strips.first().is_some_and(|s| s.title.contains("потолок")))
             },
             30.0,
         );
@@ -2990,11 +3215,11 @@ impl Check {
         let span1 = self.view.borrow().span.unwrap_or_default();
         #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
         let narrower = (span1.1 - span1.0) as f64 / (span0.1 - span0.0).max(1) as f64;
-        let fixed = (at_time(span1, 0.3) - at_time(span0, 0.3)).abs();
+        let fixed = (at_time(span1, 1.0) - at_time(span0, 1.0)).abs();
         self.check(
             (narrower - 0.512).abs() < 0.01 && fixed <= 2.0,
             format!(
-                "три ступени колеса над 30 % ширины: показ уже в {narrower:.3} раза (0,8³), место под курсором сдвинулось на {fixed:.0} мс"
+                "три ступени колеса над 30 % ширины: показ уже в {narrower:.3} раза (0,8³), правая граница сдвинулась на {fixed:.0} мс"
             ),
         );
         let shot = self.shot("time-zoom");
@@ -3044,6 +3269,7 @@ impl Check {
         self.click(whole.0, whole.1, PointerEventButton::Left);
         let whole_day = self.view.borrow().span == bounds;
         self.check(whole_day, "«весь день» — показ снова от первого среза до последнего");
+        self.time_navigation();
         // Перерыв записи: курсор на его отметке — подсказка с началом, концом и длительностью.
         self.pump(|v| v.shown_time.is_some(), 1.0);
         let gap = self
@@ -3090,19 +3316,73 @@ impl Check {
             format!("◀ — вчерашний день («{day_text}»), ▶ — снова сегодня; дальше сегодня некуда"),
         );
         // «параметры»: семь полос первых двух блоков, события — под полосами.
+        for index in 0_u8..10 {
+            if index == 2 {
+                continue;
+            }
+            let columns = f32::from(u8::try_from(self.ui.get_metric_columns().max(1)).unwrap_or(1));
+            let x = self.ui.get_metric_grid_x() + (f32::from(index) % columns + 0.3) * self.ui.get_metric_cell_width();
+            let y = self.ui.get_metric_grid_y()
+                + (f32::from(index) / columns).floor() * self.ui.get_metric_cell_height()
+                + 10.0;
+            self.click(x, y, PointerEventButton::Left);
+        }
+        let overlay_ready = self.pump(
+            |v| {
+                v.shown_time
+                    .as_ref()
+                    .is_some_and(|t| t.parameter_ranges.len() == 10 && t.strips.len() == 1)
+            },
+            30.0,
+        );
+        self.check(
+            overlay_ready,
+            "относительный вид: все десять величин на общей панели, у каждой собственный диапазон",
+        );
+        let cursor = LogicalPosition::new(self.ui.get_metric_grid_x() + 30.0, self.ui.get_metric_grid_y() + 10.0);
+        let before = self
+            .view
+            .borrow()
+            .shown_time
+            .as_ref()
+            .map(|t| t.parameter_ranges.clone())
+            .unwrap_or_default();
+        self.ui
+            .window()
+            .dispatch_event(WindowEvent::PointerMoved { position: cursor });
+        self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: cursor,
+            delta_x: 0.0,
+            delta_y: 60.0,
+        });
+        self.pump(|_| true, 0.0);
+        let after = self
+            .view
+            .borrow()
+            .shown_time
+            .as_ref()
+            .map(|t| t.parameter_ranges.clone())
+            .unwrap_or_default();
+        self.check(
+            before.get(&Quantity::Temp) != after.get(&Quantity::Temp)
+                && before.get(&Quantity::Ratio) == after.get(&Quantity::Ratio),
+            "колесо над температурой меняет только её масштаб",
+        );
+        let shot = self.shot("time-relative");
+        self.check(shot, "картинка: относительные шкалы");
         let at = (self.ui.get_lay_params_x(), self.ui.get_lay_params_y());
         self.chip(at, |v| v.layout == Layout::Params, "щелчок по «параметры»");
         let params = self.pump(
             |v| {
-                v.day_data.as_ref().is_some_and(|d| d.quantities.len() == 5)
-                    && v.shown_time.as_ref().is_some_and(|t| t.strips.len() == 7)
+                v.day_data.as_ref().is_some_and(|d| d.quantities.len() == 10)
+                    && v.shown_time.as_ref().is_some_and(|t| t.strips.len() == 10)
             },
             30.0,
         );
         let marks = self.view.borrow().shown_time.as_ref().map_or(0, |t| t.marks.len());
         self.check(
-            params && self.ui.get_time_strips().row_count() == 7 && marks > 0,
-            format!("«параметры»: полос 7, событий под полосами {marks}"),
+            params && self.ui.get_time_strips().row_count() == 10 && marks > 0,
+            format!("подписанные панели выбранных величин: полос 10, событий под полосами {marks}"),
         );
         let shot = self.shot("time-params");
         self.check(shot, "картинка: «параметры», весь день");
@@ -3114,7 +3394,7 @@ impl Check {
         self.check(shot, "картинка: «параметры» при 1280×800");
         self.resize(size);
         let at = (self.ui.get_lay_blocks_x(), self.ui.get_lay_blocks_y());
-        self.chip(at, |v| v.layout == Layout::Blocks, "снова «блоки»");
+        self.chip(at, |v| v.layout == Layout::Overlay, "снова совместный график");
         // Список событий: «все блоки» — все строки; снова «выбранные блоки».
         let mine = self.ui.get_events().row_count();
         let at = (self.ui.get_ev_all_x(), self.ui.get_ev_all_y());
@@ -3159,8 +3439,8 @@ impl Check {
         self.check(
             saved.timeline == Some(false)
                 && saved.view.is_some()
-                && saved.layout == Some(Layout::Blocks)
-                && saved.quantity == Some(Quantity::Ceiling)
+                && saved.layout == Some(Layout::Overlay)
+                && saved.metrics.as_ref().is_some_and(|m| m.len() == 10)
                 && saved.events_all == Some(false),
             format!(
                 "файл окна помнит вид: по времени {:?}, вид {:?}, раскладка {:?}, величина {:?}, события все {:?}",

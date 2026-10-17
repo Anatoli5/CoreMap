@@ -1,27 +1,13 @@
-// График статистики по времени (бриф W, часть 3, с поправкой 16.10): ось x — время одного дня журнала, две раскладки:
-// • «блоки» — выбранные блоки (хоть все двенадцать) своими цветами × одна величина: температура, фактический
-//   множитель, потолок (ступенями — журнал смены потолков), нагрузка или кристалл; события — отметками на линии блока;
-// • «параметры» — один-два блока (первые в сравнении) × все величины полосами одна под другой: температура с целью и
-//   аварийной отсечкой, множитель с потолком, нагрузка, кристалл, видеокарта (°C и Вт), вентиляторы; события — под
-//   полосами.
-// Владелец 16.10: «графики… множителей для каждого ядра… параллельно… чтобы видно было… какое ядро поменялось… на
-// какой момент времени… в каком порядке… возможность отображать сразу все… учитывать только время когда… активно
-// приложение». Отсюда:
-// • ось — только записанное время: промежуток без строк (CoreMapTray закрыт, компьютер выключен, журнал не писался)
-//   сжимается в тонкую отметку с его длительностью в подсказке, как торговые графики пропускают закрытые часы.
-//   Перерыв — промежуток больше двух шагов записи строки (0,5 с у строк по 0,25 с, 4 с у прежних по 2 с): меньший —
-//   обычный шаг журнала с дрожью таймера, а не пауза;
-// • колесо мыши — масштаб вокруг курсора, перетаскивание — сдвиг, без заданных заранее отрезков (как у просмотрщиков
-//   рядов по времени);
-// • прореживание — первая, наименьшая, наибольшая и последняя строка на столбец пикселей (M4): день строк по 0,25 с —
-//   около 345 тыс. точек на ряд, ни один всплеск не теряется;
-// • полосы рисуются здесь в картинки (Slint только выводит их): путь в 64 тыс. точек программный отрисовщик Slint
-//   рисовал 4,4 с на кадр (замер скрытой проверки 16.10), картинку — копирует.
-// Одна раскладка от другой отличается только набором рядов и полос: шкалы, деления, подсказки, наведение и
-// прореживание — общие. День читает поток статистики (store.rs) по просьбе окна, когда — решает view.rs.
+// Адаптер статистики по времени: выбранные блоки × выбранные величины, общие шкалы по единицам.
+// Совместный показ использует до двух шкал; остальные единицы получают отдельные панели.
+// Перестановка осей меняет только проекцию. Диапазоны и отсечение общие с остальными графиками.
+// Линия обзора усредняет отсчёты по времени; потолок остаётся ступенями. Прежнее M4 сохранено
+// для старого одиночного режима и его контракта. Чтение дня и сжатие перерывов не меняются.
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::plot::{Range, Viewport};
 use crate::samples::{self, Columns, Shared, What};
 
 /// Видеокарта и вентиляторы пишутся раз в 2 с (в строке, где прочитаны): у них перерыв — больше этого.
@@ -35,7 +21,7 @@ const WHEEL_ZOOM: f64 = 0.8;
 pub const STRIP_GAP: f64 = 4.0;
 
 /// Величина блока по времени.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Quantity {
     #[default]
     Temp,
@@ -43,15 +29,32 @@ pub enum Quantity {
     Ceiling,
     Busy,
     Level,
+    GpuTemp,
+    GpuPower,
+    GpuBusy,
+    FanCpu,
+    FanGpu,
 }
 
 impl Quantity {
-    pub const ALL: [Quantity; 5] = [
+    pub const BLOCK: [Quantity; 5] = [
         Quantity::Temp,
         Quantity::Ratio,
         Quantity::Ceiling,
         Quantity::Busy,
         Quantity::Level,
+    ];
+    pub const ALL: [Quantity; 10] = [
+        Quantity::Temp,
+        Quantity::Ratio,
+        Quantity::Ceiling,
+        Quantity::Busy,
+        Quantity::Level,
+        Quantity::GpuTemp,
+        Quantity::GpuPower,
+        Quantity::GpuBusy,
+        Quantity::FanCpu,
+        Quantity::FanGpu,
     ];
 
     /// Номер для окна (app.slint) и файла окна.
@@ -63,6 +66,11 @@ impl Quantity {
             Quantity::Ceiling => 2,
             Quantity::Busy => 3,
             Quantity::Level => 4,
+            Quantity::GpuTemp => 5,
+            Quantity::GpuPower => 6,
+            Quantity::GpuBusy => 7,
+            Quantity::FanCpu => 8,
+            Quantity::FanGpu => 9,
         }
     }
 
@@ -73,18 +81,115 @@ impl Quantity {
             2 => Quantity::Ceiling,
             3 => Quantity::Busy,
             4 => Quantity::Level,
+            5 => Quantity::GpuTemp,
+            6 => Quantity::GpuPower,
+            7 => Quantity::GpuBusy,
+            8 => Quantity::FanCpu,
+            9 => Quantity::FanGpu,
             _ => Quantity::Temp,
         }
     }
 
     /// Подпись полосы.
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
-            Quantity::Temp => "°C",
+            Quantity::Temp => "температура, °C",
             Quantity::Ratio => "фактический множитель",
             Quantity::Ceiling => "потолок (ступени — его смены)",
             Quantity::Busy => "нагрузка, %",
             Quantity::Level => "кристалл (средняя остальных блоков), °C",
+            Quantity::GpuTemp => "видеокарта, °C",
+            Quantity::GpuPower => "видеокарта, Вт",
+            Quantity::GpuBusy => "видеокарта, %",
+            Quantity::FanCpu => "вентилятор процессора, об/мин",
+            Quantity::FanGpu => "вентилятор видеокарты, об/мин",
+        }
+    }
+
+    #[must_use]
+    pub fn unit(self) -> Unit {
+        match self {
+            Self::Temp | Self::Level | Self::GpuTemp => Unit::Temperature,
+            Self::Ratio | Self::Ceiling => Unit::Ratio,
+            Self::Busy | Self::GpuBusy => Unit::Percent,
+            Self::GpuPower => Unit::Power,
+            Self::FanCpu | Self::FanGpu => Unit::Rpm,
+        }
+    }
+
+    #[must_use]
+    pub fn global(self) -> bool {
+        matches!(
+            self,
+            Self::GpuTemp | Self::GpuPower | Self::GpuBusy | Self::FanCpu | Self::FanGpu
+        )
+    }
+
+    #[must_use]
+    pub fn line_hint(self) -> &'static str {
+        match self.index() % 5 {
+            1 => "штрих",
+            2 => "короткий штрих",
+            3 => "точки",
+            4 => "штрих-точка",
+            _ => "сплошная",
+        }
+    }
+
+    fn line_pattern(self) -> &'static [f64] {
+        match self.index() % 5 {
+            1 => &[8.0, 4.0],
+            2 => &[4.0, 3.0],
+            3 => &[1.0, 4.0],
+            4 => &[8.0, 3.0, 1.0, 3.0],
+            _ => &[],
+        }
+    }
+}
+
+/// Общая шкала для величин с одинаковой единицей.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unit {
+    Temperature,
+    Ratio,
+    Percent,
+    Power,
+    Rpm,
+}
+
+impl Unit {
+    pub const ALL: [Self; 5] = [Self::Temperature, Self::Ratio, Self::Percent, Self::Power, Self::Rpm];
+
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Temperature => "°C",
+            Self::Ratio => "×",
+            Self::Percent => "%",
+            Self::Power => "Вт",
+            Self::Rpm => "об/мин",
+        }
+    }
+
+    #[must_use]
+    pub fn index(self) -> i32 {
+        match self {
+            Self::Temperature => 0,
+            Self::Ratio => 1,
+            Self::Percent => 2,
+            Self::Power => 3,
+            Self::Rpm => 4,
+        }
+    }
+
+    #[must_use]
+    pub fn of(index: i32) -> Self {
+        match index {
+            1 => Self::Ratio,
+            2 => Self::Percent,
+            3 => Self::Power,
+            4 => Self::Rpm,
+            _ => Self::Temperature,
         }
     }
 }
@@ -97,6 +202,8 @@ pub enum Layout {
     Blocks,
     /// Один-два блока × все величины полосами.
     Params,
+    /// Выбранные величины совместно; более двух единиц разделяются на панели.
+    Overlay,
 }
 
 /// Ряды одного блока за день, по строкам (NaN — в строке нет); ряд, о котором не просили, пуст.
@@ -121,6 +228,7 @@ impl BlockDay {
             Quantity::Ceiling => &self.ceiling,
             Quantity::Busy => &self.busy,
             Quantity::Level => &self.level,
+            Quantity::GpuTemp | Quantity::GpuPower | Quantity::GpuBusy | Quantity::FanCpu | Quantity::FanGpu => &[],
         }
     }
 
@@ -131,6 +239,9 @@ impl BlockDay {
             Quantity::Ceiling => &mut self.ceiling,
             Quantity::Busy => &mut self.busy,
             Quantity::Level => &mut self.level,
+            Quantity::GpuTemp | Quantity::GpuPower | Quantity::GpuBusy | Quantity::FanCpu | Quantity::FanGpu => {
+                unreachable!("shared series belong to Day")
+            }
         }
     }
 }
@@ -221,7 +332,7 @@ impl Day {
             self.t = order.iter().map(|&i| self.t[i]).collect();
             self.step = order.iter().map(|&i| self.step[i]).collect();
             for b in &mut self.blocks {
-                for q in Quantity::ALL {
+                for q in Quantity::BLOCK {
                     take(b.series_mut(q));
                 }
             }
@@ -329,13 +440,16 @@ fn push_row(
     let others = columns.blocks().saturating_sub(1);
     for (into, &block) in day.blocks.iter_mut().zip(places) {
         let value = |what| block.and_then(|b| columns.value(line, fields, b, what));
-        for &q in wanted {
+        for &q in wanted.iter().filter(|q| !q.global()) {
             let v = match q {
                 Quantity::Temp => value(What::Temp),
                 Quantity::Ratio => value(What::Ratio),
                 Quantity::Ceiling => value(What::Ceiling),
                 Quantity::Busy => value(What::Busy),
                 Quantity::Level => value(What::Temp).and_then(|t| samples::die_level(sum - t, known - 1, others)),
+                Quantity::GpuTemp | Quantity::GpuPower | Quantity::GpuBusy | Quantity::FanCpu | Quantity::FanGpu => {
+                    None
+                }
             };
             into.series_mut(q).push(stored(v));
         }
@@ -452,6 +566,110 @@ pub fn decimate(
         }
     }
     flush(&mut open, &mut pen_up, out);
+}
+
+/// Линия обзора: среднее по времени на четыре точки окна; разрывы остаются разрывами.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "day milliseconds and pixel buckets; averaged sample values remain f32 like the source"
+)]
+fn trend(day: &Day, values: &[f32], view: (i64, i64), pixels: usize, sparse: bool, out: &mut Vec<Point>) {
+    out.clear();
+    if values.len() != day.x.len() || pixels == 0 || view.1 <= view.0 {
+        return;
+    }
+    let first = day.x.partition_point(|&x| x < view.0).saturating_sub(1);
+    let end = (day.x.partition_point(|&x| x <= view.1) + 1).min(day.x.len());
+    if end.saturating_sub(first) <= pixels {
+        raw_points(day, values, first..end, sparse, out);
+        return;
+    }
+    let buckets = (pixels / 4).max(1) as f64;
+    let bucket_width = (view.1 - view.0) as f64 / buckets;
+    // Номер столбца, взвешенные время и значение, сумма длительностей.
+    let mut open: Option<(i64, f64, f64, f64)> = None;
+    let mut pen_up = true;
+    let mut previous: Option<usize> = None;
+    let flush = |open: &mut Option<(i64, f64, f64, f64)>, pen_up: &mut bool, out: &mut Vec<Point>| {
+        if let Some((_, time, value, weight)) = open.take() {
+            out.push(Point {
+                at: (time / weight).round() as i64,
+                v: (value / weight) as f32,
+                pen_up: *pen_up,
+            });
+            *pen_up = false;
+        }
+    };
+    for (i, &value) in values.iter().enumerate().take(end).skip(first) {
+        if day.starts.get(i).copied().unwrap_or(false) {
+            flush(&mut open, &mut pen_up, out);
+            pen_up = true;
+            previous = None;
+        }
+        if !value.is_finite() {
+            if !sparse {
+                flush(&mut open, &mut pen_up, out);
+                pen_up = true;
+                previous = None;
+            }
+            continue;
+        }
+        let elapsed = previous.map(|j| day.x[i] - day.x[j]);
+        if sparse && elapsed.is_some_and(|elapsed| elapsed > SPARSE_GAP_MS) {
+            flush(&mut open, &mut pen_up, out);
+            pen_up = true;
+            previous = None;
+        }
+        let nominal = day.step.get(i).copied().unwrap_or(250).max(1);
+        let weight = previous.map_or(nominal, |j| {
+            let elapsed = day.x[i] - day.x[j];
+            if elapsed > 0 && (sparse || elapsed <= nominal * 3 / 2) {
+                elapsed
+            } else {
+                nominal
+            }
+        }) as f64;
+        previous = Some(i);
+        let at = day.x[i];
+        let bucket = (((at - view.0) as f64 / bucket_width).floor().clamp(-1.0, buckets)) as i64;
+        if open.as_ref().is_some_and(|a| a.0 != bucket) {
+            flush(&mut open, &mut pen_up, out);
+        }
+        let item = open.get_or_insert((bucket, 0.0, 0.0, 0.0));
+        item.1 += at as f64 * weight;
+        item.2 += f64::from(value) * weight;
+        item.3 += weight;
+    }
+    flush(&mut open, &mut pen_up, out);
+}
+
+fn raw_points(day: &Day, values: &[f32], rows: std::ops::Range<usize>, sparse: bool, out: &mut Vec<Point>) {
+    let mut pen_up = true;
+    let mut previous: Option<usize> = None;
+    for (i, &v) in values.iter().enumerate().take(rows.end).skip(rows.start) {
+        if day.starts.get(i).copied().unwrap_or(false) {
+            pen_up = true;
+            previous = None;
+        }
+        if !v.is_finite() {
+            if !sparse {
+                pen_up = true;
+                previous = None;
+            }
+            continue;
+        }
+        if sparse && previous.is_some_and(|j| day.x[i] - day.x[j] > SPARSE_GAP_MS) {
+            pen_up = true;
+        }
+        out.push(Point {
+            at: day.x[i],
+            v,
+            pen_up,
+        });
+        pen_up = false;
+        previous = Some(i);
+    }
 }
 
 // ----- картинка полосы -----
@@ -581,6 +799,16 @@ fn byte(v: f32) -> u8 {
 #[must_use]
 pub fn zoom(view: (i64, i64), bounds: (i64, i64), at: f64, delta: f64) -> (i64, i64) {
     let factor = WHEEL_ZOOM.powf(delta / WHEEL_STEP);
+    if at >= 1.0 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "elapsed milliseconds across the i64 timestamp domain"
+        )]
+        let width = (i128::from(view.1) - i128::from(view.0)).max(1) as f64;
+        #[expect(clippy::cast_precision_loss, reason = "the minimum wheel window is ten seconds")]
+        let wanted = (width * factor).max(MIN_SPAN_MS as f64);
+        return zoom_end(view, bounds, wanted / width);
+    }
     #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
     let span = (view.1 - view.0) as f64;
     #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
@@ -606,6 +834,73 @@ pub fn pan(view: (i64, i64), bounds: (i64, i64), shift: f64) -> (i64, i64) {
     #[expect(clippy::cast_possible_truncation, reason = "milliseconds of a day, rounded")]
     let by = (shift * span).round() as i64;
     inside((view.0 - by, view.1 - by), bounds)
+}
+
+/// Последний отсчёт остаётся у края, ширина показа сохраняется до размера всех данных.
+#[must_use]
+pub fn follow(view: (i64, i64), bounds: (i64, i64)) -> (i64, i64) {
+    let (lo, hi, width) = bounded_width(view, bounds);
+    narrow_window(hi - width, width, lo, hi)
+}
+
+/// Масштаб от конца видимого отрезка: прошлый правый край остаётся тем же даже у начала записи.
+#[must_use]
+pub fn zoom_end(view: (i64, i64), bounds: (i64, i64), factor: f64) -> (i64, i64) {
+    let (lo, hi, _) = bounded_width(view, bounds);
+    let end = i128::from(view.1).clamp(lo, hi);
+    let available = end - lo;
+    if available == 0 {
+        return narrow_window(end, 0, lo, hi);
+    }
+    let width = (i128::from(view.1) - i128::from(view.0)).clamp(1, available);
+    let desired = if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() < f64::EPSILON {
+        width
+    } else {
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "floating scale factor, then exact bounds and endpoint reconstruction in i128"
+        )]
+        let scaled = (width as f64 * factor).clamp(1.0, available as f64).round() as i128;
+        scaled.clamp(1, available)
+    };
+    narrow_window(end - desired, desired, lo, end)
+}
+
+/// Начало показа — доля всей истории; у конца сохраняется ширина окна, а не пустое место.
+#[must_use]
+pub fn scroll(view: (i64, i64), bounds: (i64, i64), start_fraction: f64) -> (i64, i64) {
+    let (lo, hi, width) = bounded_width(view, bounds);
+    let fraction = if start_fraction.is_finite() {
+        start_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "a fraction of at most the complete i64 domain, then bounded exactly with i128"
+    )]
+    let offset = ((hi - lo) as f64 * fraction).round() as i128;
+    narrow_window(lo + offset, width, lo, hi)
+}
+
+fn bounded_width(view: (i64, i64), bounds: (i64, i64)) -> (i128, i128, i128) {
+    let lo = i128::from(bounds.0.min(bounds.1));
+    let hi = i128::from(bounds.0.max(bounds.1));
+    let width = (i128::from(view.1) - i128::from(view.0)).clamp(0, hi - lo);
+    (lo, hi, width)
+}
+
+fn narrow_window(from: i128, width: i128, lo: i128, hi: i128) -> (i64, i64) {
+    let width = width.clamp(0, hi - lo);
+    let from = from.clamp(lo, hi - width);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both endpoints stay inside bounds originally supplied as i64"
+    )]
+    let result = (from as i64, (from + width) as i64);
+    result
 }
 
 /// Показ шириной `span` с местом `x` посередине (у края дня — сдвинутый внутрь).
@@ -634,12 +929,16 @@ pub struct RefShown {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StripShown {
     pub title: String,
+    pub unit: Option<Unit>,
+    pub right_unit: Option<Unit>,
     /// Деления: доля высоты снизу и подпись.
     pub ticks: Vec<(f32, String)>,
+    pub right_ticks: Vec<(f32, String)>,
     pub picture: Picture,
     pub refs: Vec<RefShown>,
     /// Ось значений: (низ, верх); None — данных в показе нет.
     pub range: Option<(f64, f64)>,
+    pub right_range: Option<(f64, f64)>,
 }
 
 /// Отметка на оси времени (событие): доля ширины, цвет.
@@ -661,6 +960,8 @@ pub struct DotShown {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimeShown {
+    pub swap: bool,
+    pub parameter_ranges: BTreeMap<Quantity, Range>,
     pub strips: Vec<StripShown>,
     /// Деления оси времени: доля ширины и подпись.
     pub ticks: Vec<(f32, String)>,
@@ -700,6 +1001,12 @@ pub struct TimeInput<'a> {
     pub view: (i64, i64),
     pub layout: Layout,
     pub quantity: Quantity,
+    /// None сохраняет старый одиночный выбор; пустой набор скрывает все ряды.
+    pub selected: Option<&'a [Quantity]>,
+    pub manual_ranges: Option<&'a BTreeMap<Unit, Range>>,
+    pub swap: bool,
+    pub normalized: bool,
+    pub parameter_ranges: Option<&'a BTreeMap<Quantity, Range>>,
     /// Поле в пикселях картинки: ширина — столбцы прореживания; высота — всё поле (полосы делят её).
     pub columns: usize,
     pub height: usize,
@@ -737,6 +1044,8 @@ struct Row<'a> {
     steps: bool,
     thick: i64,
     alpha: f32,
+    unit: Unit,
+    quantity: Quantity,
 }
 
 /// Полоса до рисования: подпись, ряды, горизонтальные линии.
@@ -744,6 +1053,7 @@ struct Plan<'a> {
     title: String,
     rows: Vec<Row<'a>>,
     refs: Vec<Level>,
+    units: Vec<Unit>,
 }
 
 /// Высота полосы в пикселях картинки при `n` полосах на поле высотой `height`.
@@ -765,7 +1075,10 @@ pub fn strip_height(height: usize, n: usize, scale: f64) -> usize {
 #[must_use]
 pub fn time_panel(input: &TimeInput) -> TimeShown {
     let day = input.day;
-    let mut shown = TimeShown::default();
+    let mut shown = TimeShown {
+        swap: input.swap,
+        ..TimeShown::default()
+    };
     let (Some(from), Some(to)) = (day.real(input.view.0), day.real(input.view.1)) else {
         shown.empty = day
             .trouble
@@ -787,13 +1100,36 @@ pub fn time_panel(input: &TimeInput) -> TimeShown {
             format!(" · перерывов записи сжато: {}", gaps.len())
         }
     );
+    shown.parameter_ranges = parameter_ranges(input);
     let plans = plans(input);
-    let height = strip_height(input.height, plans.len(), input.scale);
+    if input.selected.is_some_and(<[Quantity]>::is_empty) {
+        shown.empty = "Выбери величины для графика.".into();
+    }
+    if input.layout == Layout::Overlay && plans.len() > 1 && !input.normalized {
+        shown.head.push_str(" · больше двух единиц: отдельные панели");
+    }
+    let height = if input.swap {
+        input.height
+    } else {
+        strip_height(input.height, plans.len(), input.scale)
+    };
+    let width = if input.swap {
+        strip_height(input.columns, plans.len(), input.scale)
+    } else {
+        input.columns
+    };
     let mut points = Vec::new();
     for plan in &plans {
-        shown.strips.push(strip(plan, input, height, &mut points));
+        shown
+            .strips
+            .push(strip(plan, input, width, height, &shown.parameter_ranges, &mut points));
     }
-    shown.ticks = time_ticks(day, view, input.columns, input.scale);
+    shown.ticks = time_ticks(
+        day,
+        view,
+        if input.swap { input.height } else { input.columns },
+        input.scale,
+    );
     #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
     let share = |x: i64| (x - view.0) as f64 / (view.1 - view.0).max(1) as f64;
     shown.gaps = gaps.iter().map(|&x| crate::panels::f(share(x))).collect();
@@ -802,7 +1138,7 @@ pub fn time_panel(input: &TimeInput) -> TimeShown {
         let Some(x) = day.place(e.at).filter(|&x| inside(x)) else {
             continue;
         };
-        let on_line = (input.layout == Layout::Blocks)
+        let on_line = (input.layout == Layout::Blocks && input.selected.is_none())
             .then(|| {
                 let b = day.blocks.get(e.block?)?;
                 let row = nearest_row(&day.x, x)?;
@@ -813,8 +1149,8 @@ pub fn time_panel(input: &TimeInput) -> TimeShown {
             .flatten();
         match on_line {
             Some(y) => shown.dots.push(DotShown {
-                x: crate::panels::f(share(x)),
-                y: crate::panels::f(y),
+                x: crate::panels::f(if input.swap { y } else { share(x) }),
+                y: crate::panels::f(if input.swap { share(x) } else { y }),
                 color: e.color,
                 kind: if e.cut { 1 } else { 2 },
             }),
@@ -829,7 +1165,11 @@ pub fn time_panel(input: &TimeInput) -> TimeShown {
 
 /// Нагрузка показывается в процентах.
 fn scale_of(q: Quantity) -> f32 {
-    if q == Quantity::Busy { 100.0 } else { 1.0 }
+    if matches!(q, Quantity::Busy | Quantity::GpuBusy) {
+        100.0
+    } else {
+        1.0
+    }
 }
 
 /// Толщина линии в пикселях картинки.
@@ -841,6 +1181,9 @@ fn thickness(scale: f64, points: f64) -> i64 {
 
 /// Полосы раскладки.
 fn plans<'a>(input: &TimeInput<'a>) -> Vec<Plan<'a>> {
+    if let Some(selected) = input.selected {
+        return selected_plans(input, selected);
+    }
     let day = input.day;
     let colour = |k: usize| input.blocks.get(k).map_or(FAN_CPU, |b| b.color);
     let thick = thickness(input.scale, 1.5);
@@ -852,6 +1195,8 @@ fn plans<'a>(input: &TimeInput<'a>) -> Vec<Plan<'a>> {
         steps: false,
         thick,
         alpha: 1.0,
+        unit: Unit::Temperature,
+        quantity: Quantity::Temp,
     };
     let shared = if day.blocks.len() > 1 { SHARED_ALPHA } else { 1.0 };
     let mut refs = Vec::new();
@@ -869,17 +1214,23 @@ fn plans<'a>(input: &TimeInput<'a>) -> Vec<Plan<'a>> {
                 times: scale_of(q),
                 steps: q == Quantity::Ceiling,
                 alpha: shared,
+                unit: q.unit(),
+                quantity: q,
                 ..row(b.series(q), colour(k))
             })
             .collect()
     };
-    let plan = |title: &str, rows: Vec<Row<'a>>, refs: Vec<Level>| Plan {
-        title: title.to_string(),
-        rows,
-        refs,
+    let plan = |title: &str, rows: Vec<Row<'a>>, refs: Vec<Level>| {
+        let units = vec![rows.first().map_or(Unit::Temperature, |r| r.unit)];
+        Plan {
+            title: title.to_string(),
+            rows,
+            refs,
+            units,
+        }
     };
     match input.layout {
-        Layout::Blocks => vec![plan(
+        Layout::Blocks | Layout::Overlay => vec![plan(
             input.quantity.title(),
             of(input.quantity),
             if input.quantity == Quantity::Temp {
@@ -889,33 +1240,32 @@ fn plans<'a>(input: &TimeInput<'a>) -> Vec<Plan<'a>> {
             },
         )],
         Layout::Params => {
-            let mut ratio: Vec<Row> = Vec::new();
-            for (k, b) in day.blocks.iter().enumerate() {
-                ratio.push(Row {
-                    steps: true,
-                    thick: thickness(input.scale, 1.0),
-                    alpha: CEILING_ALPHA,
-                    ..row(&b.ceiling, colour(k))
-                });
-                ratio.push(Row {
-                    alpha: shared,
-                    ..row(&b.ratio, colour(k))
-                });
-            }
-            let sparse = |v: &'a [f32], color: u32| Row {
+            let sparse = |v: &'a [f32], color: u32, unit: Unit| Row {
                 sparse: true,
+                unit,
                 ..row(v, color)
             };
             vec![
                 plan(Quantity::Temp.title(), of(Quantity::Temp), refs),
-                plan("множитель · потолок ступенями", ratio, Vec::new()),
+                plan("множитель · потолок ступенями", legacy_ratio_rows(input), Vec::new()),
                 plan(Quantity::Busy.title(), of(Quantity::Busy), Vec::new()),
                 plan(Quantity::Level.title(), of(Quantity::Level), Vec::new()),
-                plan("видеокарта, °C", vec![sparse(&day.gpu_temp, GPU)], Vec::new()),
-                plan("видеокарта, Вт", vec![sparse(&day.gpu_power, GPU)], Vec::new()),
+                plan(
+                    "видеокарта, °C",
+                    vec![sparse(&day.gpu_temp, GPU, Unit::Temperature)],
+                    Vec::new(),
+                ),
+                plan(
+                    "видеокарта, Вт",
+                    vec![sparse(&day.gpu_power, GPU, Unit::Power)],
+                    Vec::new(),
+                ),
                 plan(
                     "вентиляторы, об/мин: процессора · видеокарты",
-                    vec![sparse(&day.fan_cpu, FAN_CPU), sparse(&day.fan_gpu, FAN_GPU)],
+                    vec![
+                        sparse(&day.fan_cpu, FAN_CPU, Unit::Rpm),
+                        sparse(&day.fan_gpu, FAN_GPU, Unit::Rpm),
+                    ],
                     Vec::new(),
                 ),
             ]
@@ -923,91 +1273,377 @@ fn plans<'a>(input: &TimeInput<'a>) -> Vec<Plan<'a>> {
     }
 }
 
-/// Одна полоса: ось значений — по видимым точкам её рядов (и линиям `refs`), ряды — в картинку.
-fn strip(plan: &Plan, input: &TimeInput, height: usize, points: &mut Vec<Point>) -> StripShown {
-    let day = input.day;
-    let (from, to) = input.view;
-    let mut decimated: Vec<Vec<Point>> = Vec::with_capacity(plan.rows.len());
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for r in &plan.rows {
-        decimate(&day.x, &day.starts, r.v, input.view, input.columns, r.sparse, points);
-        for p in points.iter_mut() {
-            p.v *= r.times;
-            if (from..=to).contains(&p.at) {
-                lo = lo.min(f64::from(p.v));
-                hi = hi.max(f64::from(p.v));
+fn legacy_ratio_rows<'a>(input: &TimeInput<'a>) -> Vec<Row<'a>> {
+    let mut rows = Vec::new();
+    for (k, b) in input.day.blocks.iter().enumerate() {
+        let color = input.blocks.get(k).map_or(FAN_CPU, |b| b.color);
+        for (quantity, v) in [(Quantity::Ceiling, &b.ceiling), (Quantity::Ratio, &b.ratio)] {
+            let steps = quantity == Quantity::Ceiling;
+            rows.push(Row {
+                v,
+                times: 1.0,
+                color,
+                sparse: false,
+                steps,
+                thick: thickness(input.scale, if steps { 1.0 } else { 1.5 }),
+                alpha: if steps {
+                    CEILING_ALPHA
+                } else if input.day.blocks.len() > 1 {
+                    SHARED_ALPHA
+                } else {
+                    1.0
+                },
+                unit: Unit::Ratio,
+                quantity,
+            });
+        }
+    }
+    rows
+}
+
+fn global_series(day: &Day, q: Quantity) -> &[f32] {
+    match q {
+        Quantity::GpuTemp => &day.gpu_temp,
+        Quantity::GpuPower => &day.gpu_power,
+        Quantity::GpuBusy => &day.gpu_busy,
+        Quantity::FanCpu => &day.fan_cpu,
+        Quantity::FanGpu => &day.fan_gpu,
+        _ => &[],
+    }
+}
+
+fn parameter_ranges(input: &TimeInput) -> BTreeMap<Quantity, Range> {
+    let first = input.day.x.partition_point(|&x| x < input.view.0);
+    let end = input.day.x.partition_point(|&x| x <= input.view.1);
+    let wanted = input.selected.unwrap_or_else(|| std::slice::from_ref(&input.quantity));
+    let mut ranges = BTreeMap::new();
+    for &q in wanted {
+        let block = input
+            .day
+            .blocks
+            .iter()
+            .flat_map(|b| b.series(q).get(first..end).unwrap_or(&[]));
+        let global = global_series(input.day, q).get(first..end).unwrap_or(&[]).iter();
+        let values = block.chain(global).map(|&v| f64::from(v) * f64::from(scale_of(q)));
+        let manual = input
+            .parameter_ranges
+            .and_then(|m| m.get(&q))
+            .and_then(|r| Range::new(r.min, r.max));
+        if let Some(range) = manual.or_else(|| Range::fit(values)) {
+            ranges.insert(q, range);
+        }
+    }
+    ranges
+}
+
+/// Выбор величин — единственный источник состава рядов и шкал.
+fn selected_plans<'a>(input: &TimeInput<'a>, selected: &[Quantity]) -> Vec<Plan<'a>> {
+    let mut groups: BTreeMap<(Unit, i32), Plan<'a>> = BTreeMap::new();
+    for q in Quantity::ALL.into_iter().filter(|q| selected.contains(q)) {
+        let unit = q.unit();
+        let parameter = if input.layout == Layout::Params { q.index() } else { -1 };
+        let plan = groups.entry((unit, parameter)).or_insert_with(|| Plan {
+            title: String::new(),
+            rows: Vec::new(),
+            refs: Vec::new(),
+            units: vec![unit],
+        });
+        if !plan.title.is_empty() {
+            plan.title.push_str(" · ");
+        }
+        plan.title.push_str(q.title());
+        let row = |v, color, alpha| Row {
+            v,
+            times: scale_of(q),
+            color,
+            sparse: q.global(),
+            steps: q == Quantity::Ceiling,
+            thick: thickness(input.scale, if q == Quantity::Ceiling { 1.0 } else { 1.5 }),
+            alpha,
+            unit,
+            quantity: q,
+        };
+        if q.global() {
+            let color = match q {
+                Quantity::FanCpu => FAN_CPU,
+                Quantity::FanGpu => FAN_GPU,
+                _ => GPU,
+            };
+            plan.rows.push(row(global_series(input.day, q), color, 1.0));
+        } else {
+            for (k, b) in input.day.blocks.iter().enumerate() {
+                let color = input.blocks.get(k).map_or(FAN_CPU, |b| b.color);
+                plan.rows.push(row(b.series(q), color, SHARED_ALPHA));
             }
         }
-        decimated.push(points.clone()); // a few thousand points per row, per redraw
+        if q == Quantity::Temp {
+            if let Some(v) = input.limit {
+                plan.refs.push((v, TARGET, format!("цель {v:.0}°")));
+            }
+            if let Some(v) = input.emergency {
+                plan.refs.push((v, EMERGENCY, format!("аварийная {v:.0}°")));
+            }
+        }
     }
-    for (v, _, _) in &plan.refs {
-        lo = lo.min(*v);
-        hi = hi.max(*v);
+    if input.layout != Layout::Params && (groups.len() <= 2 || input.normalized) {
+        let mut combined = Plan {
+            title: String::new(),
+            rows: Vec::new(),
+            refs: Vec::new(),
+            units: Vec::new(),
+        };
+        for (_, mut group) in groups {
+            if !combined.title.is_empty() {
+                combined.title.push_str(" · ");
+            }
+            combined.title.push_str(&group.title);
+            combined.rows.append(&mut group.rows);
+            combined.refs.append(&mut group.refs);
+            combined.units.append(&mut group.units);
+        }
+        if combined.rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![combined]
+        }
+    } else {
+        groups.into_values().collect()
     }
-    let width = u32::try_from(input.columns).unwrap_or(1).max(2);
+}
+
+fn unit_ranges(plan: &Plan, input: &TimeInput) -> BTreeMap<Unit, Range> {
+    let first = input.day.x.partition_point(|&x| x < input.view.0);
+    let end = input.day.x.partition_point(|&x| x <= input.view.1);
+    let mut ranges = BTreeMap::new();
+    for &unit in plan.units.iter().filter(|_| !input.normalized) {
+        let values = plan.rows.iter().filter(|r| r.unit == unit).flat_map(|r| {
+            r.v.get(first..end)
+                .unwrap_or(&[])
+                .iter()
+                .map(move |&v| f64::from(v) * f64::from(r.times))
+        });
+        let auto = if input.selected.is_none() {
+            Range::fit(values.chain(plan.refs.iter().map(|(v, _, _)| *v)))
+        } else {
+            Range::fit(values)
+        };
+        let manual = input
+            .manual_ranges
+            .and_then(|m| m.get(&unit))
+            .and_then(|r| Range::new(r.min, r.max));
+        if let Some(range) = manual.or(auto) {
+            ranges.insert(unit, range);
+        }
+    }
+    ranges
+}
+
+/// Одна полоса: диапазон из видимых исходных значений, общая проекция и отсечение.
+fn strip(
+    plan: &Plan,
+    input: &TimeInput,
+    columns: usize,
+    height: usize,
+    parameters: &BTreeMap<Quantity, Range>,
+    points: &mut Vec<Point>,
+) -> StripShown {
+    let day = input.day;
+    let (from, to) = input.view;
+    let width = u32::try_from(columns).unwrap_or(1).max(2);
     let tall = u32::try_from(height).unwrap_or(8).max(8);
     let mut shown = StripShown {
-        title: plan.title.clone(),
+        title: if input.normalized {
+            format!("относительные шкалы · {}", plan.title)
+        } else {
+            plan.title.clone()
+        },
+        unit: if input.normalized {
+            None
+        } else {
+            plan.units.first().copied()
+        },
+        right_unit: if input.normalized {
+            None
+        } else {
+            plan.units.get(1).copied()
+        },
         picture: Picture::new(width, tall),
         ..StripShown::default()
     };
-    if !lo.is_finite() {
-        shown.title = format!("{} — нет данных", plan.title);
+    let ranges = unit_ranges(plan, input);
+    let axis_pixels = if input.swap { width } else { tall };
+    for (index, &unit) in plan.units.iter().filter(|_| !input.normalized).enumerate() {
+        if let Some(&range) = ranges.get(&unit) {
+            let ticks = value_ticks(range, axis_pixels, input.scale);
+            if index == 0 {
+                shown.range = Some((range.min, range.max));
+                shown.ticks = ticks;
+            } else {
+                shown.right_range = Some((range.min, range.max));
+                shown.right_ticks = ticks;
+            }
+        }
+    }
+    if input.normalized {
+        let relative = Range { min: 0.0, max: 100.0 };
+        shown.range = Some((relative.min, relative.max));
+        shown.ticks = value_ticks(relative, axis_pixels, input.scale);
+    }
+    if ranges.is_empty() && !input.normalized || input.normalized && parameters.is_empty() {
+        shown.title.push_str(" — нет данных");
         return shown;
     }
-    if hi - lo < 1.0 {
-        (lo, hi) = (lo - 0.5, hi + 0.5);
-    }
-    let pad = (hi - lo) * 0.08;
-    let (lo, hi) = (lo - pad, hi + pad);
-    shown.range = Some((lo, hi));
-    let value = |v: f64| (v - lo) / (hi - lo);
-    #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day, pixels")]
-    let px = |at: i64| (at - from) as f64 / (to - from).max(1) as f64 * f64::from(width - 1);
-    let py = |v: f32| (1.0 - value(f64::from(v))) * f64::from(tall - 1);
+    #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
+    let argument = Range::new(from as f64, to.max(from + 1) as f64);
+    let Some(argument) = argument else {
+        return shown;
+    };
     let mut mask = Mask::new(width, tall);
-    for (r, pts) in plan.rows.iter().zip(&decimated) {
-        mask.clear();
-        let mut last: Option<(f64, f64)> = None;
-        for p in pts {
-            let here = (px(p.at), py(p.v));
-            match last {
-                Some(prev) if !p.pen_up => {
-                    if r.steps {
-                        mask.line(prev, (here.0, prev.1), r.thick);
-                        mask.line((here.0, prev.1), here, r.thick);
-                    } else {
-                        mask.line(prev, here, r.thick);
-                    }
-                }
-                _ => mask.dot(here, r.thick),
-            }
-            last = Some(here);
+    for r in &plan.rows {
+        let Some(&value) = (if input.normalized {
+            parameters.get(&r.quantity)
+        } else {
+            ranges.get(&r.unit)
+        }) else {
+            continue;
+        };
+        let viewport = Viewport {
+            argument,
+            value,
+            swap: input.swap,
+        };
+        let pixels = if input.swap { height } else { columns };
+        if input.selected.is_some() && !r.steps {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "positive physical pixels divided by the display scale"
+            )]
+            let logical_pixels = (pixels as f64 / input.scale.max(0.1)).round().max(1.0) as usize;
+            trend(day, r.v, input.view, logical_pixels, r.sparse, points);
+        } else {
+            decimate(&day.x, &day.starts, r.v, input.view, pixels, r.sparse, points);
         }
+        paint_row(&mut mask, r, points, viewport, input.scale);
         shown.picture.blend(&mask, r.color, r.alpha);
     }
-    shown.refs = plan
-        .refs
-        .iter()
-        .map(|(v, color, text)| RefShown {
-            f: crate::panels::f(value(*v)),
-            color: *color,
-            text: text.clone(), // two lines per strip at most
+    let reference_range = if input.normalized {
+        parameters.get(&Quantity::Temp)
+    } else {
+        ranges.get(&Unit::Temperature)
+    };
+    shown.refs = reference_lines(&plan.refs, reference_range.copied());
+    shown
+}
+
+fn reference_lines(refs: &[Level], range: Option<Range>) -> Vec<RefShown> {
+    refs.iter()
+        .filter_map(|(v, color, text)| {
+            Some(RefShown {
+                f: crate::panels::f(range?.normal(*v).filter(|f| (0.0..=1.0).contains(f))?),
+                color: *color,
+                text: text.clone(), // two lines per strip at most
+            })
         })
-        .collect();
-    let wanted = (f64::from(tall) / input.scale.max(0.1) / TICK_POINTS).clamp(2.0, 8.0);
-    let step = nice_step((hi - lo) / wanted);
-    let mut tick = (lo / step).ceil() * step;
-    while tick <= hi {
+        .collect()
+}
+
+fn paint_row(mask: &mut Mask, row: &Row, points: &[Point], viewport: Viewport, scale: f64) {
+    let (width, height) = (mask.width, mask.height);
+    let screen = |(x, y): (f64, f64)| (x * f64::from(width - 1), (1.0 - y) * f64::from(height - 1));
+    mask.clear();
+    let mut last: Option<(f64, f64)> = None;
+    let mut phase = 0.0;
+    for p in points {
+        #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
+        let here = (p.at as f64, f64::from(p.v) * f64::from(row.times));
+        let mut line = |a, b| {
+            if let Some((a, b)) = viewport.segment(a, b) {
+                patterned_line(mask, screen(a), screen(b), row, scale, &mut phase);
+            }
+        };
+        match last {
+            Some(prev) if !p.pen_up => {
+                if row.steps {
+                    line(prev, (here.0, prev.1));
+                    line((here.0, prev.1), here);
+                } else {
+                    line(prev, here);
+                }
+            }
+            _ => {
+                phase = 0.0;
+                if let Some(p) = viewport
+                    .point(here.0, here.1)
+                    .filter(|p| (0.0..=1.0).contains(&p.0) && (0.0..=1.0).contains(&p.1))
+                {
+                    mask.dot(screen(p), row.thick);
+                }
+            }
+        }
+        last = Some(here);
+    }
+}
+
+fn patterned_line(mask: &mut Mask, a: (f64, f64), b: (f64, f64), row: &Row, scale: f64, phase: &mut f64) {
+    let pattern = row.quantity.line_pattern();
+    if pattern.is_empty() {
+        mask.line(a, b, row.thick);
+        return;
+    }
+    let scale = scale.max(0.1);
+    let cycle = pattern.iter().sum::<f64>() * scale;
+    let length = (b.0 - a.0).hypot(b.1 - a.1);
+    if length <= f64::EPSILON {
+        return;
+    }
+    let mut offset = phase.rem_euclid(cycle);
+    let mut piece = 0;
+    while offset >= pattern[piece] * scale {
+        offset -= pattern[piece] * scale;
+        piece = (piece + 1) % pattern.len();
+    }
+    let mut along = 0.0;
+    // Отрезок уже отсечён по полю; предел защищает от аномального размера окна.
+    for _ in 0..8192 {
+        let end = (along + pattern[piece] * scale - offset).min(length);
+        if piece.is_multiple_of(2) {
+            let at = |distance: f64| {
+                (
+                    a.0 + (b.0 - a.0) * distance / length,
+                    a.1 + (b.1 - a.1) * distance / length,
+                )
+            };
+            mask.line(at(along), at(end), row.thick);
+        }
+        along = end;
+        if along >= length {
+            break;
+        }
+        piece = (piece + 1) % pattern.len();
+        offset = 0.0;
+    }
+    *phase = (*phase + length).rem_euclid(cycle);
+}
+
+fn value_ticks(range: Range, pixels: u32, scale: f64) -> Vec<(f32, String)> {
+    let wanted = (f64::from(pixels) / scale.max(0.1) / TICK_POINTS).clamp(2.0, 8.0);
+    let step = nice_step((range.max - range.min) / wanted);
+    let mut tick = (range.min / step).ceil() * step;
+    let mut ticks = Vec::new();
+    while tick <= range.max && ticks.len() < 32 {
         let text = if step >= 1.0 {
             format!("{tick:.0}")
         } else {
             format!("{tick:.1}")
         };
-        shown.ticks.push((crate::panels::f(value(tick)), text));
+        if let Some(f) = range.normal(tick) {
+            ticks.push((crate::panels::f(f), text));
+        }
         tick += step;
     }
-    shown
+    ticks
 }
 
 /// Шаг делений: 1, 2 или 5 × 10ⁿ, не меньше `rough`.
@@ -1101,6 +1737,7 @@ pub struct Under<'a> {
     pub near: i64,
     pub layout: Layout,
     pub quantity: Quantity,
+    pub selected: Option<&'a [Quantity]>,
     pub blocks: &'a [Shown<'a>],
     pub events: &'a [Act],
 }
@@ -1125,13 +1762,14 @@ pub fn hover(day: &Day, under: &Under) -> String {
     let t = day.t[row];
     let mut out = format!("{}.{:03}", clock(t, 1000), t.rem_euclid(1000));
     let v = |s: &[f32]| s.get(row).copied().filter(|v| v.is_finite()).map(f64::from);
-    let wanted: &[Quantity] = match under.layout {
+    let wanted: &[Quantity] = under.selected.unwrap_or(match under.layout {
         Layout::Blocks => std::slice::from_ref(&under.quantity),
-        Layout::Params => &Quantity::ALL,
-    };
+        Layout::Params | Layout::Overlay => &Quantity::ALL,
+    });
     for (b, shown) in day.blocks.iter().zip(under.blocks) {
         let parts: Vec<String> = wanted
             .iter()
+            .filter(|q| !q.global())
             .filter_map(|&q| {
                 let x = v(b.series(q))?;
                 Some(match q {
@@ -1140,6 +1778,11 @@ pub fn hover(day: &Day, under: &Under) -> String {
                     Quantity::Ceiling => format!("потолок ×{x:.0}"),
                     Quantity::Busy => format!("нагрузка {:.0} %", x * 100.0),
                     Quantity::Level => format!("кристалл {x:.1} °C"),
+                    Quantity::GpuTemp
+                    | Quantity::GpuPower
+                    | Quantity::GpuBusy
+                    | Quantity::FanCpu
+                    | Quantity::FanGpu => return None,
                 })
             })
             .collect();
@@ -1147,7 +1790,14 @@ pub fn hover(day: &Day, under: &Under) -> String {
             let _ = write!(out, "\n{} — {}", shown.label, parts.join(" · ")); // into a String
         }
     }
-    if under.layout == Layout::Params {
+    if let Some(selected) = under.selected {
+        for q in Quantity::ALL.into_iter().filter(|q| q.global() && selected.contains(q)) {
+            if let Some(value) = nearest_reading(&day.t, global_series(day, q), row) {
+                let value = value * scale_of(q);
+                let _ = write!(out, "\n{} — {value:.0}", q.title());
+            }
+        }
+    } else if under.layout != Layout::Blocks {
         let reading = |s: &[f32]| nearest_reading(&day.t, s, row).map(f64::from);
         let gpu: Vec<String> = [
             reading(&day.gpu_temp).map(|v| format!("{v:.0} °C")),
@@ -1204,6 +1854,10 @@ fn nearest_reading(t: &[i64], v: &[f32], row: usize) -> Option<f32> {
 }
 
 #[cfg(test)]
+#[path = "navigation_spec.rs"]
+mod navigation_spec;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1216,6 +1870,463 @@ mod tests {
         };
         day.finish();
         day
+    }
+
+    fn metric_day() -> Day {
+        let mut day = day_of(&[0, 250, 500, 750, 1000], 250);
+        day.blocks = (0..3)
+            .map(|k| BlockDay {
+                name: k.to_string(),
+                temp: vec![60.0; 5],
+                ratio: vec![40.0; 5],
+                ceiling: vec![45.0; 5],
+                busy: vec![0.5; 5],
+                level: vec![55.0; 5],
+            })
+            .collect();
+        day.gpu_temp = vec![65.0; 5];
+        day.gpu_power = vec![80.0; 5];
+        day.gpu_busy = vec![0.75; 5];
+        day.fan_cpu = vec![3000.0; 5];
+        day.fan_gpu = vec![3200.0; 5];
+        day
+    }
+
+    fn metric_input<'a>(day: &'a Day, selected: &'a [Quantity]) -> TimeInput<'a> {
+        TimeInput {
+            day,
+            view: (0, 1000),
+            layout: Layout::Overlay,
+            quantity: Quantity::Temp,
+            selected: Some(selected),
+            manual_ranges: None,
+            swap: false,
+            normalized: false,
+            parameter_ranges: None,
+            columns: 101,
+            height: 101,
+            scale: 1.0,
+            blocks: &[],
+            limit: None,
+            emergency: None,
+            events: &[],
+        }
+    }
+
+    #[test]
+    fn selected_metrics_share_units_and_global_readings_are_not_repeated_per_block() {
+        let day = metric_day();
+        let selected = [Quantity::Temp, Quantity::GpuTemp, Quantity::GpuBusy];
+        let input = metric_input(&day, &selected);
+        let plans = plans(&input);
+        assert_eq!(plans.len(), 1, "две единицы накладываются на одном поле");
+        assert_eq!(plans[0].rows.len(), 5, "три температуры блоков и два глобальных ряда");
+        let shown = time_panel(&input);
+        assert_eq!(shown.strips[0].unit, Some(Unit::Temperature));
+        assert_eq!(shown.strips[0].right_unit, Some(Unit::Percent));
+        let percent = shown.strips[0].right_range.expect("вторая шкала");
+        assert!(
+            percent.0 > 70.0 && percent.1 < 80.0,
+            "проценты один раз, без принудительного нуля"
+        );
+        assert!(shown.strips[0].title.contains("видеокарта, °C"));
+        assert!(shown.strips[0].title.contains("видеокарта, %"));
+    }
+
+    #[test]
+    fn selected_panels_keep_every_block_and_empty_selection_draws_nothing() {
+        let day = metric_day();
+        let input = metric_input(&day, &Quantity::ALL);
+        let shown = time_panel(&input);
+        assert_eq!(shown.strips.len(), 5, "более двух единиц получают отдельные панели");
+        assert!(shown.head.contains("больше двух единиц"));
+        let panel_plans = plans(&TimeInput {
+            layout: Layout::Params,
+            ..input
+        });
+        assert_eq!(
+            panel_plans[0].rows.len(),
+            3,
+            "все три блока в отдельной панели температуры"
+        );
+        assert_eq!(panel_plans.len(), Quantity::ALL.len(), "отдельная панель на параметр");
+        let empty = time_panel(&metric_input(&day, &[]));
+        assert_eq!(empty.strips, [] as [StripShown; 0]);
+        assert!(empty.empty.contains("Выбери"));
+    }
+
+    #[test]
+    fn parameter_panels_separate_metrics_even_when_their_units_match() {
+        let day = metric_day();
+        let input = metric_input(&day, &[Quantity::Temp, Quantity::Level]);
+        assert_eq!(
+            time_panel(&input).strips.len(),
+            1,
+            "совместная шкала градусов в наложении"
+        );
+        let separate = time_panel(&TimeInput {
+            layout: Layout::Params,
+            ..input
+        });
+        assert_eq!(separate.strips.len(), 2);
+        assert_eq!(separate.strips[0].title, Quantity::Temp.title());
+        assert_eq!(separate.strips[1].title, Quantity::Level.title());
+        assert_ne!(
+            separate.strips[0].range, separate.strips[1].range,
+            "автодиапазон каждой величины свой"
+        );
+        let parameters = BTreeMap::from([
+            (Quantity::Temp, Range { min: 0.0, max: 100.0 }),
+            (Quantity::Level, Range { min: 40.0, max: 60.0 }),
+        ]);
+        let relative = time_panel(&TimeInput {
+            layout: Layout::Params,
+            normalized: true,
+            parameter_ranges: Some(&parameters),
+            ..input
+        });
+        assert_eq!(relative.strips.len(), 2);
+        assert_eq!(relative.parameter_ranges, parameters);
+        assert!(relative.strips.iter().all(|s| s.title.contains("относительные шкалы")));
+    }
+
+    #[test]
+    fn manual_range_is_retained_when_axes_are_transposed() {
+        let mut day = metric_day();
+        day.blocks.truncate(1);
+        day.blocks[0].temp.fill(25.0);
+        let manual = BTreeMap::from([(Unit::Temperature, Range { min: 0.0, max: 100.0 })]);
+        let input = TimeInput {
+            manual_ranges: Some(&manual),
+            ..metric_input(&day, &[Quantity::Temp])
+        };
+        let normal = time_panel(&input);
+        let transposed = time_panel(&TimeInput { swap: true, ..input });
+        assert_eq!(normal.strips[0].range, Some((0.0, 100.0)));
+        assert_eq!(normal.strips[0].range, transposed.strips[0].range);
+        assert_eq!(normal.strips[0].ticks, transposed.strips[0].ticks);
+        assert!(normal.strips[0].picture.alpha(50, 75) > 0, "время по горизонтали");
+        assert!(
+            transposed.strips[0].picture.alpha(25, 50) > 0,
+            "та же температура по горизонтали"
+        );
+        assert_eq!(
+            transposed.strips[0].picture.alpha(75, 50),
+            0,
+            "не повторная подгонка диапазона"
+        );
+    }
+
+    #[test]
+    fn automatic_range_uses_raw_visible_values_and_manual_range_clips_excluded_series() {
+        let mut day = metric_day();
+        day.blocks.truncate(1);
+        day.blocks[0].temp = vec![10.0, 20.0, 50.0, 20.0, 10.0];
+        let input = metric_input(&day, &[Quantity::Temp]);
+        let automatic = time_panel(&input);
+        let range = automatic.strips[0].range.expect("шкала");
+        assert!(
+            range.0 < 10.0 && range.1 > 50.0,
+            "сглаживание не прячет экстремумы от автодиапазона"
+        );
+        let manual = BTreeMap::from([(Unit::Temperature, Range { min: 60.0, max: 80.0 })]);
+        for swap in [false, true] {
+            let shown = time_panel(&TimeInput {
+                swap,
+                manual_ranges: Some(&manual),
+                ..input
+            });
+            assert!(
+                shown.strips[0].picture.rgba.iter().all(|&v| v == 0),
+                "весь ряд за ручной шкалой скрыт"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_overlay_has_independent_parameter_ranges_and_original_unit_tooltips() {
+        let day = metric_day();
+        let parameters = BTreeMap::from([
+            (Quantity::Ratio, Range { min: 30.0, max: 50.0 }),
+            (Quantity::Ceiling, Range { min: 10.0, max: 70.0 }),
+        ]);
+        let input = TimeInput {
+            normalized: true,
+            parameter_ranges: Some(&parameters),
+            ..metric_input(&day, &Quantity::ALL)
+        };
+        let shown = time_panel(&input);
+        assert_eq!(shown.strips.len(), 1, "в относительном режиме все единицы совместимы");
+        assert_eq!(
+            shown.strips[0].unit, None,
+            "относительная ось не выдает себя за физические проценты"
+        );
+        assert_eq!(shown.strips[0].right_unit, None);
+        assert!(shown.strips[0].title.contains("относительные шкалы"));
+        assert_eq!(
+            shown.parameter_ranges.get(&Quantity::Ratio),
+            parameters.get(&Quantity::Ratio)
+        );
+        assert_eq!(
+            shown.parameter_ranges.get(&Quantity::Ceiling),
+            parameters.get(&Quantity::Ceiling)
+        );
+        assert_eq!(shown.parameter_ranges.len(), Quantity::ALL.len());
+        let tip = hover(
+            &day,
+            &Under {
+                x: 500,
+                near: 0,
+                layout: Layout::Overlay,
+                quantity: Quantity::Temp,
+                selected: Some(&[Quantity::GpuTemp, Quantity::FanCpu]),
+                blocks: &[],
+                events: &[],
+            },
+        );
+        assert!(tip.contains("видеокарта, °C — 65"));
+        assert!(tip.contains("вентилятор процессора, об/мин — 3000"));
+        assert!(!tip.contains("3200"), "подсказка следует выбору параметров");
+    }
+
+    #[test]
+    fn parameter_zoom_preserves_other_metrics_and_absolute_configuration() {
+        let day = metric_day();
+        let selected = [Quantity::Temp, Quantity::Ratio, Quantity::Ceiling];
+        let units = BTreeMap::from([(Unit::Ratio, Range { min: 20.0, max: 60.0 })]);
+        let input = TimeInput {
+            manual_ranges: Some(&units),
+            ..metric_input(&day, &selected)
+        };
+        let absolute = time_panel(&input);
+        let relative_input = TimeInput {
+            normalized: true,
+            ..input
+        };
+        let relative = time_panel(&relative_input);
+        let ratio = relative.parameter_ranges[&Quantity::Ratio];
+        let zoomed = ratio.zoom(0.5, 0.5).expect("масштаб");
+        let parameters = BTreeMap::from([(Quantity::Ratio, zoomed)]);
+        let after = time_panel(&TimeInput {
+            parameter_ranges: Some(&parameters),
+            ..relative_input
+        });
+        assert_eq!(after.parameter_ranges[&Quantity::Ratio], zoomed);
+        assert_eq!(
+            after.parameter_ranges[&Quantity::Ceiling],
+            relative.parameter_ranges[&Quantity::Ceiling]
+        );
+        assert_eq!(
+            after.parameter_ranges[&Quantity::Temp],
+            relative.parameter_ranges[&Quantity::Temp]
+        );
+        let absolute_after = time_panel(&TimeInput {
+            parameter_ranges: Some(&parameters),
+            ..input
+        });
+        assert_eq!(
+            absolute.strips, absolute_after.strips,
+            "относительный масштаб не меняет абсолютные единицы"
+        );
+        let transposed = time_panel(&TimeInput {
+            swap: true,
+            ..relative_input
+        });
+        assert_eq!(relative.parameter_ranges, transposed.parameter_ranges);
+        assert_eq!(
+            relative.strips,
+            time_panel(&relative_input).strips,
+            "возврат осей сохраняет геометрию и настройки"
+        );
+    }
+
+    #[test]
+    fn relative_zoom_moves_only_its_parameter_trajectory() {
+        let mut day = metric_day();
+        day.blocks.truncate(1);
+        let parameters = BTreeMap::from([
+            (Quantity::Ratio, Range { min: 30.0, max: 50.0 }),
+            (Quantity::Ceiling, Range { min: 10.0, max: 70.0 }),
+        ]);
+        let input = TimeInput {
+            normalized: true,
+            parameter_ranges: Some(&parameters),
+            ..metric_input(&day, &[Quantity::Ratio, Quantity::Ceiling])
+        };
+        let before = time_panel(&input);
+        let changed = BTreeMap::from([
+            (
+                Quantity::Ratio,
+                parameters[&Quantity::Ratio].zoom(0.0, 0.5).expect("масштаб"),
+            ),
+            (Quantity::Ceiling, parameters[&Quantity::Ceiling]),
+        ]);
+        let after = time_panel(&TimeInput {
+            parameter_ranges: Some(&changed),
+            ..input
+        });
+        assert!(
+            before.strips[0].picture.alpha(50, 50) > 0,
+            "×40 посередине собственной шкалы 30–50"
+        );
+        assert!(
+            after.strips[0].picture.alpha(50, 0) > 0,
+            "×40 у верхней границы новой шкалы 30–40"
+        );
+        assert_eq!(after.strips[0].picture.alpha(50, 50), 0);
+        assert!(
+            before.strips[0].picture.alpha(50, 42) > 0 && after.strips[0].picture.alpha(50, 42) > 0,
+            "потолок ×45 остается на прежней высоте своей шкалы 10–70"
+        );
+    }
+
+    #[test]
+    fn overlay_patterns_distinguish_metrics_in_the_same_block_colour_and_keep_gaps() {
+        let mut day = metric_day();
+        day.blocks.truncate(1);
+        day.blocks[0].temp.fill(25.0);
+        day.blocks[0].ratio.fill(25.0);
+        let units = BTreeMap::from([
+            (Unit::Temperature, Range { min: 0.0, max: 100.0 }),
+            (Unit::Ratio, Range { min: 0.0, max: 100.0 }),
+        ]);
+        let temp_input = TimeInput {
+            manual_ranges: Some(&units),
+            ..metric_input(&day, &[Quantity::Temp])
+        };
+        let temperature = time_panel(&temp_input);
+        let ratio = time_panel(&TimeInput {
+            selected: Some(&[Quantity::Ratio]),
+            ..temp_input
+        });
+        assert!(temperature.strips[0].picture.alpha(10, 75) > 0, "сплошная температура");
+        assert_eq!(ratio.strips[0].picture.alpha(10, 75), 0, "промежуток штриха множителя");
+        assert!(
+            ratio.strips[0].picture.alpha(4, 75) > 0,
+            "сам штрих множителя присутствует"
+        );
+        assert_eq!(Quantity::Temp.line_hint(), "сплошная");
+        assert_eq!(Quantity::Ratio.line_hint(), "штрих");
+        assert_ne!(Quantity::GpuTemp.line_hint(), Quantity::GpuPower.line_hint());
+        day.blocks[0].ratio[2] = f32::NAN;
+        let broken = time_panel(&TimeInput {
+            manual_ranges: Some(&units),
+            ..metric_input(&day, &[Quantity::Ratio])
+        });
+        assert_eq!(
+            broken.strips[0].picture.alpha(50, 75),
+            0,
+            "разрыв данных не соединяется штрихом"
+        );
+    }
+
+    #[test]
+    fn following_appended_rows_keeps_the_window_width_at_the_new_end() {
+        assert_eq!(follow((10, 30), (0, 40)), (20, 40));
+        assert_eq!(follow((20, 40), (0, 55)), (35, 55));
+        assert_eq!(
+            follow((10, 100), (20, 40)),
+            (20, 40),
+            "короткая история показана целиком"
+        );
+        assert_eq!(follow((10, 30), (40, 40)), (40, 40));
+    }
+
+    #[test]
+    fn overview_scroll_uses_the_full_history_fraction_and_clamps_without_changing_width() {
+        assert_eq!(scroll((20, 40), (0, 100), 0.5), (50, 70));
+        assert_eq!(scroll((20, 40), (0, 100), 1.0), (80, 100));
+        assert_eq!(scroll((20, 40), (0, 100), -1.0), (0, 20));
+        assert_eq!(scroll((20, 40), (0, 100), f64::NAN), (0, 20));
+        assert_eq!(scroll((20, 90), (40, 60), 0.5), (40, 60));
+        // Доли здесь логического времени; физическая горизонталь/вертикаль выбирается только проекцией.
+        assert_eq!(scroll(follow((0, 20), (0, 100)), (0, 100), 0.25), (25, 45));
+    }
+
+    #[test]
+    fn overview_helpers_do_not_overflow_at_signed_timestamp_limits() {
+        let bounds = (i64::MIN, i64::MAX);
+        assert_eq!(follow(bounds, bounds), bounds);
+        assert_eq!(scroll(bounds, bounds, 1.0), bounds);
+        assert_eq!(follow((0, 10), bounds), (i64::MAX - 10, i64::MAX));
+        assert_eq!(scroll((0, 10), bounds, 0.0), (i64::MIN, i64::MIN + 10));
+        assert_eq!(scroll((0, 10), bounds, 1.0), (i64::MAX - 10, i64::MAX));
+    }
+
+    #[test]
+    fn zooming_historical_window_near_the_start_never_moves_its_selected_end() {
+        let bounds = (0, 100_000);
+        let view = (10_000, 30_000);
+        assert_eq!(zoom_end(view, bounds, 2.5), (0, 30_000));
+        assert_eq!(
+            zoom(view, bounds, 1.0, -240.0),
+            (0, 30_000),
+            "колесо и кнопки используют один предел"
+        );
+        assert_eq!(zoom_end(view, bounds, 0.5), (20_000, 30_000));
+        let latest = follow(view, (0, 120_000));
+        assert_eq!(zoom_end(latest, (0, 120_000), 2.0), (80_000, 120_000));
+        assert_eq!(zoom_end((9, 10), (0, 100), 0.01), (9, 10), "не меньше миллисекунды");
+    }
+
+    #[test]
+    fn end_zoom_is_safe_for_nonfinite_factors_and_extreme_timestamp_bounds() {
+        let bounds = (i64::MIN, i64::MAX);
+        assert_eq!(zoom_end(bounds, bounds, 1.0), bounds);
+        assert_eq!(zoom_end(bounds, bounds, 2.0), bounds);
+        assert_eq!(
+            zoom_end((i64::MAX - 20, i64::MAX), bounds, 0.5),
+            (i64::MAX - 10, i64::MAX)
+        );
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(zoom_end((10, 30), (0, 100), factor), (10, 30));
+        }
+    }
+
+    #[test]
+    fn day_request_keeps_global_selection_order_and_reads_shared_sensors_once() {
+        let directory = std::env::temp_dir().join(format!("coremap-timeline-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("каталог проверки");
+        let file = directory.join("day.csv");
+        std::fs::write(&file,
+            "time,temp_gpu,power_gpu,busy_gpu,fan_cpu,fan_gpu,0.temp,0.ratio,0.busy,0.ceiling\n2026-10-17 10:00:00.000,65,80,0.75,3000,3200,60,40,0.5,45\n").expect("данные проверки");
+        let selected = [Quantity::GpuBusy, Quantity::Temp, Quantity::FanCpu, Quantity::Ratio];
+        let day = read_day(&directory, "2026-10-17", &["day.csv".into()], &["0".into()], &selected);
+        std::fs::remove_file(file).expect("убрать файл проверки");
+        std::fs::remove_dir(directory).expect("убрать каталог проверки");
+        assert_eq!(
+            day.quantities, selected,
+            "ключ запроса учитывает глобальные параметры и порядок"
+        );
+        assert_eq!(day.blocks[0].temp, [60.0]);
+        assert_eq!(day.blocks[0].ratio, [40.0]);
+        assert!(day.blocks[0].busy.is_empty(), "не запрошенное не декодируется");
+        assert_eq!(day.gpu_busy, [0.75]);
+        assert_eq!(day.fan_cpu, [3000.0]);
+    }
+
+    #[test]
+    fn overview_is_a_mean_trend_and_retains_line_breaks() {
+        let times: Vec<i64> = (0..40_000).map(|k| k * 250).collect();
+        let day = day_of(&times, 250);
+        let mut values: Vec<f32> = (0..40_000).map(|k| if k % 2 == 0 { -10.0 } else { 10.0 }).collect();
+        let mut points = Vec::new();
+        trend(&day, &values, (0, 10_000_000), 400, false, &mut points);
+        assert!(
+            points.len() <= 101,
+            "одна точка на четыре пикселя, без вертикальных min/max"
+        );
+        assert!(
+            points.iter().all(|p| p.v.abs() < 0.01),
+            "пила превращается в среднюю линию"
+        );
+        values[20_000] = f32::NAN;
+        trend(&day, &values, (0, 10_000_000), 400, false, &mut points);
+        assert_eq!(
+            points.iter().filter(|p| p.pen_up).count(),
+            2,
+            "пустая строка разрывает линию"
+        );
     }
 
     #[test]
@@ -1464,6 +2575,11 @@ mod tests {
             view,
             layout: Layout::Blocks,
             quantity: Quantity::Ceiling,
+            selected: None,
+            manual_ranges: None,
+            swap: false,
+            normalized: false,
+            parameter_ranges: None,
             columns: 400,
             height: 200,
             scale: 1.0,
@@ -1490,6 +2606,7 @@ mod tests {
                 near: 500,
                 layout: Layout::Blocks,
                 quantity: Quantity::Ceiling,
+                selected: None,
                 blocks: &shown,
                 events: &events,
             },
