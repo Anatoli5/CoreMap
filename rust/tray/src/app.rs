@@ -35,6 +35,7 @@ use machine::{HwError, marker};
 use crate::journal::Journal;
 
 mod auto;
+mod auto_state;
 mod history;
 mod meter;
 mod sense;
@@ -507,6 +508,7 @@ impl App {
 
     /// Вход в Windows: метка оборванного замера, затем профиль запуска.
     pub fn start(&mut self, shell: &mut Shell) {
+        self.load_choice();
         match self.with_ceilings(Self::startup) {
             Ok(notice) => {
                 self.started = true;
@@ -541,6 +543,13 @@ impl App {
         // То, что стоит до профиля, — потолки после загрузки (программа входа запускается при входе в Windows).
         self.boot = self.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
         self.read_sets();
+        if self.retained_auto() {
+            self.read_files();
+            self.intended = self.limits.as_ref().map(|l| l.current().to_vec());
+            self.journal
+                .note("при запуске сохраняю тепловые ограничения вместо повторной постановки профиля");
+            return recovery;
+        }
         let (topology, store, events) = (&self.topology, &self.store, self.events.as_ref());
         let limits = self.limits.as_mut()?;
         let cpu = self.device.as_mut()?.cpu();
@@ -902,6 +911,7 @@ impl App {
     /// кончается.
     pub(super) fn quit(&mut self, shell: &mut Shell) {
         self.put_back("выход", Some("exit"));
+        self.release_auto_lease();
         self.save_maxima();
         shell.remove_icon();
         shell.destroy();
@@ -1131,11 +1141,15 @@ impl App {
             }
             let said = app.recover();
             app.read_files();
-            if app.power_while_away {
+            if app.power_while_away && !(app.auto.choice.on && app.auto.active()) {
                 app.repair_to_profile();
             }
+            let allow_reset = app.power_while_away;
             app.power_while_away = false;
             app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
+            if app.auto.choice.on {
+                app.recover_auto_mode(allow_reset);
+            }
             app.journal.note("C#-часть закрылась — потолки снова мои");
             said
         });
@@ -1216,10 +1230,17 @@ impl App {
             if let Some(unread) = limits.refresh(cpu, topology) {
                 return Some(Err(format!("после пробуждения потолки не прочитаны: {unread}")));
             }
-            let Some(intended) = app.intended.clone() else {
+            let Some(mut intended) = app.intended.clone() else {
                 app.intended = app.limits.as_ref().map(|l| l.current().to_vec());
                 return None;
             };
+            for (b, block) in app.topology.blocks.iter().enumerate() {
+                if let Some(held) = app.auto.overlay[b] {
+                    for &m in &block.members {
+                        intended[m] = held;
+                    }
+                }
+            }
             let before = app.limits.as_ref().map(|l| l.current().to_vec()).unwrap_or_default();
             let mut repaired = Vec::new();
             let mut foreign = Vec::new();

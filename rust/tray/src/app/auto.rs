@@ -33,13 +33,14 @@ use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-use machine::auto::{Cause, Controller, Decision, Frame, Settings, Timing};
+use machine::auto::{Cause, Controller, Decision, Frame, LoadFrame, Protection, Settings, Timing};
 use machine::clock::Stamp;
 use machine::files;
 use machine::memory::Memory;
 use machine::thermal::{Reading, Thermal};
 use serde_json::{Map, Value, json};
 
+use super::auto_state;
 use super::{App, Device, Item, Other, Shell, at_boot, parts};
 use crate::fans::{Fans, HpFans, SimFans};
 
@@ -270,6 +271,9 @@ pub struct Autopilot {
     memory: Memory,
     /// Время процессоров по Windows на прошлом опросе: (простой, всего).
     system: Option<(u64, u64)>,
+    /// Последнее действительное измерение Windows; первое и неудавшееся — неизвестны.
+    pub(super) global_busy: Option<f64>,
+    legacy: Vec<Option<auto_state::LegacyCut>>,
     fans: Option<Box<dyn Fans>>,
     /// Когда обороты читались (или открывалась прошивка) последний раз; следующий раз — через срок, который зависит
     /// от того, пишутся ли строки журнала срезов и чем кончился прошлый раз.
@@ -287,6 +291,8 @@ pub struct Autopilot {
     aside: Vec<bool>,
     /// По блокам: сколько чтений подряд потолок расходится с ожидаемым.
     mismatch: Vec<u8>,
+    /// Защита прочитана, но процессор ещё не подтвердил восстановление потолка.
+    recover_pending: Vec<bool>,
     /// Аренда держится этой программой, пока есть опущенный блок.
     holding: bool,
     /// Пробуждение отмечено, сверка после него ещё впереди: опрос ждёт её (ревизия H3).
@@ -306,9 +312,12 @@ pub struct Autopilot {
 #[derive(Debug, Default)]
 struct FrameBuffers {
     readings: Vec<Option<Reading>>,
+    context: Vec<Option<Reading>>,
     ceilings: Vec<i32>,
     accepted: Vec<i32>,
     floor: Vec<i32>,
+    relative: Vec<Option<f64>>,
+    prior: Vec<Option<Protection>>,
 }
 
 impl Autopilot {
@@ -320,6 +329,8 @@ impl Autopilot {
             overlay: vec![None; blocks],
             memory: Memory::default(),
             system: None,
+            global_busy: None,
+            legacy: vec![None; blocks],
             fans: None,
             fans_last: None,
             fans_fault: None,
@@ -329,13 +340,17 @@ impl Autopilot {
             ticks: 0,
             aside: vec![false; blocks],
             mismatch: vec![0; blocks],
+            recover_pending: vec![false; blocks],
             holding: false,
             wake_pending: false,
             frame: FrameBuffers {
                 readings: Vec::with_capacity(blocks),
+                context: Vec::with_capacity(blocks),
                 ceilings: Vec::with_capacity(blocks),
                 accepted: Vec::with_capacity(blocks),
                 floor: Vec::with_capacity(blocks),
+                relative: Vec::with_capacity(blocks),
+                prior: Vec::with_capacity(blocks),
             },
             decisions: Vec::with_capacity(blocks),
             origin: Instant::now(),
@@ -349,6 +364,10 @@ impl Autopilot {
     #[must_use]
     pub fn active(&self) -> bool {
         self.overlay.iter().any(Option::is_some)
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|c| (0..self.overlay.len()).any(|b| c.protection(b).is_some_and(|p| p.trial.is_some())))
     }
 }
 
@@ -410,14 +429,22 @@ impl App {
 
     pub(super) fn controller_for(&self) -> Controller {
         let c = self.auto.choice;
-        Controller::new(
+        let mut controller = Controller::new(
             Settings {
                 limit: f64::from(c.limit),
                 emergency: f64::from(c.emergency),
             },
             self.config.auto.control,
             self.topology.blocks.len(),
-        )
+        );
+        if let Some(previous) = &self.auto.controller {
+            for b in 0..self.topology.blocks.len() {
+                if let Some(protection) = previous.protection(b) {
+                    controller.seed_protection(b, protection);
+                }
+            }
+        }
+        controller
     }
 
     /// Запуск программы: метка автомодуля от прошлого запуска — вернуть принятые опущенным блокам; опрос раз в 2 с —
@@ -425,7 +452,10 @@ impl App {
     pub(super) fn start_auto(&mut self, shell: &Shell) {
         self.load_choice();
         self.replay_memory();
-        if self.marker_path().exists() {
+        if self.auto.choice.on {
+            self.auto.controller = Some(self.controller_for());
+        }
+        if self.marker_path().exists() || self.auto.choice.on {
             let said = self.with_ceilings(App::recover_auto);
             if let Ok(Some(said)) = said {
                 self.queue(&said);
@@ -439,7 +469,6 @@ impl App {
             self.journal.note("журнал срезов выключен");
         }
         if choice.on {
-            self.auto.controller = Some(self.controller_for());
             self.journal.note(&format!(
                 "автомодуль включён: до {} °C, аварийная {} °C",
                 choice.limit, choice.emergency
@@ -462,6 +491,7 @@ impl App {
                 return;
             }
         };
+        self.auto.legacy = auto_state::legacy_cuts(&text, &self.topology.blocks);
         let mut bad = 0_usize;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) else {
@@ -516,25 +546,23 @@ impl App {
                     .unwrap_or(0)
             })
             .collect();
-        format!(
-            "{{\"cpu\": {}, \"lps\": {}, \"accepted\": {}, \"auto\": {}}}",
-            files::quote(self.store.cpu()),
-            files::ints(&lps),
-            files::ints(&accepted),
-            files::ints(&overlay)
-        )
+        let protection: Vec<Value> = (0..self.topology.blocks.len())
+            .map(|b| auto_state::protection_value(self.auto.controller.as_ref().and_then(|c| c.protection(b))))
+            .collect();
+        json!({"cpu": self.store.cpu(), "lps": lps, "accepted": accepted,
+            "auto": overlay, "returnPolicy": 1, "protection": protection})
+        .to_string()
     }
 
     /// Переписать метку по надстройке; надстройки нет — убрать метку и отпустить аренду.
     pub(super) fn mark(&mut self) -> Result<(), String> {
         if !self.auto.active() {
-            if let Err(e) = files::delete_with_backup(&self.marker_path()) {
+            if self.auto.choice.on {
+                files::write_replacing(&self.marker_path(), &self.marker_text()).map_err(|e| e.to_string())?;
+            } else if let Err(e) = files::delete_with_backup(&self.marker_path()) {
                 self.journal.error(&format!("метка автомодуля не удалена: {e}"));
             }
-            if self.auto.holding {
-                self.auto.holding = false;
-                self.lease.release();
-            }
+            self.release_auto_lease();
             return Ok(());
         }
         files::write_replacing(&self.marker_path(), &self.marker_text()).map_err(|e| e.to_string())?;
@@ -547,12 +575,19 @@ impl App {
     /// Метка осталась — программа упала или её закрыли, пока надстройка была. Принятые возвращаются только блокам,
     /// которые всё ещё стоят на значении автомодуля (после перезагрузки процессор сбросил потолки, и метка ничего не
     /// значит), и не выше заводского предела. Метка прежней сборки звала надстройку «lowered».
-    fn recover_auto(&mut self) -> Option<String> {
+    pub(super) fn recover_auto(&mut self) -> Option<String> {
+        self.recover_auto_mode(true)
+    }
+
+    pub(super) fn recover_auto_mode(&mut self, allow_reset: bool) -> Option<String> {
         let path = self.marker_path();
         let read = files::read_object(&path).ok().flatten().filter(|map| {
             map.get("cpu").and_then(serde_json::Value::as_str) == Some(self.store.cpu())
                 && files::read_ints(map.get("lps")) == Some(self.store.lps().iter().map(|lp| i64::from(lp.0)).collect())
         });
+        if self.auto.choice.on {
+            return self.recover_held(read.as_ref(), allow_reset);
+        }
         let accepted = read.as_ref().and_then(|map| files::read_ints(map.get("accepted")));
         let lowered = read
             .as_ref()
@@ -585,6 +620,168 @@ impl App {
             self.journal.note(&text);
             text
         })
+    }
+
+    pub(super) fn retained_auto(&self) -> bool {
+        self.auto.choice.on
+            && files::read_object(&self.marker_path()).ok().flatten().is_some_and(|m| {
+                m.get("cpu").and_then(Value::as_str) == Some(self.store.cpu())
+                    && files::read_ints(m.get("lps"))
+                        == Some(self.store.lps().iter().map(|lp| i64::from(lp.0)).collect())
+                    && (files::read_ints(m.get("auto").or_else(|| m.get("lowered")))
+                        .is_some_and(|v| v.iter().any(|v| *v > 0))
+                        || m.get("protection")
+                            .and_then(Value::as_array)
+                            .is_some_and(|v| v.iter().any(|v| auto_state::protection_read(v).is_some())))
+            })
+    }
+
+    /// При включённом авто перезапуск не отменяет тепловое ограничение. Непроверенный шаг откатывается.
+    fn recover_held(&mut self, saved: Option<&Map<String, Value>>, allow_reset: bool) -> Option<String> {
+        let mut base = self.intended.clone().unwrap_or_default(); // once at recovery, not per sample
+        let saved_base = saved.and_then(|m| files::read_ints(m.get("accepted")));
+        let saved_auto = saved.and_then(|m| files::read_ints(m.get("auto").or_else(|| m.get("lowered"))));
+        let policy = saved.and_then(|m| m.get("returnPolicy")).and_then(Value::as_u64) == Some(1);
+        let profile = std::fs::read_to_string(self.config.data.join("profile-log.jsonl")).ok();
+        let mut restored = Vec::new();
+        self.auto.overlay.fill(None);
+        self.auto.recover_pending.fill(false);
+        for b in 0..self.topology.blocks.len() {
+            if let Some(controller) = &mut self.auto.controller {
+                controller.clear_protection(b);
+            }
+            let block = &self.topology.blocks[b];
+            let i = block.first;
+            let Some(limits) = self.limits.as_ref() else { continue };
+            let readable = limits.known(i) && limits.answered(i);
+            let current = limits.current()[i];
+            let old_auto = auto_state::list_value(saved_auto.as_deref(), i).filter(|v| *v > 0);
+            let accepted = auto_state::list_value(saved_base.as_deref(), i).unwrap_or(current);
+            let accepted = if limits.known(i) {
+                accepted.min(limits.fused()[i])
+            } else {
+                accepted
+            };
+            let stored = saved
+                .and_then(|m| m.get("protection"))
+                .and_then(Value::as_array)
+                .and_then(|v| v.get(b))
+                .and_then(auto_state::protection_read);
+            let legacy = self.auto.legacy[b].filter(|cut| {
+                !policy
+                    && cut.accepted == accepted
+                    && profile
+                        .as_ref()
+                        .is_some_and(|text| auto_state::no_owner_change(text, i, *cut))
+            });
+            let protected = stored
+                .or_else(|| {
+                    old_auto.map(|held| Protection {
+                        held,
+                        reference: None,
+                        trial: None,
+                    })
+                })
+                .or_else(|| {
+                    legacy.map(|cut| Protection {
+                        held: cut.to,
+                        reference: None,
+                        trial: None,
+                    })
+                });
+            let Some(mut protection) = protected else { continue };
+            if accepted < limits.floor(i) {
+                continue;
+            }
+            if limits.known(i) {
+                protection.held = protection.held.clamp(limits.floor(i), accepted);
+            }
+            if protection.held >= accepted {
+                continue;
+            }
+            let ours = !readable
+                || old_auto == Some(current)
+                || (allow_reset && (current == accepted || at_boot(limits, &self.boot, i)));
+            if !ours {
+                continue;
+            } // foreign/manual hardware value wins
+            protection.trial = None;
+            let held = protection.held;
+            for &m in &block.members {
+                if let Some(value) = base.get_mut(m) {
+                    *value = accepted;
+                }
+            }
+            self.auto.overlay[b] = Some(held);
+            self.auto.recover_pending[b] = true;
+            if let Some(controller) = &mut self.auto.controller {
+                controller.seed_protection(b, protection);
+            }
+            let topology = &self.topology;
+            if readable && let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
+                if let Some(refusal) = limits.set(cpu, topology, i, held) {
+                    self.journal.error(&format!(
+                        "удержание потолка {} ×{held}: {refusal}; повторю сверку",
+                        block.name
+                    ));
+                } else {
+                    self.auto.recover_pending[b] = false;
+                }
+            }
+            restored.push(format!("{} ×{held}", block.name));
+        }
+        self.intended = Some(base);
+        if let Err(e) = self.mark() {
+            self.journal.error(&format!("метка автомодуля: {e}"));
+        }
+        (!restored.is_empty()).then(|| format!("Тепловые ограничения сохранены: {}", restored.join(", ")))
+    }
+
+    pub(super) fn release_auto_lease(&mut self) {
+        if self.auto.holding {
+            self.auto.holding = false;
+            self.lease.release();
+        }
+    }
+
+    /// Автоматическая пауза не является проверкой работы и не возвращает исходные потолки.
+    pub(super) fn preserve_auto(&mut self, why: &str) {
+        let mut rollbacks = Vec::new();
+        if let Some(controller) = &self.auto.controller {
+            for b in 0..self.topology.blocks.len() {
+                if let Some(mut protection) = controller.protection(b)
+                    && protection.trial.is_some()
+                {
+                    protection.trial = None;
+                    rollbacks.push((b, protection));
+                }
+            }
+        }
+        for (b, protection) in rollbacks {
+            let topology = &self.topology;
+            let block = &topology.blocks[b];
+            if let Some((limits, cpu)) = parts(&mut self.limits, &mut self.device) {
+                if let Some(refusal) = limits.set(cpu, topology, block.first, protection.held) {
+                    self.journal
+                        .error(&format!("непроверенный шаг {} не отменён: {refusal}", block.name));
+                } else {
+                    self.auto.overlay[b] = Some(protection.held);
+                    if let Some(controller) = &mut self.auto.controller {
+                        controller.seed_protection(b, protection);
+                    }
+                }
+            }
+        }
+        if let Some(controller) = &mut self.auto.controller {
+            controller.forget();
+        }
+        self.auto.system = None;
+        self.auto.global_busy = None;
+        if let Err(e) = self.mark() {
+            self.journal.error(&format!("метка автомодуля: {e}"));
+        }
+        self.journal
+            .note(&format!("автомодуль: {why} — тепловые ограничения сохранены"));
     }
 
     /// Подменю «Автоограничение нагрева».
@@ -696,11 +893,14 @@ impl App {
         if !next.on && was.on {
             self.put_back("автомодуль выключен", Some("auto-off"));
             self.auto.controller = None;
+            if let Err(e) = self.mark() {
+                self.journal.error(&format!("метка автомодуля: {e}"));
+            }
         }
         if next.on && !next.same_auto(was) {
             // Новый выбор — опущенные возвращаются, регулятор начинает заново (прежние окна — при другой отсечке).
             // Сохранить надстройку через смену отсечки мог бы только сам регулятор (machine::auto) — не здесь.
-            self.put_back("новые настройки автомодуля", Some("settings"));
+            self.preserve_auto("новые настройки автомодуля");
             self.auto.controller = Some(self.controller_for());
             self.auto.aside.fill(false);
         }
@@ -741,6 +941,9 @@ impl App {
     /// Владелец поставил блоку потолок сам (окно): регулятор судит этот блок заново, отставленный из-за чужой правки —
     /// снова под присмотром.
     pub(super) fn auto_block_fresh(&mut self, b: usize) {
+        if let Some(pending) = self.auto.recover_pending.get_mut(b) {
+            *pending = false;
+        }
         if let Some(aside) = self.auto.aside.get_mut(b) {
             *aside = false;
         }
@@ -756,8 +959,15 @@ impl App {
     pub(super) fn auto_new_set(&mut self) {
         self.auto.aside.fill(false);
         self.auto.mismatch.fill(0);
+        self.auto.recover_pending.fill(false);
         if let Some(controller) = &mut self.auto.controller {
-            controller.forget();
+            for b in 0..self.topology.blocks.len() {
+                controller.forget_block(b);
+            }
+        }
+        if let Err(e) = self.mark() {
+            self.journal
+                .error(&format!("новый профиль: защита в метке не обновлена: {e}"));
         }
     }
 
@@ -821,7 +1031,7 @@ impl App {
             return; // потолки ставит на место возврат права или сверка после пробуждения
         }
         let started = Instant::now();
-        let busy = self.system_share() >= LOADED;
+        let busy = self.system_share().is_some_and(|v| v >= LOADED);
         let wanted = choice.on || (choice.log && busy);
         // Опрос срезов начинается под той же арендой: иначе `with_ceilings` отпустил бы драйвер, который через 0,25 с
         // снова нужен. Потолки не прочитаны — опроса нет: строка журнала без них была бы не прочитанной, а регулятор
@@ -924,32 +1134,37 @@ impl App {
         Ok(said.map_or(Polled::Quiet, Polled::Said))
     }
 
-    /// Доля работы всего процессора с прошлого опроса по Windows; первый опрос — 0. На имитации — доля работы её ядер
+    /// Доля работы всего процессора с прошлого опроса по Windows; первый опрос — неизвестно. На имитации — доля работы её ядер
     /// (их нагрузку задаёт скрытая проверка), а не Windows компьютера, где идёт проверка: шаги проверки не должны
     /// зависеть от того, чем он занят (игра владельца, соседние проверки).
-    fn system_share(&mut self) -> f64 {
+    pub(super) fn system_share(&mut self) -> Option<f64> {
         if self.config.simulate {
-            return match &self.device {
+            let share = match &self.device {
                 Some(Device::Sim(sim)) if !sim.load.is_empty() => {
                     let cores = f64::from(u32::try_from(sim.load.len()).unwrap_or(u32::MAX));
-                    (sim.load.iter().sum::<f64>() / cores).clamp(0.0, 1.0)
+                    Some((sim.load.iter().sum::<f64>() / cores).clamp(0.0, 1.0))
                 }
-                _ => 0.0,
+                _ => None,
             };
+            self.auto.global_busy = share;
+            return share;
         }
         let now = crate::shell::system_times();
         let share = match (self.auto.system, now) {
-            (Some((idle0, total0)), Some((idle1, total1))) if total1 > total0 => {
+            (Some((idle0, total0)), Some((idle1, total1)))
+                if total1 > total0 && idle1 >= idle0 && idle1 - idle0 <= total1 - total0 =>
+            {
                 #[expect(
                     clippy::cast_precision_loss,
                     reason = "a share of two tick counts; the error is far below a percent"
                 )]
                 let idle = idle1.saturating_sub(idle0) as f64 / (total1 - total0) as f64;
-                (1.0 - idle).clamp(0.0, 1.0)
+                Some((1.0 - idle).clamp(0.0, 1.0))
             }
-            _ => 0.0,
+            _ => None,
         };
         self.auto.system = now;
+        self.auto.global_busy = share;
         share
     }
 
@@ -1049,6 +1264,15 @@ impl App {
         for (b, block) in topology.blocks.iter().enumerate() {
             let i = block.first;
             let expected = self.auto.overlay[b].unwrap_or(intended[i]);
+            if self.auto.recover_pending[b] {
+                if let Some(refusal) = limits.set(cpu, topology, i, expected) {
+                    return Err(format!(
+                        "удержание теплового потолка {} ×{expected}: {refusal}",
+                        block.name
+                    ));
+                }
+                self.auto.recover_pending[b] = false;
+            }
             if !limits.known(i) || !limits.answered(i) || limits.current()[i] == expected {
                 self.auto.mismatch[b] = 0;
                 continue;
@@ -1097,9 +1321,11 @@ impl App {
             aside,
             mismatch,
             overlay,
+            recover_pending,
             ..
         } = &mut self.auto;
         frame.readings.clear();
+        frame.context.clear();
         frame.ceilings.clear();
         frame.accepted.clear();
         frame.floor.clear();
@@ -1117,11 +1343,14 @@ impl App {
             frame.floor.push(limits.floor(block.first));
             // Отставленный после чужой правки блок и блок, у которого потолок расходится с ожидаемым и ещё не признан
             // чужой правкой, не судятся.
-            let judged = !aside[b] && mismatch[b] == 0;
-            frame.readings.push(judged.then(|| self.meter.latest(block.first)));
+            let judged = !aside[b] && mismatch[b] == 0 && !recover_pending[b];
+            let reading = self.meter.latest(block.first);
+            frame.context.push(Some(reading));
+            frame.readings.push(judged.then_some(reading));
         }
         let now = self.auto.origin.elapsed();
         let limit = f64::from(self.auto.choice.limit);
+        let global_busy = self.auto.global_busy;
         let Autopilot {
             controller,
             memory,
@@ -1141,16 +1370,42 @@ impl App {
             accepted: &frame.accepted,
             floor: &frame.floor,
         };
-        controller.as_mut()?.step(now, &view, &allowed, decisions);
+        auto_state::relative_activity(&topology.blocks, &frame.context, &mut frame.relative);
+        frame.prior.clear();
+        frame
+            .prior
+            .extend((0..topology.blocks.len()).map(|b| controller.as_ref().and_then(|c| c.protection(b))));
+        let load = LoadFrame {
+            global_busy,
+            relative: &frame.relative,
+        };
+        controller.as_mut()?.step_loaded(now, &view, &load, &allowed, decisions);
         if decisions.is_empty() {
+            let changed = frame
+                .prior
+                .iter()
+                .enumerate()
+                .any(|(b, prior)| controller.as_ref().and_then(|c| c.protection(b)) != *prior);
+            if changed && let Err(e) = self.mark() {
+                self.journal.error(&format!("подтверждение потолка не сохранено: {e}"));
+            }
             return None;
         }
         let decisions = std::mem::take(&mut self.auto.decisions);
         let mut refused = None;
         for decision in &decisions {
             if let Some(refusal) = self.apply(decision, package) {
+                if let Some(controller) = &mut self.auto.controller {
+                    match self.auto.frame.prior[decision.block] {
+                        Some(p) => controller.seed_protection(decision.block, p),
+                        None => controller.clear_protection(decision.block),
+                    }
+                }
                 refused = Some(refusal);
             }
+        }
+        if let Err(e) = self.mark() {
+            self.journal.error(&format!("метка автомодуля: {e}"));
         }
         self.auto.decisions = decisions;
         refused
@@ -1186,7 +1441,7 @@ impl App {
     /// блоков, фактический множитель и загрузка блока, вентиляторы и видеокарта, если известны.
     fn record(&mut self, d: &Decision, name: &str, first: usize, base: i32, package: Option<f64>) {
         let stamp = Stamp::now();
-        if d.cause != Cause::Return {
+        if matches!(d.cause, Cause::Emergency | Cause::Target) {
             self.auto.memory.cut(first, d.from, d.temp, d.die);
         }
         let die = d.die.map_or_else(|| "?".into(), |v| format!("{v:.0}"));
@@ -1200,8 +1455,9 @@ impl App {
                 "автомодуль: блок {name} опущен ×{from} → ×{to} (2-с медиана {temp:.1} °C выше {} °C и не падает; кристалл {die} °C)",
                 self.auto.choice.limit
             ),
+            Cause::Revert => format!("автомодуль: блок {name} ×{from} → ×{to} — повышение не подтверждено работой"),
             Cause::Return => format!(
-                "автомодуль: блок {name} возвращён ×{from} → ×{to} (паузу все 2-с медианы не выше {} °C; кристалл {die} °C)",
+                "автомодуль: блок {name} пробует ×{from} → ×{to} после проверки работы (целевая {} °C; кристалл {die} °C)",
                 self.auto.choice.limit
             ),
         };
@@ -1248,15 +1504,27 @@ impl App {
         line.insert(trigger.into(), json!(temp));
         line.insert("die".into(), json!(d.die));
         line.insert("medians".into(), json!(medians));
-        line.insert("ratio".into(), json!(d.ratio.map(|v| round(v, 2))));
-        line.insert("busy".into(), json!(d.busy.map(|v| round(v, 2))));
+        line.insert("ratio".into(), json!(d.ratio));
+        line.insert("busy".into(), json!(d.busy));
         line.insert("package".into(), json!(package.map(|p| round(p, 0))));
         line.insert("fans".into(), json!(self.auto.rpm));
         line.insert("gpu".into(), json!(gpu));
         line.insert("ceilings".into(), json!(ceilings));
+        self.return_evidence(d.block, &mut line);
         // Журнал событий окна (app/timeline.rs): то же решение с итогом блока на покидаемом потолке; неизвестное — не пишется.
         let mut conditions = Map::new();
-        for name in [trigger, "die", "medians", "ratio", "busy"] {
+        for name in [
+            trigger,
+            "die",
+            "medians",
+            "ratio",
+            "busy",
+            "globalBusy",
+            "relativeRepresentative",
+            "relativeBusy",
+            "protection",
+            "evidencePhase",
+        ] {
             // Неизвестное не пишется: ни null, ни список из одних null (медиан ещё нет — первое окно не закрылось).
             let known = |v: &&Value| !v.is_null() && v.as_array().is_none_or(|a| a.iter().any(|x| !x.is_null()));
             if let Some(value) = line.get(name).filter(known) {
@@ -1266,6 +1534,40 @@ impl App {
         self.known_surroundings(&mut conditions);
         self.log_line(&Value::Object(line));
         self.log_event(d.cause.act(), Some(d.block), Some((from, to)), None, conditions);
+    }
+
+    fn return_evidence(&self, block: usize, line: &mut Map<String, Value>) {
+        line.insert("ceilingsBefore".into(), json!(self.auto.frame.ceilings));
+        line.insert("globalBusy".into(), json!(self.auto.global_busy));
+        line.insert(
+            "representativeBusy".into(),
+            json!(
+                self.auto
+                    .frame
+                    .context
+                    .iter()
+                    .map(|r| r.and_then(|r| r.busy))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        line.insert(
+            "representativeRatio".into(),
+            json!(
+                self.auto
+                    .frame
+                    .context
+                    .iter()
+                    .map(|r| r.and_then(|r| r.ratio))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        line.insert("relativeRepresentative".into(), json!(self.auto.frame.relative));
+        line.insert("relativeBusy".into(), json!(self.auto.frame.relative[block]));
+        line.insert("evidencePhase".into(), json!("before-action"));
+        line.insert(
+            "protection".into(),
+            auto_state::protection_value(self.auto.controller.as_ref().and_then(|c| c.protection(block))),
+        );
     }
 
     pub(super) fn log_line(&mut self, line: &Value) {
@@ -1280,6 +1582,10 @@ impl App {
     /// `reason` — для журнала событий окна (app/timeline.rs, kind «putback»): auto-off, settings, sleep, exit, csharp;
     /// None — смена набора: её строки «profile» и так идут от того потолка, что стоял, с поправкой.
     pub(super) fn put_back(&mut self, why: &str, reason: Option<&'static str>) {
+        if self.auto.choice.on && reason.is_some_and(|r| r != "auto-off") {
+            self.preserve_auto(why);
+            return;
+        }
         if !self.auto.active() {
             return;
         }
@@ -1341,6 +1647,7 @@ impl App {
                 _ => "запускается настройка",
             };
             self.put_back(why, Some("csharp"));
+            self.release_auto_lease();
         }
         if let Some(controller) = &mut self.auto.controller {
             controller.forget();

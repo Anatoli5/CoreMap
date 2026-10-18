@@ -85,6 +85,10 @@ pub struct AutoEntry {
     pub ratio: Option<f64>,
     #[serde(default)]
     pub busy: Option<f64>,
+    #[serde(default, rename = "globalBusy")]
+    pub global_busy: Option<f64>,
+    #[serde(default, rename = "relativeBusy")]
+    pub relative_busy: Option<f64>,
     #[serde(default)]
     pub gpu: Option<Value>,
     #[serde(default)]
@@ -105,6 +109,8 @@ pub enum Kind {
     Target,
     /// Возврат к профилю.
     Return,
+    /// Пробная ступень не подтверждена работой: возвращён удерживаемый потолок.
+    ReturnRevert,
     /// Применён профиль.
     Profile,
     /// Потолок изменён на плитке.
@@ -131,6 +137,7 @@ impl Kind {
             "emergency" => Kind::Emergency,
             "target" => Kind::Target,
             "return" => Kind::Return,
+            "return-revert" => Kind::ReturnRevert,
             "profile" => Kind::Profile,
             "edit" => Kind::Edit,
             "reset" => Kind::Reset,
@@ -156,7 +163,7 @@ impl Kind {
     pub fn color(self) -> u32 {
         match self {
             Kind::Emergency | Kind::Lower => 0x00ff_5d5d,
-            Kind::Target => 0x00ff_b454,
+            Kind::Target | Kind::ReturnRevert => 0x00ff_b454,
             Kind::Return | Kind::Raise | Kind::Back | Kind::Putback => 0x006f_d0c8,
             Kind::Profile | Kind::Edit | Kind::Reset => 0x00c8_ccd4,
             Kind::Foreign => 0x00b8_8cff,
@@ -298,6 +305,18 @@ fn conditions(
     out.join(" · ")
 }
 
+fn append_workload(details: &mut Vec<String>, global: Option<f64>, relative: Option<f64>) {
+    if let Some(busy) = global {
+        details.push(format!("весь CPU {:.0} %", busy * 100.0));
+    }
+    if let Some(share) = relative {
+        details.push(format!(
+            "доля активности среди блоков того же типа {:.0} %",
+            share * 100.0
+        ));
+    }
+}
+
 /// «×46 → ×45».
 fn change(from: Option<i64>, to: Option<i64>) -> String {
     match (from, to) {
@@ -329,7 +348,11 @@ fn from_event(e: &EventEntry) -> Event {
             "отсечка: 2-с медиана{} и не падает{at_die}",
             number(c, "median").map(|t| format!(" {t:.1} °C")).unwrap_or_default()
         ),
+        Kind::Return if number(c, "globalBusy").is_some() && number(c, "relativeBusy").is_some() => {
+            format!("пробная ступень вверх после проверки нагрузки{at_die}")
+        }
         Kind::Return => format!("возврат: паузу 2-с медианы не выше цели{at_die}"),
+        Kind::ReturnRevert => "пробная ступень не подтверждена работой — возвращено ограничение".to_string(),
         Kind::Profile => format!(
             "применён профиль{}",
             e.name.as_deref().map(|n| format!(" «{n}»")).unwrap_or_default()
@@ -352,6 +375,7 @@ fn from_event(e: &EventEntry) -> Event {
     if !rest.is_empty() {
         details.push(rest);
     }
+    append_workload(&mut details, number(c, "globalBusy"), number(c, "relativeBusy"));
     let mut details = details.join(" · ");
     if let Some(p) = e.period.as_ref() {
         let ceiling = number(Some(p), "ceiling");
@@ -423,10 +447,14 @@ fn from_auto(e: &AutoEntry, into: &mut Vec<Event>) {
             e.median.map(|m| format!(" {m:.1} °C")).unwrap_or_default(),
             e.limit.map(|l| format!(" > {l:.0} °C")).unwrap_or_default()
         ),
+        Kind::Return if e.global_busy.is_some() && e.relative_busy.is_some() => {
+            format!("пробная ступень вверх после проверки нагрузки{die}")
+        }
         Kind::Return => format!(
             "возврат: паузу 2-с медианы{}{die}",
             e.limit.map(|l| format!(" не выше {l:.0} °C")).unwrap_or_default()
         ),
+        Kind::ReturnRevert => "пробная ступень не подтверждена работой — возвращено ограничение".to_string(),
         Kind::Lower => {
             let mut why = match (e.mean, e.max) {
                 (Some(m), Some(x)) => format!("перегрев: ø {m:.0} °C, ▲ {x:.0} °C"),
@@ -445,6 +473,9 @@ fn from_auto(e: &AutoEntry, into: &mut Vec<Event>) {
             |c| format!("прохладен под нагрузкой {c} с"),
         ),
     };
+    let mut details = vec![conditions(e.ratio, e.busy, None, e.gpu.as_ref(), e.fans.as_ref())];
+    append_workload(&mut details, e.global_busy, e.relative_busy);
+    details.retain(|s| !s.is_empty());
     into.push(Event {
         at,
         time,
@@ -453,7 +484,7 @@ fn from_auto(e: &AutoEntry, into: &mut Vec<Event>) {
         block: e.block.clone(), // one name per line
         change: change(e.from, e.to),
         why,
-        details: conditions(e.ratio, e.busy, None, e.gpu.as_ref(), e.fans.as_ref()),
+        details: details.join(" · "),
         ratio: e.ratio.or_else(|| e.from.map(real)),
     });
 }
@@ -495,6 +526,42 @@ pub fn listed(events: &[Event], names: &[&str], all: bool) -> Vec<(usize, Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unconfirmed_return_is_distinct_from_an_overheat_and_keeps_workload_details() {
+        let mut entries = Vec::new();
+        read_lines(
+            r#"{"time":"2026-10-18T14:00:00+00:00","kind":"return-revert","block":"12","from":50,"to":49,"conditions":{"ratio":31.8,"busy":0.07,"globalBusy":0.15,"relativeBusy":0.04}}"#,
+            &mut entries,
+        );
+        let events = merged(&entries, &[]);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind, Kind::ReturnRevert);
+        assert!(
+            !event.kind.cuts(),
+            "неподтверждённая проба не является отсечкой по температуре"
+        );
+        assert!(event.why.contains("не подтверждена работой"));
+        assert!(event.details.contains("весь CPU 15 %"));
+        assert!(event.details.contains("того же типа 4 %"));
+    }
+
+    #[test]
+    fn old_timer_only_returns_are_not_presented_as_workload_verification() {
+        let mut entries = Vec::new();
+        read_lines(r#"{"act":"return","from":49,"to":50,"limit":86}"#, &mut entries);
+        let old = merged(&[], &entries);
+        assert!(old[0].why.contains("паузу 2-с медианы"));
+        assert!(!old[0].why.contains("проверки нагрузки"));
+        read_lines(
+            r#"{"act":"return","from":49,"to":50,"globalBusy":0.6,"relativeBusy":0.2}"#,
+            &mut entries,
+        );
+        let new = merged(&[], &entries[1..]);
+        assert!(new[0].why.contains("пробная ступень"));
+        assert!(new[0].details.contains("весь CPU 60 %"));
+    }
 
     #[test]
     fn events_and_old_auto_log_lines_merge_newest_first() {

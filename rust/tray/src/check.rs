@@ -714,7 +714,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         .filter(|&(i, _)| i != 2)
         .max_by_key(|&(_, b)| accepted.get(b.first).copied().unwrap_or(0))
         .map_or_else(|| app.topology().blocks[1].clone(), |(_, b)| b.clone());
-    let returned = format!("автомодуль: блок {} возвращён", block.name);
+    let returned = format!("автомодуль: блок {} пробует", block.name);
     let first = block.first;
     let marker = data.join("auto-held.json");
     let set_load = |app: &mut App, hot: f64, rest: f64| {
@@ -782,16 +782,14 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         &format!("автомодуль: подсказка ({})", tip.replace('\n', " / ")),
     );
     let window = hold(&names.old_window);
-    pump_until(shell, app, Duration::from_secs(3), |a| {
-        ceilings_now(a).get(first) == Some(&base)
-    });
+    pump_until(shell, app, Duration::from_secs(3), |_| lease_free(&names.lease));
     r.check(
-        ceilings_now(app).get(first) == Some(&base),
-        "автомодуль: прежнему окну — принятые потолки",
+        ceilings_now(app).get(first) == Some(&lowest),
+        "автомодуль: передача прежнему окну сохраняет тепловой потолок",
     );
     r.check(
-        !marker.exists() && lease_free(&names.lease),
-        "автомодуль: метка снята, аренда отпущена",
+        marker.exists() && lease_free(&names.lease),
+        "автомодуль: сохранена метка защиты, аренда отпущена",
     );
     let taken_back = logged(app, "потолки снова мои");
     let _ = window.send(());
@@ -823,35 +821,43 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
             ceilings_now(app).get(first)
         ),
     );
-    // Кристалл остыл (остальные ядра без нагрузки): блок возвращается к принятому по ступени за паузу.
+    // Остывание всего процессора в простое не испытывает потолок и не разрешает возврат.
     let log_from = lines_in(&data.join("auto-log.jsonl"));
     set_load(app, 0.0, 0.0);
-    pump_until(shell, app, Duration::from_secs(30), |a| {
-        ceilings_now(a).get(first) == Some(&base)
-    });
+    pump(shell, app, Duration::from_secs(3));
     let back: Vec<serde_json::Value> = lines_after(&data.join("auto-log.jsonl"), log_from)
         .iter()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|v| v["act"] == "return" && v["first"] == first)
         .collect();
-    let gaps: Vec<i64> = back
-        .windows(2)
-        .map(|w| (w[1]["at"].as_i64().unwrap_or(0) - w[0]["at"].as_i64().unwrap_or(0)) / 10_000)
-        .collect();
     r.check(
-        ceilings_now(app).get(first) == Some(&base)
-            && usize::try_from(base - again).is_ok_and(|n| n == back.len())
-            && back.iter().all(|v| v["to"].as_i64() == v["from"].as_i64().map(|f| f + 1))
-            && gaps.iter().all(|&g| g >= 950),
-        &format!(
-            "автомодуль: кристалл остыл — блок вернулся к принятому по одной ступени ({} из ×{again} в ×{base}), между возвратами не меньше паузы (мс: {gaps:?})",
-            back.len()
-        ),
+        ceilings_now(app).get(first) == Some(&again) && back.is_empty(),
+        "возврат: простой всех ядер и холодный кристалл не поднимают потолок",
     );
     r.check(
-        !marker.exists() && lease_free(&names.lease),
-        "автомодуль: всё вернулось — метки нет, аренда свободна",
+        marker.exists() && !lease_free(&names.lease),
+        "возврат: тепловая защита остаётся в метке и под арендой",
     );
+    let refused = app.set_auto(shell, &serde_json::from_str(r#"{"limit":76}"#).unwrap_or_default());
+    r.check(
+        refused.is_none() && ceilings_now(app).get(first) == Some(&again),
+        "смена целевой отсечки сохраняет снижение и сбрасывает только окно проверки",
+    );
+    app.wake_repair(shell);
+    r.check(
+        ceilings_now(app).get(first) == Some(&again),
+        "пробуждение без сброса процессора сохраняет тепловой потолок",
+    );
+    if let Some(sim) = app.sim() {
+        sim.reset_to_factory();
+    }
+    app.wake_repair(shell);
+    r.check(
+        ceilings_now(app).get(first) == Some(&again),
+        "сброс процессора сном восстанавливает сниженный, а не исходный потолок",
+    );
+    // Вернуть целевую для следующих сценариев; само по себе это не отменяет защиту.
+    app.set_auto(shell, &serde_json::from_str(r#"{"limit":75}"#).unwrap_or_default());
     // Чужая правка у блока, который автомодуль не трогал: принять, сказать один раз, больше этот блок не трогать.
     let other = app.topology().blocks[2].first; // кластер E-ядер 2–5
     let foreign = u8::try_from(accepted.get(other).copied().unwrap_or(40) - 2).unwrap_or(30);
@@ -1061,46 +1067,15 @@ fn cutoffs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &
         ),
     );
 
-    // г) Возврат: после полной паузы, все медианы которой не выше предела. Кристалл (остальные блоки) холоднее, чем при
-    //    срезах (40 °C), — память срезов не держит.
+    // г) Нулевая занятость при холодных датчиках не даёт данных для возврата.
     let from = lines_in(&log);
-    let cooled = Stamp::now().0 / 10_000;
+    let held = ceilings_now(app).get(first).copied();
     force(app, 50.0, 35.0);
-    pump_until(shell, app, Duration::from_secs(3), |_| !acts(from, "return").is_empty());
-    let back = acts(from, "return");
-    let after = back.first().map_or(0, |v| at(v) - cooled);
+    pump(shell, app, Duration::from_secs(3));
     r.check(
-        back.len() == 1
-            && (750..=3000).contains(&after)
-            && back[0]["to"].as_i64() == back[0]["from"].as_i64().map(|f| f + 1),
-        &format!("возврат: блок остыл до 50 °C — через {after} мс одна ступень вверх (пауза 1 с)"),
+        acts(from, "return").is_empty() && ceilings_now(app).get(first).copied() == held,
+        "возврат: после аварийной и целевой отсечек остывание в простое не разрешает повышение",
     );
-    // Медиана выше предела посреди паузы (выше, но падает — без среза) начинает паузу заново: без этого правила возврат
-    // пришёл бы через паузу после среза при 85 °C, посреди спада.
-    // 0,9 с при 85 °C — два окна: срез в них есть при любом начале окна.
-    let from = lines_in(&log);
-    force(app, 85.0, 30.0);
-    pump(shell, app, Duration::from_millis(900));
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(1500) {
-        force(app, 84.0 - 4.0 * start.elapsed().as_secs_f64(), 30.0);
-        pump(shell, app, Duration::from_millis(25));
-    }
-    let warm_end = Stamp::now().0 / 10_000;
-    // Кристалл — 25 °C: холоднее, чем при срезе при 85 °C (тогда 30), — возврат на тот потолок пускает и память.
-    force(app, 50.0, 25.0);
-    pump_until(shell, app, Duration::from_secs(4), |_| !acts(from, "return").is_empty());
-    let cut = acts(from, "target");
-    let back = acts(from, "return");
-    let after = back.first().map_or(i64::MIN, |v| at(v) - warm_end);
-    r.check(
-        !cut.is_empty() && back.len() == 1 && after >= 500,
-        &format!(
-            "возврат: срез при 85 °C ({} ступень), затем 1,5 с выше предела спадом — возврат только через {after} мс после конца спада, а не через паузу после среза",
-            cut.len()
-        ),
-    );
-
     // Заданные температуры — прочь, аварийная — как была, автомодуль выключен (опущенные возвращаются).
     if let Some(sim) = app.sim() {
         sim.forced.fill(None);

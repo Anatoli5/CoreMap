@@ -1772,17 +1772,16 @@ pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path,
         .into_iter()
         .filter(|v| v["block"] == cut.name.as_str())
         .collect();
-    let line = exits.first().cloned().unwrap_or(Value::Null);
+    let held = fs::read_to_string(data.join("auto-held.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     r.check(
         lowered < base
-            && exits.len() == 1
-            && line["reason"] == "exit"
-            && line["from"] == lowered
-            && line["to"] == base
-            && line["period"]["ceiling"] == lowered
-            && ceilings_now(app).get(cut.first) == Some(&base),
+            && exits.is_empty()
+            && ceilings_now(app).get(cut.first) == Some(&lowered)
+            && held.as_ref().is_some_and(|v| v["returnPolicy"] == 1),
         &format!(
-            "журнал событий: «Выход» вернул срезанному блоку {} ×{lowered} → ×{base} — строка putback (reason exit): {line}",
+            "«Выход» сохраняет тепловой потолок {} ×{lowered} и метку защиты, без возврата к ×{base}",
             cut.name
         ),
     );
@@ -1794,8 +1793,21 @@ pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path,
     // Что осталось от вышедшей программы в общей очереди событий — ей же (её таймеров больше нет).
     pump(shell, app, Duration::from_millis(50));
 
+    // Настоящий путь запуска на сохранённой защите; новый процессор имитации начинает с заводских.
+    let restart = data.join("s2");
+    if let Err(e) = fs::create_dir_all(&restart).and_then(|()| {
+        fs::copy(data.join("auto-held.json"), restart.join("auto-held.json"))?;
+        fs::copy(data.join("tray.json"), restart.join("tray.json"))?;
+        Ok(())
+    }) {
+        r.check(false, &format!("копия состояния перезапуска: {e}"));
+    }
     // 14c. Окна нет, конец сеанса Windows: выход сразу.
     if let Some((mut second, mut shell2)) = another(r, app, data, "s2") {
+        r.check(
+            ceilings_now(&mut second).get(cut.first) == Some(&lowered),
+            "перезапуск с сохранённой меткой возвращает защищённый потолок, а не исходный",
+        );
         let asked = Instant::now();
         shell2.post(WM_ENDSESSION, 1, 0);
         pump_until(&mut shell2, &mut second, Duration::from_secs(2), |a| {

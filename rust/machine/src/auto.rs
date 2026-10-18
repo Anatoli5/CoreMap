@@ -19,14 +19,17 @@
 // - Ступень вниз у обеих — на одну ниже фактического множителя блока (горячие ядра идут на 2–4 ступени ниже потолка —
 //   измерено, снижение одного потолка над ними ничего бы не дало), не ниже нижней границы допустимого потолка
 //   (`Frame::floor`, та же, что у ручного, machine::limits). Множитель не известен (блок спал) — на одну ниже потолка.
-// - Возврат к профилю (пока его не заменит оптимизатор): блок, опущенный отсечкой, получает +1 ступень, когда все его
-//   2-с медианы всю паузу были не выше предела; выше потолка профиля — никогда. За паузу — один блок, самый прохладный.
+// - Возврат к профилю: только после непрерывной работы, сопоставимой с отсечкой по собственной, общей и относительной
+//   активности, с фактическим множителем в пределах одной целой ступени от потолка. Прохлада в простое не считается.
+//   После +1 нужна отдельная проверка нового потолка; непроверенная ступень откатывается. Пауза — прежние две минуты.
 // - Без качелей: возврат на потолок, с которого блок был срезан, — только пока уровень кристалла (среднее последних 2-с
 //   медиан остальных блоков) ниже, чем был при срезе. Срезы помнит machine::memory; регулятор спрашивает её через
 //   `allowed` и отдаёт в каждом решении уровень кристалла, чтобы срез было с чем записать.
 
 use std::time::Duration;
 
+use crate::returning::Guard;
+pub use crate::returning::{LoadFrame, Protection, Trial, Workload};
 use crate::thermal::Reading;
 
 /// Выбор владельца: целевой предел и аварийный, °C.
@@ -68,6 +71,8 @@ pub enum Cause {
     Target,
     /// Возврат на ступень к профилю.
     Return,
+    /// Проверка повышенного потолка не состоялась: вернуть сохранённое ограничение.
+    Revert,
 }
 
 impl Cause {
@@ -78,6 +83,7 @@ impl Cause {
             Self::Emergency => "emergency",
             Self::Target => "target",
             Self::Return => "return",
+            Self::Revert => "return-revert",
         }
     }
 }
@@ -90,6 +96,7 @@ pub struct Decision {
     pub from: i32,
     pub to: i32,
     /// Температура, по которой решено, °C: показание (аварийная) или 2-с медиана (целевая, возврат).
+    /// При откате непроверенной ступени может быть NaN: температура неизвестна, причина отката — отсутствие проверки.
     pub temp: f64,
     /// Уровень кристалла: среднее последних 2-с медиан остальных блоков; None — ни одной нет.
     pub die: Option<f64>,
@@ -113,6 +120,8 @@ pub struct Frame<'a> {
 
 #[derive(Debug, Clone, Default)]
 struct Track {
+    guard: Guard,
+    workload: Vec<Option<Workload>>,
     /// Показания текущего 2-с окна (буфер на всё время работы: 8 показаний в окне).
     window: Vec<Reading>,
     /// Медиана последнего закрытого окна; None — окна не было или показаний в нём меньше половины опросов.
@@ -155,6 +164,10 @@ pub struct Controller {
     touched: Vec<bool>,
     /// Буфер для медианы.
     scratch: Vec<f64>,
+    last_poll: Option<Duration>,
+    ceilings_seen: Vec<i32>,
+    accepted_seen: Vec<i32>,
+    mixed_profile: bool,
 }
 
 /// Ступень вниз: на одну ниже фактического множителя (не известен — ниже потолка), не ниже `floor`. None — блок уже
@@ -206,6 +219,48 @@ fn means(window: &[Reading]) -> (Option<f64>, Option<f64>) {
     )
 }
 
+fn workload(reading: Option<Reading>, load: &LoadFrame<'_>, block: usize) -> Option<Workload> {
+    let reading = reading?;
+    if !reading.temp?.is_finite() {
+        return None;
+    }
+    let work = Workload {
+        busy: reading.busy?,
+        ratio: reading.ratio?,
+        global_busy: load.global_busy?,
+        relative: load.relative.get(block).copied().flatten()?,
+    };
+    work.valid().then_some(work)
+}
+
+fn average_workload(samples: &[Option<Workload>]) -> Option<Workload> {
+    let mut total = Workload {
+        busy: 0.0,
+        ratio: 0.0,
+        global_busy: 0.0,
+        relative: 0.0,
+    };
+    let mut count = 0_u32;
+    for sample in samples {
+        let sample = (*sample)?;
+        total.busy += sample.busy;
+        total.ratio += sample.ratio;
+        total.global_busy += sample.global_busy;
+        total.relative += sample.relative;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let n = f64::from(count);
+    Some(Workload {
+        busy: total.busy / n,
+        ratio: total.ratio / n,
+        global_busy: total.global_busy / n,
+        relative: total.relative / n,
+    })
+}
+
 impl Controller {
     #[must_use]
     pub fn new(settings: Settings, timing: Timing, blocks: usize) -> Self {
@@ -218,6 +273,10 @@ impl Controller {
             returned: None,
             touched: vec![false; blocks],
             scratch: Vec::with_capacity(16),
+            last_poll: None,
+            ceilings_seen: Vec::with_capacity(blocks),
+            accepted_seen: Vec::with_capacity(blocks),
+            mixed_profile: false,
         }
     }
 
@@ -235,14 +294,21 @@ impl Controller {
     /// подряд, всё начинается заново.
     pub fn forget(&mut self) {
         for track in &mut self.tracks {
+            let mut guard = std::mem::take(&mut track.guard);
+            guard.reset_episode();
             *track = Track {
                 window: std::mem::take(&mut track.window),
+                workload: std::mem::take(&mut track.workload),
+                guard,
                 ..Track::default()
             };
             track.window.clear();
+            track.workload.clear();
         }
         self.start = None;
         self.polls = 0;
+        self.last_poll = None;
+        self.mixed_profile = false;
     }
 
     /// Потолок блока изменён не регулятором (владелец, чужая программа, профиль): этот блок судится заново.
@@ -250,9 +316,29 @@ impl Controller {
         if let Some(track) = self.tracks.get_mut(block) {
             *track = Track {
                 window: std::mem::take(&mut track.window),
+                workload: std::mem::take(&mut track.workload),
                 ..Track::default()
             };
             track.window.clear();
+            track.workload.clear();
+        }
+    }
+
+    /// Защита сохраняется отдельно от окон наблюдения, чтобы сон и перезапуск не подтверждали возврат.
+    #[must_use]
+    pub fn protection(&self, block: usize) -> Option<Protection> {
+        self.tracks.get(block).and_then(|t| t.guard.protection)
+    }
+
+    pub fn seed_protection(&mut self, block: usize, protection: Protection) {
+        if let Some(track) = self.tracks.get_mut(block) {
+            track.guard.seed(protection);
+        }
+    }
+
+    pub fn clear_protection(&mut self, block: usize) {
+        if let Some(track) = self.tracks.get_mut(block) {
+            track.guard = Guard::default();
         }
     }
 
@@ -278,11 +364,51 @@ impl Controller {
         allowed: &dyn Fn(usize, i32, Option<f64>) -> bool,
         out: &mut Vec<Decision>,
     ) {
+        self.step_loaded(
+            now,
+            frame,
+            &LoadFrame {
+                global_busy: None,
+                relative: &[],
+            },
+            allowed,
+            out,
+        );
+    }
+
+    /// Опрос с известной общей и относительной активностью; без этих данных разрешены только снижения.
+    pub fn step_loaded(
+        &mut self,
+        now: Duration,
+        frame: &Frame<'_>,
+        load: &LoadFrame<'_>,
+        allowed: &dyn Fn(usize, i32, Option<f64>) -> bool,
+        out: &mut Vec<Decision>,
+    ) {
         out.clear();
+        if self
+            .last_poll
+            .is_some_and(|last| now < last || now.saturating_sub(last) > self.timing.window)
+        {
+            self.forget();
+        }
+        self.last_poll = Some(now);
+        if self.ceilings_seen != frame.ceilings || self.accepted_seen != frame.accepted {
+            if !self.ceilings_seen.is_empty() {
+                self.mixed_profile = true;
+                for track in &mut self.tracks {
+                    track.guard.reset_episode();
+                }
+            }
+            self.ceilings_seen.clear();
+            self.ceilings_seen.extend_from_slice(frame.ceilings);
+            self.accepted_seen.clear();
+            self.accepted_seen.extend_from_slice(frame.accepted);
+        }
         self.touched.fill(false);
         let start = *self.start.get_or_insert(now);
         self.polls += 1;
-        self.emergency(now, frame, out);
+        self.emergency(now, frame, load, out);
         if now.saturating_sub(start) >= self.timing.window {
             self.close(now, start, frame, allowed, out);
             self.start = Some(now);
@@ -291,8 +417,10 @@ impl Controller {
     }
 
     /// Показания — в окна; аварийная отсечка по каждому.
-    fn emergency(&mut self, now: Duration, frame: &Frame<'_>, out: &mut Vec<Decision>) {
+    fn emergency(&mut self, now: Duration, frame: &Frame<'_>, load: &LoadFrame<'_>, out: &mut Vec<Decision>) {
         for b in 0..self.tracks.len() {
+            let work = workload(frame.readings.get(b).copied().flatten(), load, b);
+            self.tracks[b].workload.push(work);
             let Some(reading) = frame.readings.get(b).copied().flatten() else {
                 continue;
             };
@@ -319,6 +447,7 @@ impl Controller {
                 busy: reading.busy,
             });
             let track = &mut self.tracks[b];
+            track.guard.cut(to, work);
             track.recheck_at = Some(now + self.timing.recheck);
             track.act(now);
             self.touched[b] = true;
@@ -381,9 +510,51 @@ impl Controller {
                 busy: self.tracks[b].busy,
             });
             self.tracks[b].act(now);
+            let work = average_workload(&self.tracks[b].workload);
+            self.tracks[b].guard.cut(to, work);
             self.touched[b] = true;
         }
+        self.check_trials(now, start, frame, out);
         self.give_back(now, frame, allowed, out);
+        for track in &mut self.tracks {
+            track.workload.clear();
+        }
+        self.mixed_profile = false;
+    }
+
+    fn check_trials(&mut self, now: Duration, start: Duration, frame: &Frame<'_>, out: &mut Vec<Decision>) {
+        for b in 0..self.tracks.len() {
+            let Some(&ceiling) = frame.ceilings.get(b) else {
+                continue;
+            };
+            if self.mixed_profile || self.touched[b] || self.tracks[b].acted.is_some_and(|acted| acted > start) {
+                self.tracks[b].guard.reset_episode();
+                continue;
+            }
+            let track = &mut self.tracks[b];
+            let cool = track.median.is_some_and(|m| m <= self.settings.limit);
+            let Some(to) = track
+                .guard
+                .window(now, start, self.timing.pause, ceiling, &track.workload, cool)
+            else {
+                continue;
+            };
+            let temp = track.median.unwrap_or(f64::NAN);
+            let ratio = track.ratio;
+            let busy = track.busy;
+            out.push(Decision {
+                cause: Cause::Revert,
+                block: b,
+                from: ceiling,
+                to,
+                temp,
+                die: self.die(b),
+                ratio,
+                busy,
+            });
+            self.tracks[b].act(now);
+            self.touched[b] = true;
+        }
     }
 
     /// Возврат: из блоков ниже профиля, у которых все 2-с медианы всю паузу не выше предела и которых пускает память
@@ -396,6 +567,13 @@ impl Controller {
         out: &mut Vec<Decision>,
     ) {
         let pause = self.timing.pause;
+        if self
+            .tracks
+            .iter()
+            .any(|t| t.guard.protection.is_some_and(|p| p.trial.is_some()))
+        {
+            return;
+        }
         if self.returned.is_some_and(|t| now.saturating_sub(t) < pause) {
             return;
         }
@@ -407,7 +585,12 @@ impl Controller {
                 continue;
             };
             let cool = track.cool_since.is_some_and(|since| now.saturating_sub(since) >= pause);
-            if ceiling >= profile || !cool || self.touched[b] || coolest.is_some_and(|(_, c)| m >= c) {
+            if ceiling >= profile
+                || !cool
+                || !track.guard.ready(now, pause, ceiling)
+                || self.touched[b]
+                || coolest.is_some_and(|(_, c)| m >= c)
+            {
                 continue;
             }
             if allowed(b, ceiling + 1, self.die(b)) {
@@ -427,6 +610,7 @@ impl Controller {
             busy: self.tracks[b].busy,
         });
         self.tracks[b].act(now);
+        self.tracks[b].guard.begin(from);
         self.touched[b] = true;
         self.returned = Some(now);
     }

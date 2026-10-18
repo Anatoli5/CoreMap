@@ -269,6 +269,7 @@ impl App {
         self.logging.on = false;
         self.logging.due = None;
         self.logging.previous = None;
+        self.auto.global_busy = None;
         shell.kill_timer(SENSE);
         if let Some(controller) = &mut self.auto.controller {
             controller.forget();
@@ -305,6 +306,7 @@ impl App {
         // в первой строке после паузы журнала был промежуток опроса, а не всей паузы). Решения регулятора — под той же
         // арендой, сразу по этим показаниям.
         let read = self.with_ceilings(|app| {
+            app.system_share();
             let package = app.read_sensors(window)?;
             let power = app.read_power();
             let refused = app.react(package);

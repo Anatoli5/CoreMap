@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use machine::auto::{Cause, Controller, Decision, Frame, Settings, Timing};
+use machine::auto::{Cause, Controller, Decision, Frame, LoadFrame, Settings, Timing};
 use machine::memory::Memory;
 use machine::thermal::Reading;
 
@@ -98,14 +98,29 @@ impl Bench {
         };
         let memory = &self.memory;
         let allowed = |b: usize, to: i32, die: Option<f64>| memory.allows(b, to, LIMIT, die);
-        self.c.step(self.t, &frame, &allowed, &mut self.out);
+        // Здесь все блоки имеют одинаковую долю работы; для проверки возврата
+        // явно задаём известную общую нагрузку и равномерное распределение.
+        let relative = vec![
+            Some(1.0 / f64::from(u32::try_from(feels.len()).expect("число блоков умещается в u32")));
+            feels.len()
+        ];
+        self.c.step_loaded(
+            self.t,
+            &frame,
+            &LoadFrame {
+                global_busy: Some(1.0),
+                relative: &relative,
+            },
+            &allowed,
+            &mut self.out,
+        );
         for d in std::mem::take(&mut self.out) {
             assert_eq!(
                 self.ceilings[d.block], d.from,
                 "a decision names the ceiling that stands: {d:?}"
             );
             self.ceilings[d.block] = d.to;
-            if d.cause != Cause::Return {
+            if matches!(d.cause, Cause::Emergency | Cause::Target) {
                 self.memory.cut(d.block, d.from, d.temp, d.die);
             }
             self.acts.push((self.t, d));
@@ -321,7 +336,7 @@ fn cut_once(blocks: usize, others: f64) -> Bench {
 }
 
 #[test]
-fn a_cut_block_returns_one_step_after_a_full_pause_below_the_limit_and_never_above_its_profile() {
+fn a_cut_block_returns_after_a_full_pause_of_cool_work_and_never_above_its_profile() {
     let mut b = cut_once(2, 60.0);
     let cut = b.acts[0].0;
     // Cooler than at the cut: the die (block 1) is 55 now, it was 60.
@@ -339,11 +354,15 @@ fn a_cut_block_returns_one_step_after_a_full_pause_below_the_limit_and_never_abo
     );
     assert_eq!((back[0].1.from, back[0].1.to), (49, 50));
 
-    // Three steps below the profile: one step per full pause, up to the profile ceiling.
+    // Три ступени: каждой новой пробе предшествует проверка работы, а после неё
+    // нужна отдельная проверка на новом потолке, без зачёта старых показаний.
     let mut b2 = cut_once(2, 60.0);
     b2.ceilings[0] = 47; // lowered three steps in all (as by three cuts); profile ×50
+    let mut protection = b2.c.protection(0).expect("срез оставляет защиту");
+    protection.held = 47;
+    b2.c.seed_protection(0, protection);
     let cool = b2.t;
-    b2.run(600.0, |_| vec![hot(70.0), hot(55.0)]);
+    b2.run(800.0, |_| vec![hot(70.0), hot(55.0)]);
     let times: Vec<f64> = b2
         .acts(Cause::Return)
         .iter()
@@ -352,8 +371,8 @@ fn a_cut_block_returns_one_step_after_a_full_pause_below_the_limit_and_never_abo
     assert_eq!(b2.ceilings[0], 50, "{times:?}");
     assert_eq!(times.len(), 3, "{times:?}");
     assert!(
-        times.windows(2).all(|w| w[1] - w[0] >= 120.0),
-        "a full pause per step: {times:?}"
+        times.windows(2).all(|w| w[1] - w[0] >= 240.0),
+        "проверка до пробы и после неё: {times:?}"
     );
 }
 
