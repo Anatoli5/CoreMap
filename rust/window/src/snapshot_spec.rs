@@ -191,8 +191,8 @@ fn snapshot_draws_both_fits_inside_frame_and_never_extrapolates_support() {
         let s = shown(scale, false, true, &[0, 1]);
         for (block, low, high) in [(0, 20, 40), (1, 25, 45)] {
             let series = s.series.iter().find(|line| line.block == block).expect("ряд");
-            assert!(!series.model.is_empty() && !series.model_dash.is_empty());
-            for path in [&series.model, &series.model_dash] {
+            assert!(!series.model.is_empty() && !series.sensitivity.is_empty());
+            for path in [&series.model, &series.sensitivity] {
                 let xy = path_coordinates(path);
                 assert!(!xy.is_empty() && xy.len().is_multiple_of(2));
                 assert!(xy.iter().all(|v| v.is_finite() && *v >= -0.02 && *v <= 1000.02));
@@ -213,7 +213,7 @@ fn snapshot_missing_block_has_no_borrowed_curve_and_has_explanation() {
     assert!(
         s.series
             .iter()
-            .all(|line| line.model.is_empty() && line.model_dash.is_empty() && line.model_line.is_empty())
+            .all(|line| line.model.is_empty() && line.sensitivity.is_empty() && line.model_line.is_empty())
     );
     let text = format!(
         "{} {} {}",
@@ -230,7 +230,7 @@ fn snapshot_model_switch_hides_both_fits_and_hover_geometry() {
     assert!(
         s.series
             .iter()
-            .all(|line| line.model.is_empty() && line.model_dash.is_empty() && line.model_line.is_empty())
+            .all(|line| line.model.is_empty() && line.sensitivity.is_empty() && line.model_line.is_empty())
     );
 }
 

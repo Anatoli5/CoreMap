@@ -40,9 +40,13 @@ use ui::{
 mod chart;
 mod check;
 mod conditional;
+#[cfg(test)]
+mod conditional_convergence_spec;
 mod conditional_data;
 #[cfg(test)]
 mod conditional_data_spec;
+#[cfg(test)]
+mod conditional_query_spec;
 mod conditional_report;
 mod conditional_snapshot;
 #[cfg(test)]
@@ -58,6 +62,8 @@ mod history_spec;
 mod model;
 mod model_report;
 mod plot;
+#[cfg(test)]
+mod solver_polish_spec;
 // Тесты модели нагрева по брифу, написанные отдельно от реализации (rust\AGENTS.md: «second pair of eyes»).
 #[cfg(test)]
 mod model_spec;

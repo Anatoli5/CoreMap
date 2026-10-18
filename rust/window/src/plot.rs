@@ -83,6 +83,61 @@ pub struct Viewport {
 }
 
 impl Viewport {
+    /// Выпуклая область в той же системе координат: поворот и отсечение по обеим осям.
+    pub fn polygon(self, points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        if points.len() < 3
+            || Range::new(self.argument.min, self.argument.max).is_none()
+            || Range::new(self.value.min, self.value.max).is_none()
+        {
+            return Vec::new();
+        }
+        let Some(mut polygon) = points
+            .iter()
+            .map(|&(x, y)| self.point(x, y))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Vec::new();
+        };
+        for (axis, edge, above) in [(0, 0.0, true), (0, 1.0, false), (1, 0.0, true), (1, 1.0, false)] {
+            let input = std::mem::take(&mut polygon);
+            let Some(&last) = input.last() else {
+                return polygon;
+            };
+            let coordinate = |p: (f64, f64)| if axis == 0 { p.0 } else { p.1 };
+            let inside = |p| {
+                if above {
+                    coordinate(p) >= edge
+                } else {
+                    coordinate(p) <= edge
+                }
+            };
+            let mut previous = last;
+            for point in input {
+                if inside(previous) != inside(point) {
+                    let fraction = (edge - coordinate(previous)) / (coordinate(point) - coordinate(previous));
+                    let intersection = (
+                        previous.0 + fraction * (point.0 - previous.0),
+                        previous.1 + fraction * (point.1 - previous.1),
+                    );
+                    if !intersection.0.is_finite() || !intersection.1.is_finite() {
+                        return Vec::new();
+                    }
+                    polygon.push(intersection);
+                }
+                if inside(point) {
+                    polygon.push(point);
+                }
+                previous = point;
+            }
+        }
+        let area: f64 = polygon
+            .iter()
+            .zip(polygon.iter().cycle().skip(1))
+            .map(|(a, b)| a.0 * b.1 - b.0 * a.1)
+            .sum();
+        if area == 0.0 { Vec::new() } else { polygon }
+    }
+
     pub fn point(self, argument: f64, value: f64) -> Option<(f64, f64)> {
         let point = (self.argument.normal(argument)?, self.value.normal(value)?);
         Some(if self.swap { (point.1, point.0) } else { point })
@@ -123,3 +178,7 @@ impl Viewport {
 #[cfg(test)]
 #[path = "plot_spec.rs"]
 mod spec;
+
+#[cfg(test)]
+#[path = "sensitivity_band_spec.rs"]
+mod sensitivity_spec;

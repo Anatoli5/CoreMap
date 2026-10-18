@@ -366,8 +366,8 @@ pub struct SeriesShown {
     /// Та же кривая модели ломаными в долях поля (x, y снизу вверх, оси уже повёрнуты) — для подсветки под курсором
     /// (`nearest`); скрыта или нет кривой — пусто.
     pub model_line: Vec<Vec<(f32, f32)>>,
-    /// Усы разброса точек (вид «эффективность»): отрезки в рамке 1000 × 1000 (y вниз); в других видах пусто.
-    pub whiskers: String,
+    /// Замкнутая область чувствительности в рамке 1000 × 1000 (y вниз), отдельно от основной линии.
+    pub sensitivity: String,
     pub points: Vec<PointShown>,
 }
 
@@ -435,7 +435,7 @@ impl StatsShown {
                 max: runs(&s.max),
                 model: s.model.as_str().into(),
                 model_dash: s.model_dash.as_str().into(),
-                whiskers: s.whiskers.as_str().into(),
+                sensitivity: s.sensitivity.as_str().into(),
                 color: rgb(s.color),
                 faded: s.faded,
                 marks: ModelRc::new(VecModel::from(
@@ -1113,7 +1113,7 @@ fn efficiency_column_tip(ratio: i32, compared: &[&BlockInfo], points: &[Vec<Effi
         return String::new();
     }
     format!(
-        "×{ratio} · производительность на градус: множитель / свой нагрев при полной нагрузке, всё прочее вынесено\n{}",
+        "×{ratio} · производительность на градус: множитель / свой нагрев при полной нагрузке, всё прочее вынесено\nЛиния — основная подгонка; область — чувствительность к частям обучающих данных, не доверительный интервал.\n{}",
         lines.join("\n")
     )
 }
@@ -1354,7 +1354,7 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
             model,
             model_dash,
             model_line,
-            whiskers: String::new(),
+            sensitivity: String::new(),
             points: stats
                 .iter()
                 .enumerate()
@@ -1426,7 +1426,7 @@ fn snapshot_panel(input: &StatsInput, compared: &[&BlockInfo], shown: &mut Stats
         let model = snapshot.blocks.iter().find(|curve| curve.name == block.name);
         LegendShown {
             block: block.index, name: block.name.clone(), color: color_of(input.blocks, block.index),
-            tip: model.map_or_else(|| "Для этого блока сохранённой условной кривой пока нет. Кривая другого ядра вместо неё не подставляется.".into(), |curve| format!("Ядро {} · экспериментальная модель\nСплошная — основная подгонка, пунктир — альтернативная при том же окружении.\n• расхождение — чувствительность к подгонке, не влияние вентиляторов / GPU и не доверительный интервал\n• средняя абсолютная ошибка температуры на отложенных данных {:.2} °C; это не ошибка собственного нагрева\n• полная занятость ядра, собственная история установившаяся; окружение — записанная траектория\n• {}\n• модель сохранена по журналу и автоматически не переобучается; ранжирование и подбор потолков пока не подтверждены", curve.name, curve.temperature_test_mae, snapshot.conditions)),
+            tip: model.map_or_else(|| "Для этого блока сохранённой условной кривой пока нет. Кривая другого ядра вместо неё не подставляется.".into(), |curve| format!("Ядро {} · экспериментальная модель\nЛиния — основная подгонка; область — размах подгонок при том же окружении, не обязательно симметричный относительно линии.\n• расхождение — чувствительность к подгонке, не влияние вентиляторов / GPU и не доверительный интервал\n• средняя абсолютная ошибка температуры на отложенных данных {:.2} °C; это не ошибка собственного нагрева\n• полная занятость ядра, собственная история установившаяся; окружение — записанная траектория\n• {}\n• модель сохранена по журналу и автоматически не переобучается; ранжирование и подбор потолков пока не подтверждены", curve.name, curve.temperature_test_mae, snapshot.conditions)),
         }
     }).collect();
     if available.is_empty() {
@@ -1491,14 +1491,13 @@ fn snapshot_series(input: &StatsInput, frame: &Frame, ordered: &[SnapshotCurve],
                 )
             })
             .collect();
-        let alternate: Vec<_> = curve
+        let intervals: Vec<_> = curve
             .points
             .iter()
             .map(|p| {
-                (
-                    frame.along_at(p.ratio),
-                    frame.value(snapshot_value(p, input.scale, true)),
-                )
+                let primary = snapshot_value(p, input.scale, false);
+                let alternate = snapshot_value(p, input.scale, true);
+                (p.ratio, primary.min(alternate), primary.max(alternate))
             })
             .collect();
         let mut series = SeriesShown {
@@ -1519,9 +1518,7 @@ fn snapshot_series(input: &StatsInput, frame: &Frame, ordered: &[SnapshotCurve],
                         .collect(),
                 );
             }
-            for run in clipped(&alternate) {
-                dashed_path(&run, frame, &mut series.model_dash);
-            }
+            series.sensitivity = sensitivity_path(frame, &intervals, f64::INFINITY);
         }
         shown.series.push(series);
     }
@@ -1530,7 +1527,7 @@ fn snapshot_series(input: &StatsInput, frame: &Frame, ordered: &[SnapshotCurve],
 fn snapshot_columns(frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsShown) {
     for ratio in (frame.lo..=frame.hi).filter(|&r| (0.0..=1.0).contains(&frame.along(r))) {
         let mut tip = format!(
-            "×{ratio} · сохранённый экспериментальный расчёт\nСплошная и пунктир — разные подгонки при одном окружении; между узлами — линейная интерполяция."
+            "×{ratio} · сохранённый экспериментальный расчёт\nЛиния — основная подгонка; область — размах двух подгонок при одном окружении, не доверительный интервал. Между узлами — линейная интерполяция."
         );
         for (block, curve) in ordered {
             let r = f64::from(ratio);
@@ -1560,19 +1557,31 @@ fn snapshot_columns(frame: &Frame, ordered: &[SnapshotCurve], shown: &mut StatsS
     }
 }
 
-fn uncertainty_path(frame: &Frame, ratio: i32, low: f64, high: f64, out: &mut String) {
-    if let Some(((x0, y0), (x1, y1))) = unit_viewport().segment(frame.place(ratio, low), frame.place(ratio, high)) {
-        let _ = write!(
-            out,
-            "M {:.1} {:.1} L {:.1} {:.1} ",
-            x0 * 1000.0,
-            (1.0 - y0) * 1000.0,
-            x1 * 1000.0,
-            (1.0 - y1) * 1000.0
-        );
+fn sensitivity_path(frame: &Frame, intervals: &[(f64, f64, f64)], max_gap: f64) -> String {
+    let mut out = String::new();
+    for pair in intervals.windows(2) {
+        let (a, low_a, high_a) = pair[0];
+        let (b, low_b, high_b) = pair[1];
+        if b <= a || b - a > max_gap || low_a > high_a || low_b > high_b {
+            continue;
+        }
+        let vertices = [
+            frame.turn(frame.along_at(a), frame.value(low_a)),
+            frame.turn(frame.along_at(b), frame.value(low_b)),
+            frame.turn(frame.along_at(b), frame.value(high_b)),
+            frame.turn(frame.along_at(a), frame.value(high_a)),
+        ];
+        let polygon = unit_viewport().polygon(&vertices);
+        for (index, (x, y)) in polygon.iter().enumerate() {
+            let command = if index == 0 { 'M' } else { 'L' };
+            let _ = write!(out, "{command} {:.1} {:.1} ", x * 1000.0, (1.0 - y) * 1000.0);
+        }
+        if !polygon.is_empty() {
+            out.push_str("Z ");
+        }
     }
+    out
 }
-
 /// Вид «эффективность» (бриф 16.10): у каждого выбранного блока — точки по целым множителям (производительность на
 /// градус) своим цветом, соединённые линией между соседними множителями, с усами разброса по четырём частям данных;
 /// шкалы охватывают выбранные точки с усами. Заливка точки — ø нагрузка корзины, бледность — её
@@ -1612,16 +1621,14 @@ fn efficiency_panel(input: &StatsInput, digest: &Digest, compared: &[&BlockInfo]
         let inks: Vec<f64> = pts.iter().map(|p| ink(p.secs, most)).collect();
         let at: Vec<(f64, f64)> = pts.iter().map(|p| frame.place(p.ratio, p.value)).collect();
         let ratios: Vec<i32> = pts.iter().map(|p| p.ratio).collect();
-        let mut whiskers = String::new();
-        for p in pts {
-            uncertainty_path(&frame, p.ratio, p.lo, p.hi, &mut whiskers);
-        }
+        let intervals: Vec<_> = pts.iter().map(|p| (f64::from(p.ratio), p.lo, p.hi)).collect();
+        let sensitivity = sensitivity_path(&frame, &intervals, 1.0);
         shown.series.push(SeriesShown {
             block: b.index,
             color: color_of(input.blocks, b.index),
             faded: input.highlight.is_some_and(|h| h != b.index),
             mean: runs(&ratios, &at, &inks),
-            whiskers,
+            sensitivity,
             points: pts
                 .iter()
                 .zip(&at)
@@ -2110,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_transposes_both_endpoints_and_clips_both_axes() {
+    fn sensitivity_field_clips_and_transposes_the_same_region() {
         let normal = Frame {
             lo: 40,
             hi: 50,
@@ -2120,17 +2127,48 @@ mod tests {
             argument_range: Range::new(40.0, 50.0),
         };
         let swapped = Frame { swap: true, ..normal };
-        let mut a = String::new();
-        let mut b = String::new();
-        uncertainty_path(&normal, 45, 55.0, 85.0, &mut a);
-        uncertainty_path(&swapped, 45, 55.0, 85.0, &mut b);
-        assert_eq!(a, "M 500.0 1000.0 L 500.0 0.0 ");
-        assert_eq!(b, "M 0.0 500.0 L 1000.0 500.0 ");
-        let mut outside = String::new();
-        uncertainty_path(&normal, 60, 55.0, 85.0, &mut outside);
-        assert_eq!(outside, "");
+        let intervals = [(44.0, 55.0, 85.0), (46.0, 55.0, 85.0)];
+        let a = sensitivity_path(&normal, &intervals, 2.0);
+        let b = sensitivity_path(&swapped, &intervals, 2.0);
+        let coords = |path: &str| {
+            path.split_whitespace()
+                .filter_map(|s| s.parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        };
+        let a = coords(&a);
+        let b = coords(&b);
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        for p in a.as_chunks::<2>().0 {
+            assert!(
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|q| (p[0], p[1]) == (1000.0 - q[1], 1000.0 - q[0]))
+            );
+        }
+        assert_eq!(a.iter().step_by(2).copied().reduce(f64::min), Some(400.0));
+        assert_eq!(a.iter().step_by(2).copied().reduce(f64::max), Some(600.0));
+        assert!(a.iter().all(|v| (0.0..=1000.0).contains(v)));
     }
 
+    #[test]
+    fn sensitivity_field_does_not_bridge_missing_ratios_or_invent_area_for_one_point() {
+        let frame = Frame {
+            lo: 30,
+            hi: 34,
+            t0: 0.0,
+            t1: 10.0,
+            swap: false,
+            argument_range: Range::new(30.0, 34.0),
+        };
+        let intervals = [(30.0, 1.0, 5.0), (31.0, 2.0, 8.0), (33.0, 1.0, 5.0), (34.0, 2.0, 8.0)];
+        let field = sensitivity_path(&frame, &intervals, 1.0);
+        assert_eq!(field.matches('M').count(), 2);
+        assert_eq!(field.matches('Z').count(), 2);
+        assert_eq!(sensitivity_path(&frame, &intervals[..1], 1.0), "");
+        assert_eq!(sensitivity_path(&frame, &[(30.0, 2.0, 2.0), (31.0, 3.0, 3.0)], 1.0), "");
+    }
     #[test]
     fn fractional_manual_argument_clips_lines_and_does_not_expand_column_loop() {
         let rows: Vec<String> = (0..20)

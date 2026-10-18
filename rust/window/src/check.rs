@@ -396,11 +396,11 @@ impl Check {
         let drawn = self.view.borrow().shown_stats.as_ref().is_some_and(|s| {
             s.series
                 .iter()
-                .any(|line| !line.model.is_empty() && !line.model_dash.is_empty())
+                .any(|line| !line.model.is_empty() && !line.sensitivity.is_empty())
         });
         self.check(
             drawn && self.ui.get_chart_swap(),
-            "две подгонки видны при множителе по вертикали",
+            "основная линия и область чувствительности видны при множителе по вертикали",
         );
         let shot = self.shot("conditional");
         self.check(shot, "картинка условной эффективности по вымышленной модели");
@@ -2796,7 +2796,7 @@ impl Check {
             v.shown_stats
                 .as_ref()
                 .and_then(|s| s.series.iter().find(|l| l.block == p))
-                .is_some_and(|l| !l.points.is_empty() && !l.whiskers.is_empty())
+                .is_some_and(|l| !l.points.is_empty() && !l.sensitivity.is_empty())
         };
         let drawn = self.pump(ready, 30.0);
         let series = self
@@ -2818,33 +2818,26 @@ impl Check {
                 && fits_data
                 && self.ui.get_chart_value_title().contains("производительность на °C"),
             format!(
-                "по умолчанию — «эффективность»: у {} {} точек с усами и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; автодиапазон выбранных данных: {ticks:?}",
+                "по умолчанию — «эффективность»: у {} {} точек с областью чувствительности и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; автодиапазон выбранных данных: {ticks:?}",
                 p_block.name,
                 series.as_ref().map_or(0, |l| l.points.len())
             ),
         );
-        // Усы: по отрезку на точку, оба конца на её множителе (x одинаков), точка между концами.
-        let numbers: Vec<f64> = series
-            .as_ref()
-            .map(|l| l.whiskers.split_whitespace().filter_map(|t| t.parse().ok()).collect())
-            .unwrap_or_default();
-        let segments: Vec<[f64; 4]> = numbers.as_chunks::<4>().0.to_vec();
-        let whiskers_ok = series.as_ref().is_some_and(|l| {
-            segments.len() == l.points.len()
-                && l.points.iter().zip(&segments).all(|(pt, s)| {
-                    let (x, y) = (f64::from(pt.x) * 1000.0, (1.0 - f64::from(pt.y)) * 1000.0);
-                    (s[0] - x).abs() < 1.0
-                        && (s[2] - x).abs() < 1.0
-                        && s[1].min(s[3]) <= y + 1.0
-                        && y <= s[1].max(s[3]) + 1.0
-                })
+        // Область замкнута и обрезана по полю; основной расчёт сохраняется отдельной линией.
+        let sensitivity_ok = series.as_ref().is_some_and(|line| {
+            let values: Vec<f64> = line
+                .sensitivity
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            line.sensitivity.contains('Z')
+                && values.len() >= 6
+                && values.iter().all(|v| v.is_finite() && (0.0..=1000.0).contains(v))
+                && !line.mean.is_empty()
         });
         self.check(
-            whiskers_ok,
-            format!(
-                "у каждой точки эффективности — усы на её множителе, точка между концами: отрезков {}",
-                segments.len()
-            ),
+            sensitivity_ok,
+            "эффективность: полупрозрачная замкнутая область и отдельная основная линия",
         );
         // ø, 95 % и «макс» в этом виде недоступны: настоящий щелчок по «ø» ничего не меняет.
         let curves = self.view.borrow().curves;

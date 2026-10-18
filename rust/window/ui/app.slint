@@ -116,7 +116,7 @@ export struct Series {
     max: [Run],
     model: string,
     model-dash: string,
-    whiskers: string,
+    sensitivity: string,
     color: color,
     faded: bool,
     marks: [Mark],
@@ -814,6 +814,17 @@ component Chart inherits Rectangle {
         height: root.plot-h;
         clip: true;
         opacity: s.faded ? 0.3 : 1;
+        // Область чувствительности под основной линией; это не доверительный интервал.
+        if s.sensitivity != "": Path {
+            width: parent.width;
+            height: parent.height;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: s.sensitivity;
+            fill: s.color.transparentize(0.85);
+            stroke-width: 0;
+        }
         for r in s.p95: Path {
             x: -1px;
             y: -1px;
@@ -891,19 +902,6 @@ component Chart inherits Rectangle {
             commands: s.model-dash;
             stroke: s.color;
             stroke-width: 2px;
-        }
-        // Усы разброса точек эффективности (вид «эффективность»; "" — нет).
-        if s.whiskers != "": Path {
-            x: -1px;
-            y: -1px;
-            width: parent.width + 2px;
-            height: parent.height + 2px;
-            viewbox-width: 1000;
-            viewbox-height: 1000;
-            fit: fill;
-            commands: s.whiskers;
-            stroke: s.color.transparentize(0.35);
-            stroke-width: 1.5px;
         }
         // Точка 95 % — маленькая сплошная.
         for m in s.marks: Rectangle {

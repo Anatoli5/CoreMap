@@ -144,6 +144,159 @@ fn projected(gradient: &[f64], coefficients: &[f64], nonnegative: &[bool]) -> f6
         .fold(0.0, f64::max)
 }
 
+fn free_solution(normal: &Normal, free: &[bool]) -> Option<Vec<f64>> {
+    let width = free.len();
+    let columns: Vec<usize> = (0..width).filter(|&j| free[j]).collect();
+    let n = columns.len();
+    if n == 0 {
+        return None;
+    }
+    let mut lower = vec![0.0; n.checked_mul(n)?];
+    for (j, &column) in columns.iter().enumerate() {
+        for (k, &other) in columns[..=j].iter().enumerate() {
+            let cross: f64 = (0..k).map(|i| lower[j * n + i] * lower[k * n + i]).sum();
+            let value = normal.gram[column * width + other] - cross;
+            if !value.is_finite() {
+                return None;
+            }
+            lower[j * n + k] = if j == k {
+                // Диагональ исходного нормированного Грама равна единице. Малый
+                // остаточный pivot означает потерю точности; штраф ради решения не добавляем.
+                if value <= f64::EPSILON.sqrt() {
+                    return None;
+                }
+                value.sqrt()
+            } else {
+                value / lower[k * n + k]
+            };
+        }
+    }
+    let mut solution = vec![0.0; n];
+    for (j, &column) in columns.iter().enumerate() {
+        let cross: f64 = (0..j).map(|k| lower[j * n + k] * solution[k]).sum();
+        solution[j] = (normal.rhs[column] - cross) / lower[j * n + j];
+    }
+    for j in (0..n).rev() {
+        let cross: f64 = (j + 1..n).map(|k| lower[k * n + j] * solution[k]).sum();
+        solution[j] = (solution[j] - cross) / lower[j * n + j];
+    }
+    let mut candidate = vec![0.0; width];
+    for (&column, value) in columns.iter().zip(solution) {
+        if !value.is_finite() {
+            return None;
+        }
+        candidate[column] = value;
+    }
+    Some(candidate)
+}
+
+fn nonincreasing(normal: &Normal, previous: &[f64], gradient: &[f64], candidate: &[f64]) -> bool {
+    let width = previous.len();
+    // Разность квадратичных целей через шаг и точный прежний градиент: без
+    // вычитания двух больших почти равных значений и без повторного добавления ridge.
+    let step: Vec<f64> = candidate.iter().zip(previous).map(|(new, old)| new - old).collect();
+    let change: f64 = step
+        .iter()
+        .enumerate()
+        .map(|(j, delta)| {
+            let cross: f64 = normal.gram[j * width..(j + 1) * width]
+                .iter()
+                .zip(&step)
+                .map(|(g, d)| g * d)
+                .sum();
+            delta * (gradient[j] + 0.5 * cross)
+        })
+        .sum();
+    change.is_finite() && change <= 0.0
+}
+
+enum Step {
+    FreeMinimum,
+    Blocking(usize),
+}
+
+fn feasible_step(previous: &[f64], candidate: &mut [f64], nonnegative: &[bool]) -> Option<Step> {
+    let mut blocking: Option<(usize, f64)> = None;
+    for (j, &bounded) in nonnegative.iter().enumerate() {
+        if bounded && candidate[j] < 0.0 {
+            let fraction = previous[j] / (previous[j] - candidate[j]);
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                return None;
+            }
+            if blocking.is_none_or(|(_, old)| fraction < old) {
+                blocking = Some((j, fraction));
+            }
+        }
+    }
+    if let Some((column, fraction)) = blocking {
+        for (value, old) in candidate.iter_mut().zip(previous) {
+            *value = old + fraction * (*value - old);
+        }
+        candidate[column] = 0.0;
+    }
+    if candidate
+        .iter()
+        .zip(nonnegative)
+        .any(|(&v, &bounded)| !v.is_finite() || (bounded && v < 0.0))
+    {
+        return None;
+    }
+    Some(blocking.map_or(Step::FreeMinimum, |(column, _)| Step::Blocking(column)))
+}
+
+// После лимита координатных проходов уточняем активные границы. Отрицательный
+// свободный ответ даёт шаг только до ближайшей границы; затем отрицательный
+// градиент на активной границе освобождает координату. Знаковые столбцы свободны.
+// Ни один промежуточный шаг не публикуется: отказ сохраняет исходный результат.
+fn polish(
+    normal: &Normal,
+    coefficients: &mut Vec<f64>,
+    gradient: &mut Vec<f64>,
+    nonnegative: &[bool],
+    tolerance: f64,
+) -> Option<f64> {
+    let width = coefficients.len();
+    let limit = width.checked_mul(2)?;
+    let mut free: Vec<bool> = (0..width)
+        .map(|j| normal.scales[j] > 0.0 && (!nonnegative[j] || coefficients[j] > 0.0))
+        .collect();
+    // Нужен отдельный кандидат, чтобы ограниченный поиск не портил результат при отказе.
+    let mut previous = coefficients.clone();
+    let mut previous_gradient = gradient.clone();
+    for transition in 0..=limit {
+        let mut candidate = free_solution(normal, &free)?;
+        let blocking = feasible_step(&previous, &mut candidate, nonnegative)?;
+        if !nonincreasing(normal, &previous, &previous_gradient, &candidate) {
+            return None;
+        }
+        let mut next_gradient = vec![0.0; width];
+        // Неконечный градиент отвергает только поправку, а не прежний конечный ответ.
+        if refresh(normal, &candidate, &mut next_gradient).is_err() {
+            return None;
+        }
+        let residual = projected(&next_gradient, &candidate, nonnegative);
+        if residual <= tolerance {
+            *coefficients = candidate;
+            *gradient = next_gradient;
+            return Some(residual);
+        }
+        if transition == limit {
+            return None;
+        }
+        if let Step::Blocking(column) = blocking {
+            free[column] = false;
+        } else {
+            let release = (0..width)
+                .filter(|&j| nonnegative[j] && !free[j] && next_gradient[j] < -tolerance)
+                .min_by(|&a, &b| next_gradient[a].total_cmp(&next_gradient[b]))?;
+            free[release] = true;
+        }
+        previous = candidate;
+        previous_gradient = next_gradient;
+    }
+    None
+}
+
 pub fn fit(
     rows: &[Vec<f64>],
     targets: &[f64],
@@ -188,6 +341,11 @@ pub fn fit(
         if !residual.is_finite() {
             return Err(FitError::NumericalFailure);
         }
+    }
+    if residual > tolerance
+        && let Some(improved) = polish(&normal, &mut coefficients, &mut gradient, nonnegative, tolerance)
+    {
+        residual = improved;
     }
     for (beta, scale) in coefficients.iter_mut().zip(&normal.scales) {
         *beta = if *scale > 0.0 { *beta / scale } else { 0.0 };

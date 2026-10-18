@@ -9,6 +9,18 @@ use crate::conditional_data::Prepared;
 use crate::gam_solver;
 use crate::history::Signal;
 
+#[path = "conditional_query.rs"]
+mod query;
+pub use query::{CurveEstimate, CurveQuery};
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveLoad {
+    ObservedHistory,
+    SustainedFull,
+    Sustained(f64),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub knots: Vec<f64>,
@@ -57,6 +69,39 @@ pub struct Surface {
     pub background_coefficients: Vec<f64>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default)]
+    pub fit_status: Option<FitStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct FitStatus {
+    pub converged: bool,
+    pub outer_iterations: usize,
+    pub max_kernel_change: Option<f64>,
+    pub stop: FitStop,
+}
+
+impl FitStatus {
+    fn finish(&mut self, kernel_stable: bool) {
+        if kernel_stable {
+            self.converged = true;
+            self.stop = FitStop::KernelStable;
+        }
+    }
+
+    fn update(&mut self, delta: f64) {
+        self.outer_iterations += 1;
+        self.max_kernel_change = Some(delta);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitStop {
+    KernelStable,
+    #[default]
+    IterationLimit,
+    OwnSignalUnresolved,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,6 +114,7 @@ pub struct Diagnostic {
 pub enum Error {
     Dimensions,
     InvalidMetadata,
+    InvalidQuery,
     History(crate::history::HistoryError),
     MissingContext,
     InsufficientRows,
@@ -370,6 +416,7 @@ impl Surface {
             context_coefficients: Vec::new(),
             background_coefficients: Vec::new(),
             diagnostics: Vec::new(),
+            fit_status: None,
         }
     }
 
@@ -433,7 +480,12 @@ fn count(n: usize) -> f64 {
 
 /// Чередование двух ограниченных МНК. Лаговый вес общий для участков кривой: это ограничение ранга, а не физический закон.
 pub fn fit(data: &Prepared, template: Surface, train: &[bool], ridge: f64) -> Result<Surface, Error> {
-    fit_iterations(data, template, train, ridge, 12)
+    let surface = fit_iterations(data, template, train, ridge, 12)?;
+    if surface.fit_status.is_some_and(|status| status.converged) {
+        Ok(surface)
+    } else {
+        Err(Error::NotConverged)
+    }
 }
 
 pub fn fit_iterations(
@@ -446,6 +498,8 @@ pub fn fit_iterations(
     if train.len() != data.times.len() || !ridge.is_finite() || ridge < 0.0 {
         return Err(Error::Dimensions);
     }
+    template.diagnostics.clear();
+    template.fit_status = None;
     let design = design_with(data, &template)?;
     let ids: Vec<usize> = train
         .iter()
@@ -470,6 +524,7 @@ pub fn fit_iterations(
     let mut penalties: Vec<f64> = template.background_basis.iter().map(|d| d.penalty).collect();
     penalties.resize(backgrounds + ramps * contexts, 1.0);
     let mut final_pass = false;
+    let mut status = FitStatus::default();
     // Последняя итерация пересчитывает кривую после нормировки окончательного ядра истории.
     for iteration in 0..=max_iterations {
         let rows: Vec<Vec<f64>> = ids
@@ -495,6 +550,7 @@ pub fn fit_iterations(
             .collect();
         template.weights.clone_from(&weights);
         if iteration == max_iterations || final_pass {
+            status.finish(final_pass);
             break;
         }
         let lag_rows: Vec<Vec<f64>> = ids
@@ -520,6 +576,7 @@ pub fn fit_iterations(
         let mut next = kernel.coefficients[backgrounds..].to_vec();
         let sum: f64 = next.iter().sum();
         if sum < 1e-12 {
+            status.stop = FitStop::OwnSignalUnresolved;
             break;
         }
         for w in &mut next {
@@ -531,9 +588,11 @@ pub fn fit_iterations(
             .map(|(a, backgrounds)| (a - backgrounds).abs())
             .fold(0.0, f64::max);
         weights = next;
+        status.update(delta);
         // Малое изменение ядра не означает доказанной глобальной оптимальности; следующий проход — окончательная подгонка.
         final_pass = delta < 1e-4;
     }
+    template.fit_status = Some(status);
     dimensions(&template)?;
     Ok(template)
 }

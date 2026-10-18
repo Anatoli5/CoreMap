@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::conditional::{self, Metadata, Prediction, Surface};
+use crate::conditional::{self, CurveEstimate, CurveQuery, Metadata, Prediction, Surface};
 use crate::conditional_data::{self, Prepared};
 
 #[derive(Debug, Deserialize)]
@@ -17,12 +17,15 @@ struct Request {
     train: Option<Vec<bool>>,
     ridge: Option<f64>,
     iterations: Option<usize>,
+    query: Option<CurveQuery>,
 }
 
 #[derive(Debug, Serialize)]
 struct Response {
     model: Surface,
     predictions: Vec<Option<Prediction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    curve: Option<CurveEstimate>,
     elapsed_seconds: f64,
 }
 
@@ -45,9 +48,16 @@ fn execute(input: &Path, output: &Path) -> Result<(), String> {
         .map_err(|e| format!("расчёт модели: {e:?}"))?
     };
     let predictions = surface.predict(&request.data).map_err(|e| format!("прогноз: {e:?}"))?;
+    let curve = request
+        .query
+        .as_ref()
+        .map(|query| surface.curve_query(&request.data, &query.selected, &query.ratios, query.load))
+        .transpose()
+        .map_err(|e| format!("условная кривая: {e:?}"))?;
     let response = Response {
         model: surface,
         predictions,
+        curve,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     };
     let bytes = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
