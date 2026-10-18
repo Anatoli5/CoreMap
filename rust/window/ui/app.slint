@@ -428,75 +428,50 @@ component Chip inherits Rectangle {
 
 component RangeRow inherits Rectangle {
     in property <string> title;
-    in property <string> minimum;
-    in property <string> maximum;
+    in property <bool> vertical;
     in property <bool> auto;
     callback auto-changed(bool);
-    callback edited(string, string);
     callback zoom(float);
+    callback wheel(float);
+    callback hover(bool);
     callback fit();
     out property <length> auto-x: auto-check.x + auto-check.width / 2;
-    out property <length> low-x: low.absolute-position.x + low.width / 2;
-    out property <length> high-x: high.absolute-position.x + high.width / 2;
-    out property <length> field-y: low.absolute-position.y + low.height / 2;
+    out property <length> wheel-x: zoom-area.absolute-position.x + zoom-area.width / 2;
+    out property <length> wheel-y: zoom-area.absolute-position.y + zoom-area.height / 2;
+    out property <length> minus-x: minus.absolute-position.x + minus.width / 2;
+    out property <length> plus-x: plus.absolute-position.x + plus.width / 2;
     out property <length> fit-x: fit-button.absolute-position.x + fit-button.width / 2;
     out property <length> fit-y: fit-button.absolute-position.y + fit-button.height / 2;
-    property <bool> dirty;
     height: 26px;
-    function commit() {
-        if (root.dirty) {
-            root.dirty = false;
-            root.edited(low.text, high.text);
+    zoom-area := Rectangle {
+        x: 0; y: 2px; width: root.width - 180px; height: 22px;
+        background: zoom-touch.has-hover ? Palette.plate : transparent;
+        border-radius: 3px;
+        Text {
+            x: 4px; width: parent.width - 66px; height: parent.height;
+            text: (root.vertical ? "↕ " : "↔ ") + root.title;
+            color: Palette.text; font-size: 11px;
+            vertical-alignment: center; overflow: elide;
+        }
+        Text {
+            x: parent.width - 60px; width: 56px; height: parent.height;
+            text: "колесо"; color: Palette.dim; font-size: 10px;
+            vertical-alignment: center; horizontal-alignment: right;
+        }
+        zoom-touch := TouchArea {
+            changed has-hover => { root.hover(self.has-hover); }
+            scroll-event(event) => { root.wheel(event.delta-y / 1px); accept }
         }
     }
-    Text {
-        x: 0; width: 88px; height: root.height;
-        text: root.title; color: Palette.dim; font-size: 11px;
-        vertical-alignment: center; overflow: elide;
-    }
     auto-check := CheckBox {
-        x: 92px; y: 2px; width: 60px;
+        x: root.width - 174px; y: 2px; width: 60px;
         text: "Авто"; on: root.auto;
         toggled => { root.auto-changed(!root.auto); }
     }
-    Rectangle {
-        x: 156px; y: 2px; width: max(32px, (root.width - 282px) / 2); height: 22px;
-        background: Palette.bg; border-radius: 3px;
-        border-width: 1px; border-color: low.has-focus ? Palette.accent : Palette.cell;
-        low := TextInput {
-            x: 5px; width: parent.width - 10px; height: parent.height;
-            text: root.minimum; single-line: true; enabled: !root.auto;
-            color: root.auto ? Palette.dim : Palette.text; font-size: 11px;
-            vertical-alignment: center;
-            edited => { root.dirty = true; }
-            accepted => { root.commit(); }
-            changed has-focus => { if (!self.has-focus) { root.commit(); } }
-        }
-    }
-    Text {
-        x: 156px + max(32px, (root.width - 282px) / 2); width: 14px; height: root.height;
-        text: "…"; color: Palette.dim; horizontal-alignment: center; vertical-alignment: center;
-    }
-    Rectangle {
-        x: 170px + max(32px, (root.width - 282px) / 2);
-        y: 2px; width: max(32px, (root.width - 282px) / 2); height: 22px;
-        background: Palette.bg; border-radius: 3px;
-        border-width: 1px; border-color: high.has-focus ? Palette.accent : Palette.cell;
-        high := TextInput {
-            x: 5px; width: parent.width - 10px; height: parent.height;
-            text: root.maximum; single-line: true; enabled: !root.auto;
-            color: root.auto ? Palette.dim : Palette.text; font-size: 11px;
-            vertical-alignment: center;
-            edited => { root.dirty = true; }
-            accepted => { root.commit(); }
-            changed has-focus => { if (!self.has-focus) { root.commit(); } }
-        }
-    }
     fit-button := Chip { x: root.width - 108px; y: 2px; width: 56px; text: "Вписать"; clicked => { root.fit(); } }
-    Chip { x: root.width - 48px; y: 2px; width: 22px; text: "−"; clicked => { root.zoom(1.25); } }
-    Chip { x: root.width - 22px; y: 2px; width: 22px; text: "+"; clicked => { root.zoom(0.8); } }
+    minus := Chip { x: root.width - 48px; y: 2px; width: 22px; text: "−"; clicked => { root.zoom(1.25); } }
+    plus := Chip { x: root.width - 22px; y: 2px; width: 22px; text: "+"; clicked => { root.zoom(0.8); } }
 }
-
 // Ползунок целого числа. Пока его тянут, число под ручкой видно сразу (shown, moved — для показа), а применяется оно
 // одним released, когда кнопку отпустили: программа у часов получает одну команду за движение, а не десятки.
 component ValueSlider inherits Rectangle {
@@ -1470,20 +1445,15 @@ export component AppWindow inherits Window {
     in property <bool> chart-swap;
     in property <bool> range-auto-arg: true;
     in property <bool> range-auto-value: true;
-    in property <string> range-min-arg;
-    in property <string> range-max-arg;
-    in property <string> range-min-value;
-    in property <string> range-max-value;
     in property <string> range-title-arg: "Множитель, ×";
     in property <string> range-title-value: "Значение";
-    in property <string> range-error;
     in property <int> range-unit;
     in property <[MetricChoice]> metric-rows;
     in property <bool> normalized: true;
     in property <int> range-parameter;
     callback range-auto(bool, bool);
-    callback range-edited(bool, string, string);
     callback range-zoom(bool, float);
+    callback range-wheel(bool, float);
     callback range-fit(bool);
     callback range-unit-changed(int);
     callback metric-toggled(int);
@@ -1626,12 +1596,14 @@ export component AppWindow inherits Window {
     out property <length> range-arg-auto-y: argument-range.absolute-position.y + argument-range.height / 2;
     out property <length> range-value-auto-x: value-range.absolute-position.x + value-range.auto-x;
     out property <length> range-value-auto-y: value-range.absolute-position.y + value-range.height / 2;
-    out property <length> range-arg-min-x: argument-range.low-x;
-    out property <length> range-arg-max-x: argument-range.high-x;
-    out property <length> range-arg-field-y: argument-range.field-y;
-    out property <length> range-value-min-x: value-range.low-x;
-    out property <length> range-value-max-x: value-range.high-x;
-    out property <length> range-value-field-y: value-range.field-y;
+    out property <length> range-arg-wheel-x: argument-range.wheel-x;
+    out property <length> range-arg-wheel-y: argument-range.wheel-y;
+    out property <length> range-value-wheel-x: value-range.wheel-x;
+    out property <length> range-value-wheel-y: value-range.wheel-y;
+    out property <length> range-arg-minus-x: argument-range.minus-x;
+    out property <length> range-arg-plus-x: argument-range.plus-x;
+    out property <length> range-value-minus-x: value-range.minus-x;
+    out property <length> range-value-plus-x: value-range.plus-x;
     out property <length> range-arg-fit-x: argument-range.fit-x;
     out property <length> range-arg-fit-y: argument-range.fit-y;
     out property <length> range-value-fit-x: value-range.fit-x;
@@ -1892,7 +1864,7 @@ export component AppWindow inherits Window {
     property <length> g4-y: root.g4-fits ? root.g3-y : root.g3-y + root.ctl-row;
     property <length> base-controls-h: (root.chart-time ? root.g3-y : root.g4-y) + root.ctl-row;
     property <length> ranges-y: root.controls-top + root.base-controls-h + (root.chart-time ? root.ctl-row : 0px);
-    property <length> controls-h: root.base-controls-h + (root.chart-time ? root.ctl-row : 0px) + 52px + (root.range-error != "" ? 18px : 0px);
+    property <length> controls-h: root.base-controls-h + (root.chart-time ? root.ctl-row : 0px) + 52px;
     out property <length> events-h: min(6, max(1, root.events.length)) * 18px;
     out property <length> auto-h: !root.has-auto ? 0px : root.has-emergency ? 90px : 64px;
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.events-h - 28px - root.auto-h;
@@ -2615,27 +2587,28 @@ export component AppWindow inherits Window {
         argument-range := RangeRow {
             x: root.pad; y: root.ranges-y; width: root.ctl-w;
             title: root.range-title-arg;
-            minimum: root.range-min-arg; maximum: root.range-max-arg;
+            vertical: root.chart-swap;
             auto: root.range-auto-arg;
             auto-changed(auto) => { root.range-auto(true, auto); }
-            edited(lo, hi) => { root.range-edited(true, lo, hi); }
             zoom(factor) => { root.range-zoom(true, factor); }
+            wheel(delta) => { root.range-wheel(true, delta); }
+            hover(on) => {
+                root.tip(on, "argument-zoom", "Масштаб оси\nКолесо над названием приближает или отдаляет график по этой оси.\n• ручной зум выключает Авто только для этой оси\n• Вписать подбирает масштаб один раз; Авто подстраивает его при обновлении\n• для времени сохраняется конец выбранного окна", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
             fit() => { root.range-fit(true); }
         }
         value-range := RangeRow {
             x: root.pad; y: root.ranges-y + 26px; width: root.ctl-w;
             title: root.range-title-value;
-            minimum: root.range-min-value; maximum: root.range-max-value;
+            vertical: !root.chart-swap;
             auto: root.range-auto-value;
             auto-changed(auto) => { root.range-auto(false, auto); }
-            edited(lo, hi) => { root.range-edited(false, lo, hi); }
             zoom(factor) => { root.range-zoom(false, factor); }
+            wheel(delta) => { root.range-wheel(false, delta); }
+            hover(on) => {
+                root.tip(on, "value-zoom", "Масштаб оси\nКолесо над названием приближает или отдаляет график по выбранной шкале.\n• остальные шкалы сохраняются\n• ручной зум выключает Авто этой шкалы\n• Вписать подбирает масштаб один раз; Авто подстраивает его при обновлении", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
             fit() => { root.range-fit(false); }
-        }
-        if root.range-error != "": Text {
-            x: root.pad; y: root.ranges-y + 52px; width: root.ctl-w; height: 18px;
-            text: root.range-error; color: Palette.bad; font-size: 11px;
-            overflow: elide; vertical-alignment: center;
         }
         // Список событий: заголовок и переключатель «все блоки / выбранные».
         HorizontalLayout {

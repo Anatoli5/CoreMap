@@ -93,7 +93,7 @@ fn connect_ranges(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     let v = Rc::clone(view);
     ui.on_range_fit(move |argument| v.borrow_mut().range_fit(argument));
     let v = Rc::clone(view);
-    ui.on_range_edited(move |argument, min, max| v.borrow_mut().range_edited(argument, &min, &max));
+    ui.on_range_wheel(move |argument, delta| v.borrow_mut().range_wheel(argument, delta));
     let v = Rc::clone(view);
     ui.on_range_zoom(move |argument, factor| v.borrow_mut().range_zoom(argument, factor));
     let v = Rc::clone(view);

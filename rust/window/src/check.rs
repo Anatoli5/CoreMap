@@ -1338,123 +1338,161 @@ impl Check {
             |v| !v.swap,
             "повторный щелчок «Поменять оси» возвращает множитель по горизонтали",
         );
-        self.numeric_chart_ranges();
+        self.direct_chart_zoom();
     }
 
-    fn replace_field(&mut self, x: f32, y: f32, text: &str) {
-        self.click(x, y, PointerEventButton::Left);
-        let window = self.ui.window();
-        for key in
-            std::iter::once(slint::platform::Key::End).chain(std::iter::repeat_n(slint::platform::Key::Backspace, 64))
-        {
-            window.dispatch_event(WindowEvent::KeyPressed { text: key.into() });
-            window.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
-        }
-        self.type_text(text);
-        let window = self.ui.window();
-        window.dispatch_event(WindowEvent::KeyPressed {
-            text: slint::platform::Key::Return.into(),
-        });
-        window.dispatch_event(WindowEvent::KeyReleased {
-            text: slint::platform::Key::Return.into(),
+    fn scale_scroll(&mut self, argument: bool, delta: f32) {
+        let (x, y) = if argument {
+            (self.ui.get_range_arg_wheel_x(), self.ui.get_range_arg_wheel_y())
+        } else {
+            (self.ui.get_range_value_wheel_x(), self.ui.get_range_value_wheel_y())
+        };
+        self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(x, y),
+            delta_x: 0.0,
+            delta_y: delta,
         });
         self.pump(|_| true, 0.0);
     }
 
-    fn numeric_chart_ranges(&mut self) {
-        let ranges = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| s.argument_range.zip(s.value_range));
-        let Some((argument, value)) = ranges else {
-            self.check(false, "нет разрешённых диапазонов для проверки ручных полей");
+    fn scale_auto_click(&mut self, argument: bool) {
+        let (x, y) = if argument {
+            (self.ui.get_range_arg_auto_x(), self.ui.get_range_arg_auto_y())
+        } else {
+            (self.ui.get_range_value_auto_x(), self.ui.get_range_value_auto_y())
+        };
+        self.click(x, y, PointerEventButton::Left);
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "independent axis gestures and preserved sibling state in one UI scenario"
+    )]
+    fn direct_chart_zoom(&mut self) {
+        let ranges = |check: &Self| {
+            check
+                .view
+                .borrow()
+                .shown_stats
+                .as_ref()
+                .and_then(|s| s.argument_range.zip(s.value_range))
+        };
+        let span = |r: crate::plot::Range| r.max - r.min;
+        let close = |a: f64, b: f64| (a - b).abs() <= b.abs().max(1.0) * 1e-9;
+        if !self.ui.get_range_auto_arg() {
+            self.scale_auto_click(true);
+        }
+        if !self.ui.get_range_auto_value() {
+            self.scale_auto_click(false);
+        }
+        let Some((argument, value)) = ranges(self) else {
+            self.check(false, "нет данных для проверки прямого зума");
             return;
         };
-        let wanted_argument = crate::plot::Range::new(
-            argument.min + (argument.max - argument.min) * 0.1,
-            argument.max - (argument.max - argument.min) * 0.1,
-        )
-        .expect("часть исходного диапазона");
-        let wanted_value = crate::plot::Range::new(
-            value.min + (value.max - value.min) * 0.1,
-            value.max - (value.max - value.min) * 0.1,
-        )
-        .expect("часть исходного диапазона");
-        let auto_a = (self.ui.get_range_arg_auto_x(), self.ui.get_range_arg_auto_y());
-        let auto_v = (self.ui.get_range_value_auto_x(), self.ui.get_range_value_auto_y());
-        self.click(auto_a.0, auto_a.1, PointerEventButton::Left);
-        self.click(auto_v.0, auto_v.1, PointerEventButton::Left);
-        self.replace_field(
-            self.ui.get_range_arg_min_x(),
-            self.ui.get_range_arg_field_y(),
-            &format!("{:.6}", wanted_argument.min),
-        );
-        self.replace_field(
-            self.ui.get_range_arg_max_x(),
-            self.ui.get_range_arg_field_y(),
-            &format!("{:.6}", wanted_argument.max),
-        );
-        self.replace_field(
-            self.ui.get_range_value_min_x(),
-            self.ui.get_range_value_field_y(),
-            &format!("{:.6}", wanted_value.min),
-        );
-        self.replace_field(
-            self.ui.get_range_value_max_x(),
-            self.ui.get_range_value_field_y(),
-            &format!("{:.6}", wanted_value.max),
-        );
-        let actual = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| s.argument_range.zip(s.value_range));
-        let close =
-            |a: crate::plot::Range, b: crate::plot::Range| (a.min - b.min).abs() < 1e-5 && (a.max - b.max).abs() < 1e-5;
+        self.scale_scroll(true, 0.5);
+        let small = ranges(self);
         self.check(
-            actual.is_some_and(|(a, v)| close(a, wanted_argument) && close(v, wanted_value))
+            small.is_some_and(|(a, v)| span(a) < span(argument) && v == value)
+                && !self.ui.get_range_auto_arg()
+                && self.ui.get_range_auto_value(),
+            "дробное колесо над множителем меняет только его масштаб и его Авто",
+        );
+        self.scale_scroll(true, 0.0);
+        self.check(ranges(self) == small, "нулевое движение колеса не меняет масштаб");
+        self.scale_scroll(true, -0.5);
+        self.check(
+            ranges(self).is_some_and(|(a, v)| close(span(a), span(argument)) && v == value),
+            "обратное движение колеса возвращает прежний масштаб",
+        );
+        self.scale_auto_click(true);
+        self.scale_scroll(true, 2.0);
+        let larger = ranges(self);
+        self.check(
+            larger
+                .zip(small)
+                .is_some_and(|((a, v), (s, _))| span(a) < span(s) && v == value),
+            "величина движения колеса учитывается плавно, без округления до делений",
+        );
+        self.scale_auto_click(true);
+        for _ in 0..4 {
+            self.scale_scroll(true, 0.5);
+        }
+        self.check(
+            ranges(self)
+                .zip(larger)
+                .is_some_and(|((a, v), (b, _))| close(span(a), span(b)) && v == value),
+            "несколько малых движений дают тот же масштаб, что одно суммарное",
+        );
+        self.scale_auto_click(true);
+        self.scale_scroll(false, 0.5);
+        self.check(
+            ranges(self).is_some_and(|(a, v)| a == argument && span(v) < span(value))
+                && self.ui.get_range_auto_arg()
+                && !self.ui.get_range_auto_value(),
+            "колесо над значением меняет только его масштаб и его Авто",
+        );
+        self.click(
+            self.ui.get_range_arg_plus_x(),
+            self.ui.get_range_arg_wheel_y(),
+            PointerEventButton::Left,
+        );
+        let manual = ranges(self);
+        self.check(
+            manual.is_some_and(|(a, v)| span(a) < span(argument) && span(v) < span(value))
                 && !self.ui.get_range_auto_arg()
                 && !self.ui.get_range_auto_value(),
-            "настоящие щелчки и ввод задали ручные границы обеих осей",
+            "кнопка плюс приближает выбранную ось",
         );
         let swap = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
         self.click(swap.0, swap.1, PointerEventButton::Left);
-        let after_swap = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| s.argument_range.zip(s.value_range));
         self.check(
-            actual == after_swap && self.ui.get_chart_swap(),
-            "перестановка осей сохранила введённые физические границы",
+            manual == ranges(self) && self.ui.get_chart_swap(),
+            "перестановка осей сохраняет оба масштаба",
+        );
+        self.scale_scroll(true, 0.5);
+        self.check(
+            ranges(self)
+                .zip(manual)
+                .is_some_and(|((a, v), (old, other))| span(a) < span(old) && v == other),
+            "после перестановки колесо множителя меняет ту же логическую ось",
+        );
+        let before_value = ranges(self);
+        self.scale_scroll(false, 0.5);
+        self.check(
+            ranges(self)
+                .zip(before_value)
+                .is_some_and(|((a, v), (other, old))| a == other && span(v) < span(old)),
+            "после перестановки колесо значения независимо меняет его ось",
         );
         self.click(swap.0, swap.1, PointerEventButton::Left);
+        let before_minus = ranges(self);
+        self.click(
+            self.ui.get_range_value_minus_x(),
+            self.ui.get_range_value_wheel_y(),
+            PointerEventButton::Left,
+        );
+        self.check(
+            ranges(self)
+                .zip(before_minus)
+                .is_some_and(|((a, v), (other, old))| a == other && span(v) > span(old)),
+            "кнопка минус отдаляет выбранную ось, сохраняя другую",
+        );
         let fit = (self.ui.get_range_value_fit_x(), self.ui.get_range_value_fit_y());
         self.click(fit.0, fit.1, PointerEventButton::Left);
-        let fit_once = self.view.borrow().shown_stats.as_ref().and_then(|s| s.value_range);
         self.check(
-            fit_once == Some(value) && !self.ui.get_range_auto_value(),
-            "Вписать подбирает границы один раз и оставляет постоянное Авто выключенным",
+            ranges(self).is_some_and(|(_, v)| v == value) && !self.ui.get_range_auto_value(),
+            "Вписать подбирает масштаб один раз и оставляет Авто выключенным",
         );
-        self.click(auto_a.0, auto_a.1, PointerEventButton::Left);
-        self.click(auto_v.0, auto_v.1, PointerEventButton::Left);
-        let restored = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| s.argument_range.zip(s.value_range));
+        self.scale_auto_click(true);
+        self.scale_auto_click(false);
         self.check(
-            restored == Some((argument, value)) && self.ui.get_range_auto_arg() && self.ui.get_range_auto_value(),
-            "Авто вернуло диапазоны выбранных данных по обеим осям",
+            ranges(self) == Some((argument, value)) && self.ui.get_range_auto_arg() && self.ui.get_range_auto_value(),
+            "Авто возвращает масштабы по выбранным данным",
         );
+        let shot = self.shot("zoom-controls");
+        self.check(shot, "картинка: прямой масштаб без ручных границ");
         self.leave();
     }
-
     /// Шаг 2в: кривые модели нагрева (DECISIONS #39). У каждого выбранного блока — кривая его цвета: сплошная над
     /// наблюдёнными множителями, пунктир за ними, температура не падает с множителем; в подсказке блока в легенде —
     /// модель, условия и ошибка (без ватт — бриф 16.10 «эффективность»); выключатель «модель» прячет и возвращает
@@ -2406,7 +2444,10 @@ impl Check {
             "щелчок по «абсолютная» — шкала, на которой рисуется отсечка",
         );
         // Проверка ползунков требует видимых отсечек; автодиапазоны проверяются отдельным сценарием.
-        self.view.borrow_mut().range_edited(false, "40", "100");
+        self.view.borrow_mut().range_set(
+            false,
+            crate::plot::Range::new(40.0, 100.0).expect("границы теста отсечек"),
+        );
         let sent = self.view.borrow().sent;
         let start_limit = i32::try_from(start.limit).unwrap_or(LIMIT_TO);
 
@@ -3033,6 +3074,19 @@ impl Check {
                 && self.ui.get_time_scroll_end() <= 1.0,
             "полоса обзора перемещает окно, сохраняет ширину и показывает положение в дне",
         );
+        self.scale_scroll(true, 0.5);
+        let inward = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            inward.1 == scrolled.1 && inward.0 > scrolled.0 && !self.view.borrow().time_follow,
+            "колесо над шкалой времени приближает историческое окно от выбранного конца",
+        );
+        self.scale_scroll(true, -0.5);
+        let outward = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            outward.1 == scrolled.1 && outward.0 < inward.0 && !self.view.borrow().time_follow,
+            "обратное колесо отдаляет историческое окно, сохраняя конец и отрыв от новых данных",
+        );
+        let width = outward.1 - outward.0;
         let end = (self.ui.get_time_end_x(), self.ui.get_time_end_y());
         self.click(end.0, end.1, PointerEventButton::Left);
         let at_end = self.view.borrow().span.unwrap_or_default();
@@ -3076,6 +3130,13 @@ impl Check {
         self.check(
             self.ui.get_chart_swap() && self.ui.get_time_scroll_h() > self.ui.get_time_scroll_w() && shot,
             "перестановка осей поворачивает обзор вместе с осью времени",
+        );
+        let before = self.view.borrow().span.unwrap_or_default();
+        self.scale_scroll(true, 0.5);
+        let after = self.view.borrow().span.unwrap_or_default();
+        self.check(
+            after.1 == before.1 && after.0 > before.0 && !self.view.borrow().time_follow,
+            "вертикальная шкала времени после перестановки также масштабируется от конца",
         );
         self.click(swap.0, swap.1, PointerEventButton::Left);
         if let Some(day) = original {

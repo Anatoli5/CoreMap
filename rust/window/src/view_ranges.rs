@@ -64,24 +64,8 @@ impl View {
 
     pub(super) fn show_ranges(&self) {
         let ui = self.ui();
-        let a = self.resolved_range(true);
-        let v = self.resolved_range(false);
         ui.set_range_auto_arg(!self.ranges.contains_key(&self.range_key(true)));
         ui.set_range_auto_value(!self.ranges.contains_key(&self.range_key(false)));
-        let text = |value: Option<f64>| {
-            value
-                .map(|v| {
-                    format!("{v:.6}")
-                        .trim_end_matches('0')
-                        .trim_end_matches('.')
-                        .to_string()
-                })
-                .unwrap_or_default()
-        };
-        ui.set_range_min_arg(text(a.map(|r| r.min)).into());
-        ui.set_range_max_arg(text(a.map(|r| r.max)).into());
-        ui.set_range_min_value(text(v.map(|r| r.min)).into());
-        ui.set_range_max_value(text(v.map(|r| r.max)).into());
         ui.set_range_title_arg(
             if self.timeline {
                 "Время записи, мин"
@@ -132,7 +116,6 @@ impl View {
             self.ranges.insert(key, range);
             self.refresh_ranges();
         }
-        self.ui().set_range_error("".into());
         self.remember();
     }
 
@@ -146,53 +129,46 @@ impl View {
         if self.timeline && argument && auto {
             self.time_follow = true;
         }
-        self.ui().set_range_error("".into());
-        self.refresh_ranges();
-        self.remember();
-    }
-
-    pub fn range_edited(&mut self, argument: bool, min: &str, max: &str) {
-        let parse = |text: &str| text.trim().replace(',', ".").parse::<f64>().ok();
-        let range = parse(min).zip(parse(max)).and_then(|(min, max)| Range::new(min, max));
-        let Some(range) = range.filter(|r| !self.timeline || !argument || r.milliseconds().is_some()) else {
-            self.ui().set_range_error(
-                if self.timeline && argument {
-                    "Введи возрастающие границы времени с точностью не меньше миллисекунды."
-                } else {
-                    "Нужны две конечные границы: минимум меньше максимума."
-                }
-                .into(),
-            );
-            return;
-        };
-        if self.timeline && argument {
-            self.time_follow = self.docking_range(range);
-        }
-        self.ranges.insert(self.range_key(argument), range);
-        self.ui().set_range_error("".into());
         self.refresh_ranges();
         self.remember();
     }
 
     pub fn range_zoom(&mut self, argument: bool, factor: f32) {
+        self.zoom_axis(argument, f64::from(factor));
+    }
+
+    pub fn range_wheel(&mut self, argument: bool, delta: f32) {
+        if delta.is_finite() && delta != 0.0 {
+            self.zoom_axis(argument, (-f64::from(delta) / 600.0).exp());
+        }
+    }
+
+    fn zoom_axis(&mut self, argument: bool, factor: f64) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
         if let Some(range) = self
             .resolved_range(argument)
             .and_then(|r| {
                 if argument && self.timeline {
-                    self.zoom_time_range(r, f64::from(factor))
+                    self.zoom_time_range(r, factor)
                 } else {
-                    r.zoom(0.5, f64::from(factor))
+                    r.zoom(0.5, factor)
                 }
             })
             .filter(|r| !self.timeline || !argument || r.milliseconds().is_some())
         {
-            if self.timeline && argument {
-                self.time_follow = self.docking_range(range);
-            }
-            self.ranges.insert(self.range_key(argument), range);
-            self.refresh_ranges();
-            self.remember();
+            self.range_set(argument, range);
         }
+    }
+
+    pub fn range_set(&mut self, argument: bool, range: Range) {
+        if self.timeline && argument {
+            self.time_follow = self.docking_range(range);
+        }
+        self.ranges.insert(self.range_key(argument), range);
+        self.refresh_ranges();
+        self.remember();
     }
 
     pub fn range_unit_changed(&mut self, index: i32) {
