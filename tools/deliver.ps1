@@ -43,9 +43,13 @@ foreach ($name in $names) {
 }
 Set-Content -Path $installedFile -Value $version -Encoding ASCII
 
-# Next number: the last part goes up by one (0.2 -> 0.3).
-$parts = $version.Split('.')
-$parts[$parts.Length - 1] = [string]([int]$parts[$parts.Length - 1] + 1)
+# Следующий номер: после девятки переносим разряд (0.6.9 -> 0.7.0).
+$parts = @($version.Split('.') | ForEach-Object { [int]$_ })
+for ($index = $parts.Length - 1; $index -ge 0; $index--) {
+    $parts[$index]++
+    if ($parts[$index] -lt 10 -or $index -eq 0) { break }
+    $parts[$index] = 0
+}
 $next = $parts -join '.'
 Set-Content -Path (Join-Path $root 'VERSION') -Value $next -Encoding ASCII
 Write-Host "delivered $version (previous $installed kept in archive); VERSION is now $next"
