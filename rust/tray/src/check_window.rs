@@ -521,7 +521,6 @@ fn logging_with_window(r: &mut Report, app: &mut App, shell: &mut Shell, client:
         "цена опроса срезов при открытом окне (имитация): {}",
         cost.unwrap_or_default()
     ));
-    let blocks = u64::try_from(app.topology().blocks.len()).unwrap_or(0);
     let (polled, windowed, read) = (
         after.polls - before.polls,
         after.window_polls - before.window_polls,
@@ -535,9 +534,9 @@ fn logging_with_window(r: &mut Report, app: &mut App, shell: &mut Shell, client:
             && after.starts == before.starts
             && polled > 0
             && (2 * windowed).abs_diff(polled) <= 1
-            && read == windowed * cores + (polled - windowed) * blocks,
+            && read == polled * cores,
         &format!(
-            "журнал срезов при открытом окне: {polled} опросов, из них {windowed} опросов окна; {read} чтений ядер — все {cores} в опросе окна, {blocks} первых в остальных, ни одного сверх"
+            "журнал срезов при открытом окне: {polled} опросов, из них {windowed} опросов окна; {read} чтений ядер — все {cores} в каждом опросе для проверки порога по любому ядру, ни одного сверх"
         ),
     );
     // Ревизия 15.10, п. 1: средние под нагрузкой — по опросам окна, каждый опрос окна — один раз, и только он.
@@ -978,8 +977,8 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     let reads_before = app.reads();
     pump(shell, app, Duration::from_millis(1100));
     r.check(
-        app.reads() == reads_before,
-        "без окна датчики не читаются: автомодуль выключен, процессор не занят — опрос раз в 2 с их не трогает (канал ждёт окно)",
+        app.reads() > reads_before && app.logging().on && !app.logging().rows,
+        "без окна и без автомодуля журнал проверяет ядра, но прохладный простой не пишет",
     );
 
     // 12'. Окна нет, журнал срезов включён, процессор занят: опрос срезов читает блоки, и горячее показание поднимает
@@ -997,10 +996,10 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     warm_all(app, None, 0.15);
     let polled = {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !app.logging().rows {
+        while Instant::now() < deadline && !app.logging().on {
             pump(shell, app, Duration::from_millis(50));
         }
-        app.logging().rows
+        app.logging().on
     };
     let events_before = events_today(data).len();
     warm_all(app, Some(97.0), 0.15);
@@ -1591,8 +1590,11 @@ pub fn run(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, plac
     let (states, reads) = (app.serving().states, app.reads());
     pump(shell, app, Duration::from_millis(1500));
     r.check(
-        logged(app, "окно отключилось") > gone && app.serving().states == states && app.reads() == reads,
-        "окно ушло — состояний нет, датчики не читаются",
+        logged(app, "окно отключилось") > gone
+            && app.serving().states == states
+            && app.reads() > reads
+            && app.logging().on,
+        "окно ушло — состояний нет, включённый журнал продолжает проверять ядра",
     );
 
     // 12k. Канал снова свободен: второе окно подключается; молчащее отключается через 2 с; не JSON — разрыв.

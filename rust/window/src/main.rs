@@ -88,6 +88,8 @@ mod samples_spec;
 // отдельно от реализации.
 #[cfg(test)]
 mod chart_spec;
+#[cfg(test)]
+mod filtered_gap_spec;
 mod store;
 mod timeline;
 mod view;

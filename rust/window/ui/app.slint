@@ -536,6 +536,7 @@ component ValueSlider inherits Rectangle {
         mouse-cursor: root.enabled ? pointer : default;
         pointer-event(event) => {
             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.hover(false);
                 root.held = true;
                 root.drag = root.at(self.mouse-x);
                 root.moved(root.drag);
@@ -559,7 +560,7 @@ component ValueSlider inherits Rectangle {
                 root.released(root.drag);
             }
         }
-        changed has-hover => { root.hover(self.has-hover); }
+        changed has-hover => { root.hover(false); }
     }
 }
 
@@ -615,9 +616,9 @@ component TileView inherits Rectangle {
     // Кластер E-ядер: четыре клетки ядер 2 × 2 — у каждой своя температура и свой цвет; потолок у кластера один.
     for cell in data.cells: Rectangle {
         x: root.cells-x + cell.col * (root.cell-w + root.cell-gap);
-        y: root.pad + cell.row * ((root.height - 2 * root.pad - root.cell-gap) / 2 + root.cell-gap);
+        y: root.pad + cell.row * ((root.height - 2 * root.pad - root.line - root.cell-gap) / 2 + root.cell-gap);
         width: root.cell-w;
-        height: (root.height - 2 * root.pad - root.cell-gap) / 2;
+        height: (root.height - 2 * root.pad - root.line - root.cell-gap) / 2;
         background: cell.fill;
         border-radius: 4 * root.u;
         Text {
@@ -646,7 +647,7 @@ component TileView inherits Rectangle {
         x: data.cluster ? root.cells-x + root.cells-w + 6 * root.u : 0;
         y: root.pad - 2 * root.u;
         width: root.width - self.x - 8 * root.u;
-        height: root.height - 2 * root.pad + 4 * root.u;
+        height: root.height - 2 * root.pad + 4 * root.u - (data.cluster ? root.line : 0px);
         spacing: 0;
         alignment: space-between;
         Text { text: data.peak; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
@@ -655,6 +656,7 @@ component TileView inherits Rectangle {
         if !data.cluster: Text { text: data.mean; color: Palette.text; font-size: root.small; horizontal-alignment: right; }
         Rectangle { vertical-stretch: 1; }
         HorizontalLayout {
+            visible: !data.cluster;
             alignment: end;
             spacing: 5 * root.u;
             if data.auto != "": Rectangle {
@@ -670,6 +672,23 @@ component TileView inherits Rectangle {
         }
     }
 
+
+    if data.cluster: HorizontalLayout {
+        x: root.pad; y: root.height - root.pad - root.line;
+        width: root.width - 2 * root.pad; height: root.line;
+            alignment: end;
+            spacing: 5 * root.u;
+            if data.auto != "": Rectangle {
+                width: cluster-auto-text.preferred-width + 8 * root.u;
+                background: #10203a;
+                border-radius: 3 * root.u;
+                border-width: data.ban ? 1px : 0;
+                border-color: Palette.bad;
+                cluster-auto-text := Text { text: data.auto; color: Palette.auto; font-size: root.small; horizontal-alignment: center; }
+            }
+            Text { text: data.pair; color: data.pair-color; font-size: root.small; }
+            if data.delta != "": Text { text: data.delta; color: Palette.text; font-size: root.small; font-weight: 600; }
+        }
     // Выбран (в статистике): обводка цветом его линии на графике.
     if data.selected: Rectangle {
         x: -3px;
@@ -1242,9 +1261,9 @@ component TimeChart inherits Rectangle {
     for g in root.gaps: Path {
         visible: root.drawn;
         x: root.plot-x + (root.swap ? 0px : g * root.plot-w - 1px);
-        y: root.plot-y + (root.swap ? (1 - g) * root.plot-h - 1px : 0px);
-        width: root.swap ? root.plot-w : 3px;
-        height: root.swap ? 3px : root.plot-h;
+        y: root.plot-y + (root.swap ? (1 - g) * root.plot-h - 1px : root.plot-h - 6px);
+        width: root.swap ? 6px : 3px;
+        height: root.swap ? 3px : 6px;
         viewbox-width: root.swap ? 100 : 3;
         viewbox-height: root.swap ? 3 : 100;
         fit: fill;
@@ -2761,6 +2780,14 @@ export component AppWindow inherits Window {
                 root.tip(on, "limit", "Отсечка, °C\nЦель: выше неё блок работать не должен — автомодуль снижает его потолок.\n• среднее арифметическое за окно выше цели — снижение ниже фактического множителя\n• после изменения — заданная пауза, затем новое полное окно; аварийная отсечка продолжает работать\n• пробная ступень вверх — после заданного периода прохладной работы с проверкой фактической частоты и нагрузки; простой возврат не разрешает\n• следующая ступень — только после новой проверки; неподтверждённое повышение откатывается\n• память перегрева сравнивает фактические ступени остальных блоков; совпавшее состояние ограничивает возврат к частоте, на которой уже был перегрев\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
+        TouchArea {
+            x: 0; y: 36px; width: parent.label-w; height: 24px;
+            changed has-hover => { limit-slider.hover(self.has-hover); }
+        }
+        TouchArea {
+            x: parent.width - parent.value-w; y: 36px; width: parent.value-w; height: 24px;
+            changed has-hover => { limit-slider.hover(self.has-hover); }
+        }
         Text {
             x: parent.width - parent.value-w;
             y: 36px;
@@ -2800,6 +2827,16 @@ export component AppWindow inherits Window {
                 root.tip(on, "emergency", "Аварийная отсечка, °C\nОдно показание блока не ниже неё — потолок сразу на ступень ниже: защита от резкого перегрева.\n• проверка снова через 1 с: всё ещё не ниже — ещё ступень\n• \{root.auto-emergency-min}–\{root.auto-emergency-max} °C (от цели + 1 до 100); по умолчанию 95 — на 5 °C ниже, чем троттлит ThrottleStop (100 °C)\n• возврат — как у отсечки: по одной пробной ступени после проверки работы; простой не разрешает подъём, неподтверждённая ступень откатывается\n• применяется, когда отпустишь ползунок; на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
+        TouchArea {
+            visible: root.has-emergency;
+            x: 0; y: 62px; width: parent.label-w; height: 24px;
+            changed has-hover => { emergency-slider.hover(self.has-hover); }
+        }
+        TouchArea {
+            visible: root.has-emergency;
+            x: parent.width - parent.value-w; y: 62px; width: parent.value-w; height: 24px;
+            changed has-hover => { emergency-slider.hover(self.has-hover); }
+        }
         Text {
             visible: root.has-emergency;
             x: parent.width - parent.value-w;
@@ -2830,6 +2867,14 @@ export component AppWindow inherits Window {
                 value: control.value; enabled: root.auto-ready; lit: root.auto-on;
                 released(v) => { root.manual-released(i, v); }
                 hover(on) => { root.tip(on, "manual-" + i, control.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+            }
+            TouchArea {
+                x: 0; width: 112px; height: parent.height;
+                changed has-hover => { setting.hover(self.has-hover); }
+            }
+            TouchArea {
+                x: parent.width - 40px; width: 40px; height: parent.height;
+                changed has-hover => { setting.hover(self.has-hover); }
             }
             Text {
                 x: parent.width - 40px; width: 40px; height: parent.height;

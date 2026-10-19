@@ -275,6 +275,8 @@ pub struct Day {
     pub fan_gpu: Vec<f32>,
     /// Шаг записи строки, мс (250 или 2000) — по нему перерыв.
     step: Vec<i64>,
+    /// Предыдущая успешная строка: только доказанная журналом намеренная фильтрация.
+    filtered_from: Vec<Option<i64>>,
     /// Что не прочиталось (строка владельцу).
     pub trouble: Option<String>,
 }
@@ -316,7 +318,18 @@ impl Day {
     /// Перерывы записи: место на сжатой оси, начало и конец по часам.
     #[must_use]
     pub fn gaps(&self) -> Vec<(i64, i64, i64)> {
-        self.stretches.windows(2).map(|w| (w[1].x, w[0].t1, w[1].t0)).collect()
+        self.starts
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(i, &start)| {
+                (start && self.filtered_from.get(i).copied().flatten() != Some(self.t[i - 1])).then_some((
+                    self.x[i],
+                    self.t[i - 1],
+                    self.t[i],
+                ))
+            })
+            .collect()
     }
 
     /// Строки по порядку времени, перерывы и сжатая ось. Строки с часами назад переставляются по времени.
@@ -331,6 +344,9 @@ impl Day {
             };
             self.t = order.iter().map(|&i| self.t[i]).collect();
             self.step = order.iter().map(|&i| self.step[i]).collect();
+            if !self.filtered_from.is_empty() {
+                self.filtered_from = order.iter().map(|&i| self.filtered_from[i]).collect();
+            }
             for b in &mut self.blocks {
                 for q in Quantity::BLOCK {
                     take(b.series_mut(q));
@@ -428,6 +444,8 @@ fn push_row(
 ) {
     day.t.push(at.ms);
     day.step.push(at.step);
+    day.filtered_from
+        .push(columns.filtered_from(line, fields).map(|at| at.ms));
     let (mut sum, mut known) = (0.0, 0);
     if wanted.contains(&Quantity::Level) {
         for b in 0..columns.blocks() {
@@ -1132,7 +1150,18 @@ pub fn time_panel(input: &TimeInput) -> TimeShown {
     );
     #[expect(clippy::cast_precision_loss, reason = "milliseconds of a day")]
     let share = |x: i64| (x - view.0) as f64 / (view.1 - view.0).max(1) as f64;
-    shown.gaps = gaps.iter().map(|&x| crate::panels::f(share(x))).collect();
+    // Совпавшие по экрану отметки объединены; сами перерывы и их подсказки остаются точными.
+    let pixels = if input.swap { input.height } else { input.columns }.max(1);
+    for &x in &gaps {
+        let fraction = crate::panels::f(share(x));
+        if shown
+            .gaps
+            .last()
+            .is_none_or(|last| f64::from(fraction - last) * f64::from(u32::try_from(pixels).unwrap_or(u32::MAX)) >= 3.0)
+        {
+            shown.gaps.push(fraction);
+        }
+    }
     let range = shown.strips.first().and_then(|s| s.range);
     for e in input.events {
         let Some(x) = day.place(e.at).filter(|&x| inside(x)) else {
@@ -1750,7 +1779,7 @@ pub fn hover(day: &Day, under: &Under) -> String {
     let x = under.x;
     if let Some(&(_, start, end)) = day.gaps().iter().find(|g| (g.0 - x).abs() <= under.near) {
         return format!(
-            "Перерыв записи {}–{} ({})\nЖурнал срезов не писался: CoreMapTray закрыт, компьютер выключен или запись выключена; на оси времени его нет.",
+            "Перерыв записи {}–{} ({})\nПричина отсутствия измерений не записана или непрерывность нарушена; на оси времени этот интервал сжат.",
             clock(start, 1000),
             clock(end, 1000),
             crate::panels::span_of(seconds(end - start))

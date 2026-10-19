@@ -254,12 +254,23 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     // 0. Метка автомодуля от прежней загрузки (процессор с тех пор сброшен): по ней ничего не поднимается, даже
     //    если в ней записано выше заводского (ревизия H1).
     let lps: Vec<u32> = app.topology().lps().iter().map(|lp| lp.0).collect();
+    let boot_caps = ceilings_now(app);
+    let expected_startup = app
+        .store()
+        .read_profile()
+        .ok()
+        .flatten()
+        .map_or_else(|| boot_caps.clone(), |profile| profile.ratios);
+    // Метка должна быть устаревшей и относительно заводских, и относительно сохранённых потолков.
+    let stale_low = (1..=255)
+        .find(|value| !boot_caps.contains(value) && !expected_startup.contains(value))
+        .expect("24 simulated cores cannot occupy all 255 marker values");
     let stale = format!(
         "{{\"cpu\": {}, \"lps\": {}, \"accepted\": {}, \"lowered\": {}}}",
         machine::files::quote(app.store().cpu()),
         machine::files::ints(&lps),
         machine::files::ints(&vec![60; lps.len()]),
-        machine::files::ints(&vec![40; lps.len()])
+        machine::files::ints(&vec![stale_low; lps.len()])
     );
     let _ = fs::write(data.join("auto-held.json"), stale); // не записалась — проверка ниже это покажет
     // data	ray.json, как его пишет 0.5.4: ключа «log» нет — журнал срезов включён (владелец 16.10: два выключателя,
@@ -268,9 +279,11 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
     let start = Instant::now();
     let before = shell::usage();
     app.start(shell);
-    let raised = ceilings_now(app).contains(&60);
+    let startup_caps = ceilings_now(app);
+    let startup_messages = app.said.clone(); // one diagnostic snapshot at startup
+
     r.check(
-        !raised && !data.join("auto-held.json").exists(),
+        startup_caps == expected_startup && !data.join("auto-held.json").exists(),
         "метка автомодуля от прежней загрузки ничего не подняла и снята",
     );
     let started = shell::usage();
@@ -297,7 +310,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
                 .unwrap_or_default();
             r.check(
                 current == p.ratios,
-                &format!("профиль запуска «{}» поставлен при входе", p.name),
+                &format!("профиль запуска «{}» поставлен при входе; сразу {:?}, после опроса {:?}, ожидается {:?}, сообщения {:?}", p.name, startup_caps, current, p.ratios, startup_messages),
             );
         }
         Ok(None) => r.note("профиля запуска нет — стоят заводские"),
@@ -636,6 +649,10 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         r.note(&format!("tray.log: {line}"));
     }
 
+    let resume_log = app.auto_choice().log;
+    if resume_log {
+        app.command(shell, LOG_ID);
+    }
     // 9a. Модерн-стэндбай: пробуждение приходит как «экран выключен → включён». Выход из «притушен» — не сон.
     let intended = app.intended().map(<[i32]>::to_vec).unwrap_or_default();
     let wake_from = app.journal().tray_path().metadata().map_or(0, |m| m.len());
@@ -673,6 +690,9 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         }
     }
 
+    if resume_log {
+        app.command(shell, LOG_ID);
+    }
     // 9b. Сон, пока открыто окно: после его закрытия профиль ставится заново, а не принимается то, что оставил сон.
     let profile = app.store().read_profile().ok().flatten();
     let window = hold(&names.old_window);
@@ -891,6 +911,7 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
 
     // 11b. Журнал срезов на настоящих сроках (опрос 0,25 с, обороты раз в 2 с, решение раз в 2 с), окна нет.
     logging_real(r, app, shell, data, &block);
+    filtered_capture(r, app, shell, data);
 
     // 11c. Два выключателя — журнал срезов и автомодуль — независимы (владелец 16.10): все четыре сочетания.
     switches(r, app, shell, data, &block);
@@ -1169,7 +1190,7 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
         old.push_str(",53,45.00,0.50,70");
     }
     old.push('\n');
-    let idle = !app.logging().on;
+    let idle = !app.logging().rows;
     let _ = fs::remove_file(&part2); // the scratch folder may hold none; a leftover would be ours anyway
     let planted = fs::write(&file, &old).is_ok();
     load(app, 1.0);
@@ -1185,7 +1206,7 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
             && kept
             && first.starts_with(&format!("{old_header},"))
             && first.contains(",power_cpu,temp_gpu,power_gpu,busy_gpu,")
-            && first.ends_with(",busy_gpu,power_cores")
+            && first.ends_with(",busy_gpu,power_cores,filtered_from")
             && text.lines().count() >= 4
             && text.lines().skip(1).all(|l| l.split(',').count() == width)
             && told == 1,
@@ -1225,7 +1246,11 @@ fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path)
     let at = lines_in(&part2);
     pump(shell, app, Duration::from_secs(1));
     let after = lines_after(&part2, at);
-    let no_power = after.iter().all(|l| field(l, width - 4).is_empty());
+    let power_at = first
+        .split(',')
+        .position(|name| name == "power_cpu")
+        .expect("столбец мощности");
+    let no_power = after.iter().all(|l| field(l, power_at).is_empty());
     let going = app.logging().rows;
     let power_told = errors(data, "мощность корпуса не прочитана");
     if let Some(sim) = app.sim() {
@@ -1288,7 +1313,7 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
     // Время, корпус, два вентилятора; по 4 на блок; мощность корпуса и видеокарта (DECISIONS #37); в конце — мощность
     // ядер. Напряжения блоков нет (владелец 16.10: его задаёт процессор от множителя и условий; в 0.5.4 оно было).
     let pack = 4 + 4 * blocks;
-    let width = pack + 4 + 1;
+    let width = pack + 4 + 2;
     let head = lines.next().unwrap_or_default();
     let header = head.split(',').count();
     let rows: Vec<&str> = lines.collect();
@@ -1297,11 +1322,12 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             && field(head, pack) == "power_cpu"
             && field(head, pack + 3) == "busy_gpu"
             && field(head, pack + 4) == "power_cores"
+            && field(head, pack + 5) == "filtered_from"
             && !head.contains("volts")
             && !rows.is_empty()
             && rows.iter().all(|l| l.split(',').count() == width),
         &format!(
-            "срезы: заголовок {header} столбцов из {width}, кончается «busy_gpu,power_cores», напряжения нет; строк {}",
+            "срезы: заголовок {header} столбцов из {width}, кончается «busy_gpu,power_cores,filtered_from», напряжения нет; строк {}",
             rows.len()
         ),
     );
@@ -1336,7 +1362,7 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
         .iter()
         .filter(|l| {
             let package = field(l, pack).parse::<f64>().ok();
-            let cores = field(l, width - 1).parse::<f64>().ok();
+            let cores = field(l, pack + 4).parse::<f64>().ok();
             matches!((package, cores), (Some(p), Some(c)) if (p - c - 8.0).abs() < 0.15)
         })
         .count();
@@ -1400,7 +1426,7 @@ pub fn cost_line(app: &App) -> Option<String> {
 /// срезов — первое ядро каждого блока на опрос, автомодуль раз в 2 с сам не читает. Регулятор на этих сроках за
 /// несколько секунд ничего не решает (окно 20 с). Только имитация: настоящие таймеры, но не настоящий процессор.
 fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &machine::topology::Block) {
-    let blocks = u64::try_from(app.topology().blocks.len()).unwrap_or(0);
+    let blocks = u64::try_from(app.topology().cores.len()).unwrap_or(0);
     let was = app.retime(shell, AutoTiming::REAL);
     // Горячий блок занят целиком, остальные ядра — на 0,15: процессор занят ≥ 10 %, строки журнала пишутся.
     let set_load = |app: &mut App, hot_load: f64, rest: f64| {
@@ -1423,19 +1449,19 @@ fn logging_real(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, h
     app.command(shell, AUTO_ON); // выключить
     let right_after = app.logging().rows;
     set_load(app, 0.0, 0.0);
-    pump_until(shell, app, Duration::from_secs(5), |a| !a.logging().on);
-    let stopped = !app.logging().on && !app.logging().rows;
+    pump_until(shell, app, Duration::from_secs(5), |a| !a.logging().rows);
+    let stopped = app.logging().on && !app.logging().rows;
     let cost = cost_line(app);
     app.retime(shell, was);
     r.check(
         before.on && before.rows && after.rows && after.starts == before.starts && right_after && stopped,
-        "журнал срезов: строки пошли при занятом процессоре, шли без перерыва 6 с; выключение автомодуля их не остановило, остановил опрос раз в 2 с — процессор не занят",
+        "журнал срезов: строки пошли при занятом процессоре, шли без перерыва 6 с; выключение автомодуля их не остановило, отфильтрованы строки при низкой загрузке, опрос ядер продолжается",
     );
     let (polled, read) = (after.polls - before.polls, reads_after - reads);
     r.check(
         polled > 0 && read == polled * blocks,
         &format!(
-            "журнал срезов без окна: {read} чтений ядер за {polled} опросов — по первому ядру каждого из {blocks} блоков; автомодуль за это время сам не читал"
+            "журнал срезов без окна: {read} чтений ядер за {polled} опросов — по каждому из {blocks} ядер; автомодуль за это время сам не читал"
         ),
     );
     let rows = rows_since(data, &from);
@@ -1541,7 +1567,7 @@ fn switches(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: 
     let writes = |app: &mut App| app.sim().map_or(0, |s| s.writes);
     let was = app.auto_choice();
     r.check(
-        !was.on && was.log && !app.logging().on,
+        !was.on && was.log && app.logging().on && !app.logging().rows,
         &format!("перед шагом: автомодуль выключен, журнал включён и стоит ({was:?})"),
     );
 
@@ -1697,9 +1723,8 @@ fn switches(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: 
     pump_until(shell, app, Duration::from_secs(2), |a| a.logging().on);
     let restarted = app.logging().on;
     set_load(app, 0.0, 0.0);
-    let released = app.releases();
-    pump_until(shell, app, Duration::from_secs(2), |a| !a.logging().on);
-    let stopped = !app.logging().on && app.releases() > released;
+    pump_until(shell, app, Duration::from_secs(2), |a| !a.logging().rows);
+    let stopped = app.logging().on && !app.logging().rows;
     let (ticks, reads, asked, released, polls) = (
         app.auto_ticks(),
         app.reads(),
@@ -1715,12 +1740,12 @@ fn switches(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: 
             && restarted
             && stopped
             && polled > 0
-            && app.reads() == reads
-            && asks(app) == asked
+            && app.reads() > reads
+            && asks(app) >= asked
             && app.releases() == released
-            && app.logging().polls == polls,
+            && app.logging().polls > polls,
         &format!(
-            "журнал включён (автомодуль остался выключен), процессор не занят: журнал остановлен, драйвер отпущен; опрос идёт ({polled} сообщений таймера за 1 с), а датчики и потолки не читаются"
+            "журнал включён, автомодуль выключен: прохладный простой отфильтрован; опрос всех ядер продолжается ({polled} контрольных сообщений за 1 с)"
         ),
     );
     // Отсечка — как была до шага В.
@@ -1888,4 +1913,49 @@ fn logging_failures(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Pat
     );
     load(app, 0.0);
     app.retime(shell, was);
+}
+
+/// Один занятый LP внутри E-кластера включает запись; фильтрация связывает точные крайние строки.
+fn filtered_capture(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path) {
+    let Some(core) = app
+        .topology()
+        .blocks
+        .iter()
+        .find(|b| b.members.len() > 1)
+        .and_then(|b| b.members.get(1))
+        .copied()
+    else {
+        r.check(false, "проверке отбора нужен E-кластер");
+        return;
+    };
+    let forced = app.sim().map(|sim| sim.forced.clone()).unwrap_or_default(); // copy once, restore scenario input
+    let choose = |app: &mut App, busy: f64| {
+        if let Some(sim) = app.sim() {
+            sim.forced.fill(Some(45.0));
+            sim.load.fill(0.0);
+            sim.load[core] = busy;
+        }
+    };
+    choose(app, 0.6);
+    pump_until(shell, app, Duration::from_secs(2), |a| a.logging().rows);
+    pump(shell, app, Duration::from_millis(200));
+    let file = today(data);
+    let old = fs::read_to_string(&file).unwrap_or_default();
+    let anchor = old.lines().last().map(|l| field(l, 0).to_owned()).unwrap_or_default();
+    choose(app, 0.1);
+    pump_until(shell, app, Duration::from_secs(2), |a| !a.logging().rows);
+    let count = lines_in(&file);
+    pump(shell, app, Duration::from_millis(300));
+    let held = count == lines_in(&file) && app.logging().on;
+    choose(app, 0.6);
+    pump_until(shell, app, Duration::from_secs(2), |a| a.logging().rows);
+    let text = fs::read_to_string(&file).unwrap_or_default();
+    let proof = text.lines().skip(count).find(|l| field(l, 0) != anchor);
+    r.check(held && proof.is_some_and(|l| l.split(',').next_back() == Some(anchor.as_str())),
+        "один непервый LP E-кластера включает запись; низкая нагрузка фильтруется, после неё точная ссылка на предыдущую строку");
+    choose(app, 0.0);
+    if let Some(sim) = app.sim() {
+        sim.forced = forced;
+    }
+    pump_until(shell, app, Duration::from_secs(2), |a| !a.logging().rows);
 }

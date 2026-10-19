@@ -533,6 +533,7 @@ pub fn effect(splits: &BTreeMap<i32, Split>) -> Option<Effect> {
 #[derive(Clone, Debug)]
 pub struct Columns {
     width: usize,
+    filtered_from: Option<usize>,
     package: Option<usize>,
     fan_cpu: Option<usize>,
     fan_gpu: Option<usize>,
@@ -611,6 +612,7 @@ impl Columns {
         let at = |name: &str| names.iter().position(|c| *c == name);
         (!blocks.is_empty()).then(|| Columns {
             width: names.len(),
+            filtered_from: at("filtered_from"),
             package: at("package"),
             fan_cpu: at("fan_cpu"),
             fan_gpu: at("fan_gpu"),
@@ -621,6 +623,11 @@ impl Columns {
             power_cores: at("power_cores"),
             blocks,
         })
+    }
+
+    /// Связь с предыдущей успешно записанной строкой после доказанной намеренной фильтрации.
+    pub fn filtered_from(&self, line: &str, fields: &[(usize, usize)]) -> Option<RowTime> {
+        field(line, fields, self.filtered_from).and_then(row_time)
     }
 
     /// Блоки файла по порядку столбцов.

@@ -65,10 +65,6 @@ pub(super) const COST_EVERY: Duration = Duration::from_secs(60);
 /// Столько чтений подряд потолок блока должен расходиться с ожидаемым, чтобы считаться чужой правкой: одно чтение
 /// бывает и запоздалым ответом на собственную запись, и чужим запросом в ящике (`ThrottleStop` не берёт наш замок).
 const FOREIGN_READS: u8 = 2;
-/// С такой доли работы всего процессора (по Windows) пишется журнал срезов (DECISIONS #32, подзапись 16.10). Простой
-/// Windows — 1–5 %; число — выбор агента, не мерено. Автомодуля оно не касается: его опрос идёт всегда, пока он включён
-/// (бриф T: условий нагрузки нет нигде).
-const LOADED: f64 = 0.10;
 /// Обороты для окна, пока журнал срезов не пишется, и после отказа прошивки — не чаще: каждый раз — вызов прошивки
 /// (около 30 мс, замер на машине владельца 15.10), а отказавший может держать цикл программы до 4 с (fans.rs,
 /// `PATIENCE_MS`): опрос журнала и состояния окна в это время стоят (ревизия 15.10, п. 4).
@@ -377,7 +373,7 @@ pub struct Autopilot {
     /// решения.
     frame: FrameBuffers,
     decisions: Vec<Decision>,
-    origin: Instant,
+    pub(super) origin: Instant,
     last_tick: Option<Instant>,
     last_cost: Option<Instant>,
     pub(super) last_said: Option<String>,
@@ -397,6 +393,14 @@ struct FrameBuffers {
 }
 
 impl Autopilot {
+    pub(super) fn thermal_action(&self) -> bool {
+        self.controller.is_some()
+            && self
+                .decisions
+                .iter()
+                .any(|d| matches!(d.cause, Cause::Target | Cause::Emergency))
+    }
+
     #[must_use]
     pub fn new(blocks: usize) -> Self {
         Self {
@@ -1245,7 +1249,7 @@ impl App {
     /// Опрос раз в 2 с. Таймер есть, пока включён автомодуль или журнал срезов (`apply_choice`). Датчиков он не читает
     /// (бриф T: один путь чтения — опрос срезов, app/sense.rs), он решает:
     /// - нужен ли опрос срезов раз в 0,25 с: автомодулю — всегда, пока он включён (условий нагрузки нет); журналу
-    ///   срезов — пока процессор занят (≥ `LOADED` по Windows);
+    ///   срезов — пока процессор занят (есть хотя бы одно ядро с занятостью ≥ 40 % или горячее цели);
     /// - пишутся ли строки журнала: журнал включён и процессор занят (DECISIONS #32, подзапись 16.10);
     /// - сверка потолков под арендой: чужая правка принимается (автомодуль этот блок больше не трогает), сброс сном —
     ///   дело сверки после пробуждения; потолки не прочитаны — опрос срезов стоит, владельцу — одно сообщение.
@@ -1274,8 +1278,8 @@ impl App {
             return; // потолки ставит на место возврат права или сверка после пробуждения
         }
         let started = Instant::now();
-        let busy = self.system_share().is_some_and(|v| v >= LOADED);
-        let wanted = choice.on || (choice.log && busy);
+        self.system_share();
+        let wanted = choice.on || choice.log;
         // Опрос срезов начинается под той же арендой: иначе `with_ceilings` отпустил бы драйвер, который через 0,25 с
         // снова нужен. Потолки не прочитаны — опроса нет: строка журнала без них была бы не прочитанной, а регулятор
         // судил бы по последним известным (ревизия 15.10, п. 3).
@@ -1288,10 +1292,11 @@ impl App {
                 checked
             })
         });
-        if matches!(outcome, Some(Ok(Ok(Polled::Quiet | Polled::Said(_))))) {
-            self.set_rows(choice.log && busy);
-        } else {
+        let ready = matches!(outcome, Some(Ok(Ok(Polled::Quiet | Polled::Said(_)))));
+        if !ready {
             self.stop_sensing(shell);
+        } else if !choice.log {
+            self.set_rows(false);
         }
         let said = match outcome {
             None => None,

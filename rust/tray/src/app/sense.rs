@@ -1,21 +1,11 @@
 // Чтение датчиков — один путь на всех, и журнал срезов (выбор владельца 15.10, вариант А: строка раз в 0,25 с).
 //
-// Опрос срезов (`AutoTiming::sample`, 0,25 с) идёт, пока он кому-то нужен — решает опрос раз в 2 с, app/auto.rs:
-// включённому автомодулю — всегда (бриф T: аварийной отсечке нужно каждое показание, условий нагрузки нет), журналу
-// срезов — пока процессор занят ≥ 10 % по Windows; и пока прочитаны потолки. Он читает корпус и первые ядра блоков и
-// отдаёт каждое показание регулятору (app/auto.rs, `react`) — сам автомодуль датчиков больше не читает. Строки журнала
-// (`Logging::rows`) пишутся, только пока журнал включён своим выключателем и процессор занят (владелец 16.10:
-// «отдельно какой-то выключатель для логирования и отдельно выключатель для автоподстройки»; меню значка «Журнал
-// срезов», в окне — «запись»). Пока открыто окно, каждый второй опрос — опрос окна (дважды в секунду, как таймер
-// состояния окна): он читает все ядра и сразу отдаёт окну средние под нагрузкой и состояние (app/serve.rs). В
-// промежуточных опросах остальные ядра никому не нужны: строке и регулятору нужны первые ядра блоков, а у кластера
-// E-ядер датчик температуры общий (ревизия 15.10, п. 5). Каждое чтение ядра (`record`) идёт в последнее показание
-// (app/meter.rs) и в сумму окна. Строка среза — показания этого опроса: температуры — в момент чтения, доля работы и
-// фактический множитель — за промежуток с прошлого опроса (по счётчикам ядра), время — с миллисекундами (таймеры
-// Windows дрожат на 16 мс).
-//
-// Опроса нет — всё как до него: окно само читает все ядра раз в полсекунды; оба выключателя выключены или журналу
-// опрос не нужен (процессор не занят, автомодуль выключен) — ничего не читается.
+// Опрос срезов (0,25 с) идёт, пока включён автомодуль или журнал. При включённом журнале читаются все ядра:
+// строка нужна, если хотя бы одно занято >= 40 %, температура достигла цели или была тепловая коррекция.
+// Неизвестная занятость/температура не доказывает ненужность строки. Прочие известные прохладные состояния
+// намеренно отфильтрованы; filtered_from связывает первую строку после фильтра с последней успешной до него.
+// Сон, ошибка, выключение записи и пропуск контрольного опроса разрушают эту связь. Автомодуль от отбора не зависит.
+// Пока открыто окно, каждый второй опрос отдаёт ему состояние; счётчики занятости/частоты — за интервал опроса.
 //
 // Обороты, пока пишутся строки, — раз в 2 с (вызов прошивки — около 30 мс, замер на машине владельца), в строке —
 // только той, где прочитаны; в остальных пусто (окно считает пустое неизвестным); без строк — раз в 10 с (для условий в
@@ -83,6 +73,7 @@ const PACKAGE_COLUMNS: &str = ",power_cpu,temp_gpu,power_gpu,busy_gpu";
 /// Опрос срезов и журнал срезов: идёт ли опрос, пишутся ли строки, когда следующий опрос, файл дня, цена за минуту.
 #[derive(Debug, Default)]
 pub struct Logging {
+    trace: super::recording::FilterTrace,
     /// Идёт опрос раз в `AutoTiming::sample` (его показания берёт регулятор, а строки — журнал, если `rows`).
     pub on: bool,
     /// Пишутся строки журнала срезов (только пока идёт опрос).
@@ -129,6 +120,12 @@ pub struct Logging {
     pub window_polls: u64,
     pub starts: u64,
     pub opens: u64,
+}
+
+impl Logging {
+    pub(super) fn trace_disrupt(&mut self) {
+        self.trace.disrupt();
+    }
 }
 
 /// Видеокарта для журнала срезов: читатель (открывается при первом чтении и остаётся открытым), когда читалась, чем
@@ -198,13 +195,17 @@ impl App {
         }
         self.kept.package(package);
         let mut watch = self.serving.watch_mut();
-        let count = if window {
+        let count = if window || self.auto.choice.log {
             self.topology.cores.len()
         } else {
             self.topology.blocks.len()
         };
         for k in 0..count {
-            let core = if window { k } else { self.topology.blocks[k].first };
+            let core = if window || self.auto.choice.log {
+                k
+            } else {
+                self.topology.blocks[k].first
+            };
             let reading = device
                 .thermal()
                 .block(core)
@@ -235,6 +236,13 @@ impl App {
     /// читается только для строк: старое не должно попасть в журнал действий как нынешнее). Строки — только пока идёт
     /// опрос.
     pub(super) fn set_rows(&mut self, rows: bool) {
+        if !rows {
+            self.logging.trace.disrupt();
+        }
+        self.set_rows_state(rows);
+    }
+
+    fn set_rows_state(&mut self, rows: bool) {
         let rows = rows && self.logging.on;
         if self.logging.rows == rows {
             return;
@@ -244,6 +252,14 @@ impl App {
             self.logging.file = None;
             self.logging.gpu.reading = None;
         }
+    }
+
+    /// Известные прохладные ядра ниже порога — фильтрация; пропуск опроса прерывает доказательство.
+    fn filter_samples(&mut self) {
+        self.logging
+            .trace
+            .filtered(self.auto.origin.elapsed(), self.config.auto.sample * 3);
+        self.set_rows_state(false);
     }
 
     /// Цена — заново (скрытая проверка сменила сроки опроса): первая строка снова после первых опросов.
@@ -264,10 +280,11 @@ impl App {
     /// подряд), драйвер отпущен, если он больше никому не нужен (автомодуль выключен, окна нет) — без опроса программа
     /// ничего не держит открытым. Срок следующей попытки открыть файл (`retry`) остаётся: ошибка от остановки не прошла.
     pub(super) fn stop_sensing(&mut self, shell: &Shell) {
+        self.logging.trace.disrupt();
         if !self.logging.on {
             return;
         }
-        self.set_rows(false);
+        self.set_rows_state(false);
         self.logging.on = false;
         self.logging.due = None;
         self.logging.previous = None;
@@ -300,6 +317,7 @@ impl App {
         }
         let started = Instant::now();
         let stamp = Stamp::now();
+        let sampled_at = self.auto.origin.elapsed();
         // Опрос окна — когда с прошлого прошло больше трёх четвертей его полсекунды (при шаге 0,25 с — каждый второй):
         // окно получает состояние дважды в секунду, как от своего таймера, и показания за полсекунды.
         let window = self.serving.window_due(started, STATE_EVERY.saturating_sub(step / 2));
@@ -312,6 +330,21 @@ impl App {
             let package = app.read_sensors(window)?;
             let power = app.read_power();
             let refused = app.react(package);
+            if app.auto.choice.log {
+                if !super::recording::complete((0..app.topology.cores.len()).map(|core| app.meter.latest(core))) {
+                    app.logging.trace.disrupt();
+                }
+                let relevant = super::recording::relevant(
+                    (0..app.topology.cores.len()).map(|core| app.meter.latest(core)),
+                    f64::from(app.auto.choice.limit),
+                    app.auto.thermal_action(),
+                );
+                if relevant {
+                    app.set_rows(true);
+                } else {
+                    app.filter_samples();
+                }
+            }
             Ok::<_, String>((package, power, refused))
         });
         let (package, (power, power_cost), refused) = match read {
@@ -358,7 +391,7 @@ impl App {
         };
         let written = Instant::now();
         if self.logging.rows {
-            self.write_sample(stamp, package, fresh, power, gpu);
+            self.write_sample(stamp, sampled_at, package, fresh, power, gpu);
         }
         self.account(
             read + written.elapsed(),
@@ -503,7 +536,15 @@ impl App {
     /// потолок, фактический множитель, доля работы, температура; в конце — мощность корпуса за промежуток и видеокарта
     /// (только если прочитана в этом опросе). Заголовок — в новый файл; новый день — новый файл и чистка старых. Файла
     /// нет и открыть его пока нельзя (`retry`) — строка не пишется: об ошибке уже сказано.
-    fn write_sample(&mut self, stamp: Stamp, package: Option<f64>, fans: bool, power: Power, gpu: bool) {
+    fn write_sample(
+        &mut self,
+        stamp: Stamp,
+        sampled_at: Duration,
+        package: Option<f64>,
+        fans: bool,
+        power: Power,
+        gpu: bool,
+    ) {
         let now = Instant::now();
         let mut day = std::mem::take(&mut self.logging.day);
         day.clear();
@@ -517,10 +558,13 @@ impl App {
         if self.logging.file.is_none() && self.logging.retry.is_none_or(|at| now >= at) {
             self.open_day(&day, stamp, now, &mut text);
         }
+        let mut stamp_range = None;
         if self.logging.file.is_some()
             && let Some(limits) = self.limits.as_ref()
         {
+            let start = text.len();
             stamp.write_local(Pattern::Millis, &mut text);
+            stamp_range = Some(start..text.len());
             text.push(',');
             put(&mut text, package, 0);
             let rpm = if fans { self.auto.rpm.as_deref() } else { None };
@@ -551,6 +595,14 @@ impl App {
             put(&mut text, card.and_then(|g| g.busy), 2);
             text.push(',');
             put(&mut text, power.cores, 1);
+            text.push(',');
+            if let Some(from) = self
+                .logging
+                .trace
+                .token(self.auto.origin.elapsed(), self.config.auto.sample * 3)
+            {
+                text.push_str(from);
+            }
             text.push('\n');
         }
         let written = match self.logging.file.as_mut() {
@@ -558,14 +610,20 @@ impl App {
             _ => None,
         };
         match written {
-            Some(Ok(())) => self.logging.said = None,
+            Some(Ok(())) => {
+                self.logging.said = None;
+                if let Some(range) = stamp_range {
+                    self.logging.trace.written(sampled_at, &text[range]);
+                }
+            }
             Some(Err(e)) => {
+                self.logging.trace.disrupt();
                 // Не записалось (диск полон, том пропал): файл — заново, но не раньше `OPEN_RETRY`.
                 self.logging.file = None;
                 self.logging.retry = Some(now + OPEN_RETRY);
                 self.samples_trouble(&format!("срез не записан: {e}"));
             }
-            None => {}
+            None => self.logging.trace.disrupt(),
         }
         self.logging.text = text;
         self.logging.day = day;
@@ -631,6 +689,7 @@ impl App {
             path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
         );
         self.logging.file = None;
+        self.logging.trace.disrupt();
         self.journal.note(&note);
     }
 
@@ -726,7 +785,7 @@ fn header(blocks: &[Block]) -> String {
         let _ = write!(text, ",{n}.ceiling,{n}.ratio,{n}.busy,{n}.temp"); // into a String: cannot fail
     }
     text.push_str(PACKAGE_COLUMNS);
-    text.push_str(",power_cores");
+    text.push_str(",power_cores,filtered_from");
     text
 }
 
@@ -875,7 +934,7 @@ mod tests {
         // The window takes «X.Y» as column Y of block X (rust/window/src/samples.rs, Columns::parse): package columns
         // have no dot. The row ends with the cores' power; no per-block voltage since 0.5.5 (owner 16.10).
         assert!(added.iter().all(|c| !c.contains('.')), "{added:?}");
-        assert_eq!(added[4..], ["power_cores"]);
+        assert_eq!(added[4..], ["power_cores", "filtered_from"]);
     }
 
     #[test]

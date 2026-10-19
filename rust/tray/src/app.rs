@@ -39,6 +39,7 @@ mod auto_state;
 mod configurations;
 mod history;
 mod meter;
+mod recording;
 mod sense;
 mod serve;
 mod timeline;

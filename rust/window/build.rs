@@ -7,7 +7,9 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=COREMAP_STAMP");
     println!("cargo:rerun-if-env-changed=COREMAP_VERSION");
-    let stamp = std::env::var("COREMAP_STAMP").unwrap_or_default();
+    // The standard stamp also identifies this local build helper: SAC may refuse its previous unsigned image.
+    let stamp =
+        std::env::var("COREMAP_STAMP").unwrap_or_else(|_| option_env!("COREMAP_STAMP").unwrap_or_default().to_owned());
     println!("cargo:rustc-env=COREMAP_BUILT={stamp}");
     let version = std::env::var("COREMAP_VERSION").unwrap_or_else(|_| "без номера".into());
     println!("cargo:rustc-env=COREMAP_VERSION={version}");

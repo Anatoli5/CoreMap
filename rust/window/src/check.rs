@@ -3474,6 +3474,21 @@ impl Check {
             let share = (value - row.minimum) as f32 / (row.maximum - row.minimum) as f32;
             let x = self.ui.get_manual_grid_x() + col * (cell_w + 12.0) + 121.0 + share * (cell_w - 170.0);
             let y = self.ui.get_manual_grid_y() + row_y + 12.0;
+            if i == 0 {
+                self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                    position: LogicalPosition::new(self.ui.get_manual_grid_x() + 20.0, y),
+                });
+                let ui = self.ui.as_weak();
+                let helped = self.pump(|_| ui.upgrade().is_some_and(|u| u.get_tip_shown()), 1.0);
+                self.ui.window().dispatch_event(WindowEvent::PointerMoved {
+                    position: LogicalPosition::new(x, y),
+                });
+                self.pump(|_| true, 0.0);
+                self.check(
+                    helped && !self.ui.get_tip_shown(),
+                    "подсказка названию доступна, над дорожкой ползунка скрыта",
+                );
+            }
             let before = self.view.borrow().sent;
             self.click(x, y, PointerEventButton::Left);
             let confirmed = self.pump(

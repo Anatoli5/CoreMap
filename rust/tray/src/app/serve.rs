@@ -628,6 +628,7 @@ impl App {
             return;
         };
         if reason.is_some() {
+            self.logging.trace_disrupt();
             self.serving.watch.blank();
         }
         session.trouble = reason;
