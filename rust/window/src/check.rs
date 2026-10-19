@@ -1783,7 +1783,7 @@ impl Check {
         self.pump(|v| v.profiles.is_some(), 5.0);
         let expected = self
             .profile_value(e_block.first)
-            .map_or_else(String::new, |p| panels::signed(target - p));
+            .map_or_else(String::new, |p| panels::signed(p - target));
         let delta = self.delta(e_block.index);
         self.check(
             delta == expected,
@@ -1956,7 +1956,7 @@ impl Check {
                 && apply
                 && !save
                 && !can_mark
-                && delta == panels::signed(target - fused),
+                && delta == panels::signed(fused - target),
             format!(
                 "щелчок по «заводские»: ничего не поставлено и не послано ({still}); «{status}»; на плитке «{delta}»; применить {apply}, сохранить {save}, отметка при старте {can_mark}"
             ),
@@ -1975,7 +1975,7 @@ impl Check {
         let delta = self.delta(e_block.index);
         let expected = format!("«{PROFILE}» — отличается: {name} ×{target} → сейчас ×{start}");
         self.check(
-            status == expected && apply && save && delta == panels::signed(start - target),
+            status == expected && apply && save && delta == panels::signed(target - start),
             format!("текущее изменилось: «{status}», на плитке «{delta}»; применить {apply}, сохранить {save}"),
         );
 

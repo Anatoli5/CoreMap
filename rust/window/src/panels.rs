@@ -61,11 +61,10 @@ pub struct Ceiling {
 }
 
 impl Ceiling {
-    /// Разница текущего состояния с выбранным профилем (сейчас минус профиль, с поправкой автомодуля); 0 — нет или не
-    /// известно.
+    /// Изменение при применении выбранного профиля: профиль минус установленный потолок; 0 — нет или не известно.
     pub fn delta(&self) -> i64 {
         match (self.now, self.profile) {
-            (Some(now), Some(profile)) => now - profile,
+            (Some(now), Some(profile)) => profile - now,
             _ => 0,
         }
     }
@@ -390,7 +389,7 @@ pub fn profile_panel(input: &ProfileInput) -> ProfileShown {
         status_tip.push_str("\n• авто — поправка автомодуля, она входит в текущее состояние");
     }
     status_tip.push_str(
-        "\n• «применить» ставит потолки профиля, «сохранить» пишет текущее состояние в профиль\n• на плитках — та же разница: сейчас минус профиль",
+        "\n• «применить» ставит потолки профиля, «сохранить» пишет текущее состояние в профиль\n• на плитках — выбранный потолок минус установленный: установленный + дельта = выбранный",
     );
 
     let autos_named: Vec<String> = blocks
@@ -1044,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tile_delta_is_the_current_state_minus_the_chosen_profile() {
+    fn the_tile_delta_is_the_chosen_profile_minus_the_installed_ceiling() {
         let b = block(1, "2–5", vec![1, 2, 3, 4]);
         let limit = [50, 42, 42, 42, 42];
         let profile = [50, 45, 45, 45, 45];
@@ -1066,8 +1065,10 @@ mod tests {
                 intended: None,
             },
         );
-        // В профиле ×45, владелец поставил ×44, автомодуль ещё −2: сейчас ×42 — разница −3, из них −2 автомодуля.
-        assert_eq!((c.delta(), c.auto, c.ban), (-3, -2, Some(44)));
+        // В профиле ×45, сейчас ×42: применить нужно +3. Поправка автомодуля отдельно остаётся −2.
+        assert_eq!((c.delta(), c.auto, c.ban), (3, -2, Some(44)));
+        assert_eq!(Ceiling { profile: Some(40), ..c }.delta(), -2);
+        assert_eq!(Ceiling { profile: Some(42), ..c }.delta(), 0);
         // Программа входа шлёт только потолок надстройки и потолки владельца по ядрам — тот же ответ.
         let plain = [None, Some(AutoMark::Ceiling(42))];
         let intended = [Some(50), Some(44), Some(44), Some(44), Some(44)];
@@ -1080,7 +1081,7 @@ mod tests {
                 intended: Some(&intended),
             },
         );
-        assert_eq!((c.delta(), c.auto, c.ban), (-3, -2, None));
+        assert_eq!((c.delta(), c.auto, c.ban), (3, -2, None));
         // Профиль не выбран — разницы нет.
         assert_eq!(ceiling(&b, Some(&limit), None, Overlay::default()).delta(), 0);
     }
