@@ -4,6 +4,42 @@ use machine::thermal::Reading;
 use machine::topology::Block;
 use serde_json::{Map, Value, json};
 
+/// Физические показания одного опроса ДО коррекции. Множитель усреднён по времени бодрствования между чтениями;
+/// температура прочитана около конца этого интервала. Ядра читаются последовательно, снимок не атомарный.
+/// Потолки сюда не входят: они сохраняются отдельно как контекст управляющих команд.
+pub(super) fn physical_value(
+    readings: &[Option<Reading>],
+    relative: &[Option<f64>],
+    global_busy: Option<f64>,
+) -> Value {
+    let fraction = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+    let temps: Vec<Option<f64>> = readings
+        .iter()
+        .map(|r| r.and_then(|r| r.temp).filter(|v| v.is_finite()))
+        .collect();
+    let ratios: Vec<Option<f64>> = readings
+        .iter()
+        .map(|r| r.and_then(|r| r.ratio).filter(|v| v.is_finite() && *v > 0.0))
+        .collect();
+    let busy: Vec<Option<f64>> = readings
+        .iter()
+        .map(|r| r.and_then(|r| r.busy).filter(|v| fraction(*v)))
+        .collect();
+    let relative: Vec<Option<f64>> = (0..readings.len())
+        .map(|i| relative.get(i).copied().flatten().filter(|v| fraction(*v)))
+        .collect();
+    json!({
+        "basis": "actual",
+        "sampling": "sequential-poll",
+        "ratioBasis": "awake-interval-average",
+        "temp": temps,
+        "ratio": ratios,
+        "busy": busy,
+        "relativeBusy": relative,
+        "globalBusy": global_busy.filter(|v| fraction(*v)),
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LegacyCut {
     pub at: u64,
@@ -158,6 +194,10 @@ pub(super) fn no_owner_change(text: &str, first: usize, cut: LegacyCut) -> bool 
 
 // Независимые проверки сохранения и относительной активности по контракту API.
 // Независимые проверки сохранения и относительной активности по контракту API.
+#[cfg(test)]
+#[path = "physical_spec.rs"]
+mod physical_specs;
+
 #[cfg(test)]
 mod independent_return_specs {
     use super::{Block, LegacyCut, legacy_cuts, no_owner_change, protection_read, protection_value, relative_activity};

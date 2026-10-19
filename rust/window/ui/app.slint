@@ -9,6 +9,15 @@
 // Окно открывается по размеру содержимого (preferred-*): схема при масштабе 1 и панели по их естественной ширине; шире
 // или выше — схема растёт по высоте окна, панели забирают остальную ширину. Пустых полей нет.
 
+export struct AutoControl {
+    label: string,
+    unit: string,
+    minimum: int,
+    maximum: int,
+    value: int,
+    tip: string,
+}
+
 export struct CellData {
     text: string,      // номер ядра
     temp: string,      // «52°»
@@ -1499,6 +1508,8 @@ export component AppWindow inherits Window {
     in property <int> auto-emergency: 95;
     in property <int> auto-emergency-min: 86;
     in property <int> auto-emergency-max: 100;
+    in property <[AutoControl]> manual-controls;
+    callback manual-released(int, int);
     callback auto-toggled();
     callback limit-moved(int);
     callback limit-released(int);
@@ -1514,6 +1525,9 @@ export component AppWindow inherits Window {
     // Куда целится скрытая проверка: середины выключателей, дорожка ползунка.
     out property <length> auto-switch-x: auto-switch.absolute-position.x + auto-switch.width / 2;
     out property <length> auto-switch-y: auto-switch.absolute-position.y + auto-switch.height / 2;
+    out property <length> manual-grid-x: root.stats-x + root.pad;
+    out property <length> manual-grid-y: root.auto-y + (root.has-emergency ? 90px : 64px);
+    out property <length> manual-cell-w: (root.stats-w - 2 * root.pad - 12px) / 2;
     out property <length> limit-track-x: limit-slider.absolute-position.x + limit-slider.track-x;
     out property <length> limit-track-w: limit-slider.track-w;
     out property <length> limit-track-y: limit-slider.absolute-position.y + limit-slider.height / 2;
@@ -1864,7 +1878,7 @@ export component AppWindow inherits Window {
     property <length> ranges-y: root.controls-top + root.base-controls-h + (root.chart-time ? root.ctl-row : 0px);
     property <length> controls-h: root.base-controls-h + (root.chart-time ? root.ctl-row : 0px) + 52px;
     out property <length> events-h: min(6, max(1, root.events.length)) * 18px;
-    out property <length> auto-h: !root.has-auto ? 0px : root.has-emergency ? 90px : 64px;
+    out property <length> auto-h: !root.has-auto ? 0px : (root.has-emergency ? 90px : 64px) + (root.manual-controls.length > 0 ? 56px : 0px);
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.events-h - 28px - root.auto-h;
     out property <length> chart-y: root.body-y + root.controls-top + root.controls-h;
     out property <length> chart-h: root.auto-y - root.chart-y;
@@ -2514,7 +2528,7 @@ export component AppWindow inherits Window {
                 on: root.chart-swap;
                 toggled => { root.axes-changed(!root.chart-swap); }
                 hover(on) => {
-                    root.tip(on, "axes-swap", "Поменять оси местами\nПереставляет геометрию графика вместе с точками, интервалами и шкалами.\n• действует по времени и по множителю\n• границы и выбранные величины сохраняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    root.tip(on, "axes-swap", "Поменять оси местами\nПереставляет геометрию графика вместе с точками, интервалами и шкалами.\n• отдельно запоминается по времени и по множителю\n• границы и выбранные величины сохраняются", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
             normalized-chip := Chip {
@@ -2691,8 +2705,7 @@ export component AppWindow inherits Window {
     }
     // ----- Автомодуль: настройки программы у часов (DECISIONS #36, #40; бриф T) -----
     // Под графиком, где его красные линии отсечек, над списком его действий: всё про автомодуль — в одном месте.
-    // Строки: выключатель; отсечка (цель); аварийная отсечка. Подтягивания вверх нет (DECISIONS #40: его заменит подбор
-    // потолков по модели). Одинаковое дело — одинаковый элемент: числа — ползунками, «да / нет» — выключателями.
+    // Одинаковое дело — одинаковый элемент: числа — ползунками, «да / нет» — выключателями.
     Rectangle {
         visible: root.has-auto;
         x: root.stats-x + root.pad;
@@ -2709,7 +2722,7 @@ export component AppWindow inherits Window {
             enabled: root.auto-ready;
             toggled => { root.auto-toggled(); }
             hover(on) => {
-                root.tip(on, "auto-on", "Автомодуль\nДве отсечки опускают потолок горячего блока на ступень: аварийная — по одному показанию, обычная — по 2-с медиане выше цели; опущенные блоки он возвращает к профилю.\n• при любой нагрузке: горячий и свободный блок тоже опускается\n• не ниже нижней границы потолка (той же, что в меню потолка плитки) и не выше профиля\n• работает в CoreMapTray, окно для этого не нужно\n• при включённом авто сон и перезапуск сохраняют снижение; выключение авто возвращает потолки профиля\n• выключен — потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "auto-on", "Автомодуль\nДве отсечки опускают потолок горячего блока на ступень: аварийная — по одному показанию, обычная — по средней температуре за выбранное окно; опущенные блоки он возвращает к профилю.\n• при любой нагрузке: горячий и свободный блок тоже опускается\n• не ниже нижней границы потолка (той же, что в меню потолка плитки) и не выше профиля\n• работает в CoreMapTray, окно для этого не нужно\n• при включённом авто сон и перезапуск сохраняют снижение; выключение авто возвращает потолки профиля\n• выключен — потолки не трогает\n• то же — в меню значка CoreMapTray", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -2745,7 +2758,7 @@ export component AppWindow inherits Window {
             moved(v) => { root.limit-moved(v); }
             released(v) => { root.limit-released(v); }
             hover(on) => {
-                root.tip(on, "limit", "Отсечка, °C\nЦель: выше неё блок работать не должен — автомодуль снижает его потолок.\n• каждые 2 с — медиана показаний блока за 2 с: выше цели и не падает — потолок на ступень ниже; выше, но падает — ждёт, прошлая ступень ещё действует\n• пробная ступень вверх — после 2 мин прохладной работы с проверкой фактического множителя, нагрузки ядра, всего CPU и распределения нагрузки; простой возврат не разрешает\n• следующая ступень — только после новой проверки; неподтверждённое повышение откатывается\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                root.tip(on, "limit", "Отсечка, °C\nЦель: выше неё блок работать не должен — автомодуль снижает его потолок.\n• среднее арифметическое за окно выше цели — снижение ниже фактического множителя\n• после изменения — заданная пауза, затем новое полное окно; аварийная отсечка продолжает работать\n• пробная ступень вверх — после заданного периода прохладной работы с проверкой фактической частоты и нагрузки; простой возврат не разрешает\n• следующая ступень — только после новой проверки; неподтверждённое повышение откатывается\n• память перегрева сравнивает фактические ступени остальных блоков; совпавшее состояние ограничивает возврат к частоте, на которой уже был перегрев\n• \{root.auto-limit-min}–\{root.auto-limit-max} °C, шаг 1 °C; применяется, когда отпустишь ползунок\n• на «абсолютной» и «по времени» — линией", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
             }
         }
         Text {
@@ -2798,6 +2811,32 @@ export component AppWindow inherits Window {
             font-size: 12px;
             horizontal-alignment: right;
             vertical-alignment: center;
+        }
+        for control[i] in root.manual-controls: Rectangle {
+            x: mod(i, 2) * (parent.width + 12px) / 2;
+            y: (root.has-emergency ? 90px : 64px) + floor(i / 2) * 26px;
+            width: (parent.width - 12px) / 2;
+            height: 24px;
+            Text {
+                width: 112px; height: parent.height;
+                text: control.label;
+                font-size: 11px; color: Palette.dim;
+                vertical-alignment: center;
+            }
+            setting := ValueSlider {
+                x: 114px; y: 2px;
+                width: parent.width - 156px; height: 20px;
+                minimum: control.minimum; maximum: control.maximum;
+                value: control.value; enabled: root.auto-ready; lit: root.auto-on;
+                released(v) => { root.manual-released(i, v); }
+                hover(on) => { root.tip(on, "manual-" + i, control.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+            }
+            Text {
+                x: parent.width - 40px; width: 40px; height: parent.height;
+                text: "\{setting.shown} \{control.unit}";
+                color: root.auto-on ? Palette.text : Palette.dim;
+                font-size: 11px; horizontal-alignment: right; vertical-alignment: center;
+            }
         }
     }
     Lines {

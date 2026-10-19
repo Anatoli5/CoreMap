@@ -203,7 +203,7 @@ pub struct Limits {
 #[serde(rename_all = "camelCase")]
 pub struct AutoSettings {
     pub on: bool,
-    /// Цель (отсечка по 2-с медиане), °C.
+    /// Цель обычной отсечки, °C; вид правила зависит от версии программы у часов.
     pub limit: i64,
     /// Допустимая цель, °C: [от, до].
     pub limit_range: [i64; 2],
@@ -213,9 +213,27 @@ pub struct AutoSettings {
     /// Допустимая аварийная, °C: [цель + 1, 100]; нет — окно считает так же.
     #[serde(default)]
     pub emergency_range: Option<[i64; 2]>,
+    #[serde(default)]
+    pub window_secs: Option<i64>,
+    #[serde(default)]
+    pub settle_secs: Option<i64>,
+    #[serde(default)]
+    pub return_gap: Option<i64>,
+    #[serde(default)]
+    pub return_secs: Option<i64>,
 }
 
 impl AutoSettings {
+    #[must_use]
+    pub fn manual_values(&self) -> Option<[i64; 4]> {
+        Some([
+            self.window_secs?,
+            self.settle_secs?,
+            self.return_gap?,
+            self.return_secs?,
+        ])
+    }
+
     /// Допустимая аварийная: как прислала программа у часов, иначе цель + 1 … 100 (бриф T).
     #[must_use]
     pub fn emergency_span(&self) -> [i64; 2] {

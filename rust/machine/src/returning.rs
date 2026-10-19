@@ -65,6 +65,7 @@ pub(crate) struct Guard {
 impl Guard {
     pub fn reset_episode(&mut self) {
         self.eligible_since = None;
+        self.trial_since = None;
     }
 
     pub fn seed(&mut self, protection: Protection) {

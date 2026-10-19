@@ -717,7 +717,7 @@ fn log_settings(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut C
 /// тянет ползунок целевой отсечки до 88 °C, меняет аварийную, выключает автомодуль — четыре жеста (глубины и
 /// подтягивания нет, #38, бриф T). Проход окна ведёт агент окна (бриф W): если в нём другие жесты, эти числа — за ним.
 const WINDOW_LIMIT: i32 = 88;
-const WINDOW_GESTURES: usize = 4;
+const WINDOW_GESTURES: usize = 8;
 /// Щелчков по «запись» в той же проверке окна: выключить и включить журнал срезов.
 const WINDOW_LOG_GESTURES: usize = 2;
 /// Название профиля, который окно в той же проверке сохраняет, применяет, перезаписывает и удаляет щелчками.
@@ -843,6 +843,10 @@ fn real_window(r: &mut Report, app: &mut App, shell: &mut Shell, root: &Path, ou
         on: false,
         limit: WINDOW_LIMIT,
         emergency: after.emergency,
+        window_secs: 3,
+        settle_secs: 4,
+        return_gap: 2,
+        return_secs: 60,
         log: true,
     };
     r.check(

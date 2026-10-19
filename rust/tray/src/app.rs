@@ -36,6 +36,7 @@ use crate::journal::Journal;
 
 mod auto;
 mod auto_state;
+mod configurations;
 mod history;
 mod meter;
 mod sense;

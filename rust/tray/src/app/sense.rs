@@ -182,6 +182,8 @@ impl App {
     /// `record`; раз в 10 с, пока открыто окно, — потолки заново. Под арендой (`with_ceilings`). Ok — температура
     /// корпуса.
     pub(super) fn read_sensors(&mut self, window: bool) -> Result<Option<f64>, String> {
+        // Перечитать потолки ДО датчиков: один и тот же вектор принадлежит показаниям и решениям.
+        self.refresh_for_window();
         let Some(device) = self.device.as_mut() else {
             return Err("нет доступа к процессору".into());
         };
@@ -212,7 +214,7 @@ impl App {
         if let Some(watch) = watch {
             watch.package(package);
         }
-        self.refresh_for_window();
+        self.observe_physical_poll();
         self.keep_maxima();
         Ok(package)
     }

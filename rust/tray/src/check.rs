@@ -219,6 +219,7 @@ pub fn run(root: &Path, out: &Path, saved: bool) -> i32 {
             control: machine::auto::Timing {
                 window: Duration::from_millis(400),
                 recheck: Duration::from_millis(200),
+                settle: Duration::from_millis(400),
                 pause: Duration::from_secs(1),
             },
         },
@@ -801,23 +802,22 @@ fn scenario(r: &mut Report, app: &mut App, shell: &mut Shell, names: &Names, pla
         again < base,
         &format!("автомодуль: окно закрылось — горячий блок снова опущен (×{again})"),
     );
-    // Память срезов: срезы записаны; из журнала действий восстанавливаются те же (как после перезапуска).
+    // Память физических состояний: отбросить оперативную копию и прочитать уже записанное с диска.
     let cuts = app.cuts_now();
-    app.replay_memory();
+    app.restart_physical_memory();
     r.check(
-        cuts > 0 && app.cuts_now() == cuts && logged(app, "не падает") > 0,
-        &format!("автомодуль: срезы записаны в память ({cuts} потолков), из журнала действий восстанавливаются те же"),
+        cuts > 0 && app.cuts_now() == cuts && logged(app, "среднее за") > 0,
+        &format!("автомодуль: память физических состояний ({cuts} записей) восстановлена с диска после очистки оперативной копии"),
     );
     check_logs(r, app, data, block.first);
-    // Без качелей (бриф T): блок остыл (без нагрузки — 40 °C, нагрузки в правиле нет), но кристалл — остальные блоки —
-    // тот же, что при срезах: на потолок, с которого блок срезан, он не возвращается и за три паузы.
+    // Остывание своего блока в простое не даёт доказательства для возврата, даже при работе остальных.
     set_load(app, 0.0, 0.15);
     let raised = logged(app, &returned);
     pump(shell, app, Duration::from_secs(3));
     r.check(
         ceilings_now(app).get(first) == Some(&again) && logged(app, &returned) == raised,
         &format!(
-            "автомодуль: остывший блок не вернулся за 3 с при паузе 1 с — кристалл не холоднее, чем при срезе (стоит {:?})",
+            "автомодуль: остывший простаивающий блок не вернулся за 3 с при паузе 1 с (стоит {:?})",
             ceilings_now(app).get(first)
         ),
     );
@@ -1007,7 +1007,7 @@ fn cutoffs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &
             && once[0]["reading"] == 95.0
             && once[0]["die"] == 40.0
             && once[0]["to"].as_i64() == once[0]["from"].as_i64().map(|f| f - 1)
-            && once[0]["medians"].as_array().is_some_and(|m| m.len() == blocks)
+            && once[0]["means"].as_array().is_some_and(|m| m.len() == blocks)
             && once[0]["fans"] == serde_json::json!([3200, 3000])
             && once[0].get("gpu").is_some()
             && idle(&once),
@@ -1056,10 +1056,10 @@ fn cutoffs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &
     let falling = acts(from.unwrap_or(usize::MAX), "target");
     r.check(
         flat.len() >= 2
-            && flat_gaps.iter().all(|&g| g >= 380)
-            && flat.iter().all(|v| v["median"].as_f64().is_some_and(|m| m > 75.0))
+            && flat_gaps.iter().all(|&g| g >= 780)
+            && flat.iter().all(|v| v["mean"].as_f64().is_some_and(|m| m > 75.0))
             && idle(&flat)
-            && falling.is_empty(),
+            && !falling.is_empty(),
         &format!(
             "целевая отсечка: 88 °C ровно 1,5 с — {} ступеней раз в окно (мс: {flat_gaps:?}); 88 → 76 °C спадом — {} ступеней",
             flat.len(),
@@ -1115,6 +1115,13 @@ fn lines_after(path: &Path, skip: usize) -> Vec<String> {
     reason = "one scenario, step after step, reads best as one piece"
 )]
 fn package_inputs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path) {
+    // Предыдущий сценарий проверял сохранение ручек 3/4/2/60 через окно. Этот сценарий отдельно задаёт свои сроки.
+    let defaults = serde_json::json!({"windowSecs": 2, "settleSecs": 2, "returnGap": 0, "returnSecs": 120});
+    let refusal = app.set_auto(shell, defaults.as_object().expect("настройки стенда — объект"));
+    r.check(
+        refusal.is_none(),
+        "входы теплового пакета: исходные ручные сроки сценария заданы",
+    );
     let was = app.retime(
         shell,
         AutoTiming {
@@ -1258,9 +1265,9 @@ fn check_logs(r: &mut Report, app: &App, data: &Path, first: usize) {
             && v["block"].is_string()
             && v["from"].is_i64()
             && v["to"].as_i64() == v["from"].as_i64().map(|f| f - 1)
-            && v["median"].as_f64().is_some_and(|m| m > 75.0)
+            && v["mean"].as_f64().is_some_and(|m| m > 75.0)
             && v["die"].is_f64()
-            && v["medians"].as_array().is_some_and(|a| a.len() == blocks)
+            && v["means"].as_array().is_some_and(|a| a.len() == blocks)
             && v["ratio"].is_f64()
             && v["busy"] == 1.0
             && v["fans"] == serde_json::json!([3200, 3000])

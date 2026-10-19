@@ -75,6 +75,8 @@ pub struct AutoEntry {
     pub reading: Option<f64>,
     #[serde(default)]
     pub median: Option<f64>,
+    #[serde(default, rename = "windowSecs")]
+    pub window_secs: Option<u64>,
     #[serde(default)]
     pub limit: Option<f64>,
     #[serde(default)]
@@ -247,6 +249,12 @@ fn temps(c: Option<&Value>) -> Vec<String> {
     if let Some(m) = list("medians", 1) {
         out.push(format!("2-с медианы {m} °C"));
     }
+    if let Some(m) = list("means", 1) {
+        let window = number(c, "windowSecs")
+            .map(|s| format!(" за {s:.0} с"))
+            .unwrap_or_default();
+        out.push(format!("средние{window} {m} °C"));
+    }
     out
 }
 
@@ -343,6 +351,13 @@ fn from_event(e: &EventEntry) -> Event {
             number(c, "reading")
                 .map(|t| format!(": показание {t:.0} °C"))
                 .unwrap_or_default()
+        ),
+        Kind::Target if number(c, "mean").is_some() => format!(
+            "отсечка: средняя {:.1} °C{} выше цели{at_die}",
+            number(c, "mean").unwrap_or_default(),
+            number(c, "windowSecs")
+                .map(|s| format!(" за {s:.0} с"))
+                .unwrap_or_default(),
         ),
         Kind::Target => format!(
             "отсечка: 2-с медиана{} и не падает{at_die}",
@@ -441,6 +456,12 @@ fn from_auto(e: &AutoEntry, into: &mut Vec<Event>) {
             "аварийная отсечка: показание{}{}{die}",
             e.reading.map(|r| format!(" {r:.0} °C")).unwrap_or_default(),
             e.emergency.map(|l| format!(" ≥ {l:.0} °C")).unwrap_or_default()
+        ),
+        Kind::Target if e.mean.is_some() => format!(
+            "отсечка: средняя {:.1} °C{}{}{die}",
+            e.mean.unwrap_or_default(),
+            e.window_secs.map(|s| format!(" за {s} с")).unwrap_or_default(),
+            e.limit.map(|l| format!(" > {l:.0} °C")).unwrap_or_default(),
         ),
         Kind::Target => format!(
             "отсечка: 2-с медиана{}{} и не падает{die}",

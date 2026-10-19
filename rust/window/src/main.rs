@@ -224,6 +224,8 @@ pub fn connect(ui: &AppWindow, view: &Rc<RefCell<view::View>>) {
     ui.on_emergency_moved(move |value| v.borrow_mut().emergency_moved(value));
     let v = Rc::clone(view);
     ui.on_emergency_released(move |value| v.borrow_mut().emergency_released(value));
+    let v = Rc::clone(view);
+    ui.on_manual_released(move |index, value| v.borrow_mut().manual_released(index, value));
     // Закрытие: размер и место — в файл окна; окно прячется, его цикл кончается.
     let v = Rc::clone(view);
     ui.window().on_close_requested(move || {

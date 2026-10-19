@@ -226,6 +226,7 @@ pub struct View {
     pub model: bool,
     live_full: bool,
     pub swap: bool,
+    pub time_swap: bool,
     /// Ось x — время (иначе множитель).
     pub timeline: bool,
     /// Раскладка по времени и величина раскладки «блоки».
@@ -288,6 +289,7 @@ pub struct View {
     limit_dragging: bool,
     /// То же у аварийной отсечки (подтверждение — тема settings).
     emergency_held: Option<i32>,
+    manual_held: [Option<i32>; 4],
     emergency_dragging: bool,
     /// Сколько команд окно послало (скрытой проверке: движение ползунка — одна команда).
     pub sent: u32,
@@ -313,6 +315,7 @@ impl View {
         let model = memory.saved.model.unwrap_or(true);
         let live_full = memory.saved.live_full.unwrap_or(false);
         let swap = memory.saved.swap.unwrap_or(false);
+        let time_swap = memory.saved.time_swap.unwrap_or(swap);
         let timeline = memory.saved.timeline.unwrap_or(false);
         let layout = match memory.saved.layout {
             Some(Layout::Params) => Layout::Params,
@@ -345,6 +348,7 @@ impl View {
             model,
             live_full,
             swap,
+            time_swap,
             timeline,
             layout,
             quantity,
@@ -385,6 +389,7 @@ impl View {
             limit_held: None,
             limit_dragging: false,
             emergency_held: None,
+            manual_held: [None; 4],
             emergency_dragging: false,
             sent: 0,
             memory,
@@ -416,6 +421,7 @@ impl View {
                 self.limit_held = None;
                 self.limit_dragging = false;
                 self.emergency_held = None;
+                self.manual_held.fill(None);
                 self.emergency_dragging = false;
                 self.show_link();
                 self.show_auto();
@@ -459,6 +465,7 @@ impl View {
                     if !reply.ok && pending.held {
                         self.limit_held = None;
                         self.emergency_held = None;
+                        self.manual_held.fill(None);
                         self.show_auto();
                         self.refresh_stats();
                         self.refresh_time();
@@ -893,6 +900,10 @@ impl View {
 
     fn refresh_stats(&mut self) {
         self.refresh_events();
+        let ui = self.ui();
+        if ui.get_chart_swap() != self.axes_swapped() {
+            ui.set_chart_swap(self.axes_swapped());
+        }
         let cutoff = self.cutoff();
         let emergency = self.emergency();
         let Some(hello) = self.hello.as_ref() else { return };
@@ -950,9 +961,6 @@ impl View {
         }
         if ui.get_chart_model() != self.model_switch() {
             ui.set_chart_model(self.model_switch());
-        }
-        if ui.get_chart_swap() != self.swap {
-            ui.set_chart_swap(self.swap);
         }
         #[expect(clippy::cast_precision_loss, reason = "a few dozen columns: exact in f32")]
         let width = shown.columns.len().max(1) as f32;
@@ -1100,6 +1108,7 @@ impl View {
             ui.set_log_on(logging);
         }
         let Some(a) = &self.auto else { return };
+        self.show_manual(a);
         let ints = [
             (
                 ui.get_auto_limit(),
@@ -1168,6 +1177,13 @@ impl View {
     )]
     fn settle_holds(&mut self) {
         let Some(a) = &self.auto else { return };
+        if let Some(values) = a.manual_values() {
+            for (held, actual) in self.manual_held.iter_mut().zip(values) {
+                if held.is_some_and(|v| i64::from(v) == actual) {
+                    *held = None;
+                }
+            }
+        }
         if !self.emergency_dragging
             && let Some(held) = self.emergency_held
             && a.emergency == Some(i64::from(held))
@@ -1268,6 +1284,56 @@ impl View {
         }
     }
 
+    fn show_manual(&self, auto: &AutoSettings) {
+        let values = auto.manual_values();
+        let ui = self.ui();
+        let current = ui.get_manual_controls();
+        if match values {
+            Some(values) => {
+                current.row_count() == 4
+                    && values.iter().enumerate().all(|(i, value)| {
+                        current
+                            .row_data(i)
+                            .is_some_and(|row| row.value == self.manual_held[i].unwrap_or_else(|| slint_int(*value)))
+                    })
+            }
+            None => current.row_count() == 0,
+        } {
+            return;
+        }
+        let rows = values.map(|values| {
+            let labels = ["Окно средней", "После изменения", "Запас возврата", "Проверка возврата"];
+            let units = ["с", "с", "°C", "с"];
+            let bounds = [(1, 60), (0, 120), (0, 30), (1, 600)];
+            let tips = [
+                "Окно средней температуры\nОбычная отсечка использует среднее арифметическое показаний ядра за это окно.\n• выше цели — снижение потолка\n• после изменения конфигурации требуется новое полное окно",
+                "Пауза после изменения\nДаёт температуре отреагировать на новую конфигурацию перед обычной проверкой.\n• затем собирается новое окно средней\n• аварийная отсечка не ждёт этой паузы",
+                "Запас для возврата\nСредняя температура для подъёма должна быть не выше цели минус этот запас.\n• ноль — возврат при температуре не выше цели\n• простой не подтверждает возможность повышения",
+                "Период проверки возврата\nСтолько времени нужна прохладная работа с проверкой фактической частоты и нагрузки.\n• подъём — одна пробная ступень, затем новая проверка\n• память перегрева учитывает фактические множители остальных блоков\n• неподтверждённая ступень откатывается",
+            ];
+            (0..4).map(|i| crate::ui::AutoControl {
+                label: labels[i].into(), unit: units[i].into(),
+                minimum: bounds[i].0, maximum: bounds[i].1,
+                value: self.manual_held[i].unwrap_or_else(|| slint_int(values[i])),
+                tip: tips[i].into(),
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        ui.set_manual_controls(ModelRc::new(VecModel::from(rows)));
+    }
+
+    pub fn manual_released(&mut self, index: i32, value: i32) {
+        let Ok(index) = usize::try_from(index) else { return };
+        let fields = ["windowSecs", "settleSecs", "returnGap", "returnSecs"];
+        let Some(&field) = fields.get(index) else { return };
+        let Some(actual) = self.auto.as_ref().and_then(AutoSettings::manual_values) else {
+            return;
+        };
+        let same = actual[index] == i64::from(value);
+        self.manual_held[index] =
+            (!same && self.set_auto(field, value.into(), "Настройка автомодуля не изменена", true)).then_some(value);
+        self.show_auto();
+    }
+
     // ----- что окно помнит о себе -----
 
     /// Пишет файл окна, если запомненное изменилось: сравниваемые блоки (по названиям), подсветка, обычные размер и
@@ -1290,6 +1356,7 @@ impl View {
         saved.model = Some(self.model);
         saved.live_full = Some(self.live_full);
         saved.swap = Some(self.swap);
+        saved.time_swap = Some(self.time_swap);
         saved.timeline = Some(self.timeline);
         saved.layout = Some(self.layout);
         saved.quantity = Some(self.quantity);
@@ -1440,10 +1507,19 @@ impl View {
         }
     }
 
-    /// Оси местами: температура по горизонтали (true).
+    #[must_use]
+    pub fn axes_swapped(&self) -> bool {
+        if self.timeline { self.time_swap } else { self.swap }
+    }
+
+    /// Оси меняются только в текущем виде графика.
     pub fn axes_changed(&mut self, swap: bool) {
-        if self.swap != swap {
-            self.swap = swap;
+        if self.axes_swapped() != swap {
+            if self.timeline {
+                self.time_swap = swap;
+            } else {
+                self.swap = swap;
+            }
             self.refresh_stats();
             self.refresh_time();
             self.show_ranges();
@@ -1536,7 +1612,7 @@ impl View {
             "множитель",
             "потолок",
             "нагрузка %",
-            "кристалл °C",
+            "остальные блоки °C",
             "GPU °C",
             "GPU Вт",
             "GPU %",
@@ -1810,7 +1886,7 @@ impl View {
                     parameter_ranges: Some(&self.parameter_ranges()),
                     selected: Some(&self.selected),
                     manual_ranges: Some(&self.time_ranges()),
-                    swap: self.swap,
+                    swap: self.time_swap,
                     columns,
                     height,
                     scale,

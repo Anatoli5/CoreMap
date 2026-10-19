@@ -105,14 +105,15 @@ impl App {
         }
     }
 
-    /// Условия правки владельца: последние 2-с медианы регулятора (если он есть), последние показания всех блоков и
+    /// Условия правки владельца: последние средние регулятора за выбранное окно, последние показания всех блоков и
     /// самого блока, видеокарта и вентиляторы — что известно.
     pub(super) fn own_conditions(&self, block: usize) -> Map<String, Value> {
         let mut map = Map::new();
         if let Some(controller) = self.auto.controller.as_ref() {
-            let medians: Vec<Option<f64>> = controller.medians().map(|m| m.map(|v| round(v, 1))).collect();
-            if medians.iter().any(Option::is_some) {
-                map.insert("medians".into(), json!(medians));
+            let means: Vec<Option<f64>> = controller.means().map(|m| m.map(|v| round(v, 1))).collect();
+            if means.iter().any(Option::is_some) {
+                map.insert("means".into(), json!(means));
+                map.insert("windowSecs".into(), json!(self.auto.choice.window_secs));
             }
         }
         let temps: Vec<Option<f64>> = self

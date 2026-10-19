@@ -2573,6 +2573,7 @@ impl Check {
             off && self.ui.get_chart_cutoff() < 0.0 && sent_total == GESTURES,
             format!("щелчок выключил автомодуль — линии отсечки нет; команд за {GESTURES} жестов: {sent_total}"),
         );
+        self.manual_settings();
 
         // 5. «запись» — журнал срезов, свой выключатель (владелец 16.10): выключить и включить; автомодуль не меняется.
         let came = self.pump(|v| v.log.is_some(), 1.0);
@@ -2689,7 +2690,10 @@ impl Check {
         let auto = self.view.borrow().auto.clone();
         self.check(
             came && auto.as_ref().is_some_and(|a| {
-                !a.on && a.limit == i64::from(LIMIT_TO) && a.emergency == Some(i64::from(EMERGENCY_TO))
+                !a.on
+                    && a.limit == i64::from(LIMIT_TO)
+                    && a.emergency == Some(i64::from(EMERGENCY_TO))
+                    && a.manual_values() == Some([3, 4, 2, 60])
             }) && self.ui.get_auto_limit() == LIMIT_TO
                 && self.ui.get_auto_emergency() == EMERGENCY_TO,
             format!("настройки автомодуля — от CoreMapTray, какими их оставили: {auto:?}"),
@@ -3435,6 +3439,7 @@ impl Check {
         );
         let at = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
         self.chip(at, |v| !v.timeline, "снова «по множителю»");
+        self.independent_axes();
         let file = self.data.join(crate::saved::FILE);
         let saved = std::fs::read_to_string(&file)
             .ok()
@@ -3451,6 +3456,80 @@ impl Check {
                 saved.timeline, saved.view, saved.layout, saved.quantity, saved.events_all
             ),
         );
+    }
+
+    fn manual_settings(&mut self) {
+        self.check(
+            self.ui.get_manual_controls().row_count() == 4,
+            "четыре ручные настройки автомодуля доступны",
+        );
+        for (i, value) in [3_i32, 4, 2, 60].into_iter().enumerate() {
+            let Some(row) = self.ui.get_manual_controls().row_data(i) else {
+                continue;
+            };
+            let cell_w = self.ui.get_manual_cell_w();
+            let col = if i % 2 == 0 { 0.0 } else { 1.0 };
+            let row_y = if i < 2 { 0.0 } else { 26.0 };
+            #[expect(clippy::cast_precision_loss, reason = "small whole UI slider limits")]
+            let share = (value - row.minimum) as f32 / (row.maximum - row.minimum) as f32;
+            let x = self.ui.get_manual_grid_x() + col * (cell_w + 12.0) + 121.0 + share * (cell_w - 170.0);
+            let y = self.ui.get_manual_grid_y() + row_y + 12.0;
+            let before = self.view.borrow().sent;
+            self.click(x, y, PointerEventButton::Left);
+            let confirmed = self.pump(
+                |v| {
+                    v.auto
+                        .as_ref()
+                        .and_then(crate::wire::AutoSettings::manual_values)
+                        .is_some_and(|values| values[i] == i64::from(value))
+                },
+                5.0,
+            );
+            self.check(
+                confirmed && self.view.borrow().sent == before + 1,
+                format!(
+                    "{}: мышью установлено {value} {}, одна команда, подтверждение программы у часов",
+                    row.label, row.unit
+                ),
+            );
+        }
+    }
+
+    fn independent_axes(&mut self) {
+        let ratio = self.view.borrow().swap;
+        let time = self.view.borrow().time_swap;
+        let at = (self.ui.get_time_chip_x(), self.ui.get_time_chip_y());
+        self.chip(at, |v| v.timeline, "отдельные оси: по времени");
+        let at = (self.ui.get_swap_chip_x(), self.ui.get_swap_chip_y());
+        self.click(at.0, at.1, PointerEventButton::Left);
+        self.pump(|v| v.time_swap != time, 1.0);
+        self.check(
+            self.view.borrow().swap == ratio && self.ui.get_chart_swap() != time,
+            "перестановка осей времени сохраняет оси множителя",
+        );
+        let at = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
+        self.chip(at, |v| !v.timeline, "отдельные оси: снова по множителю");
+        self.check(
+            self.ui.get_chart_swap() == ratio,
+            "множитель восстанавливает свою ориентацию",
+        );
+        let at = (self.ui.get_time_chip_x(), self.ui.get_time_chip_y());
+        self.chip(at, |v| v.timeline, "отдельные оси: снова по времени");
+        self.check(
+            self.ui.get_chart_swap() != time,
+            "время восстанавливает свою ориентацию",
+        );
+        let file = self.data.join(crate::saved::FILE);
+        let saved = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|t| crate::saved::parse(&t).ok())
+            .unwrap_or_default();
+        self.check(
+            saved.swap == Some(ratio) && saved.time_swap == Some(!time),
+            "ориентации времени и множителя сохраняются раздельно в файле",
+        );
+        let at = (self.ui.get_blocks_chip_x(), self.ui.get_blocks_chip_y());
+        self.chip(at, |v| !v.timeline, "отдельные оси: вернуться к множителю");
     }
 }
 

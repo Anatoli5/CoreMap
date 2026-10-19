@@ -1,7 +1,7 @@
-// Правила двух отсечек и возврата — по брифу T (outputs/cutoffs-brief-2026-10-16.md, DECISIONS #40, подзапись
-// «две отсечки»), а не по коду регулятора: каждый тест — строка брифа. Опрос — раз в 0,25 с, как у CoreMapTray;
-// сроки — настоящие (`Timing::REAL`: окно медианы 2 с, повтор аварийной проверки 1 с, пауза возврата 2 мин).
-// Память срезов — настоящая (machine::memory), как её спрашивает программа входа.
+// Правила двух отсечек и возврата, с обновлением ручного регулятора 19.10: среднее вместо медианы,
+// без ожидания тренда, после смены конфигурации — установление и полное новое окно.
+// Опрос раз в 0,25 с; `Timing::REAL`: окно 2 с, аварийная перепроверка 1 с, установление 2 с, проверка возврата 2 мин.
+// Пример внешнего callback памяти использует machine::memory; полными конфигурациями продукта владеет tray.
 
 use std::time::Duration;
 
@@ -59,6 +59,7 @@ impl Bench {
                 Settings {
                     limit: LIMIT,
                     emergency: EMERGENCY,
+                    return_gap: 0.0,
                 },
                 Timing::REAL,
                 ceilings.len(),
@@ -167,7 +168,7 @@ fn one_reading_at_the_emergency_limit_cuts_that_block_at_once() {
     assert!((cuts[0].1.temp - 95.0).abs() < 1e-9, "the reading that triggered it");
     assert!(
         b.acts(Cause::Target).is_empty(),
-        "one hot reading moves no 2-s median: {:?}",
+        "one hot reading among cool readings leaves the window mean below target: {:?}",
         b.acts
     );
 }
@@ -220,47 +221,51 @@ fn every_block_has_its_own_emergency_check() {
 // ----- целевая отсечка -----
 
 #[test]
-fn the_target_cut_fires_every_two_seconds_while_the_median_is_above_and_not_falling() {
-    // «every 2 s, per block … median above the limit and not lower than the previous 2-s median: −1 step».
+fn the_target_cut_waits_for_settling_and_a_fresh_mean_window_between_changes() {
     let mut b = Bench::new(&[50]);
     b.run(4.0, |_| vec![hot(70.0)]);
     let from = b.t;
-    b.run(12.0, |_| vec![hot(88.0)]); // above 85, below the emergency limit; flat = not falling
+    b.run(12.0, |_| vec![hot(88.0)]); // above 85, below the emergency limit
     let cuts = b.since(from, Cause::Target);
-    assert!((5..=6).contains(&cuts.len()), "one per 2-s window: {cuts:?}");
+    assert_eq!(
+        cuts.len(),
+        3,
+        "a fresh 2-s window after each 2-s settling pause: {cuts:?}"
+    );
     assert!(
         cuts.windows(2)
-            .all(|w| w[1].0.saturating_sub(w[0].0) == Duration::from_secs(2)),
-        "spaced by the window: {cuts:?}"
+            .all(|w| w[1].0.saturating_sub(w[0].0) == Duration::from_millis(4250)),
+        "settling plus full window after the write is observed on the next poll: {cuts:?}"
     );
     assert!(cuts.iter().all(|(_, d)| d.to == d.from - 1), "one step each");
     assert_eq!(b.acts(Cause::Emergency), []);
 }
 
 #[test]
-fn the_target_cut_waits_while_the_median_falls_even_above_the_limit() {
-    // «If it is above but falling: wait. The last step is still working.»
+fn a_falling_mean_above_target_still_cuts_after_settling() {
     let mut b = Bench::new(&[50]);
     b.run(4.0, |_| vec![hot(93.0)]);
     let from = b.t;
-    // 93 → 86 over 28 s (longer than any averaging window of the old controller): every 2-s median lower than the one
-    // before, all above 85.
+    // 93 → 86 over 28 s: every fresh window mean is lower, all above 85.
     b.run(28.0, move |t| {
         vec![hot(93.0 - 0.25 * t.saturating_sub(from).as_secs_f64())]
     });
-    assert_eq!(b.since(from + STEP, Cause::Target), [], "falling: no step");
-    // Flat again above the limit: the cut comes back.
+    assert!(
+        !b.since(from + STEP, Cause::Target).is_empty(),
+        "a falling temperature still above target does not suppress the target rule"
+    );
+    // A flat temperature above target continues to trigger the rule.
     let flat = b.t;
     b.run(6.0, |_| vec![hot(87.0)]);
     assert!(!b.since(flat, Cause::Target).is_empty(), "{:?}", b.acts);
 }
 
 #[test]
-fn a_rising_median_above_the_limit_is_cut_and_a_spike_under_the_emergency_limit_is_not() {
+fn a_rising_mean_above_the_limit_is_cut_and_a_small_window_mean_is_not() {
     let mut b = Bench::new(&[50, 50]);
     b.run(4.0, |_| vec![hot(70.0), hot(70.0)]);
     let from = b.t;
-    // Block 0: rising 86 → 92. Block 1: 70, with one 92 reading in every window - the median stays 70.
+    // Block 0: rising 86 → 92. Block 1: 70, with one 92 reading per 2 s; the mean stays below target.
     b.run(6.0, move |t| {
         let spike = t.saturating_sub(from).as_millis() % 2000 == 750; // one reading in every 2-s window
         vec![
@@ -377,8 +382,7 @@ fn a_cut_block_returns_after_a_full_pause_of_cool_work_and_never_above_its_profi
 }
 
 #[test]
-fn one_median_above_the_limit_in_the_pause_restarts_it() {
-    // «returns +1 step when all of its 2-s medians stayed at or below the limit for the whole pause».
+fn one_mean_above_the_return_threshold_restarts_the_proof_duration() {
     let mut b = cut_once(2, 60.0);
     b.floor[0] = 49; // at the floor: the hot window below cannot cut again, only the pause is tested
     let cool = b.t;
@@ -429,7 +433,7 @@ fn no_return_to_the_cut_ceiling_while_the_die_is_as_hot_as_at_the_cut() {
     let cut = b.acts(Cause::Target)[0].1;
     assert!(
         cut.die.is_some_and(|d| (d - 60.0).abs() < 1e-9),
-        "die = mean of the others' medians: {cut:?}"
+        "diagnostic die = mean of the others' window means: {cut:?}"
     );
     b.run(600.0, |_| vec![hot(70.0), hot(60.0), hot(60.0)]);
     assert_eq!(b.acts(Cause::Return), [], "die 60 now, 60 at the cut: no return");
@@ -446,7 +450,7 @@ fn no_return_to_the_cut_ceiling_while_the_die_is_as_hot_as_at_the_cut() {
 }
 
 #[test]
-fn the_die_level_is_the_mean_of_the_other_blocks_two_second_medians() {
+fn the_die_level_is_the_mean_of_the_other_blocks_window_means() {
     let mut b = Bench::new(&[50, 50, 50]);
     b.run(4.0, |_| vec![hot(70.0), hot(60.0), hot(66.0)]);
     b.poll(&[hot(96.0), hot(60.0), hot(66.0)]);

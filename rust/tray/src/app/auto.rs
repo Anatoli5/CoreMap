@@ -10,10 +10,9 @@
 // ≥ 10 % по Windows), пишутся ли строки (журнал включён и процессор занят), и сверяет потолки (чужая правка). Оба
 // выключены — опроса нет, драйвер закрыт между действиями.
 //
-// Память срезов (machine::memory) не пускает блок обратно на потолок, с которого он срезан, пока уровень кристалла не
-// ниже, чем был при срезе; она восстанавливается при запуске из журнала действий data\auto-log.jsonl — там каждое
-// решение с условиями: что сработало (emergency, target, return) и по какому показанию или медиане, уровень кристалла,
-// последние 2-с медианы всех блоков, фактический множитель и загрузка блока, вентиляторы, видеокарта.
+// Физические наблюдения в журнале отделены от контекста выставленных потолков. Возврат проверяет фактическую
+// частоту и собственную/общую/относительную активность; совпадение команд потолков не объявляет физическое состояние
+// повторённым. Старый журнал срезов читается отдельно для совместимости, неизвестные условия не достраиваются.
 //
 // Блоки не на профиле — «надстройка» над принятыми потолками (`intended`): принятые не меняются, надстройка помнит,
 // какой блок куда опущен. Пока надстройка есть, программа держит аренду «CoreMap.Ceilings»: прежнее окно или движок,
@@ -31,6 +30,7 @@
 
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use machine::auto::{Cause, Controller, Decision, Frame, LoadFrame, Protection, Settings, Timing};
@@ -41,6 +41,7 @@ use machine::thermal::{Reading, Thermal};
 use serde_json::{Map, Value, json};
 
 use super::auto_state;
+use super::configurations::{Kind as PhysicalKind, Ledger, Rule, Trigger};
 use super::{App, Device, Item, Other, Shell, at_boot, parts};
 use crate::fans::{Fans, HpFans, SimFans};
 
@@ -118,6 +119,10 @@ pub struct Choice {
     pub emergency: i32,
     /// Журнал срезов data\samples (по умолчанию включён: файл прежней сборки без ключа «log» — тоже включён).
     pub log: bool,
+    pub window_secs: i32,
+    pub settle_secs: i32,
+    pub return_gap: i32,
+    pub return_secs: i32,
 }
 
 impl Default for Choice {
@@ -127,6 +132,10 @@ impl Default for Choice {
             limit: 85,
             emergency: EMERGENCY_DEFAULT,
             log: true,
+            window_secs: 2,
+            settle_secs: 2,
+            return_gap: 0,
+            return_secs: 120,
         }
     }
 }
@@ -163,13 +172,47 @@ impl Choice {
                 .and_then(|v| whole(v, &emergency_range(limit)))
                 .unwrap_or(EMERGENCY_DEFAULT.max(limit + 1)),
             log: map.get("log").and_then(Value::as_bool).unwrap_or(default.log),
+            window_secs: map
+                .get("windowSecs")
+                .and_then(|v| whole(v, &(1..=60)))
+                .unwrap_or(default.window_secs),
+            settle_secs: map
+                .get("settleSecs")
+                .and_then(|v| whole(v, &(0..=120)))
+                .unwrap_or(default.settle_secs),
+            return_gap: map
+                .get("returnGap")
+                .and_then(|v| whole(v, &(0..=30)))
+                .unwrap_or(default.return_gap),
+            return_secs: map
+                .get("returnSecs")
+                .and_then(|v| whole(v, &(1..=600)))
+                .unwrap_or(default.return_secs),
         }
     }
 
     /// Те же настройки автомодуля (выключатель и обе отсечки): смена журнала срезов их не касается.
     #[must_use]
     pub fn same_auto(self, other: Self) -> bool {
-        (self.on, self.limit, self.emergency) == (other.on, other.limit, other.emergency)
+        Self { log: other.log, ..self } == other
+    }
+
+    fn physical_rule(self) -> Rule {
+        Rule {
+            limit: self.limit,
+            emergency: self.emergency,
+            window_secs: self.window_secs,
+        }
+    }
+
+    fn timing(self, base: Timing) -> Timing {
+        // Проверка ускоряет каждый срок относительно его прежнего реального значения.
+        Timing {
+            window: base.window.mul_f64(f64::from(self.window_secs) / 2.0),
+            settle: base.settle.mul_f64(f64::from(self.settle_secs) / 2.0),
+            pause: base.pause.mul_f64(f64::from(self.return_secs) / 120.0),
+            ..base
+        }
     }
 
     /// Команда окна «log.set» {on}: журнал срезов включён или нет. Отказ, если «on» нет, оно не да/нет или есть
@@ -211,6 +254,21 @@ impl Choice {
                     })?;
                 }
                 "emergency" => emergency = Some(value),
+                "windowSecs" => {
+                    next.window_secs =
+                        whole(value, &(1..=60)).ok_or("окно среднего — целое число секунд от 1 до 60")?;
+                }
+                "settleSecs" => {
+                    next.settle_secs =
+                        whole(value, &(0..=120)).ok_or("пауза установления — целое число секунд от 0 до 120")?;
+                }
+                "returnGap" => {
+                    next.return_gap = whole(value, &(0..=30)).ok_or("запас возврата — целое число °C от 0 до 30")?;
+                }
+                "returnSecs" => {
+                    next.return_secs =
+                        whole(value, &(1..=600)).ok_or("проверка возврата — целое число секунд от 1 до 600")?;
+                }
                 other => return Err(format!("незнакомая настройка автомодуля «{other}»")),
             }
             any = true;
@@ -238,7 +296,10 @@ impl Choice {
     /// Как выбор лежит в data\tray.json.
     #[must_use]
     pub fn file_text(self) -> String {
-        json!({ "auto": self.on, "limit": self.limit, "emergency": self.emergency, "log": self.log }).to_string()
+        json!({ "auto": self.on, "limit": self.limit, "emergency": self.emergency, "log": self.log,
+            "windowSecs": self.window_secs, "settleSecs": self.settle_secs,
+            "returnGap": self.return_gap, "returnSecs": self.return_secs })
+        .to_string()
     }
 
     /// Тема окну «settings»: выбор и допустимые отсечки — их держит эта программа, окно по ним строит ползунки;
@@ -252,6 +313,10 @@ impl Choice {
                 "on": self.on, "limit": self.limit, "emergency": self.emergency,
                 "limitRange": [LIMIT_RANGE.start(), LIMIT_RANGE.end()],
                 "emergencyRange": [range.start(), range.end()],
+                "windowSecs": self.window_secs, "settleSecs": self.settle_secs,
+                "returnGap": self.return_gap, "returnSecs": self.return_secs,
+                "windowSecsRange": [1, 60], "settleSecsRange": [0, 120],
+                "returnGapRange": [0, 30], "returnSecsRange": [1, 600],
             },
             "log": { "on": self.log },
         })
@@ -263,6 +328,17 @@ impl Choice {
 #[derive(Debug)]
 pub struct Autopilot {
     pub choice: Choice,
+    pub(super) physical: Ledger,
+    pub(super) physical_poll: Vec<Option<Reading>>,
+    pub(super) physical_relative: Vec<Option<f64>>,
+    physical_ceilings: Vec<Option<i32>>,
+    physical_poll_snapshot: Option<Rc<Value>>,
+    physical_window: Vec<Option<Reading>>,
+    physical_window_relative: Vec<Option<f64>>,
+    physical_window_snapshot: Option<Rc<Value>>,
+    physical_span: Option<(Duration, Duration)>,
+    pub(super) stats_saved: Option<Instant>,
+    pub(super) stats_dirty: bool,
     pub(super) controller: Option<Controller>,
     /// По блокам: потолок, поставленный автомодулем (ниже принятого); None — блок на принятом. Окно видит его в
     /// состоянии (app/serve.rs, поле auto).
@@ -325,6 +401,17 @@ impl Autopilot {
     pub fn new(blocks: usize) -> Self {
         Self {
             choice: Choice::default(),
+            physical: Ledger::default(),
+            physical_poll: Vec::with_capacity(blocks),
+            physical_relative: Vec::with_capacity(blocks),
+            physical_ceilings: Vec::with_capacity(blocks),
+            physical_poll_snapshot: None,
+            physical_window: Vec::with_capacity(blocks),
+            physical_window_relative: Vec::with_capacity(blocks),
+            physical_window_snapshot: None,
+            physical_span: None,
+            stats_saved: None,
+            stats_dirty: false,
             controller: None,
             overlay: vec![None; blocks],
             memory: Memory::default(),
@@ -380,6 +467,28 @@ impl Device {
     }
 }
 
+fn profile_snapshot(
+    readings: &[Option<Reading>],
+    relative: &[Option<f64>],
+    global_busy: Option<f64>,
+    ceilings: &[Option<i32>],
+    span: Option<(Duration, Duration)>,
+    at: Duration,
+) -> Value {
+    let recorded = Stamp::now();
+    let mut physical = auto_state::physical_value(readings, relative, global_busy);
+    if let Some((start, end)) = span {
+        physical["sampling"] = json!("completed-controller-window");
+        physical["ratioBasis"] = json!("busy-weighted-window-average");
+        physical["tempBasis"] = json!("arithmetic-mean-valid-polls");
+        physical["busyBasis"] = json!("arithmetic-mean-known-polls");
+        physical["startControllerSecs"] = json!(start.as_secs_f64());
+        physical["endControllerSecs"] = json!(end.as_secs_f64());
+    }
+    json!({ "physical": physical, "ceilingsBefore": ceilings, "recordedControllerSecs": at.as_secs_f64(),
+        "recordedAt": recorded.roundtrip(), "recordedTicks": recorded.0 })
+}
+
 /// Что сказал опрос раз в 2 с.
 enum Polled {
     Quiet,
@@ -398,6 +507,128 @@ enum FanFault {
 }
 
 impl App {
+    pub(super) fn observe_physical_poll(&mut self) {
+        let auto = &mut self.auto;
+        auto.physical_poll.clear();
+        auto.physical_poll
+            .extend(self.topology.blocks.iter().map(|b| Some(self.meter.latest(b.first))));
+        auto.physical_ceilings.clear();
+        auto.physical_ceilings.extend(self.topology.blocks.iter().map(|b| {
+            self.limits
+                .as_ref()
+                .filter(|limits| limits.known(b.first) && limits.answered(b.first))
+                .map(|limits| limits.current()[b.first])
+        }));
+        auto_state::relative_activity(&self.topology.blocks, &auto.physical_poll, &mut auto.physical_relative);
+        auto.physical_poll_snapshot = auto.physical.observe(PhysicalKind::Instant, &auto.physical_poll, || {
+            profile_snapshot(
+                &auto.physical_poll,
+                &auto.physical_relative,
+                auto.global_busy,
+                &auto.physical_ceilings,
+                None,
+                auto.origin.elapsed(),
+            )
+        });
+    }
+
+    fn observe_physical_window(&mut self) {
+        let auto = &mut self.auto;
+        let Some(controller) = &auto.controller else { return };
+        let span = controller.window_span();
+        if span.is_none() || span == auto.physical_span {
+            return;
+        }
+        auto.physical_span = span;
+        auto.physical.set_window_secs(auto.choice.window_secs);
+        auto.physical_window.clear();
+        auto.physical_window.extend(
+            controller
+                .window_readings()
+                .map(|r| r.temp.filter(|t| t.is_finite()).map(|_| r)),
+        );
+        auto_state::relative_activity(
+            &self.topology.blocks,
+            &auto.physical_window,
+            &mut auto.physical_window_relative,
+        );
+        auto.physical_window_snapshot = auto.physical.observe(PhysicalKind::Window, &auto.physical_window, || {
+            profile_snapshot(
+                &auto.physical_window,
+                &auto.physical_window_relative,
+                None,
+                &auto.physical_ceilings,
+                span,
+                auto.origin.elapsed(),
+            )
+        });
+    }
+
+    fn prepare_physical_failure_sources(&mut self) {
+        let auto = &mut self.auto;
+        if auto.decisions.iter().any(|d| d.cause == Cause::Emergency) && auto.physical_poll_snapshot.is_none() {
+            auto.physical_poll_snapshot = Some(Rc::new(profile_snapshot(
+                &auto.physical_poll,
+                &auto.physical_relative,
+                auto.global_busy,
+                &auto.physical_ceilings,
+                None,
+                auto.origin.elapsed(),
+            )));
+        }
+        if auto.decisions.iter().any(|d| d.cause == Cause::Target)
+            && auto.physical_window_snapshot.is_none()
+            && auto.physical_span.is_some()
+            && auto.physical_span == auto.controller.as_ref().and_then(Controller::window_span)
+        {
+            auto.physical_window_snapshot = Some(Rc::new(profile_snapshot(
+                &auto.physical_window,
+                &auto.physical_window_relative,
+                None,
+                &auto.physical_ceilings,
+                auto.physical_span,
+                auto.origin.elapsed(),
+            )));
+        }
+    }
+
+    fn remember_physical_failure(&mut self, decision: &Decision) {
+        let kind = match decision.cause {
+            Cause::Emergency => PhysicalKind::Instant,
+            Cause::Target => PhysicalKind::Window,
+            _ => return,
+        };
+        let auto = &mut self.auto;
+        let (readings, cached) = match kind {
+            PhysicalKind::Instant => (&auto.physical_poll, &auto.physical_poll_snapshot),
+            PhysicalKind::Window => {
+                if auto.physical_span != auto.controller.as_ref().and_then(Controller::window_span) {
+                    return;
+                }
+                (&auto.physical_window, &auto.physical_window_snapshot)
+            }
+        };
+        let Some(snapshot) = cached.as_ref().map(Rc::clone) else {
+            auto.physical.blocked = true;
+            self.journal
+                .error("тепловая коррекция без исходного физического снимка — автовозврат приостановлен");
+            self.serving
+                .notice("Автовозврат приостановлен: исходный физический снимок коррекции отсутствует");
+            return;
+        };
+        auto.physical.failure(
+            Trigger {
+                block: decision.block,
+                cause: decision.cause,
+                kind,
+                ratio: decision.ratio,
+            },
+            readings,
+            auto.choice.physical_rule(),
+            snapshot,
+        );
+    }
+
     fn settings_path(&self) -> std::path::PathBuf {
         self.config.data.join("tray.json")
     }
@@ -433,8 +664,9 @@ impl App {
             Settings {
                 limit: f64::from(c.limit),
                 emergency: f64::from(c.emergency),
+                return_gap: f64::from(c.return_gap),
             },
-            self.config.auto.control,
+            c.timing(self.config.auto.control),
             self.topology.blocks.len(),
         );
         if let Some(previous) = &self.auto.controller {
@@ -501,6 +733,7 @@ impl App {
             // Какое поле — температура среза: аварийная — показание, целевая — медиана, прежняя — средняя за окно.
             let temp_key = match map.get("act").and_then(Value::as_str) {
                 Some("emergency") => "reading",
+                Some("target") if map.get("policy").and_then(Value::as_str) == Some("manual-mean-config-v1") => "mean",
                 Some("target") => "median",
                 Some("lower") => "mean",
                 _ => continue,
@@ -973,7 +1206,17 @@ impl App {
 
     /// Сколько срезов памяти действует сейчас при нынешнем пределе (скрытая проверка).
     pub(crate) fn cuts_now(&self) -> usize {
-        self.auto.memory.holding(f64::from(self.auto.choice.limit))
+        self.auto.physical.failures(self.auto.choice.physical_rule())
+    }
+
+    /// Скрытая имитационная проверка: убрать память и прочитать физические записи с диска БЕЗ новой записи перед этим.
+    /// Так проверяется сохранение успешных тепловых отсечек, а не сохранение оставшегося объекта в памяти.
+    pub(crate) fn restart_physical_memory(&mut self) {
+        if !self.config.simulate {
+            return;
+        }
+        self.auto.physical = Ledger::default();
+        self.load_maxima();
     }
 
     /// Строка подсказки: что автомодуль сейчас делает.
@@ -1349,20 +1592,17 @@ impl App {
             frame.readings.push(judged.then_some(reading));
         }
         let now = self.auto.origin.elapsed();
-        let limit = f64::from(self.auto.choice.limit);
         let global_busy = self.auto.global_busy;
+        let rule = self.auto.choice.physical_rule();
         let Autopilot {
             controller,
-            memory,
+            physical,
             frame,
             decisions,
             ..
         } = &mut self.auto;
-        let blocks = &topology.blocks;
-        let allowed = |b: usize, to: i32, die: Option<f64>| {
-            blocks
-                .get(b)
-                .is_some_and(|block| memory.allows(block.first, to, limit, die))
+        let allowed = |b: usize, to: i32, _: Option<f64>, window: &[Reading]| {
+            physical.allows_closed(b, to, &frame.context, window, rule)
         };
         let view = Frame {
             readings: &frame.readings,
@@ -1379,7 +1619,16 @@ impl App {
             global_busy,
             relative: &frame.relative,
         };
-        controller.as_mut()?.step_loaded(now, &view, &load, &allowed, decisions);
+        controller
+            .as_mut()?
+            .step_loaded_physical(now, &view, &load, &allowed, decisions);
+        self.observe_physical_window();
+        let Autopilot {
+            controller,
+            frame,
+            decisions,
+            ..
+        } = &mut self.auto;
         if decisions.is_empty() {
             let changed = frame
                 .prior
@@ -1391,6 +1640,11 @@ impl App {
             }
             return None;
         }
+        self.apply_decisions(package)
+    }
+
+    fn apply_decisions(&mut self, package: Option<f64>) -> Option<String> {
+        self.prepare_physical_failure_sources();
         let decisions = std::mem::take(&mut self.auto.decisions);
         let mut refused = None;
         for decision in &decisions {
@@ -1403,6 +1657,9 @@ impl App {
                 }
                 refused = Some(refusal);
             }
+        }
+        if self.auto.physical.failure_changed {
+            self.save_maxima();
         }
         if let Err(e) = self.mark() {
             self.journal.error(&format!("метка автомодуля: {e}"));
@@ -1436,11 +1693,10 @@ impl App {
         None
     }
 
-    /// Сделанное решение: срез — в память срезов; строка журнала программы и строка журнала действий со всеми
-    /// условиями (бриф T): что сработало и по какому показанию или медиане, уровень кристалла, последние 2-с медианы всех
-    /// блоков, фактический множитель и загрузка блока, вентиляторы и видеокарта, если известны.
+    /// Успешное решение: тепловой отказ — измеренному вектору; в журналы — средние и исходный вектор опроса.
     fn record(&mut self, d: &Decision, name: &str, first: usize, base: i32, package: Option<f64>) {
         let stamp = Stamp::now();
+        self.remember_physical_failure(d);
         if matches!(d.cause, Cause::Emergency | Cause::Target) {
             self.auto.memory.cut(first, d.from, d.temp, d.die);
         }
@@ -1452,8 +1708,8 @@ impl App {
                 self.auto.choice.emergency
             ),
             Cause::Target => format!(
-                "автомодуль: блок {name} опущен ×{from} → ×{to} (2-с медиана {temp:.1} °C выше {} °C и не падает; кристалл {die} °C)",
-                self.auto.choice.limit
+                "автомодуль: блок {name} опущен ×{from} → ×{to} (среднее за {} с {temp:.1} °C выше {} °C; кристалл {die} °C)",
+                self.auto.choice.window_secs, self.auto.choice.limit
             ),
             Cause::Revert => format!("автомодуль: блок {name} ×{from} → ×{to} — повышение не подтверждено работой"),
             Cause::Return => format!(
@@ -1462,11 +1718,11 @@ impl App {
             ),
         };
         self.journal.note(&text);
-        let medians: Vec<Option<f64>> = self
+        let means: Vec<Option<f64>> = self
             .auto
             .controller
             .as_ref()
-            .map(|c| c.medians().map(|m| m.map(|v| round(v, 1))).collect())
+            .map(|c| c.means().map(|m| m.map(|v| round(v, 1))).collect())
             .unwrap_or_default();
         let ceilings: Vec<Option<i32>> = self
             .topology
@@ -1492,18 +1748,16 @@ impl App {
         line.insert("accepted".into(), json!(base));
         line.insert("limit".into(), json!(self.auto.choice.limit));
         line.insert("emergency".into(), json!(self.auto.choice.emergency));
-        // Что сработало: аварийная — одно показание, целевая и возврат — 2-с медиана.
-        let trigger = if d.cause == Cause::Emergency {
-            "reading"
-        } else {
-            "median"
-        };
+        line.insert("policy".into(), json!("manual-mean-config-v1"));
+        line.insert("windowSecs".into(), json!(self.auto.choice.window_secs));
+        // Аварийная — одно показание; целевая и возврат — среднее за выбранное окно.
+        let trigger = if d.cause == Cause::Emergency { "reading" } else { "mean" };
         // Температура среза и уровень кристалла — без округления: из них при запуске восстанавливается память срезов, а
         // она сравнивает уровень кристалла строго («ниже, чем при срезе»). Округлённый вверх, он пустил бы возврат при
         // том же кристалле (найдено скрытой проверкой: 47,46 °C записалось бы как 47,5).
         line.insert(trigger.into(), json!(temp));
         line.insert("die".into(), json!(d.die));
-        line.insert("medians".into(), json!(medians));
+        line.insert("means".into(), json!(means));
         line.insert("ratio".into(), json!(d.ratio));
         line.insert("busy".into(), json!(d.busy));
         line.insert("package".into(), json!(package.map(|p| round(p, 0))));
@@ -1516,7 +1770,12 @@ impl App {
         for name in [
             trigger,
             "die",
-            "medians",
+            "means",
+            "policy",
+            "windowSecs",
+            "ceilingsBefore",
+            "physical",
+            "physicalWindow",
             "ratio",
             "busy",
             "globalBusy",
@@ -1537,6 +1796,30 @@ impl App {
     }
 
     fn return_evidence(&self, block: usize, line: &mut Map<String, Value>) {
+        // Только при записи действия: точные измерения, без округления для интерфейса и без подмены потолками.
+        line.insert(
+            "physical".into(),
+            auto_state::physical_value(
+                &self.auto.frame.context,
+                &self.auto.frame.relative,
+                self.auto.global_busy,
+            ),
+        );
+        if let Some(controller) = &self.auto.controller
+            && let Some((start, end)) = controller.window_span()
+        {
+            // Сводка сохранённого окна отдельно от последнего опроса; глобальная нагрузка окна не измерена здесь.
+            let readings: Vec<Option<Reading>> = controller.window_readings().map(Some).collect();
+            let mut window = auto_state::physical_value(&readings, &[], None);
+            window["sampling"] = json!("completed-controller-window");
+            window["ratioBasis"] = json!("busy-weighted-window-average");
+            window["tempBasis"] = json!("arithmetic-mean-valid-polls");
+            window["busyBasis"] = json!("arithmetic-mean-known-polls");
+            window["startControllerSecs"] = json!(start.as_secs_f64());
+            window["endControllerSecs"] = json!(end.as_secs_f64());
+            window["recordedControllerSecs"] = json!(self.auto.origin.elapsed().as_secs_f64());
+            line.insert("physicalWindow".into(), window);
+        }
         line.insert("ceilingsBefore".into(), json!(self.auto.frame.ceilings));
         line.insert("globalBusy".into(), json!(self.auto.global_busy));
         line.insert(
@@ -1681,6 +1964,98 @@ mod tests {
     }
 
     #[test]
+    fn manual_controls_roundtrip_and_change_only_named_fields() {
+        let original = Choice::default();
+        let selected = original
+            .changed(&map(
+                r#"{"windowSecs":9,"settleSecs":0,"returnGap":7,"returnSecs":350}"#,
+            ))
+            .expect("valid manual settings");
+        assert_eq!(
+            (
+                selected.window_secs,
+                selected.settle_secs,
+                selected.return_gap,
+                selected.return_secs
+            ),
+            (9, 0, 7, 350)
+        );
+        assert_eq!(Choice::read(&map(&selected.file_text())), selected);
+        let next = selected.changed(&map(r#"{"limit":80}"#)).expect("valid target");
+        assert_eq!(
+            Choice {
+                limit: original.limit,
+                ..next
+            },
+            selected
+        );
+        assert_eq!(
+            selected.physical_rule(),
+            Choice {
+                settle_secs: 20,
+                return_gap: 0,
+                return_secs: 2,
+                ..selected
+            }
+            .physical_rule()
+        );
+        assert!(!selected.same_auto(original));
+    }
+
+    #[test]
+    fn invalid_manual_controls_never_partially_apply() {
+        let original = Choice::default();
+        for text in [
+            r#"{"windowSecs":0,"on":true}"#,
+            r#"{"windowSecs":61}"#,
+            r#"{"settleSecs":-1}"#,
+            r#"{"settleSecs":121}"#,
+            r#"{"returnGap":-1}"#,
+            r#"{"returnGap":31}"#,
+            r#"{"returnSecs":0}"#,
+            r#"{"returnSecs":601}"#,
+            r#"{"windowSecs":2.0}"#,
+            r#"{"returnSecs":"120"}"#,
+        ] {
+            assert!(original.changed(&map(text)).is_err(), "{text}");
+        }
+        let migrated = Choice::read(&map(
+            r#"{"auto":true,"windowSecs":0,"settleSecs":4,"returnGap":-1,"returnSecs":600}"#,
+        ));
+        assert_eq!(
+            (
+                migrated.window_secs,
+                migrated.settle_secs,
+                migrated.return_gap,
+                migrated.return_secs
+            ),
+            (2, 4, 0, 600)
+        );
+        assert!(migrated.on);
+    }
+
+    #[test]
+    fn accelerated_checks_scale_every_manual_duration() {
+        let timing = Timing {
+            window: Duration::from_millis(20),
+            recheck: Duration::from_millis(10),
+            settle: Duration::from_millis(20),
+            pause: Duration::from_millis(1200),
+        };
+        let configured = Choice {
+            window_secs: 4,
+            settle_secs: 3,
+            return_secs: 60,
+            ..Choice::default()
+        }
+        .timing(timing);
+        assert_eq!(configured.window, Duration::from_millis(40));
+        assert_eq!(configured.settle, Duration::from_millis(30));
+        assert_eq!(configured.pause, Duration::from_millis(600));
+        assert_eq!(configured.recheck, timing.recheck);
+    }
+
+    #[test]
     fn file_of_the_previous_build_is_read_as_is_its_depth_and_step_up_ignored() {
         // Файлы, записанные сборками с глубиной (0.5.3 и раньше) и с подтягиванием (0.5.5 и раньше): лишние ключи любого
         // вида не мешают остальному; аварийной в них нет — 95 °C.
@@ -1696,6 +2071,7 @@ mod tests {
                     limit: 75,
                     emergency: 95,
                     log: true,
+                    ..Choice::default()
                 },
                 "{text}: a file without «log» (0.5.4 and earlier) keeps the samples log on"
             );
@@ -1709,10 +2085,20 @@ mod tests {
             limit: 77,
             emergency: 93,
             log: false,
+            ..Choice::default()
         }
         .file_text();
         assert!(!text.contains("depth") && !text.contains("stepUp"), "{text}");
-        assert_eq!(text, r#"{"auto":true,"emergency":93,"limit":77,"log":false}"#);
+        assert_eq!(
+            Choice::read(&map(&text)),
+            Choice {
+                on: true,
+                limit: 77,
+                emergency: 93,
+                log: false,
+                ..Choice::default()
+            }
+        );
     }
 
     #[test]
@@ -1764,6 +2150,7 @@ mod tests {
             limit: 81,
             emergency: 92,
             log: true,
+            ..Choice::default()
         };
         let next = was.log_changed(&map(r#"{"id":4,"c":"log.set","on":false}"#));
         assert_eq!(next, Ok(Choice { log: false, ..was }));
@@ -1818,6 +2205,7 @@ mod tests {
             limit: 80,
             emergency: 95,
             log: true,
+            ..Choice::default()
         };
         let next = was.changed(&map(r#"{"id":7,"c":"auto.set","limit":82}"#));
         assert_eq!(next, Ok(Choice { limit: 82, ..was }));
@@ -1850,6 +2238,7 @@ mod tests {
             limit: 80,
             emergency: 90,
             log: true,
+            ..Choice::default()
         };
         assert_eq!(was.changed(&map(r#"{"limit":90}"#)).map(|c| c.emergency), Ok(91));
         assert_eq!(was.changed(&map(r#"{"limit":95}"#)).map(|c| c.emergency), Ok(96));
@@ -1902,6 +2291,7 @@ mod tests {
             limit: 77,
             emergency: 93,
             log: false,
+            ..Choice::default()
         };
         let topic: Value = serde_json::from_str(&choice.topic()).unwrap_or(Value::Null);
         assert_eq!(topic["t"], "settings");
@@ -1909,7 +2299,7 @@ mod tests {
             topic["auto"],
             json!({
                 "on": true, "limit": 77, "emergency": 93,
-                "limitRange": [60, 95], "emergencyRange": [78, 100],
+                "limitRange": [60, 95], "emergencyRange": [78, 100], "windowSecs": 2, "settleSecs": 2, "returnGap": 0, "returnSecs": 120, "windowSecsRange": [1, 60], "settleSecsRange": [0, 120], "returnGapRange": [0, 30], "returnSecsRange": [1, 600],
             })
         );
         assert_eq!(topic["log"], json!({ "on": false }), "the log switch has its own field");

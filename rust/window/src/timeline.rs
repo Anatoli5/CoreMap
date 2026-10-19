@@ -97,7 +97,7 @@ impl Quantity {
             Quantity::Ratio => "фактический множитель",
             Quantity::Ceiling => "потолок (ступени — его смены)",
             Quantity::Busy => "нагрузка, %",
-            Quantity::Level => "кристалл (средняя остальных блоков), °C",
+            Quantity::Level => "остальные блоки (средняя температура), °C",
             Quantity::GpuTemp => "видеокарта, °C",
             Quantity::GpuPower => "видеокарта, Вт",
             Quantity::GpuBusy => "видеокарта, %",
@@ -1777,7 +1777,7 @@ pub fn hover(day: &Day, under: &Under) -> String {
                     Quantity::Ratio => format!("×{x:.1}"),
                     Quantity::Ceiling => format!("потолок ×{x:.0}"),
                     Quantity::Busy => format!("нагрузка {:.0} %", x * 100.0),
-                    Quantity::Level => format!("кристалл {x:.1} °C"),
+                    Quantity::Level => format!("средняя остальных блоков {x:.1} °C"),
                     Quantity::GpuTemp
                     | Quantity::GpuPower
                     | Quantity::GpuBusy

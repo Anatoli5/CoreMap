@@ -51,6 +51,7 @@ impl Bench {
                 Settings {
                     limit: 86.0,
                     emergency: 95.0,
+                    return_gap: 0.0,
                 },
                 Timing::REAL,
                 1,
@@ -424,6 +425,7 @@ fn one_pending_trial_keeps_other_cores_from_invalidating_it() {
         Settings {
             limit: 86.0,
             emergency: 95.0,
+            return_gap: 0.0,
         },
         Timing::REAL,
         2,

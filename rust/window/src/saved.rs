@@ -97,8 +97,10 @@ pub struct Saved {
     pub model: Option<bool>,
     /// Дополнительная условная кривая при постоянной нагрузке 100 %.
     pub live_full: Option<bool>,
-    /// Оси местами: температура по горизонтали (true).
+    /// Перестановка осей графика по множителю.
     pub swap: Option<bool>,
+    /// Перестановка осей графика по времени; старое общее значение наследуется при чтении окна.
+    pub time_swap: Option<bool>,
     /// Обычный размер окна, логические точки (не зависят от масштаба экрана).
     pub size: Option<(f32, f32)>,
     /// Левый верхний угол окна с рамкой, физические точки экрана.
@@ -249,6 +251,7 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         model: map.get("model").and_then(Value::as_bool),
         live_full: map.get("liveFull").and_then(Value::as_bool),
         swap: map.get("swap").and_then(Value::as_bool),
+        time_swap: map.get("timeSwap").and_then(Value::as_bool),
         size,
         position,
         maximized: map.get("maximized").and_then(Value::as_bool).unwrap_or(false),
@@ -346,6 +349,9 @@ pub fn text(saved: &Saved) -> String {
     }
     if let Some(swap) = saved.swap {
         map.insert("swap".into(), swap.into());
+    }
+    if let Some(swap) = saved.time_swap {
+        map.insert("timeSwap".into(), swap.into());
     }
     if let Some((w, h)) = saved.size {
         map.insert("size".into(), json!([w.round(), h.round()]));
@@ -499,6 +505,7 @@ mod tests {
             model: Some(false),
             live_full: Some(true),
             swap: Some(true),
+            time_swap: Some(false),
             size: Some((1500.0, 900.0)),
             position: Some((120, 80)),
             maximized: false,

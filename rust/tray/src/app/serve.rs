@@ -662,16 +662,38 @@ impl App {
     /// когда наибольшая выросла или блок сброшен сменой потолка владельца (`keep_maxima`, — редко: таймера нет).
     /// Средние пишутся вместе с этим; накопленное с последней записи при падении программы теряется.
     pub(super) fn save_maxima(&mut self) {
-        let text = self.kept.to_json(self.store.cpu(), &self.lps_numbers());
-        self.kept.take_changed();
-        if let Err(e) = files::write_replacing(&self.maxima_path(), &text) {
-            self.journal.error(&format!("наибольшие и средние не записаны: {e}"));
+        let result = (|| {
+            let mut value: Value = serde_json::from_str(&self.kept.to_json(self.store.cpu(), &self.lps_numbers()))
+                .map_err(|e| e.to_string())?;
+            value["physicalProfiles"] = self.auto.physical.value()?;
+            files::write_replacing(&self.maxima_path(), &value.to_string()).map_err(|e| e.to_string())
+        })();
+        self.auto.stats_saved = Some(Instant::now());
+        match result {
+            Ok(()) => {
+                self.kept.take_changed();
+                self.auto.physical.changed = false;
+                self.auto.physical.failure_changed = false;
+                self.auto.stats_dirty = false;
+            }
+            Err(e) => {
+                self.auto.stats_dirty = true;
+                self.journal
+                    .error(&format!("статистика и память физических состояний не записаны: {e}"));
+                self.serving
+                    .notice(&format!("Статистика и память физических состояний не записаны: {e}"));
+            }
         }
     }
 
     /// После чтения датчиков: наибольшая выросла или блок сброшен — переписать файл.
     pub(super) fn keep_maxima(&mut self) {
-        if self.kept.take_changed() {
+        self.auto.stats_dirty |= self.kept.take_changed();
+        let due = self
+            .auto
+            .stats_saved
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(10));
+        if due && (self.auto.stats_dirty || self.auto.physical.changed) {
             self.save_maxima();
         }
     }
@@ -681,8 +703,18 @@ impl App {
     /// при первом чтении с окном (`Watch::align`).
     pub(super) fn load_maxima(&mut self) {
         let path = self.maxima_path();
+        let layout = json!({ "cpu": self.store.cpu(), "lps": self.lps_numbers(),
+            "blocks": self.topology.blocks.iter().map(|b| json!({ "members": b.members, "kind": format!("{:?}", b.kind) })).collect::<Vec<_>>() }).to_string();
+        self.auto.physical.initialize(layout);
         match files::read_object(&path) {
             Ok(Some(map)) => {
+                if let Some(value) = map.get("physicalProfiles")
+                    && let Err(e) = self.auto.physical.restore(value, self.topology.blocks.len())
+                {
+                    self.auto.physical.blocked = true;
+                    self.journal.error(&e);
+                    self.serving.notice(&format!("Автовозврат приостановлен: {e}"));
+                }
                 let (cpu, lps) = (self.store.cpu().to_owned(), self.lps_numbers()); // once at start
                 if !self.kept.restore(&map, &cpu, &lps) {
                     self.journal
@@ -690,9 +722,15 @@ impl App {
                 }
             }
             Ok(None) => {}
-            Err(spoiled) => self
-                .journal
-                .error(&format!("наибольшие и средние не прочитаны: {spoiled}")),
+            Err(spoiled) => {
+                self.auto.physical.blocked = true;
+                self.journal.error(&format!(
+                    "статистика и память физических состояний не прочитаны: {spoiled}"
+                ));
+                self.serving.notice(&format!(
+                    "Автовозврат приостановлен: память физических состояний не прочитана: {spoiled}"
+                ));
+            }
         }
         if let (Some(intended), Some(limits)) = (self.intended.as_deref(), self.limits.as_ref())
             && self.kept.align(intended, limits.current())
@@ -957,6 +995,7 @@ impl App {
             "max.reset" => {
                 let meter = &self.meter;
                 self.kept.reset(|core| meter.latest(core).temp);
+                self.auto.physical.reset_statistics();
                 self.log_event("reset", None, None, None, serde_json::Map::new());
                 self.save_maxima();
                 None
