@@ -224,6 +224,7 @@ pub struct View {
     pub max: bool,
     /// Кривые модели нагрева (переключатель «модель»).
     pub model: bool,
+    live_full: bool,
     pub swap: bool,
     /// Ось x — время (иначе множитель).
     pub timeline: bool,
@@ -310,6 +311,7 @@ impl View {
         let curves = memory.saved.curves.unwrap_or_default();
         let max = memory.saved.max.unwrap_or(false);
         let model = memory.saved.model.unwrap_or(true);
+        let live_full = memory.saved.live_full.unwrap_or(false);
         let swap = memory.saved.swap.unwrap_or(false);
         let timeline = memory.saved.timeline.unwrap_or(false);
         let layout = match memory.saved.layout {
@@ -341,6 +343,7 @@ impl View {
             curves,
             max,
             model,
+            live_full,
             swap,
             timeline,
             layout,
@@ -904,7 +907,7 @@ impl View {
             scale: self.scale,
             curves: self.curves,
             max: self.max,
-            model: self.model,
+            model: self.model_switch(),
             swap: self.swap,
             argument_range: self.ranges.get("ratio").copied(),
             value_range: self.ranges.get(&format!("ratio-value:{}", self.scale.index())).copied(),
@@ -946,8 +949,8 @@ impl View {
         if ui.get_chart_max() != self.max {
             ui.set_chart_max(self.max);
         }
-        if ui.get_chart_model() != self.model {
-            ui.set_chart_model(self.model);
+        if ui.get_chart_model() != self.model_switch() {
+            ui.set_chart_model(self.model_switch());
         }
         if ui.get_chart_swap() != self.swap {
             ui.set_chart_swap(self.swap);
@@ -1286,6 +1289,7 @@ impl View {
         saved.curves = Some(self.curves);
         saved.max = Some(self.max);
         saved.model = Some(self.model);
+        saved.live_full = Some(self.live_full);
         saved.swap = Some(self.swap);
         saved.timeline = Some(self.timeline);
         saved.layout = Some(self.layout);
@@ -1420,9 +1424,21 @@ impl View {
 
     /// Кривые модели нагрева: показать или скрыть (свой выключатель, вместе с линиями ø и 95 %).
     pub fn model_toggled(&mut self) {
-        self.model = !self.model;
+        if self.scale == Scale::Efficiency {
+            self.live_full = !self.live_full;
+        } else {
+            self.model = !self.model;
+        }
         self.refresh_stats();
         self.remember();
+    }
+
+    fn model_switch(&self) -> bool {
+        if self.scale == Scale::Efficiency {
+            self.live_full
+        } else {
+            self.model
+        }
     }
 
     /// Оси местами: температура по горизонтали (true).

@@ -9,11 +9,9 @@
 // Окну поток начинает читать, когда знает блоки и их соседей (`Order::Die`, после знакомства): строка наибольшей
 // температуры корзины («макс») помнит температуры соседей. Сменились блоки — файлы читаются заново.
 //
-// Модель нагрева (model.rs, DECISIONS #39) — здесь же, после прохода: строки по 0,25 с каждого файла оставляет тот же
-// разбор (`Scratch::count_keeping`), второго чтения файлов нет. Подгонка — заново по всем оставленным строкам: сразу после
-// знакомства (или смены соседей), а пока срезы дописываются — не чаще раза в `REFIT`. После подгонки — хранение
-// (`model::retain`, бриф W 16.10, вместо границы 8 ч): у насыщенных клеток (блок, множитель) старые строки выбрасываются.
-// Окно подгонку не ждёт: она приходит в той же сводке.
+// Сырые строки одного разбора сохраняются без сокращения прежней моделью. Условная модель получает неизменяемый
+// снимок в отдельном вычислительном потоке: один пакет журналов, блоки последовательно, готовые запросы в Digest.live.
+// Прежняя модель остаётся для диагностических видов и не меняет исходную историю условной модели.
 //
 // День журнала для вида «по времени» (timeline.rs) поток читает по просьбе окна (`Order::Day`) — весь день заново, не из
 // сводки; пока этот день дописывается, перечитывает его не чаще раза в `DAY_REFRESH`.
@@ -24,6 +22,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::conditional_runtime::{self, LiveCurves, Runtime};
 use crate::events::{self, AutoEntry, Event, EventEntry};
 use crate::model::{self, Die, Log, Model};
 use crate::samples::{self, Carry, Columns, Fresh, Scratch, Tail, Tally};
@@ -34,8 +33,8 @@ use crate::timeline::{self, Day, Quantity};
 pub const SCAN: Duration = Duration::from_secs(5);
 /// Срезы за сколько дней (программа входа хранит 30 и удаляет старые сама).
 pub const DAYS: i64 = 30;
-/// Подгонка модели, пока срезы дописываются, — не чаще раза в минуту: минута новых строк почти не меняет кривые, а
-/// подгонка с хранением — проход по всем оставленным строкам. Цена — настройка, не правило управления (бриф W).
+/// Минимальная пауза после завершения пакета подгонки до следующего: фоновый расчёт не должен работать непрерывно,
+/// пока срезы дописываются. Прежняя настройка темпа, не измеренный бюджет вычислений или правило управления.
 pub const REFIT: Duration = Duration::from_secs(60);
 /// Показанный день дописывается — перечитать его не чаще раза в столько (день строк по 0,25 с — десятки МБ текста).
 pub const DAY_REFRESH: Duration = Duration::from_secs(30);
@@ -43,6 +42,7 @@ pub const DAY_REFRESH: Duration = Duration::from_secs(30);
 /// Что окно получает из потока статистики.
 #[derive(Debug, Default)]
 pub struct Digest {
+    pub live: Option<Arc<LiveCurves>>,
     pub conditional: Option<Arc<crate::conditional_snapshot::Snapshot>>,
     pub conditional_trouble: Option<String>,
     pub tally: Tally,
@@ -112,6 +112,14 @@ struct SampleFile {
     reason = "independent facts of the reading thread (waits for blocks, refit due, rows stale, day stale), not one state machine"
 )]
 struct Worker {
+    live: Option<Arc<LiveCurves>>,
+    runtime: Option<Runtime>,
+    runtime_enabled: bool,
+    live_trouble: Option<String>,
+    generation: u64,
+    source_revision: u64,
+    live_fitted: Option<Instant>,
+    live_submitted_revision: Option<u64>,
     conditional: Option<Arc<crate::conditional_snapshot::Snapshot>>,
     conditional_stamp: Option<SystemTime>,
     conditional_trouble: Option<String>,
@@ -155,8 +163,10 @@ pub fn start(dir: PathBuf, deliver: impl Fn(Delivery) + Send + 'static) -> mpsc:
         dir,
         days: Some(DAYS),
         wait_die: true,
+        runtime_enabled: true,
         ..Worker::default()
     };
+    worker.ensure_runtime();
     thread::Builder::new()
         .name("статистика".into())
         .spawn(move || {
@@ -196,6 +206,18 @@ impl Worker {
         self.refit = true;
         self.files.clear();
         self.die = Some(die);
+        self.reset_live();
+    }
+
+    fn reset_live(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.source_revision = self.source_revision.saturating_add(1);
+        self.live = None;
+        self.live_submitted_revision = None;
+        self.live_fitted = None;
+        if let Some(runtime) = &self.runtime {
+            runtime.invalidate(self.generation);
+        }
     }
 
     /// Пора ли подгонять модель в момент `now`: соседи известны и либо сменились (первая подгонка после знакомства —
@@ -232,9 +254,10 @@ impl Worker {
     fn scan(&mut self, first: bool) -> Option<Digest> {
         let started = Instant::now();
         let mut changed = first | self.read_conditional(first);
-        let mut trouble = None;
+        let mut trouble = self.live_trouble.clone();
         let mut parsed_bytes = 0;
         let mut parsed_rows = 0;
+        let mut source_available = true;
 
         // Срезы: файлы дня (`day_of`) не старше DAYS дней (у отчёта — все).
         let cutoff = self.days.map(|days| samples::date_before(SystemTime::now(), days));
@@ -245,11 +268,17 @@ impl Worker {
                 .filter(|n| day_of(n).is_some_and(|d| cutoff.as_deref().is_none_or(|c| d >= c)))
                 .collect::<Vec<_>>(),
             // Папки срезов нет — программа входа ещё ничего не писала; это не ошибка.
-            Err(_) => Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                trouble = Some(format!("папка срезов не прочитана: {error}"));
+                source_available = false;
+                self.files.keys().cloned().collect() // Ошибка доступа не означает удаления уже прочитанных файлов.
+            }
         };
         let before = self.files.len();
         self.files.retain(|name, _| names.contains(name));
         let mut fresh = self.files.len() != before;
+        let mut reset = fresh;
         let die = self.die.as_deref();
         for name in names {
             let path = self.samples.join(&name);
@@ -259,31 +288,38 @@ impl Worker {
                 .is_some_and(|d| day_of(&name) == Some(d.date.as_str()));
             let file = self.files.entry(name).or_default();
             match read_samples(&path, file, &mut self.scratch, die) {
-                Ok(Some((bytes, rows))) => {
+                Ok(Some((bytes, rows, again))) => {
                     fresh = true;
+                    reset |= again;
                     self.day_stale |= of_day;
                     parsed_bytes += bytes;
                     parsed_rows += rows;
                 }
                 Ok(None) => {}
-                Err(e) => trouble = Some(format!("срезы {} не прочитаны: {e}", path.display())),
+                Err(e) => {
+                    trouble = Some(format!("срезы {} не прочитаны: {e}", path.display()));
+                    source_available = false;
+                }
             }
         }
         changed |= fresh;
         self.stale |= fresh;
-        // Модель — по оставленным строкам заново (цена — `Model::time`), затем хранение.
-        if self.due(Instant::now())
-            && let Some(die) = &self.die
-        {
-            let mut logs: Vec<&mut Log> = self.files.values_mut().map(|f| &mut f.log).collect();
-            let model = model::fit(&logs.iter().map(|l| &**l).collect::<Vec<_>>(), die);
-            self.retained = Some(model::retain(&mut logs, die, &model));
-            self.model = Some(Arc::new(model));
-            self.fitted = Some(Instant::now());
-            self.refit = false;
-            self.stale = false;
+        if reset {
+            self.reset_live();
+        }
+        if fresh {
+            self.source_revision = self.source_revision.saturating_add(1);
+            self.mark_live_pending();
+        }
+        changed |= self.update_live(source_available);
+        if let Some(message) = &self.live_trouble {
+            trouble = Some(message.clone()); // Пользовательская ошибка текущей сводки.
+        }
+        if !source_available {
+            self.mark_live_pending();
             changed = true;
         }
+        changed |= self.fit_legacy();
 
         changed |= self.read_events(cutoff.as_deref(), &mut trouble);
 
@@ -302,6 +338,7 @@ impl Worker {
             .collect();
         days.dedup();
         Some(Digest {
+            live: self.live.as_ref().map(Arc::clone),
             conditional: self.conditional.as_ref().map(Arc::clone),
             conditional_trouble: self.conditional_trouble.clone(),
             tally,
@@ -316,6 +353,113 @@ impl Worker {
             parse_time: started.elapsed(),
             trouble,
         })
+    }
+
+    fn fit_legacy(&mut self) -> bool {
+        // Прежний расчёт нужен диагностическим видам. Он не владеет хранением исходных строк новой модели.
+        if !self.due(Instant::now()) {
+            return false;
+        }
+        let Some(die) = &self.die else { return false };
+        let logs: Vec<&Log> = self.files.values().map(|f| &f.log).collect();
+        self.model = Some(Arc::new(model::fit(&logs, die)));
+        self.retained = None;
+        self.fitted = Some(Instant::now());
+        self.refit = false;
+        self.stale = false;
+        true
+    }
+
+    fn mark_live_pending(&mut self) {
+        let mut live = self.live.as_deref().cloned().unwrap_or_else(|| LiveCurves {
+            generation: self.generation,
+            source_revision: self.source_revision,
+            ..LiveCurves::default()
+        }); // Здесь копируются только Arc готовых блоков, не точки и не журналы.
+        live.pending = true;
+        self.live = Some(Arc::new(live));
+    }
+
+    fn update_live(&mut self, source_available: bool) -> bool {
+        self.ensure_runtime();
+        let Some(runtime) = &mut self.runtime else {
+            return false;
+        };
+        let mut changed = false;
+        let update = match runtime.poll() {
+            Ok(update) => update,
+            Err(message) => {
+                self.runtime = None;
+                self.live = None;
+                self.live_trouble = Some(format!("условная модель не пересчитана: {message}"));
+                self.live_fitted = Some(Instant::now());
+                return true;
+            }
+        };
+        if let Some(update) = update {
+            // pending самого вычислителя означает незавершённый пакет. Проверяется до добавления признака более
+            // свежих строк: при непрерывной записи этот второй признак остаётся true и после завершения подгонки.
+            self.live_fitted = completed_at(self.live_fitted, self.generation, &update, Instant::now());
+            if let Some(live) = receive_live(
+                self.live.as_deref(),
+                update,
+                self.generation,
+                self.source_revision,
+                self.die.as_ref().map_or(0, |die| die.names.len()),
+            ) {
+                self.live = Some(Arc::new(live));
+                changed = true;
+            }
+        }
+        let due = live_due(
+            Instant::now(),
+            self.live_fitted,
+            self.source_revision,
+            self.live_submitted_revision,
+        );
+        if !source_available || !due || runtime.busy() {
+            return changed;
+        }
+        let Some(die) = &self.die else {
+            return changed;
+        };
+        let batch = conditional_runtime::Batch {
+            generation: self.generation,
+            source_revision: self.source_revision,
+            // Одна копия сырых журналов на пакет нужна, чтобы читатель продолжал принимать новые строки во время
+            // подгонки. Одновременно существует только один пакет, без очереди копий по каждому блоку/срезу.
+            logs: self.files.values().map(|f| f.log.clone()).collect(),
+            die: Arc::clone(die),
+            options: crate::conditional_live::Options::default(),
+        };
+        self.live_submitted_revision = Some(self.source_revision);
+        self.live_fitted = Some(Instant::now());
+        match runtime.submit(batch) {
+            Ok(()) => self.live_trouble = None,
+            Err(error) => {
+                self.live_trouble = Some(format!("условная модель не пересчитана: {error}"));
+                self.live = None;
+                self.runtime = None;
+            }
+        }
+        true
+    }
+
+    fn ensure_runtime(&mut self) {
+        if !self.runtime_enabled || self.runtime.is_some() || self.live_fitted.is_some_and(|at| at.elapsed() < REFIT) {
+            return;
+        }
+        match Runtime::start() {
+            Ok(runtime) => {
+                self.runtime = Some(runtime);
+                self.live_submitted_revision = None;
+                self.live_trouble = None;
+            }
+            Err(error) => {
+                self.live_trouble = Some(format!("поток условной модели не запущен: {error}"));
+                self.live_fitted = Some(Instant::now());
+            }
+        }
     }
 
     fn read_conditional(&mut self, first: bool) -> bool {
@@ -378,6 +522,44 @@ impl Worker {
         }
         logged
     }
+}
+
+fn completed_at(previous: Option<Instant>, generation: u64, update: &LiveCurves, now: Instant) -> Option<Instant> {
+    if update.generation == generation && !update.pending {
+        Some(now)
+    } else {
+        previous
+    }
+}
+
+fn live_due(now: Instant, completed: Option<Instant>, source_revision: u64, submitted: Option<u64>) -> bool {
+    submitted != Some(source_revision) && completed.is_none_or(|at| now.saturating_duration_since(at) >= REFIT)
+}
+
+fn receive_live(
+    previous: Option<&LiveCurves>,
+    update: Arc<LiveCurves>,
+    generation: u64,
+    source_revision: u64,
+    blocks: usize,
+) -> Option<LiveCurves> {
+    if update.generation != generation {
+        return None;
+    }
+    let pending = update.pending;
+    // При обновлении полный предыдущий пакет остаётся целиком и с прежней подписью источника. Старт без такого
+    // пакета показывает блоки по мере готовности. Финальный отказ блока заменяет старую кривую, как и успех.
+    let mut live = if let Some(previous) = previous
+        && previous.generation == generation
+        && previous.blocks.len() == blocks
+        && pending
+    {
+        previous.clone() // Только Arc готовых блоков, без копии точек/журналов.
+    } else {
+        Arc::unwrap_or_clone(update)
+    };
+    live.pending |= pending || live.source_revision != source_revision;
+    Some(live)
 }
 
 /// Все файлы срезов папки `samples` (без границы в 30 дней) — для скрытого отчёта модели: тот же разбор, что у окна.
@@ -456,24 +638,24 @@ fn read_samples(
     file: &mut SampleFile,
     scratch: &mut Scratch,
     die: Option<&Die>,
-) -> std::io::Result<Option<(u64, u64)>> {
-    let text = match samples::read_new(path, &mut file.tail)? {
+) -> std::io::Result<Option<(u64, u64, bool)>> {
+    let (text, again) = match samples::read_new(path, &mut file.tail)? {
         Fresh::Same => return Ok(None),
-        Fresh::More(text) => text,
+        Fresh::More(text) => (text, false),
         Fresh::Again(text) => {
             file.headed = false;
             file.columns = None;
             file.tally = Tally::default();
             file.carry = Carry::default();
             file.log = Log::default();
-            text
+            (text, true)
         }
     };
     let mut body = text.as_str();
     if !file.headed {
         // Первая полная строка файла — заголовок (read_new отдаёт только полные строки).
         let Some((header, rest)) = body.split_once('\n') else {
-            return Ok(Some((text.len() as u64, 0)));
+            return Ok(Some((text.len() as u64, 0, again)));
         };
         file.headed = true;
         file.columns = Columns::parse(header);
@@ -489,7 +671,7 @@ fn read_samples(
     if let Some(columns) = &file.columns {
         scratch.count_keeping(columns, body, &mut file.carry, &mut file.tally, Some(&mut file.log));
     }
-    Ok(Some((text.len() as u64, file.tally.rows - rows_before)))
+    Ok(Some((text.len() as u64, file.tally.rows - rows_before, again)))
 }
 
 #[cfg(test)]
@@ -528,6 +710,188 @@ mod tests {
         let samples = dir.join("samples");
         std::fs::create_dir_all(&samples).expect("папка срезов");
         (dir, samples)
+    }
+
+    #[test]
+    fn canonical_raw_history_survives_a_saturated_legacy_fit() {
+        let (dir, samples) = temp_samples("raw-not-legacy-retained");
+        let mut text = String::from("time,package,0.ceiling,0.ratio,0.busy,0.temp,1.ceiling,1.ratio,1.busy,1.temp\n");
+        for q in 0..7200u32 {
+            let (s, ms) = (q / 4, q % 4 * 250);
+            let (ratio, temp) = if (3000..3200).contains(&q) { (40, 62) } else { (45, 66) };
+            writeln!(
+                text,
+                "2026-10-15 01:{:02}:{:02}.{ms:03},60,53,{ratio},0.8,{temp},53,45,0.8,58",
+                s / 60,
+                s % 60
+            )
+            .expect("строка в памяти");
+        }
+        std::fs::write(samples.join("2026-10-15.csv"), text).expect("сырые измерения");
+        let mut worker = Worker {
+            dir: dir.clone(),
+            samples,
+            days: None,
+            die: Some(Arc::new(Die {
+                names: vec!["0".into(), "1".into()],
+                e: vec![false; 2],
+                neighbours: vec![vec![1], vec![0]],
+            })),
+            refit: true,
+            ..Worker::default()
+        };
+        let digest = worker.scan(true).expect("проход с подгонкой");
+        assert_eq!(digest.tally.rows, 7200);
+        assert_eq!(worker.files.values().map(|f| f.log.rows()).sum::<usize>(), 7200);
+        assert!(
+            digest.retained.is_none(),
+            "прежняя насыщенность не сокращает историю новой модели"
+        );
+        let _ = std::fs::remove_dir_all(dir); // Только временный каталог данного теста.
+    }
+
+    #[test]
+    fn raw_append_marks_old_curve_pending_and_rewrite_invalidates_its_generation() {
+        let (dir, samples) = temp_samples("live-revision");
+        let file = samples.join("2026-10-15.csv");
+        std::fs::write(&file, quarter_rows("2026-10-15", 3600, 3610)).expect("первый журнал");
+        let mut worker = Worker {
+            dir: dir.clone(),
+            samples,
+            days: None,
+            die: Some(one_block()),
+            ..Worker::default()
+        };
+        worker.scan(true).expect("чтение");
+        let generation = worker.generation;
+        let revision = worker.source_revision;
+        worker.live = Some(Arc::new(LiveCurves {
+            generation,
+            source_revision: revision,
+            pending: false,
+            blocks: Vec::new(),
+        }));
+        let mut text = std::fs::read_to_string(&file).expect("журнал");
+        text.push_str(
+            quarter_rows("2026-10-15", 3610, 3620)
+                .split_once('\n')
+                .expect("заголовок")
+                .1,
+        );
+        std::fs::write(&file, text).expect("дописанные строки");
+        let appended = worker.scan(false).expect("новая сводка");
+        assert!(worker.source_revision > revision);
+        let live = appended.live.expect("свежесть кривой");
+        assert!(live.pending);
+        assert_eq!(
+            live.source_revision, revision,
+            "старый результат не получает новую подпись источника"
+        );
+        assert_eq!(worker.files.values().map(|f| f.log.rows()).sum::<usize>(), 80);
+
+        std::fs::write(&file, quarter_rows("2026-10-15", 3600, 3601)).expect("перезаписанный журнал");
+        let rewritten = worker.scan(false).expect("сброс источника");
+        assert!(worker.generation > generation);
+        let live = rewritten.live.expect("ожидание новой модели");
+        assert!(live.pending && live.blocks.is_empty());
+        assert_eq!(live.generation, worker.generation);
+        assert_eq!(worker.files.values().map(|f| f.log.rows()).sum::<usize>(), 4);
+        let _ = std::fs::remove_dir_all(dir); // Только временный каталог данного теста.
+    }
+
+    #[test]
+    fn complete_revision_stays_visible_until_refresh_finishes_including_a_failed_block() {
+        let block = |name: &str, status: &str| {
+            Arc::new(crate::conditional_runtime::LiveBlock {
+                name: name.into(),
+                observed: None,
+                sustained: None,
+                status: status.into(),
+                prepared_rows: 0,
+                training_rows: 0,
+                eligible_rows: 0,
+                first_ms: None,
+                last_ms: None,
+                coverage: Vec::new(),
+                omitted_contexts: Vec::new(),
+                options: crate::conditional_live::Options::default(),
+            })
+        };
+        let previous = LiveCurves {
+            generation: 3,
+            source_revision: 10,
+            pending: false,
+            blocks: vec![block("0", "предыдущий результат"), block("1", "предыдущий результат")],
+        };
+        let partial = Arc::new(LiveCurves {
+            generation: 3,
+            source_revision: 11,
+            pending: true,
+            blocks: vec![block("0", "новый результат")],
+        });
+        let visible = receive_live(Some(&previous), Arc::clone(&partial), 3, 12, 2).expect("ожидание обновления");
+        assert_eq!(visible.source_revision, 10);
+        assert!(visible.pending && Arc::ptr_eq(&visible.blocks[1], &previous.blocks[1]));
+        let startup = receive_live(None, partial, 3, 12, 2).expect("первый расчёт поступает по блокам");
+        assert_eq!(startup.blocks.len(), 1);
+        assert_eq!(startup.source_revision, 11);
+
+        let complete = Arc::new(LiveCurves {
+            generation: 3,
+            source_revision: 11,
+            pending: false,
+            blocks: vec![block("0", "новый результат"), block("1", "новая подгонка не сошлась")],
+        });
+        let replaced = receive_live(Some(&previous), Arc::clone(&complete), 3, 12, 2).expect("новый полный результат");
+        assert_eq!(replaced.source_revision, 11);
+        assert!(replaced.pending, "появилась ещё более свежая исходная запись");
+        assert_eq!(replaced.blocks[1].status, "новая подгонка не сошлась");
+        assert!(!Arc::ptr_eq(&replaced.blocks[1], &previous.blocks[1]));
+        assert!(
+            receive_live(None, complete, 4, 12, 2).is_none(),
+            "старое поколение не проходит"
+        );
+    }
+
+    #[test]
+    fn live_refresh_pause_starts_at_completion_even_when_a_batch_takes_longer_than_the_interval() {
+        let started = Instant::now();
+        let finished = started + REFIT + Duration::from_secs(10);
+        let mut update = LiveCurves {
+            generation: 2,
+            source_revision: 8,
+            pending: true,
+            blocks: Vec::new(),
+        };
+        let before = completed_at(Some(started), 2, &update, finished);
+        assert_eq!(before, Some(started), "промежуточный блок не завершает пакет");
+        update.pending = false;
+        let completed = completed_at(before, 2, &update, finished);
+        assert_eq!(completed, Some(finished));
+        assert!(
+            !live_due(finished, completed, 9, Some(8)),
+            "нет немедленной новой подгонки"
+        );
+        assert!(!live_due(
+            finished + REFIT.saturating_sub(Duration::from_millis(1)),
+            completed,
+            9,
+            Some(8)
+        ));
+        assert!(live_due(finished + REFIT, completed, 9, Some(8)));
+        assert!(
+            !live_due(finished + REFIT, completed, 8, Some(8)),
+            "источник не менялся"
+        );
+        assert_eq!(
+            completed_at(None, 3, &update, finished),
+            None,
+            "отменённый пакет не задерживает новое поколение"
+        );
+        assert!(
+            live_due(finished, None, 1, None),
+            "первый пакет нового поколения начинается сразу"
+        );
     }
 
     #[test]

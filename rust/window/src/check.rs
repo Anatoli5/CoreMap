@@ -2780,139 +2780,89 @@ fn rounded(v: f32) -> u32 {
 // ----- эффективность, «макс», отсечки, вид «по времени» (бриф W) -----
 
 impl Check {
-    /// Шаг 1б: вид «эффективность» (бриф 16.10) — по умолчанию (файла окна нет): у блока — точки по целым множителям
-    /// (производительность на градус) с линией между соседними и усами разброса, ø, 95 % и «макс» недоступны (щелчок по
-    /// «ø» ничего не меняет), ось — «производительность на °C» от нуля; в подсказке столбца — эффективность с разбросом,
-    /// свой нагрев и данные, в подсказке блока — что влияет на температуру ядра. Картинки F-own.png, F-own-tip.png. В
-    /// конце — «над кристаллом» и снова один P-блок: дальше идут шаги сырых корзин.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one scenario of clicks, hovers and pictures, read top to bottom"
-    )]
+    /// Основной график проверяется на результатах живой модели и двух режимах нагрузки.
     fn own_view(&mut self, p_block: &BlockInfo, e_block: &BlockInfo) {
         let (p, e) = (p_block.index, e_block.index);
         let default = self.view.borrow().scale == Scale::Efficiency && self.ui.get_chart_view() == 0;
         let ready = |v: &View| {
-            v.shown_stats
-                .as_ref()
-                .and_then(|s| s.series.iter().find(|l| l.block == p))
-                .is_some_and(|l| !l.points.is_empty() && !l.sensitivity.is_empty())
+            v.shown_stats.as_ref().is_some_and(|s| {
+                s.series.iter().any(|line| line.block == p && !line.mean.is_empty()) && s.note.contains("Живой расчёт")
+            })
         };
         let drawn = self.pump(ready, 30.0);
-        let series = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| s.series.iter().find(|l| l.block == p).cloned());
-        let plain = series
-            .as_ref()
-            .is_some_and(|l| l.p95.is_empty() && l.max.is_empty() && l.model.is_empty() && !l.mean.is_empty());
-        let ticks: Vec<String> = self.ui.get_chart_ticks().iter().map(|t| t.text.to_string()).collect();
-        let fitted_range = self.view.borrow().shown_stats.as_ref().and_then(|s| s.value_range);
-        let fits_data = fitted_range.is_some_and(|r| r.min > 0.0 && r.max > r.min);
         self.check(
-            default
-                && drawn
-                && plain
-                && fits_data
-                && self.ui.get_chart_value_title().contains("производительность на °C"),
-            format!(
-                "по умолчанию — «эффективность»: у {} {} точек с областью чувствительности и линия между соседними множителями, линий 95 %, наибольших и кривой модели нет; автодиапазон выбранных данных: {ticks:?}",
-                p_block.name,
-                series.as_ref().map_or(0, |l| l.points.len())
-            ),
+            default && drawn && self.ui.get_chart_value_title().contains("собственный нагрев"),
+            "основная эффективность пришла от живой условной модели, а не прежнего расчёта",
         );
-        // Область замкнута и обрезана по полю; основной расчёт сохраняется отдельной линией.
-        let sensitivity_ok = series.as_ref().is_some_and(|line| {
-            let values: Vec<f64> = line
-                .sensitivity
-                .split_whitespace()
-                .filter_map(|t| t.parse().ok())
-                .collect();
-            line.sensitivity.contains('Z')
-                && values.len() >= 6
-                && values.iter().all(|v| v.is_finite() && (0.0..=1000.0).contains(v))
-                && !line.mean.is_empty()
-        });
-        self.check(
-            sensitivity_ok,
-            "эффективность: полупрозрачная замкнутая область и отдельная основная линия",
-        );
-        // ø, 95 % и «макс» в этом виде недоступны: настоящий щелчок по «ø» ничего не меняет.
         let curves = self.view.borrow().curves;
-        let (x, y) = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
-        self.click(x, y, PointerEventButton::Left);
-        let (x, y) = (self.ui.get_max_chip_x(), self.ui.get_max_chip_y());
-        self.click(x, y, PointerEventButton::Left);
-        let still = self.view.borrow().curves == curves && !self.view.borrow().max;
-        self.check(
-            still,
-            "щелчки по серым «ø» и «макс» в «эффективности» ничего не изменили",
+        let at = (self.ui.get_mean_chip_x(), self.ui.get_mean_chip_y());
+        self.click(at.0, at.1, PointerEventButton::Left);
+        let raw_unchanged = self.view.borrow().curves == curves;
+        self.check(raw_unchanged, "сырые средние не меняют условную кривую");
+        let old_model_switch = self.view.borrow().model;
+        let full_before = self.ui.get_chart_model();
+        let at = (self.ui.get_model_chip_x(), self.ui.get_model_chip_y());
+        if !full_before {
+            self.click(at.0, at.1, PointerEventButton::Left);
+        }
+        let full = self.pump(
+            |v| {
+                v.shown_stats.as_ref().is_some_and(|s| {
+                    s.series
+                        .iter()
+                        .any(|line| line.block == p && !line.model_dash.is_empty())
+                })
+            },
+            3.0,
         );
-        // Второй блок — кластер: две линии.
+        let legacy_unchanged = self.view.borrow().model == old_model_switch;
+        self.check(
+            full && self.ui.get_chart_model() && legacy_unchanged,
+            "«100 %» добавляет отдельный запрос полной нагрузки, сохраняя выключатель модели сырых графиков",
+        );
+        if !full_before {
+            self.click(at.0, at.1, PointerEventButton::Left);
+        }
         let (ex, ey) = self.tile_center(e);
         self.click(ex, ey, PointerEventButton::Left);
-        let two = self.pump(|v| v.compared == [p, e], 2.0);
-        let lines = self.ui.get_chart_series().row_count();
-        self.check(
-            two && lines == 2,
-            format!("кластер {} добавлен: линий {lines}", e_block.name),
+        let two = self.pump(
+            |v| {
+                v.compared == [p, e]
+                    && v.shown_stats
+                        .as_ref()
+                        .is_some_and(|s| s.series.iter().any(|line| line.block == e && !line.mean.is_empty()))
+            },
+            30.0,
         );
+        self.check(two, "к сравнению добавилась живая условная кривая E-блока");
         let shot = self.shot("own");
-        self.check(shot, "картинка: эффективность у P-ядра и кластера");
-        // Подсказка столбца: у столбца с точкой P-ядра — эффективность с разбросом, свой нагрев, данные и нагрузка.
-        let (column, tip) = self
-            .view
-            .borrow()
-            .shown_stats
-            .as_ref()
-            .and_then(|s| {
-                s.columns
-                    .iter()
-                    .enumerate()
-                    .find(|(_, c)| c.tip.contains("на °C") && c.tip.contains(&p_block.name))
-                    .map(|(i, c)| (i, c.tip.replace('\u{a0}', " ")))
-            })
-            .unwrap_or_default();
-        let tip_ok = tip.contains("производительность на градус")
-            && tip.contains("на °C")
-            && tip.contains("свой нагрев")
-            && tip.contains("данных")
-            && tip.contains("нагрузка ø");
-        self.check(
-            tip_ok,
-            format!("подсказка столбца эффективности: «{}»", tip.replace('\n', " / ")),
-        );
-        self.chart_tip(column, 0.5, "эффективность: подсказка столбца");
-        let shot = self.shot("own-tip");
-        self.check(shot, "картинка: подсказка столбца эффективности");
-        self.leave();
-        let legend: Vec<String> = self.ui.get_stats_legend().iter().map(|l| l.tip.to_string()).collect();
-        let influence = legend.iter().all(|t| {
-            t.contains("Что влияет на температуру ядра")
-                && t.contains("кристалл")
-                && t.contains("своя работа")
-                && t.contains("соседи")
-                && t.contains("предыдущие секунды")
-                && t.contains("действуют через кристалл")
-                && t.contains("эффективность: множитель / свой нагрев")
+        self.check(shot, "картинка: живая эффективность P-ядра и E-блока");
+        let tip = self.view.borrow().shown_stats.as_ref().and_then(|s| {
+            s.columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.tip.contains("свой нагрев") && c.tip.contains("записанная нагрузка"))
+                .map(|(index, c)| (index, c.tip.clone()))
         });
         self.check(
-            influence,
-            format!(
-                "в подсказке блока — что влияет на температуру ядра и что такое эффективность: {}",
-                legend
-                    .first()
-                    .map(|t| t
-                        .lines()
-                        .filter(|l| l.starts_with("• "))
-                        .collect::<Vec<_>>()
-                        .join(" / "))
-                    .unwrap_or_default()
-            ),
+            tip.is_some(),
+            "столбец показывает условную эффективность и собственный нагрев для обоих режимов",
         );
-        // Дальше — сырые корзины: «над кристаллом» и снова один P-блок.
+        if let Some((column, _)) = tip {
+            self.chart_tip(column, 0.5, "условная модель: подсказка столбца");
+            let shot = self.shot("own-tip");
+            self.check(shot, "картинка: условия живого расчёта");
+            self.leave();
+        }
+        let descriptions = self
+            .ui
+            .get_stats_legend()
+            .iter()
+            .all(|l| l.tip.contains("пригодных") && l.tip.contains("история") && l.tip.contains("период"));
+        self.check(
+            descriptions,
+            "подсказка ядра сообщает данные, период, историю и ограничения расчёта",
+        );
         let above = (self.ui.get_above_chip_x(), self.ui.get_above_chip_y());
         self.chip(above, |v| v.scale == Scale::AboveDie, "щелчок по «над кристаллом»");
         self.click(ex, ey, PointerEventButton::Left);

@@ -32,6 +32,9 @@ use crate::store::Digest;
 use crate::wire::BlockInfo;
 use crate::{Column, Cut, LegendItem, Mark, Run, Series, Tick};
 
+#[path = "chart_live.rs"]
+mod live;
+
 // ----- выбор владельца -----
 
 /// Вид графика (бриф 16.10, «эффективность»): один из трёх.
@@ -1145,6 +1148,10 @@ pub fn stats_panel(input: &StatsInput) -> StatsShown {
         .iter()
         .filter_map(|&b| input.blocks.iter().find(|x| x.index == b))
         .collect();
+    if input.scale == Scale::Efficiency {
+        live::panel(input, &compared, &mut shown);
+        return shown;
+    }
     if matches!(input.scale, Scale::ConditionalEfficiency | Scale::ConditionalHeat) {
         snapshot_panel(input, &compared, &mut shown);
         return shown;

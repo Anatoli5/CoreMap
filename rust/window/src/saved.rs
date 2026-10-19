@@ -95,6 +95,8 @@ pub struct Saved {
     pub events_all: Option<bool>,
     /// Кривые модели нагрева на графике.
     pub model: Option<bool>,
+    /// Дополнительная условная кривая при постоянной нагрузке 100 %.
+    pub live_full: Option<bool>,
     /// Оси местами: температура по горизонтали (true).
     pub swap: Option<bool>,
     /// Обычный размер окна, логические точки (не зависят от масштаба экрана).
@@ -245,6 +247,7 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         },
         events_all: map.get("eventsAll").and_then(Value::as_bool),
         model: map.get("model").and_then(Value::as_bool),
+        live_full: map.get("liveFull").and_then(Value::as_bool),
         swap: map.get("swap").and_then(Value::as_bool),
         size,
         position,
@@ -337,6 +340,9 @@ pub fn text(saved: &Saved) -> String {
     }
     if let Some(model) = saved.model {
         map.insert("model".into(), model.into());
+    }
+    if let Some(full) = saved.live_full {
+        map.insert("liveFull".into(), full.into());
     }
     if let Some(swap) = saved.swap {
         map.insert("swap".into(), swap.into());
@@ -491,6 +497,7 @@ mod tests {
             quantity: Some(Quantity::Ceiling),
             events_all: Some(true),
             model: Some(false),
+            live_full: Some(true),
             swap: Some(true),
             size: Some((1500.0, 900.0)),
             position: Some((120, 80)),

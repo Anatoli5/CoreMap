@@ -45,9 +45,11 @@ mod conditional_convergence_spec;
 mod conditional_data;
 #[cfg(test)]
 mod conditional_data_spec;
+mod conditional_live;
 #[cfg(test)]
 mod conditional_query_spec;
 mod conditional_report;
+mod conditional_runtime;
 mod conditional_snapshot;
 #[cfg(test)]
 mod conditional_surface_spec;
@@ -59,6 +61,10 @@ mod gam_solver_spec;
 mod history;
 #[cfg(test)]
 mod history_spec;
+#[cfg(test)]
+mod live_model_spec;
+#[cfg(test)]
+mod live_route_spec;
 mod model;
 mod model_report;
 mod plot;

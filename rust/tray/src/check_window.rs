@@ -262,6 +262,8 @@ fn maxima(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client,
     // Потолок блока a сменён в окне (плитка): сбрасывается блок a, и только он.
     let index = |first: usize| blocks.iter().position(|x| x.first == first).unwrap_or(0);
     let ceiling_a = ceilings_now(app).get(fa).copied().unwrap_or(0);
+    // В состоянии плитки максимум округлён до целого; журнал сохраняет точное показание, как maxima.json.
+    let expected_max = saved_maximum(&file, fa, ceiling_a);
     let events_from = events_today(data).len();
     let (_, ok, why) = order(
         shell,
@@ -292,7 +294,7 @@ fn maxima(r: &mut Report, app: &mut App, shell: &mut Shell, client: &mut Client,
             && line["from"] == ceiling_a
             && line["to"] == ceiling_a - 1
             && line["period"]["ceiling"] == ceiling_a
-            && same(&line["period"]["max"], &before["max"][fa])
+            && same(&line["period"]["max"], &expected_max)
             && same(&line["period"]["mean"], &before["avg"][fa])
             && line["period"]["maxTime"].is_string()
             && line["conditions"]["temp"].is_number(),
@@ -922,6 +924,17 @@ fn events_today(data: &Path) -> Vec<Value> {
 /// Одно и то же число, как бы оно ни было записано (73 и 73.0 — одно; null — ни с чем).
 fn same(a: &Value, b: &Value) -> bool {
     a.as_f64().is_some_and(|x| b.as_f64() == Some(x))
+}
+
+/// Точный сохранённый максимум покидаемого потолка, без округления плитки.
+fn saved_maximum(text: &str, first: usize, ceiling: i32) -> Value {
+    let saved = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+    saved["blocks"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|b| b["first"].as_u64() == u64::try_from(first).ok()))
+        .and_then(|block| block["byCeiling"].as_array())
+        .and_then(|entries| entries.iter().find(|e| e["ceiling"] == ceiling))
+        .map_or(Value::Null, |entry| entry["max"].clone())
 }
 
 /// Строки журнала событий после первых `from` с этим `kind`.
@@ -1861,5 +1874,25 @@ pub fn leaving(r: &mut Report, app: &mut App, shell: &mut Shell, places: (&Path,
             &format!("окно не закрылось — программа вышла без него через {left:?}"),
         );
         client.close();
+    }
+}
+
+#[cfg(test)]
+mod event_maximum_spec {
+    use super::*;
+
+    #[test]
+    fn event_maximum_uses_the_exact_departing_ceiling_value_not_the_rounded_tile() {
+        let saved = r#"{"blocks":[{"first":1,"byCeiling":[{"ceiling":43,"max":99.0}]},
+            {"first":0,"byCeiling":[{"ceiling":42,"max":73.0},{"ceiling":43,"max":74.5}]}]}"#;
+        let exact = saved_maximum(saved, 0, 43);
+        assert!(same(&json!(74.5), &exact));
+        assert!(
+            !same(&json!(75), &exact),
+            "округлённая плитка не подменяет точный максимум события"
+        );
+        assert!(!same(&json!(73), &exact), "максимум другого потолка не подходит");
+        assert!(!same(&json!(99), &exact), "максимум другого блока не подходит");
+        assert!(!same(&saved_maximum(saved, 0, 44), &Value::Null));
     }
 }

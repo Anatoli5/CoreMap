@@ -11,7 +11,7 @@ use crate::history::Signal;
 
 #[path = "conditional_query.rs"]
 mod query;
-pub use query::{CurveEstimate, CurveQuery};
+pub use query::{CurveEstimate, CurveEstimatePoint, CurveQuery};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -259,7 +259,7 @@ fn transpose(columns: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
     (0..n).map(|i| columns.iter().map(|c| c[i]).collect()).collect()
 }
 
-fn design_with(data: &Prepared, surface: &Surface) -> Result<Design, Error> {
+pub(crate) fn design_with(data: &Prepared, surface: &Surface) -> Result<Design, Error> {
     validate(&surface.metadata, data)?;
     let n = data.times.len();
     let k = surface.metadata.knots.len() - 1;
