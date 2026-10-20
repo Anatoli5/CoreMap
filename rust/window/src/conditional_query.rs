@@ -2,7 +2,7 @@
 // Это условные запросы при сохранённом окружении, не прогноз перераспределения работы Windows.
 use serde::{Deserialize, Serialize};
 
-use super::{CurveLoad, Error, Surface, count, design_with, dimensions, dot, lagged, ramp};
+use super::{CurveLoad, Design, Error, Surface, count, design_with, dimensions, dot, lagged, ramp};
 use crate::conditional_data::Prepared;
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +67,33 @@ impl Surface {
         ratios: &[f64],
         load: CurveLoad,
     ) -> Result<CurveEstimate, Error> {
+        let fixed = self.query_input(data, selected, ratios, load)?;
+        let design = design_with(data, self)?;
+        self.curve_designed(data, selected, ratios, fixed, &design)
+    }
+
+    // Обе линии используют один неизменяемый базис; он освобождается сразу после запроса.
+    pub(crate) fn curve_pair(
+        &self,
+        data: &Prepared,
+        selected: &[bool],
+        ratios: &[f64],
+    ) -> Result<[CurveEstimate; 2], Error> {
+        self.query_input(data, selected, ratios, CurveLoad::ObservedHistory)?;
+        let design = design_with(data, self)?;
+        Ok([
+            self.curve_designed(data, selected, ratios, None, &design)?,
+            self.curve_designed(data, selected, ratios, Some(1.0), &design)?,
+        ])
+    }
+
+    fn query_input(
+        &self,
+        data: &Prepared,
+        selected: &[bool],
+        ratios: &[f64],
+        load: CurveLoad,
+    ) -> Result<Option<f64>, Error> {
         if selected.len() != data.times.len() {
             return Err(Error::Dimensions);
         }
@@ -80,7 +107,17 @@ impl Surface {
         // Проверка размерностей базиса предшествует его использованию, включая публичные JSON-модели.
         super::validate(&self.metadata, data)?;
         dimensions(self)?;
-        let design = design_with(data, self)?;
+        Ok(fixed)
+    }
+
+    fn curve_designed(
+        &self,
+        data: &Prepared,
+        selected: &[bool],
+        ratios: &[f64],
+        fixed: Option<f64>,
+        design: &Design,
+    ) -> Result<CurveEstimate, Error> {
         let ids: Vec<usize> = selected
             .iter()
             .zip(&design.valid)

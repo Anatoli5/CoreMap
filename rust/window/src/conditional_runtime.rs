@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::conditional::{CurveEstimate, CurveLoad};
+use crate::conditional::CurveEstimate;
 use crate::conditional_live::{self, Coverage, Options};
 use crate::model::{Die, Log};
 
@@ -105,12 +105,9 @@ fn query_pair(fit: &conditional_live::BlockFit) -> (Option<CurveEstimate>, Optio
     let Some(model) = &fit.model else {
         return (None, None, None);
     };
-    match (
-        model.curve_query(CurveLoad::ObservedHistory),
-        model.curve_query(CurveLoad::SustainedFull),
-    ) {
-        (Ok(observed), Ok(sustained)) => (Some(observed), Some(sustained), None),
-        _ => (
+    match model.query_pair() {
+        Ok([observed, sustained]) => (Some(observed), Some(sustained), None),
+        Err(_) => (
             None,
             None,
             Some("Не удалось построить условный срез модели; прежняя кривая не подставляется".into()),

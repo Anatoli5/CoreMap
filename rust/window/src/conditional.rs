@@ -131,11 +131,22 @@ pub struct Prediction {
 
 #[derive(Debug)]
 pub struct Design {
-    // Строка × лаг нагрузки × интервал множителя; отдельная матрица — чтобы не создавать полный тензор всех лагов.
-    drive: Vec<Vec<Vec<f64>>>,
+    // Строка × лаг нагрузки × интервал множителя, один непрерывный буфер вместо выделения на каждую пару строка/лаг.
+    drive: Vec<f64>,
+    drive_width: usize,
     environment: Vec<Vec<f64>>,
     background: Vec<Vec<f64>>,
     pub valid: Vec<bool>,
+}
+
+impl Design {
+    fn drives(&self) -> impl Iterator<Item = &[f64]> {
+        self.drive.chunks_exact(self.drive_width)
+    }
+
+    fn drive(&self, row: usize) -> &[f64] {
+        &self.drive[row * self.drive_width..(row + 1) * self.drive_width]
+    }
 }
 
 fn finite(value: f64) -> Option<f64> {
@@ -263,7 +274,11 @@ pub(crate) fn design_with(data: &Prepared, surface: &Surface) -> Result<Design, 
     validate(&surface.metadata, data)?;
     let n = data.times.len();
     let k = surface.metadata.knots.len() - 1;
-    let mut drive = vec![vec![vec![0.0; k]; surface.metadata.own_bands.len() + 1]; n];
+    let drive_width = k
+        .checked_mul(surface.metadata.own_bands.len() + 1)
+        .ok_or(Error::Dimensions)?;
+    let cells = n.checked_mul(drive_width).ok_or(Error::Dimensions)?;
+    let mut drive = vec![0.0; cells];
     for (j, knot) in surface.metadata.knots.windows(2).enumerate() {
         let values: Vec<f64> = data
             .ratio
@@ -275,8 +290,8 @@ pub(crate) fn design_with(data: &Prepared, surface: &Surface) -> Result<Design, 
             .chain(surface.metadata.own_bands.iter().copied().map(Some))
             .enumerate()
         {
-            for (row, v) in drive.iter_mut().zip(lagged(data, &values, lag)?) {
-                row[l][j] = v;
+            for (row, v) in drive.chunks_exact_mut(drive_width).zip(lagged(data, &values, lag)?) {
+                row[l * k + j] = v;
             }
         }
     }
@@ -293,13 +308,14 @@ pub(crate) fn design_with(data: &Prepared, surface: &Surface) -> Result<Design, 
     let environment = transpose(&env, n);
     let background = transpose(&bg, n);
     let valid = drive
-        .iter()
+        .chunks_exact(drive_width)
         .zip(&environment)
         .zip(&background)
-        .map(|((d, e), b)| d.iter().flatten().chain(e).chain(b).all(|v| v.is_finite()))
+        .map(|((d, e), b)| d.iter().chain(e).chain(b).all(|v| v.is_finite()))
         .collect();
     Ok(Design {
         drive,
+        drive_width,
         environment,
         background,
         valid,
@@ -424,9 +440,9 @@ impl Surface {
         validate(&self.metadata, data)?;
         dimensions(self)?;
         let design = design_with(data, self)?;
+        let ramps = self.metadata.knots.len() - 1;
         Ok(design
-            .drive
-            .iter()
+            .drives()
             .enumerate()
             .map(|(i, d)| {
                 if !design.valid[i] {
@@ -437,7 +453,7 @@ impl Surface {
                     .iter()
                     .enumerate()
                     .map(|(k, c)| {
-                        let retained: f64 = d.iter().zip(&self.weights).map(|(r, w)| r[k] * w).sum();
+                        let retained: f64 = d.chunks_exact(ramps).zip(&self.weights).map(|(r, w)| r[k] * w).sum();
                         retained * dot(&design.environment[i], c)
                     })
                     .sum::<f64>();
@@ -481,6 +497,21 @@ fn count(n: usize) -> f64 {
 /// Чередование двух ограниченных МНК. Лаговый вес общий для участков кривой: это ограничение ранга, а не физический закон.
 pub fn fit(data: &Prepared, template: Surface, train: &[bool], ridge: f64) -> Result<Surface, Error> {
     let surface = fit_iterations(data, template, train, ridge, 12)?;
+    converged(surface)
+}
+
+// Только в пределах одной подгонки с теми же неизменяемыми данными и базисом.
+pub(crate) fn fit_designed(
+    data: &Prepared,
+    template: Surface,
+    train: &[bool],
+    ridge: f64,
+    design: &Design,
+) -> Result<Surface, Error> {
+    converged(fit_iterations_designed(data, template, train, ridge, 12, design)?)
+}
+
+fn converged(surface: Surface) -> Result<Surface, Error> {
     if surface.fit_status.is_some_and(|status| status.converged) {
         Ok(surface)
     } else {
@@ -490,7 +521,7 @@ pub fn fit(data: &Prepared, template: Surface, train: &[bool], ridge: f64) -> Re
 
 pub fn fit_iterations(
     data: &Prepared,
-    mut template: Surface,
+    template: Surface,
     train: &[bool],
     ridge: f64,
     max_iterations: usize,
@@ -498,9 +529,34 @@ pub fn fit_iterations(
     if train.len() != data.times.len() || !ridge.is_finite() || ridge < 0.0 {
         return Err(Error::Dimensions);
     }
+    let design = design_with(data, &template)?;
+    fit_iterations_designed(data, template, train, ridge, max_iterations, &design)
+}
+
+fn initial_weights(lags: usize) -> Vec<f64> {
+    let mut weights = vec![0.0; lags];
+    if lags == 1 {
+        weights[0] = 1.0;
+    } else {
+        let initial = (lags - 1).min(3);
+        weights[1..=initial].fill(1.0 / count(initial));
+    }
+    weights
+}
+
+fn fit_iterations_designed(
+    data: &Prepared,
+    mut template: Surface,
+    train: &[bool],
+    ridge: f64,
+    max_iterations: usize,
+    design: &Design,
+) -> Result<Surface, Error> {
+    if train.len() != data.times.len() || !ridge.is_finite() || ridge < 0.0 {
+        return Err(Error::Dimensions);
+    }
     template.diagnostics.clear();
     template.fit_status = None;
-    let design = design_with(data, &template)?;
     let ids: Vec<usize> = train
         .iter()
         .enumerate()
@@ -514,13 +570,7 @@ pub fn fit_iterations(
     let ramps = template.metadata.knots.len() - 1;
     let contexts = template.context_basis.len();
     let backgrounds = template.background_basis.len();
-    let mut weights = vec![0.0; lags];
-    if lags == 1 {
-        weights[0] = 1.0;
-    } else {
-        let initial = (lags - 1).min(3);
-        weights[1..=initial].fill(1.0 / count(initial));
-    }
+    let mut weights = initial_weights(lags);
     let mut penalties: Vec<f64> = template.background_basis.iter().map(|d| d.penalty).collect();
     penalties.resize(backgrounds + ramps * contexts, 1.0);
     let mut final_pass = false;
@@ -532,7 +582,11 @@ pub fn fit_iterations(
             .map(|&i| {
                 let mut row = design.background[i].clone();
                 for j in 0..ramps {
-                    let retained: f64 = weights.iter().zip(&design.drive[i]).map(|(w, d)| w * d[j]).sum();
+                    let retained: f64 = weights
+                        .iter()
+                        .zip(design.drive(i).chunks_exact(ramps))
+                        .map(|(w, d)| w * d[j])
+                        .sum();
                     row.extend(design.environment[i].iter().map(|e| retained * e));
                 }
                 row
@@ -562,7 +616,7 @@ pub fn fit_iterations(
                     .map(|c| dot(c, &design.environment[i]))
                     .collect();
                 let mut row = design.background[i].clone();
-                row.extend(design.drive[i].iter().map(|d| dot(d, &gains)));
+                row.extend(design.drive(i).chunks_exact(ramps).map(|d| dot(d, &gains)));
                 row
             })
             .collect();

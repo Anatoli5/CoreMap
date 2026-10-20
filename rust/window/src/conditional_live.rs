@@ -2,7 +2,9 @@
 // 32 с и ridge 0,002 — воспроизводимый численный кандидат, а не установленная постоянная ноутбука.
 use std::collections::BTreeMap;
 
-use crate::conditional::{self, CurveEstimate, CurveLoad, Error, Metadata, Surface};
+#[cfg(test)]
+use crate::conditional::CurveLoad;
+use crate::conditional::{self, CurveEstimate, Error, Metadata, Surface};
 use crate::conditional_data::{self, Prepared};
 use crate::model::{Die, Log};
 
@@ -53,11 +55,17 @@ pub struct Fitted {
 }
 
 impl Fitted {
-    pub fn curve_query(&self, load: CurveLoad) -> Result<CurveEstimate, Error> {
-        self.query(load)
+    #[cfg(test)]
+    pub fn query(&self, load: CurveLoad) -> Result<CurveEstimate, Error> {
+        self.query_ratios(&self.ratios()?, load)
     }
 
-    pub fn query(&self, load: CurveLoad) -> Result<CurveEstimate, Error> {
+    pub fn query_pair(&self) -> Result<[CurveEstimate; 2], Error> {
+        self.surface
+            .curve_pair(&self.data, &vec![true; self.data.times.len()], &self.ratios()?)
+    }
+
+    fn ratios(&self) -> Result<Vec<f64>, Error> {
         let extent = self
             .data
             .ratio
@@ -70,10 +78,10 @@ impl Fitted {
             return Err(Error::InsufficientRows);
         };
         // Равномерная сетка — только разрешение линии; численная модель не округляет измеренный множитель.
-        let ratios: Vec<f64> = (0..=64).map(|i| lo + (hi - lo) * f64::from(i) / 64.0).collect();
-        self.query_ratios(&ratios, load)
+        Ok((0..=64).map(|i| lo + (hi - lo) * f64::from(i) / 64.0).collect())
     }
 
+    #[cfg(test)]
     pub fn query_ratios(&self, ratios: &[f64], load: CurveLoad) -> Result<CurveEstimate, Error> {
         self.surface
             .curve_query(&self.data, &vec![true; self.data.times.len()], ratios, load)
@@ -289,14 +297,15 @@ fn fit_prepared(data: Prepared, options: Options, result: &mut BlockFit) -> Resu
         return Err(Error::InsufficientRows);
     }
     let template = Surface::template(meta, bands);
-    valid = conditional::design_with(&data, &template)?.valid;
+    let design = conditional::design_with(&data, &template)?;
+    valid.clone_from(&design.valid);
     for (yes, &target) in valid.iter_mut().zip(&data.target) {
         *yes &= target.is_finite();
     }
     result.eligible_rows = valid.iter().filter(|&&yes| yes).count();
     let train = training_mask(&valid, &data.ratio, options.max_training_rows);
     result.training_rows = train.iter().filter(|&&yes| yes).count();
-    let surface = conditional::fit(&data, template, &train, options.ridge)?;
+    let surface = conditional::fit_designed(&data, template, &train, options.ridge, &design)?;
     Ok(Fitted { surface, data })
 }
 

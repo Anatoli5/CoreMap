@@ -559,3 +559,59 @@ fn queried_ratios_report_knot_domain_without_claiming_joint_support() {
         }
     }
 }
+
+// Проверка ресурсной правки по независимой арифметике: два участка, три разных веса истории,
+// переменные нагрузка/вентилятор и разрыв. Значения не вычисляются через внутренний Design.
+#[test]
+fn paired_curves_preserve_asymmetric_history_and_rebuild_after_input_changes() {
+    let mut value = current_json();
+    value["metadata"]["knots"] = json!([0.0, 10.0, 20.0]);
+    value["metadata"]["own_bands"] = json!([[0, 1], [1, 2]]);
+    value["weights"] = json!([0.2, 0.3, 0.5]);
+    value["context_coefficients"] = json!([[8.0, 2.0], [3.0, 1.0]]);
+    let mut surface = decode(value);
+    let mut source = data(
+        &[5.0, 15.0, 20.0, 10.0, f64::NAN, 5.0, 15.0],
+        &[1.0, 0.5, 0.25, 1.0, 1.0, 0.75, 0.5],
+        &[0.0, 10.0, 5.0, 0.0, 2.0, 8.0, 10.0],
+    );
+    source.segments = vec![0, 0, 0, 0, 1, 1, 1];
+    let predicted = surface.predict(&source).expect("полные строки");
+    close(predicted[2].as_ref().expect("история 2 с").own_heat, 2.5);
+    close(predicted[3].as_ref().expect("история 2 с").temperature, 34.8);
+    assert!(predicted[..2].iter().chain(&predicted[4..]).all(Option::is_none));
+    let pair = surface
+        .curve_pair(&source, &[true; 7], &[10.0, 20.0])
+        .expect("две линии");
+    assert_eq!((pair[0].rows, pair[1].rows), (2, 2));
+    close(pair[0].points[0].own_heat, 3.85);
+    close(pair[0].points[1].own_heat, 5.3375);
+    close(pair[0].points[1].performance, 12.5);
+    close(pair[1].points[0].own_heat, 6.5);
+    close(pair[1].points[1].own_heat, 9.0);
+    for (actual, mode) in pair.iter().zip([CurveLoad::ObservedHistory, CurveLoad::SustainedFull]) {
+        let single = surface
+            .curve_query(&source, &[true; 7], &[10.0, 20.0], mode)
+            .expect("одна линия");
+        assert_eq!(
+            serde_json::to_value(actual).expect("парная линия"),
+            serde_json::to_value(single).expect("отдельная линия")
+        );
+    }
+    source.busy[0] = 0.0;
+    let changed = surface.curve_pair(&source, &[true; 7], &[20.0]).expect("новые данные");
+    close(changed[0].points[0].own_heat, 3.5875);
+    close(changed[1].points[0].own_heat, 9.0);
+    surface.context_coefficients[0][0] = 4.0;
+    let changed = surface.curve_pair(&source, &[true; 7], &[20.0]).expect("новая модель");
+    close(changed[0].points[0].own_heat, 2.3375);
+    close(changed[1].points[0].own_heat, 6.0);
+    assert!(matches!(
+        surface.curve_pair(&source, &[], &[20.0]),
+        Err(Error::Dimensions)
+    ));
+    assert!(matches!(
+        surface.curve_pair(&source, &[true; 7], &[f64::NAN]),
+        Err(Error::InvalidQuery)
+    ));
+}

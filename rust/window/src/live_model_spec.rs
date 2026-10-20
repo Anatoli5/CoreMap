@@ -45,6 +45,22 @@ fn no_source_measurements_cannot_yield_a_live_curve() {
 }
 
 #[test]
+fn paired_live_query_preserves_both_separate_curves() {
+    let die = topology(1);
+    let log = samples(&die, 180, 0.7, true, 0);
+    let fit = fit_block(&[&log], &die, 0, options(0));
+    let model = fit.model.expect("модель известной зависимости");
+    let pair = model.query_pair().expect("две линии живого графика");
+    for (actual, load) in pair.iter().zip([CurveLoad::ObservedHistory, CurveLoad::SustainedFull]) {
+        let single = model.query(load).expect("отдельная линия");
+        assert_eq!(
+            serde_json::to_value(actual).expect("парная линия"),
+            serde_json::to_value(single).expect("отдельная линия")
+        );
+    }
+}
+
+#[test]
 fn absent_own_busy_is_not_reconstructed_as_full_or_idle() {
     let die = topology(1);
     let mut log = Log::new(die.names.clone());
