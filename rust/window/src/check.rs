@@ -3469,14 +3469,17 @@ impl Check {
             };
             let cell_w = self.ui.get_manual_cell_w();
             let col = if i % 2 == 0 { 0.0 } else { 1.0 };
-            let row_y = if i < 2 { 0.0 } else { 26.0 };
+            let row_y = if i < 2 { 0.0 } else { self.ui.get_manual_row_h() };
             #[expect(clippy::cast_precision_loss, reason = "small whole UI slider limits")]
             let share = (value - row.minimum) as f32 / (row.maximum - row.minimum) as f32;
-            let x = self.ui.get_manual_grid_x() + col * (cell_w + 12.0) + 121.0 + share * (cell_w - 170.0);
-            let y = self.ui.get_manual_grid_y() + row_y + 12.0;
+            let x = self.ui.get_manual_grid_x() + col * (cell_w + 12.0) + 7.0 + share * (cell_w - 14.0);
+            let y = self.ui.get_manual_grid_y() + row_y + self.ui.get_manual_slider_y() + 10.0;
             if i == 0 {
                 self.ui.window().dispatch_event(WindowEvent::PointerMoved {
-                    position: LogicalPosition::new(self.ui.get_manual_grid_x() + 20.0, y),
+                    position: LogicalPosition::new(
+                        self.ui.get_manual_grid_x() + 20.0,
+                        self.ui.get_manual_grid_y() + self.ui.get_manual_label_h() / 2.0,
+                    ),
                 });
                 let ui = self.ui.as_weak();
                 let helped = self.pump(|_| ui.upgrade().is_some_and(|u| u.get_tip_shown()), 1.0);
@@ -3484,9 +3487,13 @@ impl Check {
                     position: LogicalPosition::new(x, y),
                 });
                 self.pump(|_| true, 0.0);
+                let over_track = self.ui.get_tip_shown();
                 self.check(
-                    helped && !self.ui.get_tip_shown(),
-                    "подсказка названию доступна, над дорожкой ползунка скрыта",
+                    helped && !over_track,
+                    format!(
+                        "подсказка названию доступна ({helped}), над дорожкой ползунка скрыта ({})",
+                        !over_track
+                    ),
                 );
             }
             let before = self.view.borrow().sent;

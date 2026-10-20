@@ -1060,7 +1060,11 @@ fn cutoffs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &
     pump(shell, app, Duration::from_secs(1));
     force(app, 88.0, 40.0);
     let from = lines_in(&log);
-    pump(shell, app, Duration::from_millis(1500));
+    // Ждём два действия, а не две удачно попавшие в короткий стеновой срок серии Windows-таймеров.
+    // Минимальный интервал проверяется отдельно; при пропуске опросов контроллер правильно начинает окно заново.
+    let flat_started = Instant::now();
+    pump_until(shell, app, Duration::from_secs(3), |_| acts(from, "target").len() >= 2);
+    let flat_ms = flat_started.elapsed().as_millis();
     let flat = acts(from, "target");
     let flat_gaps = gaps(&flat);
     // Падает 88 → 76 °C (8 °C/с): медиана каждого окна ниже прошлой, все выше 75. Первые 0,45 с не в счёт — в первом окне
@@ -1082,7 +1086,7 @@ fn cutoffs(r: &mut Report, app: &mut App, shell: &mut Shell, data: &Path, hot: &
             && idle(&flat)
             && !falling.is_empty(),
         &format!(
-            "целевая отсечка: 88 °C ровно 1,5 с — {} ступеней раз в окно (мс: {flat_gaps:?}); 88 → 76 °C спадом — {} ступеней",
+            "целевая отсечка: 88 °C {flat_ms} мс — {} ступеней раз в окно (мс: {flat_gaps:?}); 88 → 76 °C спадом — {} ступеней",
             flat.len(),
             falling.len()
         ),

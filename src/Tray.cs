@@ -1227,7 +1227,9 @@ namespace CoreMap
             string windowExe = Path.Combine(Program.Root, "CoreMapWindow.exe");
             foreach (string old in Directory.GetFiles(outputs, "window*.png")) File.Delete(old);  // картинки прошлого прохода не должны сойти за нынешние
             string refused = null;
-            try { code = File.Exists(windowExe) ? RunProcess(windowExe, "--pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 60, null) : -2; }
+            // Полный проход с живой моделью занял 48,9 с, а под нагрузкой дошёл до 59,9 с и был прерван
+            // посреди следующих проверок. Это общий предел от зависания, не требование к задержке интерфейса.
+            try { code = File.Exists(windowExe) ? RunProcess(windowExe, "--pipe " + pipe + " --snapshot \"" + picture + "\" --size 1920x1040", 120, null) : -2; }
             catch (System.ComponentModel.Win32Exception e) { code = -3; refused = e.Message; }  // Smart App Control не пустил файл
             Pump(() => !engine.Alive, 10);
             check(code == 0 && File.Exists(picture) && !engine.Alive,

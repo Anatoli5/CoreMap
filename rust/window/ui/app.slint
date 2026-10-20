@@ -1547,6 +1547,9 @@ export component AppWindow inherits Window {
     out property <length> manual-grid-x: root.stats-x + root.pad;
     out property <length> manual-grid-y: root.auto-y + (root.has-emergency ? 90px : 64px);
     out property <length> manual-cell-w: (root.stats-w - 2 * root.pad - 12px) / 2;
+    out property <length> manual-row-h: 46px;
+    out property <length> manual-label-h: 20px;
+    out property <length> manual-slider-y: 22px;
     out property <length> limit-track-x: limit-slider.absolute-position.x + limit-slider.track-x;
     out property <length> limit-track-w: limit-slider.track-w;
     out property <length> limit-track-y: limit-slider.absolute-position.y + limit-slider.height / 2;
@@ -1897,7 +1900,7 @@ export component AppWindow inherits Window {
     property <length> ranges-y: root.controls-top + root.base-controls-h + (root.chart-time ? root.ctl-row : 0px);
     property <length> controls-h: root.base-controls-h + (root.chart-time ? root.ctl-row : 0px) + 52px;
     out property <length> events-h: min(6, max(1, root.events.length)) * 18px;
-    out property <length> auto-h: !root.has-auto ? 0px : (root.has-emergency ? 90px : 64px) + (root.manual-controls.length > 0 ? 56px : 0px);
+    out property <length> auto-h: !root.has-auto ? 0px : (root.has-emergency ? 90px : 64px) + ceil(root.manual-controls.length / 2) * root.manual-row-h;
     out property <length> auto-y: root.body-y + root.body-h - root.pad - root.events-h - 28px - root.auto-h;
     out property <length> chart-y: root.body-y + root.controls-top + root.controls-h;
     out property <length> chart-h: root.auto-y - root.chart-y;
@@ -2851,33 +2854,34 @@ export component AppWindow inherits Window {
         }
         for control[i] in root.manual-controls: Rectangle {
             x: mod(i, 2) * (parent.width + 12px) / 2;
-            y: (root.has-emergency ? 90px : 64px) + floor(i / 2) * 26px;
+            y: (root.has-emergency ? 90px : 64px) + floor(i / 2) * root.manual-row-h;
             width: (parent.width - 12px) / 2;
-            height: 24px;
+            height: root.manual-row-h - 2px;
             Text {
-                width: 112px; height: parent.height;
+                x: 0; y: 0;
+                width: parent.width - 48px; height: root.manual-label-h;
                 text: control.label;
                 font-size: 11px; color: Palette.dim;
                 vertical-alignment: center;
             }
             setting := ValueSlider {
-                x: 114px; y: 2px;
-                width: parent.width - 156px; height: 20px;
+                x: 0; y: root.manual-slider-y;
+                width: parent.width; height: 20px;
                 minimum: control.minimum; maximum: control.maximum;
                 value: control.value; enabled: root.auto-ready; lit: root.auto-on;
                 released(v) => { root.manual-released(i, v); }
-                hover(on) => { root.tip(on, "manual-" + i, control.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                hover(on) => { root.tip(on, "manual-" + i, control.tip, self.absolute-position.x, self.absolute-position.y - root.manual-slider-y, self.width, root.manual-label-h); }
             }
             TouchArea {
-                x: 0; width: 112px; height: parent.height;
+                x: 0; y: 0; width: parent.width - 48px; height: root.manual-label-h;
                 changed has-hover => { setting.hover(self.has-hover); }
             }
             TouchArea {
-                x: parent.width - 40px; width: 40px; height: parent.height;
+                x: parent.width - 40px; y: 0; width: 40px; height: root.manual-label-h;
                 changed has-hover => { setting.hover(self.has-hover); }
             }
             Text {
-                x: parent.width - 40px; width: 40px; height: parent.height;
+                x: parent.width - 40px; y: 0; width: 40px; height: root.manual-label-h;
                 text: "\{setting.shown} \{control.unit}";
                 color: root.auto-on ? Palette.text : Palette.dim;
                 font-size: 11px; horizontal-alignment: right; vertical-alignment: center;
