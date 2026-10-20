@@ -1802,7 +1802,10 @@ impl Check {
         let i = keys.iter().position(|k| k == key)?;
         Some((
             self.ui.get_prof_x() + self.ui.get_pad() + 80.0,
-            self.ui.get_sets_y() + units(i) * self.ui.get_set_h() + self.ui.get_set_h() / 2.0,
+            self.ui.get_sets_y()
+                + self.ui.get_sets_offset()
+                + units(i) * self.ui.get_set_h()
+                + self.ui.get_set_h() / 2.0,
         ))
     }
 
@@ -1821,12 +1824,62 @@ impl Check {
 
     /// Щелчок по строке списка: выбор профиля.
     fn choose(&mut self, key: &str) -> bool {
-        let Some(row) = self.set_row(key) else {
+        self.open_profiles();
+        let Some(mut row) = self.set_row(key) else {
             self.check(false, format!("строки «{key}» в списке нет"));
             return false;
         };
+        let top = self.ui.get_sets_y();
+        let bottom = top + self.ui.get_sets_h();
+        if row.1 < top || row.1 >= bottom {
+            let middle = top.midpoint(bottom);
+            self.ui.window().dispatch_event(WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(row.0, middle),
+                delta_x: 0.0,
+                delta_y: middle - row.1,
+            });
+            self.pump(|_| true, 0.0);
+            row = self.set_row(key).expect("scrolling does not remove a profile");
+        }
+        if !self.check(
+            row.1 >= top && row.1 < bottom,
+            format!("строка «{key}» доступна после прокрутки"),
+        ) {
+            return false;
+        }
         self.press(row);
         self.view.borrow().chosen.as_deref() == Some(key)
+    }
+
+    fn open_profiles(&mut self) {
+        if !self.ui.get_profiles_open() {
+            self.press((
+                self.ui.get_profile_picker_x() + self.ui.get_profile_picker_w() / 2.0,
+                self.ui.get_profile_picker_y() + self.ui.get_profile_picker_h() / 2.0,
+            ));
+        }
+    }
+
+    /// Раскрытие не применяет профиль и не меняет вид графика; закрытие возвращает место схеме.
+    fn profile_picker(&mut self) {
+        let before = self.view.borrow().sent;
+        let chosen = self.view.borrow().chosen.clone();
+        let swapped = self.ui.get_chart_swap();
+        self.check(!self.ui.get_profiles_open(), "список профилей изначально свёрнут");
+        self.open_profiles();
+        self.check(self.ui.get_profiles_open(), "щелчок в заголовке раскрывает профили");
+        self.type_text("\u{1b}");
+        self.check(!self.ui.get_profiles_open(), "Escape закрывает список профилей");
+        self.open_profiles();
+        self.press((self.ui.get_stats_x() + self.ui.get_stats_w() - 4.0, 4.0));
+        self.check(!self.ui.get_profiles_open(), "щелчок снаружи закрывает профили");
+        self.check(
+            self.view.borrow().sent == before
+                && self.view.borrow().chosen == chosen
+                && self.ui.get_chart_swap() == swapped,
+            "раскрытие и закрытие не посылают команд и сохраняют выбор и оси",
+        );
+        self.open_profiles();
     }
 
     /// Потолок выбранного профиля у ядра; None — профиль не выбран или его потолков нет.
@@ -1879,6 +1932,7 @@ impl Check {
         {
             return;
         }
+        self.profile_picker();
         let (chosen, wanted, logon) = {
             let v = self.view.borrow();
             (
@@ -1919,6 +1973,13 @@ impl Check {
         self.check(
             typed == PROFILE && self.ui.get_can_save_as(),
             format!("в поле названия «{typed}», «сохранить как» доступна"),
+        );
+        self.type_text("\u{1b}");
+        let closed_from_input = !self.ui.get_profiles_open();
+        self.open_profiles();
+        self.check(
+            closed_from_input && self.ui.get_prof_name() == PROFILE,
+            "Escape из поля закрывает панель; повторное раскрытие сохраняет введённое название",
         );
         let save_as_button = (
             self.ui.get_prof_x() + self.ui.get_prof_w() - self.ui.get_pad() - 64.0,
@@ -2051,6 +2112,8 @@ impl Check {
             deleted && back,
             format!("«удалить» убрал «{PROFILE}»; потолок {name} — как до шага (×{start}): {back}"),
         );
+        self.type_text("\u{1b}");
+        self.check(!self.ui.get_profiles_open(), "после работы с профилями список свёрнут");
     }
 
     /// Отметка «загружать при старте Windows» щелчками (против программы у часов): ставится у «проверка окна», переходит
@@ -2166,14 +2229,17 @@ impl Check {
             let ui = &self.ui;
             let (w, h) = (units_u32(size.0), units_u32(size.1));
             let die_right = ui.get_margin() + ui.get_die_w() + 2.0 * ui.get_pad();
-            let fits = die_right <= ui.get_prof_x()
-                && ui.get_prof_x() + ui.get_prof_w() <= ui.get_stats_x()
+            let fits = die_right <= ui.get_stats_x()
+                && ui.get_stats_x() - die_right <= ui.get_margin() + 0.5
                 && ui.get_stats_x() + ui.get_stats_w() <= w + 0.5
                 && ui.get_die_y() + ui.get_die_h() <= h
                 && ui.get_chart_h() >= 140.0
-                && ui.get_row_c_y() + ui.get_btn_h() <= h;
+                && ui.get_prof_x() >= 0.0
+                && ui.get_prof_x() + ui.get_prof_w() <= w
+                && ui.get_prof_y() + ui.get_prof_h() <= h
+                && !ui.get_profiles_open();
             let line = format!(
-                "окно {}×{}: схема ×{:.2} ({:.0}×{:.0}), профили {:.0} px, статистика {:.0} px, график {:.0} px высотой — разделы не налезают",
+                "окно {}×{}: схема ×{:.2} ({:.0}×{:.0}), раскрывающиеся профили {:.0} px, статистика {:.0} px, график {:.0} px высотой — отдельной колонки профилей нет",
                 size.0,
                 size.1,
                 ui.get_scale(),

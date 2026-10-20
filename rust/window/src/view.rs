@@ -1015,6 +1015,12 @@ impl View {
         if !ui.get_has_profiles() {
             ui.set_has_profiles(true);
         }
+        let caption = shown
+            .rows
+            .iter()
+            .find(|row| row.selected)
+            .map_or("Профили", |row| row.name.as_str());
+        set_text(&ui.get_profile_caption(), caption, |t| ui.set_profile_caption(t));
         set_text(&ui.get_prof_status(), &shown.status, |t| ui.set_prof_status(t));
         set_text(&ui.get_prof_status_tip(), &shown.status_tip, |t| {
             ui.set_prof_status_tip(t);

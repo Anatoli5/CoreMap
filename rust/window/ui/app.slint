@@ -1,5 +1,5 @@
-// Окно CoreMap (DECISIONS #28, #32 шаг 2): верхняя полоса, строка отказа, три раздела — «Кристалл» (плитки блоков и
-// полосы тепловой связи соседей), «Профили», «Статистика» выбранного блока с настройками автомодуля под графиком
+// Окно CoreMap (DECISIONS #28, #32 шаг 2): верхняя полоса, строка отказа, схема ядер с раскрывающимися профилями
+// и статистика выбранного блока с настройками автомодуля под графиком
 // (DECISIONS #36) — и меню потолка.
 // Что и каким цветом показывать, решает Rust (src/view.rs, src/panels.rs): сюда приходят готовые строки, цвета и
 // места в долях, отсюда уходят щелчки. Строка модели перерисовывается, только когда Rust её заменил, — а он заменяет
@@ -1434,6 +1434,8 @@ export component AppWindow inherits Window {
     // Профили (DECISIONS #38): строка — выбранный профиль против текущего состояния; список; применить, сохранить,
     // удалить; «загружать при старте Windows»; сохранить как.
     in property <bool> has-profiles;
+    in property <string> profile-caption: "Профили";
+    out property <bool> profiles-open;
     in property <string> prof-status;
     in property <string> prof-status-tip;
     in property <bool> prof-attention;
@@ -1801,12 +1803,11 @@ export component AppWindow inherits Window {
     out property <length> pad: 12px;
     out property <length> head-h: 32px;
     property <length> legend-h: 24px;
-    property <length> prof-nat-w: 340px;
     property <length> stats-nat-w: 470px;
     property <length> stats-min-w: 380px;
 
     // Размер по содержимому: схема при масштабе 1 и панели по естественной ширине.
-    out property <length> natural-w: root.margin + root.die-nat-w + 2 * root.pad + root.margin + root.prof-nat-w + root.margin + root.stats-nat-w + root.margin;
+    out property <length> natural-w: root.margin + root.die-nat-w + 2 * root.pad + root.margin + root.stats-nat-w + root.margin;
     out property <length> natural-h: root.top-h + root.margin + root.head-h + root.die-nat-h + root.legend-h + root.pad + root.margin;
     preferred-width: root.natural-w;
     preferred-height: root.natural-h;
@@ -1820,21 +1821,24 @@ export component AppWindow inherits Window {
     out property <length> body-y: root.top-h + root.problem-h + root.margin;
     property <length> body-h: root.height - root.body-y - root.margin;
     property <float> scale-h: (root.body-h - root.head-h - root.legend-h - root.pad) / root.die-nat-h;
-    property <float> scale-w: (root.width - 5 * root.margin - 2 * root.pad - 300px - root.stats-min-w) / root.die-nat-w;
+    property <float> scale-w: (root.width - 3 * root.margin - 2 * root.pad - root.stats-min-w) / root.die-nat-w;
     out property <float> scale: max(0.5, min(root.scale-h, root.scale-w));
     out property <length> die-w: root.die-nat-w * root.scale;
     out property <length> die-h: root.die-nat-h * root.scale;
     out property <length> die-x: root.margin + root.pad;
     out property <length> die-y: root.body-y + root.head-h;
 
-    // Панели справа от схемы: профили — до 420 px, статистика — остальное.
-    property <length> right-x: root.margin + root.die-w + 2 * root.pad + root.margin;
-    property <length> right-w: root.width - root.right-x - root.margin;
-    out property <length> prof-x: root.right-x;
-    // По содержимому окна — естественная ширина; шире окно — растёт до 420 px, остальное — статистике.
-    out property <length> prof-w: max(300px, min(420px, root.right-w - root.stats-nat-w - root.margin));
-    out property <length> stats-x: root.prof-x + root.prof-w + root.margin;
+    // Справа от схемы всё место получает статистика. Профили раскрываются поверх окна.
+    out property <length> stats-x: root.margin + root.die-w + 2 * root.pad + root.margin;
     out property <length> stats-w: root.width - root.stats-x - root.margin;
+    out property <length> profile-picker-x: root.margin + root.pad + 104px;
+    out property <length> profile-picker-y: root.body-y + 4px;
+    out property <length> profile-picker-w: max(32px, root.die-w - 174px);
+    out property <length> profile-picker-h: 24px;
+    out property <length> prof-x: min(root.profile-picker-x, root.width - root.prof-w - root.margin);
+    out property <length> prof-w: min(420px, root.width - 2 * root.margin);
+    out property <length> prof-y: root.body-y + root.head-h;
+    out property <length> prof-h: root.note-y + 18px + root.pad - root.prof-y;
 
     // Профили: где что лежит (скрытая проверка целится по этим же числам). Сверху вниз: строка «выбранный против
     // текущего», строка значков, список (по числу профилей; больше, чем помещается, — прокручивается), сразу под ним
@@ -1845,12 +1849,13 @@ export component AppWindow inherits Window {
     out property <length> set-h: 26px;
     property <length> mean-w: 40px;  // столбец среднего потолка набора («52.4»)
     property <length> check-h: 22px;
-    out property <length> status-y: root.body-y + root.head-h;
+    out property <length> status-y: root.prof-y + root.head-h;
     property <length> legend-y: root.status-y + 22px;
     out property <length> sets-y: root.legend-y + 16px + 6px;
     property <length> below-sets: 6px + root.btn-h + 6px + root.check-h + 6px + root.btn-h + 4px + 18px + root.pad;
-    property <length> sets-room: root.body-y + root.body-h - root.sets-y - root.below-sets;
-    out property <length> sets-h: min(root.sets.length * root.set-h + 4px, root.sets-room);
+    property <length> sets-room: root.height - root.margin - root.sets-y - root.below-sets;
+    out property <length> sets-h: min(root.sets.length * root.set-h + 4px, min(260px, max(root.set-h, root.sets-room)));
+    out property <length> sets-offset: profile-list.content-y;
     out property <length> row-b-y: root.sets-y + root.sets-h + 6px;
     out property <length> startup-y: root.row-b-y + root.btn-h + 6px;
     out property <length> row-c-y: root.startup-y + root.check-h + 6px;
@@ -2042,6 +2047,7 @@ export component AppWindow inherits Window {
             root.tile-hover(tile.block, on);
         }
         menu(x, y) => {
+            root.profiles-open = false;
             root.menu-x = x;
             root.menu-y = y;
             root.tile-menu(tile.block);
@@ -2065,206 +2071,31 @@ export component AppWindow inherits Window {
         }
     }
 
-    // ----- Профили -----
+    // Выбранный профиль — компактной строкой рядом с ядрами.
     Rectangle {
-        x: root.prof-x;
-        y: root.body-y;
-        width: root.prof-w;
-        height: root.body-h;
-        background: Palette.panel;
-        border-radius: 8px;
-        Text { x: root.pad; y: 9px; text: "Профили"; color: Palette.dim; font-weight: 600; }
-        if !root.has-profiles: Text {
-            x: root.pad;
-            y: root.head-h;
-            width: parent.width - 2 * root.pad;
-            text: "Профилей нет: движок не прислал их (потолки недоступны или он их не знает).";
-            color: Palette.dim;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-    }
-    // Строка: выбранный профиль против текущего состояния; обрезается по ширине панели, целиком — в подсказке.
-    if root.has-profiles: Text {
-        x: root.prof-x + root.pad;
-        y: root.status-y;
-        width: root.prof-w - 2 * root.pad;
-        height: 18px;
-        text: root.prof-status;
-        color: root.prof-attention ? Palette.accent : Palette.dim;
-        font-size: 12px;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-    if root.has-profiles: TouchArea {
-        x: root.prof-x + root.pad;
-        y: root.status-y;
-        width: root.prof-w - 2 * root.pad;
-        height: 18px;
-        changed has-hover => {
-            root.tip(self.has-hover, "status", root.prof-status-tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-        }
-    }
-    // Значки списка — строкой над ним; справа — заголовки столбцов среднего потолка набора по P- и по E-ядрам.
-    if root.has-profiles: Text {
-        x: root.prof-x + root.pad;
-        y: root.legend-y;
-        width: root.prof-w - 2 * root.pad - 2 * root.mean-w - 8px;
-        height: 16px;
-        text: "● как сейчас   ► при старте";
-        color: Palette.dim;
-        font-size: 11px;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-    if root.has-profiles: Rectangle {
-        x: root.prof-x + root.prof-w - root.pad - 2 * root.mean-w - 8px;
-        y: root.legend-y;
-        width: 2 * root.mean-w;
-        height: 16px;
-        Text { x: 0; width: root.mean-w; height: parent.height; text: "ø P"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
-        Text { x: root.mean-w; width: root.mean-w; height: parent.height; text: "ø E"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
-        TouchArea {
-            changed has-hover => {
-                root.tip(self.has-hover, "means", "Средний потолок набора\nПо P-ядрам и по E-ядрам отдельно — оценка уровня набора: выше — быстрее.\n• это потолки, а не фактические множители: под нагрузкой ядро может идти ниже", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-            }
-        }
-    }
-
-    // Список: щелчок выбирает профиль и ничего не ставит — строка и плитки показывают разницу с текущим.
-    if root.has-profiles: Flickable {
-        x: root.prof-x + root.pad;
-        y: root.sets-y;
-        width: root.prof-w - 2 * root.pad;
-        height: root.sets-h;
-        content-height: max(self.height, root.sets.length * root.set-h);
-        for s[i] in root.sets: Rectangle {
-            y: i * root.set-h;
-            height: root.set-h;
-            width: parent.width;
-            border-radius: 4px;
-            background: s.selected ? Palette.line : set-touch.has-hover ? Palette.cell : transparent;
-            Text { x: 6px; width: 12px; text: s.standing ? "●" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
-            Text { x: 18px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
-            Text {
-                x: 34px;
-                width: parent.width - 34px - 2 * root.mean-w - 12px;
-                text: s.name;
-                color: Palette.text;
-                font-size: 13px;
-                vertical-alignment: center;
-                height: parent.height;
-                overflow: elide;
-            }
-            // Средний потолок набора по P- и по E-ядрам — для сравнения наборов между собой.
-            Text { x: parent.width - 8px - 2 * root.mean-w; width: root.mean-w; height: parent.height; text: s.p-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
-            Text { x: parent.width - 8px - root.mean-w; width: root.mean-w; height: parent.height; text: s.e-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
-            set-touch := TouchArea {
-                clicked => { root.set-clicked(i); }
-                changed has-hover => {
-                    root.tip(self.has-hover, "set" + i, s.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                }
-            }
-        }
-    }
-
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.pad;
-        y: root.row-b-y;
-        width: root.btn-w;
-        height: root.btn-h;
-        text: "применить";
-        enabled: root.can-apply;
-        tip: "Применить выбранный профиль\nСтавит его потолки в процессор — он становится текущим состоянием.\n• выбор строки в списке сам ничего не ставит\n• поправки автомодуля возвращаются к потолкам профиля\n• загрузку при старте Windows не меняет";
-        clicked => { root.profile-apply(); }
-        hover(on) => { root.tip(on, "apply", self.tip, self.x, self.y, self.width, self.height); }
-    }
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
-        y: root.row-b-y;
-        width: root.btn-w;
-        height: root.btn-h;
-        text: "сохранить";
-        enabled: root.can-save;
-        tip: root.save-tip;
-        clicked => { root.profile-save(); }
-        hover(on) => { root.tip(on, "save", self.tip, self.x, self.y, self.width, self.height); }
-    }
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.pad + 2 * (root.btn-w + root.btn-gap);
-        y: root.row-b-y;
-        width: root.btn-w;
-        height: root.btn-h;
-        text: "удалить";
-        enabled: root.can-delete;
-        tip: "Удалить выбранный профиль\n• если он загружался при старте Windows — больше ничего загружаться не будет\n• потолки, которые стоят сейчас, остаются до перезагрузки";
-        clicked => { root.profile-delete(); }
-        hover(on) => { root.tip(on, "delete", self.tip, self.x, self.y, self.width, self.height); }
-    }
-    if root.has-profiles: CheckBox {
-        x: root.prof-x + root.pad;
-        y: root.startup-y;
-        width: root.prof-w - 2 * root.pad;
-        height: root.check-h;
-        text: "загружать при старте Windows";
-        on: root.startup-on;
-        enabled: root.can-startup;
-        toggled => { root.startup-toggled(); }
-        hover(on) => {
-            root.tip(on, "startup", "Загружать при старте Windows\nCoreMapTray ставит этот профиль при входе в Windows; отмечен может быть только один — в списке он со знаком ►.\n• только для сохранённого профиля: «заводские» и несохранённые изменения не загружаются\n• снять отметку — при входе ничего не ставится\n• профиль с потолком выше заводского сначала пробный: после сбоя он отключается", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-        }
-    }
-    if root.has-profiles: Rectangle {
-        x: root.prof-x + root.pad;
-        y: root.row-c-y;
-        width: root.prof-w - 2 * root.pad - 128px - root.btn-gap;
-        height: root.btn-h;
-        background: Palette.bg;
+        x: root.profile-picker-x; y: root.profile-picker-y;
+        width: root.profile-picker-w; height: root.profile-picker-h;
         border-radius: 4px;
-        border-width: 1px;
-        border-color: name-input.has-focus ? Palette.accent : Palette.cell;
-        name-input := TextInput {
-            x: 6px;
-            width: parent.width - 12px;
-            height: parent.height;
-            vertical-alignment: center;
-            single-line: true;
-            color: Palette.text;
-            font-size: 13px;
-            text <=> root.prof-name;
-            edited => { root.name-edited(); }
-            accepted => { if (root.can-save-as) { root.profile-save-as(); } }
+        background: profile-touch.has-hover || root.profiles-open ? Palette.line : Palette.cell;
+        Text {
+            x: 7px; y: 0; width: max(0px, parent.width - 29px); height: parent.height;
+            text: root.profile-caption; color: root.prof-attention ? Palette.accent : Palette.text;
+            font-size: 12px; vertical-alignment: center; overflow: elide;
         }
-        if root.prof-name == "": Text {
-            x: 6px;
-            height: parent.height;
-            vertical-alignment: center;
-            text: "новое название";
-            color: Palette.dim;
-            font-size: 12px;
+        Text { x: parent.width - 20px; y: 0; width: 16px; height: parent.height; text: "▾"; color: Palette.text; vertical-alignment: center; horizontal-alignment: center; }
+        profile-touch := TouchArea {
+            enabled: root.has-profiles;
+            mouse-cursor: pointer;
+            clicked => {
+                root.menu-shown = false;
+                root.profiles-open = !root.profiles-open;
+                root.tip-wanted = false; root.tip-shown = false;
+                keys.focus();
+            }
+            changed has-hover => {
+                root.tip(self.has-hover && !root.profiles-open, "profile-picker", "Профили\n" + root.prof-status-tip + "\n• раскрыть список, применить или сохранить профиль", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
         }
-    }
-    if root.has-profiles: Btn {
-        x: root.prof-x + root.prof-w - root.pad - 128px;
-        y: root.row-c-y;
-        width: 128px;
-        height: root.btn-h;
-        text: root.save-as-text;
-        enabled: root.can-save-as;
-        tip: "Сохранить как профиль с названием из поля\nЗаписывает текущее состояние новым профилем; он становится выбранным.\n• название уже есть — тот профиль перезаписывается\n• загрузку при старте Windows не меняет";
-        clicked => { root.profile-save-as(); }
-        hover(on) => { root.tip(on, "save-as", self.tip, self.x, self.y, self.width, self.height); }
-    }
-    if root.has-profiles: Text {
-        x: root.prof-x + root.pad;
-        y: root.note-y;
-        width: root.prof-w - 2 * root.pad;
-        height: 18px;
-        text: root.save-note;
-        color: Palette.dim;
-        font-size: 11px;
-        overflow: elide;
-        vertical-alignment: center;
     }
 
     // ----- Статистика -----
@@ -2900,14 +2731,239 @@ export component AppWindow inherits Window {
         clicked(row) => { root.event-clicked(row); }
     }
 
+    if root.profiles-open: TouchArea {
+        x: 0; y: 0; width: root.width; height: root.height;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.profiles-open = false;
+                root.tip-wanted = false; root.tip-shown = false;
+            }
+        }
+    }
+
+    // ----- Профили -----
+    if root.profiles-open: Rectangle {
+        x: root.prof-x;
+        y: root.prof-y;
+        width: root.prof-w;
+        height: root.prof-h;
+        background: Palette.panel;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Palette.line;
+        TouchArea { x: 0; y: 0; width: parent.width; height: parent.height; }
+        Btn {
+            x: parent.width - root.pad - 24px; y: 4px; width: 24px; height: 24px;
+            text: "×"; clicked => { root.profiles-open = false; root.tip-wanted = false; root.tip-shown = false; }
+        }
+        Text { x: root.pad; y: 9px; text: "Профили"; color: Palette.dim; font-weight: 600; }
+        if !root.has-profiles: Text {
+            x: root.pad;
+            y: root.head-h;
+            width: parent.width - 2 * root.pad;
+            text: "Профилей нет: движок не прислал их (потолки недоступны или он их не знает).";
+            color: Palette.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+    // Строка: выбранный профиль против текущего состояния; обрезается по ширине панели, целиком — в подсказке.
+    if root.has-profiles && root.profiles-open: Text {
+        x: root.prof-x + root.pad;
+        y: root.status-y;
+        width: root.prof-w - 2 * root.pad;
+        height: 18px;
+        text: root.prof-status;
+        color: root.prof-attention ? Palette.accent : Palette.dim;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if root.has-profiles && root.profiles-open: TouchArea {
+        x: root.prof-x + root.pad;
+        y: root.status-y;
+        width: root.prof-w - 2 * root.pad;
+        height: 18px;
+        changed has-hover => {
+            root.tip(self.has-hover, "status", root.prof-status-tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+        }
+    }
+    // Значки списка — строкой над ним; справа — заголовки столбцов среднего потолка набора по P- и по E-ядрам.
+    if root.has-profiles && root.profiles-open: Text {
+        x: root.prof-x + root.pad;
+        y: root.legend-y;
+        width: root.prof-w - 2 * root.pad - 2 * root.mean-w - 8px;
+        height: 16px;
+        text: "● как сейчас   ► при старте";
+        color: Palette.dim;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if root.has-profiles && root.profiles-open: Rectangle {
+        x: root.prof-x + root.prof-w - root.pad - 2 * root.mean-w - 8px;
+        y: root.legend-y;
+        width: 2 * root.mean-w;
+        height: 16px;
+        Text { x: 0; width: root.mean-w; height: parent.height; text: "ø P"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+        Text { x: root.mean-w; width: root.mean-w; height: parent.height; text: "ø E"; color: Palette.dim; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+        TouchArea {
+            changed has-hover => {
+                root.tip(self.has-hover, "means", "Средний потолок набора\nПо P-ядрам и по E-ядрам отдельно — оценка уровня набора: выше — быстрее.\n• это потолки, а не фактические множители: под нагрузкой ядро может идти ниже", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+            }
+        }
+    }
+
+    // Список: щелчок выбирает профиль и ничего не ставит — строка и плитки показывают разницу с текущим.
+    profile-list := Flickable {
+        visible: root.has-profiles && root.profiles-open;
+        x: root.prof-x + root.pad;
+        y: root.sets-y;
+        width: root.prof-w - 2 * root.pad;
+        height: root.sets-h;
+        content-height: max(self.height, root.sets.length * root.set-h);
+        for s[i] in root.sets: Rectangle {
+            y: i * root.set-h;
+            height: root.set-h;
+            width: parent.width;
+            border-radius: 4px;
+            background: s.selected ? Palette.line : set-touch.has-hover ? Palette.cell : transparent;
+            Text { x: 6px; width: 12px; text: s.standing ? "●" : ""; color: Palette.text; font-size: 12px; vertical-alignment: center; height: parent.height; }
+            Text { x: 18px; width: 12px; text: s.startup ? "►" : ""; color: s.disabled ? Palette.bad : Palette.accent; font-size: 11px; vertical-alignment: center; height: parent.height; }
+            Text {
+                x: 34px;
+                width: parent.width - 34px - 2 * root.mean-w - 12px;
+                text: s.name;
+                color: Palette.text;
+                font-size: 13px;
+                vertical-alignment: center;
+                height: parent.height;
+                overflow: elide;
+            }
+            // Средний потолок набора по P- и по E-ядрам — для сравнения наборов между собой.
+            Text { x: parent.width - 8px - 2 * root.mean-w; width: root.mean-w; height: parent.height; text: s.p-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+            Text { x: parent.width - 8px - root.mean-w; width: root.mean-w; height: parent.height; text: s.e-mean; color: Palette.text; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+            set-touch := TouchArea {
+                clicked => { root.set-clicked(i); }
+                changed has-hover => {
+                    root.tip(self.has-hover, "set" + i, s.tip, self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                }
+            }
+        }
+    }
+
+    if root.has-profiles && root.profiles-open: Btn {
+        x: root.prof-x + root.pad;
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "применить";
+        enabled: root.can-apply;
+        tip: "Применить выбранный профиль\nСтавит его потолки в процессор — он становится текущим состоянием.\n• выбор строки в списке сам ничего не ставит\n• поправки автомодуля возвращаются к потолкам профиля\n• загрузку при старте Windows не меняет";
+        clicked => { root.profile-apply(); }
+        hover(on) => { root.tip(on, "apply", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles && root.profiles-open: Btn {
+        x: root.prof-x + root.pad + root.btn-w + root.btn-gap;
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "сохранить";
+        enabled: root.can-save;
+        tip: root.save-tip;
+        clicked => { root.profile-save(); }
+        hover(on) => { root.tip(on, "save", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles && root.profiles-open: Btn {
+        x: root.prof-x + root.pad + 2 * (root.btn-w + root.btn-gap);
+        y: root.row-b-y;
+        width: root.btn-w;
+        height: root.btn-h;
+        text: "удалить";
+        enabled: root.can-delete;
+        tip: "Удалить выбранный профиль\n• если он загружался при старте Windows — больше ничего загружаться не будет\n• потолки, которые стоят сейчас, остаются до перезагрузки";
+        clicked => { root.profile-delete(); }
+        hover(on) => { root.tip(on, "delete", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles && root.profiles-open: CheckBox {
+        x: root.prof-x + root.pad;
+        y: root.startup-y;
+        width: root.prof-w - 2 * root.pad;
+        height: root.check-h;
+        text: "загружать при старте Windows";
+        on: root.startup-on;
+        enabled: root.can-startup;
+        toggled => { root.startup-toggled(); }
+        hover(on) => {
+            root.tip(on, "startup", "Загружать при старте Windows\nCoreMapTray ставит этот профиль при входе в Windows; отмечен может быть только один — в списке он со знаком ►.\n• только для сохранённого профиля: «заводские» и несохранённые изменения не загружаются\n• снять отметку — при входе ничего не ставится\n• профиль с потолком выше заводского сначала пробный: после сбоя он отключается", self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+        }
+    }
+    if root.has-profiles && root.profiles-open: Rectangle {
+        x: root.prof-x + root.pad;
+        y: root.row-c-y;
+        width: root.prof-w - 2 * root.pad - 128px - root.btn-gap;
+        height: root.btn-h;
+        background: Palette.bg;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: name-input.has-focus ? Palette.accent : Palette.cell;
+        name-input := TextInput {
+            x: 6px;
+            width: parent.width - 12px;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            color: Palette.text;
+            font-size: 13px;
+            text <=> root.prof-name;
+            edited => { root.name-edited(); }
+            accepted => { if (root.can-save-as) { root.profile-save-as(); } }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.profiles-open = false; return accept; }
+                reject
+            }
+        }
+        if root.prof-name == "": Text {
+            x: 6px;
+            height: parent.height;
+            vertical-alignment: center;
+            text: "новое название";
+            color: Palette.dim;
+            font-size: 12px;
+        }
+    }
+    if root.has-profiles && root.profiles-open: Btn {
+        x: root.prof-x + root.prof-w - root.pad - 128px;
+        y: root.row-c-y;
+        width: 128px;
+        height: root.btn-h;
+        text: root.save-as-text;
+        enabled: root.can-save-as;
+        tip: "Сохранить как профиль с названием из поля\nЗаписывает текущее состояние новым профилем; он становится выбранным.\n• название уже есть — тот профиль перезаписывается\n• загрузку при старте Windows не меняет";
+        clicked => { root.profile-save-as(); }
+        hover(on) => { root.tip(on, "save-as", self.tip, self.x, self.y, self.width, self.height); }
+    }
+    if root.has-profiles && root.profiles-open: Text {
+        x: root.prof-x + root.pad;
+        y: root.note-y;
+        width: root.prof-w - 2 * root.pad;
+        height: 18px;
+        text: root.save-note;
+        color: Palette.dim;
+        font-size: 11px;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+
     // Меню потолка — слой поверх окна, а не PopupWindow: в Slint 1.18 всплывающее окно не сообщает, что его
     // закрыли щелчком мимо, а Rust и скрытой проверке нужно знать, открыто ли меню. Закрывают его щелчок мимо и Esc.
     keys := FocusScope {
         width: 0;
         height: 0;
         key-pressed(event) => {
-            if (root.menu-shown && event.text == Key.Escape) {
+            if ((root.menu-shown || root.profiles-open) && event.text == Key.Escape) {
                 root.menu-shown = false;
+                root.profiles-open = false;
                 return accept;
             }
             reject
